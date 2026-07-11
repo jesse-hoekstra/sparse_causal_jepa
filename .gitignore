@@ -1,0 +1,35 @@
+# --- Never committed: data, checkpoints, run outputs (see .claude/agents/README.md) ---
+data/
+checkpoints/
+wandb/
+# Hydra run dirs / sweep dirs (no inline comments — git treats them as pattern text)
+outputs/
+sources/
+multirun/
+*.ckpt
+*.pt
+*.pth
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# --- Tooling caches ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Editors / OS cruft ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
