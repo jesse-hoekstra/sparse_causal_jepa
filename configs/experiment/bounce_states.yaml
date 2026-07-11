@@ -1,0 +1,55 @@
+# @package _global_
+# GT-embedding diagnostic on bounce (D11): channel split + SPARTAN on
+# ground-truth object states — the "does sparsity identify the graph and the
+# masses when the representation is clean?" experiment, and the τ calibration.
+# CPU-friendly worked example:
+#   python scripts/train.py experiment=bounce_states
+#   python scripts/eval_identifiability.py outputs/<run dir>
+
+model:
+  type: states
+  state_dim: 4 # [x, y, vx, vy]
+  slot_size: 32
+  pooling_heads: 4
+  max_history: 64
+  spartan_layers: 2
+  spartan_embed_dim: 128
+  spartan_mlp_hidden: 128
+  spartan_mlp_layers: 3
+  spartan_temperature: 1.0
+  aux_dim: null
+
+data:
+  name: bounce
+  num_clips: 4000
+  clip_len: 40 # episode length L (D13: their bounce uses long sequences)
+  num_balls: 5
+  speed: 0.7 # higher collision rate -> more mass evidence per window
+  seed: 0
+  render: false # states regime: skip frame rendering (big CPU saving)
+  cache: true # episodes memoized across epochs (states-only items are tiny)
+
+train:
+  steps: 20000
+  batch_size: 16 # x30 transitions/episode = 480 predictions per step (D15)
+  lr: 3.0e-4 # small model, no CNN — faster than the SPARTAN A.1 default
+  input_key: states
+  context_len: 10 # D15: one S^ph from 10 steps, K = 30 shared-parameter transitions
+  # MUST stay strong: with trainable embeddings, the Lagrangian's tau is
+  # scale-dependent, and a weak regularizer lets the model satisfy the
+  # constraint by SHRINKING the target embeddings (partial collapse) instead of
+  # learning dynamics (observed with 0.1: target std 0.31 -> 0.04, pred_loss
+  # 5e-5, sparsity term dominated, SHD degraded). VISReg's scale term is the
+  # anchor. SPARTAN never faces this - its embeddings are frozen.
+  lambda_reg: 1.0
+  # τ CALIBRATION (SPARTAN App. A.2): run with train.sparsity_enabled=false and
+  # OTHERWISE IDENTICAL config (τ is scale/config-dependent, D12), read the
+  # held-out pred_loss via scripts/eval_identifiability.py, set τ ~1.2x that.
+  # Measured 2026-07-10 (lambda_reg=1.0, 6k steps): FC pred_loss 0.050 -> τ 0.06.
+  sparsity_tau: 0.06
+  sparsity_step_size: 0.02 # dual moves visibly within ~10^4 steps (CPU-scale)
+  log_every: 100
+  checkpoint_every: 2000
+
+wandb:
+  enabled: false

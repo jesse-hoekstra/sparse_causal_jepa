@@ -1,0 +1,34 @@
+#!/bin/bash
+# Rung 1 (Baumgartner-exact bounce, D13): 8 seeds in parallel, one per task.
+# Submit from the repo root:   sbatch scripts/slurm_rung1.sbatch
+#
+# Prerequisites on the cluster (once):
+#   python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+#   wandb login            # or export WANDB_API_KEY=... ; use offline mode if
+#                          # compute nodes have no internet (sync afterwards).
+#
+# GPU note: the states-regime model is small; CPU tasks are perfectly viable.
+# For GPUs, uncomment the two GPU lines and add train.device=cuda below —
+# and do a short smoke run first (the code is CPU-tested; see decisions.md).
+
+#SBATCH --job-name=rung1_bounce
+#SBATCH --output=outputs/rung1_%A_task%t.out
+#SBATCH --nodes=1
+#SBATCH --ntasks=8
+#SBATCH --cpus-per-task=4
+##SBATCH --gpus=8
+##SBATCH --ntasks-per-gpu=1
+#SBATCH --time=48:00:00
+
+# module load cray-python   # only if the cluster requires it for the venv
+
+srun --ntasks=8 bash -c '
+  SEED=${SLURM_PROCID}
+  export PYTHON=.venv/bin/python
+  bash scripts/run_bounce_example.sh \
+    --run-tag="rung1_seed${SEED}" --tau-factor=2.0 --calib-steps=6000 --main-steps=300000 \
+    experiment=bounce_baumgartner \
+    train.seed=${SEED} data.seed=${SEED} \
+    wandb.enabled=true train.eval_every=5000 train.eval_episodes=128 \
+    > "outputs/rung1_seed${SEED}.log" 2>&1
+'

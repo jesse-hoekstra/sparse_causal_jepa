@@ -1,0 +1,67 @@
+# Base config for scripts/train.py (Hydra). Experiment presets override this:
+#   python scripts/train.py experiment=smoke
+# Every hyperparameter of the objective and the model lives here (D8).
+
+defaults:
+  - _self_
+  - experiment: null
+
+model:
+  type: vision # vision (SCJepa, pixels) | states (StateJepa, GT-embedding regime)
+  state_dim: 4 # states regime only: dimension of GT object states
+  resolution: 64
+  num_slots: 7
+  slot_size: 128
+  slot_mlp_size: 256
+  num_iterations: 2
+  enc_channels: [3, 64, 64, 64, 64]
+  enc_out_channels: 128
+  pooling_heads: 4
+  pooling_type: cross_slot # D14 default | per_slot (D4 ablation)
+  max_history: 64
+  spartan_layers: 3 # SPARTAN App. A.1
+  spartan_embed_dim: 512 # SPARTAN App. A.1
+  spartan_mlp_hidden: 512
+  spartan_mlp_layers: 3
+  spartan_temperature: 1.0
+  aux_dim: null # Push-T: action dim; CLEVRER/synthetic: null
+
+data:
+  name: bounce # bounce | synthetic_smoke (CLEVRER/Push-T pending)
+  num_clips: 1000 # episodes (bounce) or clips (smoke)
+  clip_len: 4 # Th + 1
+  seed: 0
+  # bounce-specific (ignored by synthetic_smoke):
+  num_balls: 5
+  resolution: ${model.resolution}
+  radius: 0.08
+  mass_range: [0.5, 3.0]
+  speed: 0.5
+  render: true # false skips frames (GT-embedding regime)
+
+train:
+  steps: 100
+  batch_size: 4
+  lr: 5.0e-5 # SPARTAN App. A.1 (Adam)
+  grad_clip: 1.0
+  lambda_reg: 1.0 # weight of the VISReg/SIGReg term (both branches)
+  sparsity_enabled: true # the ±sparsity ablation toggle
+  sparsity_tau: 0.1 # target pred loss (paper: fully-connected model's loss)
+  sparsity_step_size: 1.0e-3
+  sparsity_lambda_init: 1.0e3
+  sparsity_momentum: 0.99
+  regularizer: visreg # D3: visreg | sigreg
+  num_projections: 256
+  seed: 0
+  device: cpu
+  input_key: frames # frames (vision) | states (GT-embedding regime)
+  context_len: null # D15 sliding window: null -> single transition (K=1)
+  eval_every: null # periodic held-out identifiability eval (states regime only)
+  eval_episodes: 128 # episodes per periodic eval (seed-offset 17 split)
+  log_every: 10
+  checkpoint_every: 200
+
+wandb:
+  enabled: false # keep CI/dev offline by default; enable per-run
+  project: sparse-causal-jepa
+  mode: online

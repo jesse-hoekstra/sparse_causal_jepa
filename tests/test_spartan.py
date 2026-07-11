@@ -1,0 +1,154 @@
+"""Invariant tests for the SPARTAN predictor (hard attention, path matrix, sparsity)."""
+
+from typing import cast
+
+import pytest
+import torch
+
+from scjepa.models import Spartan
+from scjepa.models.spartan import SpartanLayer
+
+B, N, D = 2, 3, 8
+T = 2 * N  # state + parameter tokens
+
+
+@pytest.fixture
+def model() -> Spartan:
+    torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
+    return Spartan(slot_size=D, num_layers=2, embed_dim=None, mlp_hidden_size=16)
+
+
+@pytest.fixture
+def inputs() -> tuple[torch.Tensor, torch.Tensor]:
+    torch.manual_seed(1)  # pyright: ignore[reportUnknownMemberType]
+    return torch.randn(B, N, D), torch.randn(B, N, D)
+
+
+def test_output_shapes(model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+    out = model(*inputs)
+    assert out.prediction.shape == (B, N, D)
+    assert out.path_matrix.shape == (B, T, T)
+    assert out.sparsity.shape == ()
+    assert torch.isfinite(out.prediction).all()
+
+
+def test_path_matrix_is_integer_valued(
+    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    """Hard {0,1} adjacencies (Eq. 3) ⇒ Ā counts paths ⇒ integer entries."""
+    for train in (True, False):
+        model.train(train)
+        path = model(*inputs).path_matrix
+        torch.testing.assert_close(path, path.round(), atol=1e-4, rtol=0)
+        assert (path >= 0).all()
+        # Residual identity (Eq. 5): every token has at least the self path.
+        diagonal = path.diagonal(dim1=1, dim2=2)
+        assert (diagonal >= 1 - 1e-4).all()
+
+
+def test_sparsity_equals_path_sum(
+    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    out = model(*inputs)
+    torch.testing.assert_close(out.sparsity, out.path_matrix.sum(dim=(1, 2)).mean())
+
+
+def test_sparsity_penalty_has_gradients(
+    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    """Straight-through sampling must let |Ā| gradients reach the q/k projections."""
+    model.train()
+    model(*inputs).sparsity.backward()  # pyright: ignore[reportUnknownMemberType]
+    for layer_index, module in enumerate(model.layers):
+        layer = cast(SpartanLayer, module)
+        for projection in (layer.project_q, layer.project_k):
+            assert projection.weight.grad is not None, f"layer {layer_index}: no grad"
+            assert projection.weight.grad.abs().sum() > 0, f"layer {layer_index}: zero grad"
+
+
+def test_mask_blocks_information_flow(model: Spartan) -> None:
+    """THE causal claim: Ā_ij = 0 ⇒ ∂ prediction_i / ∂ token_j = 0 (eval mode)."""
+    model.eval()
+    torch.manual_seed(2)  # pyright: ignore[reportUnknownMemberType]
+    state = torch.randn(1, N, D, requires_grad=True)
+    params = torch.randn(1, N, D, requires_grad=True)
+    out = model(state, params)
+    path = out.path_matrix[0]  # (T, T)
+
+    checked_zero = checked_nonzero = 0
+    for i in range(N):  # prediction rows = state-token positions
+        grads = torch.autograd.grad(out.prediction[0, i].sum(), (state, params), retain_graph=True)
+        token_grads = torch.cat([grads[0][0], grads[1][0]], dim=0)  # (T, d)
+        for j in range(T):
+            if path[i, j] < 0.5:
+                assert token_grads[j].abs().max() < 1e-6, f"leak {j} → prediction {i}"
+                checked_zero += 1
+            elif token_grads[j].abs().max() > 0:
+                checked_nonzero += 1
+    assert checked_nonzero > 0  # dependence actually flows where paths exist
+    if checked_zero == 0:
+        pytest.skip("random init produced a fully connected graph; nothing to check")
+
+
+def test_slot_permutation_equivariance(
+    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    """Permuting slots (same permutation for S_t and Ŝ^ph) permutes predictions."""
+    model.eval()
+    state, params = inputs
+    perm = torch.randperm(N)
+    with torch.no_grad():
+        base = model(state, params).prediction
+        permuted = model(state[:, perm], params[:, perm]).prediction
+    torch.testing.assert_close(permuted, base[:, perm])
+
+
+def test_auxiliary_tokens() -> None:
+    torch.manual_seed(3)  # pyright: ignore[reportUnknownMemberType]
+    aux_model = Spartan(slot_size=D, num_layers=1, embed_dim=None, mlp_hidden_size=16, aux_dim=4)
+    state, params = torch.randn(B, N, D), torch.randn(B, N, D)
+    aux = torch.randn(B, 2, 4)
+    out = aux_model(state, params, aux)
+    assert out.prediction.shape == (B, N, D)
+    assert out.path_matrix.shape == (B, T + 2, T + 2)
+    # Aux is optional even when the pathway exists (CLEVRER-style usage).
+    assert aux_model(state, params).path_matrix.shape == (B, T, T)
+
+
+def test_embed_dim_projection() -> None:
+    """App. A.1 separates token dim from embedding dim: d -> e -> d round trip."""
+    torch.manual_seed(4)  # pyright: ignore[reportUnknownMemberType]
+    model = Spartan(slot_size=D, num_layers=1, embed_dim=32, mlp_hidden_size=16)
+    out = model(torch.randn(B, N, D), torch.randn(B, N, D))
+    assert out.prediction.shape == (B, N, D)  # back in slot space
+    assert out.path_matrix.shape == (B, T, T)
+    out.prediction.square().mean().backward()  # pyright: ignore[reportUnknownMemberType]
+    assert not isinstance(model.in_project, torch.nn.Identity)
+    assert not isinstance(model.out_project, torch.nn.Identity)
+
+
+def test_input_guards(model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+    state, params = inputs
+    with pytest.raises(ValueError, match="both"):
+        model(state, torch.randn(B, N + 1, D))
+    with pytest.raises(ValueError, match="aux_dim=None"):
+        model(state, params, aux=torch.randn(B, 2, 4))
+
+
+def test_logit_penalty_finite_and_grows_with_logits(
+    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    """Eq. 11 (Baumgartner): larger attention logits ⇒ larger penalty.
+
+    The penalty must be finite, at least 2 (exp(x) + exp(-x) >= 2), and grow
+    when logits are inflated — it exists to keep the softmax gradient alive.
+    """
+    model.eval()
+    out = model(*inputs)
+    assert torch.isfinite(out.logit_penalty)
+    assert out.logit_penalty >= 2.0 - 1e-4  # exp(x) + exp(-x) >= 2
+    layer = cast(SpartanLayer, model.layers[0])
+    with torch.no_grad():
+        layer.project_q.weight.mul_(3.0)
+    inflated = model(*inputs)
+    assert inflated.logit_penalty > out.logit_penalty
