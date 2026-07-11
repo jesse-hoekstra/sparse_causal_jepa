@@ -1,0 +1,25 @@
+# @package _global_
+# EXACT-COMPARISON config: Baumgartner et al. (dynamical_system.pdf) bounce,
+# their App. E environment matched as closely as their paper specifies:
+#   - 5 balls, elastic collisions, object-level (state) observations
+#   - masses ~ non-zero-mean normal (exact params UNSPECIFIED upstream; ours
+#     below, clamped to mass_range — flag in any writeup)
+#   - radius proportional to mass ("for ease of observation" + variability;
+#     deliberately departs from D11 invisibility for this comparison)
+#   - attention-logit loss (their Eq. 11; F.4: required against path plateau)
+#   - MCC = their F.1 MLP-R² metric (reported as `mcc` by the eval harness)
+# Their scale: ~300k steps, 8 seeds (Fig. 17) -> GPU/overnight, not laptop.
+# Their reference results (Fig. 3, bounce): SPARTAN MCC ~0.9+.
+# The MODEL is still ours (JEPA, D6-D9) — that difference is the experiment.
+# Run via: TAU_FACTOR=2.0 bash scripts/run_bounce_example.sh experiment=bounce_baumgartner
+
+defaults:
+  - bounce_states
+
+data:
+  mass_normal: [1.5, 0.5] # UNSPECIFIED upstream — our choice
+  radius_from_mass: true
+
+train:
+  steps: 300000
+  lambda_logit: 1.0e-3 # their lambda_logit is unspecified ("small") — knob

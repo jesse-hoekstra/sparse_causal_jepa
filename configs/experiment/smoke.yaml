@@ -1,0 +1,30 @@
+# @package _global_
+# Tiny CPU smoke run: exercises the full objective end-to-end in seconds.
+# Usage: python scripts/train.py experiment=smoke
+
+model:
+  num_slots: 3
+  slot_size: 16
+  slot_mlp_size: 32
+  num_iterations: 1
+  enc_channels: [3, 8, 8]
+  enc_out_channels: 16
+  pooling_heads: 2
+  spartan_layers: 1
+  spartan_embed_dim: null
+  spartan_mlp_hidden: 32
+  spartan_mlp_layers: 2
+
+data:
+  name: synthetic_smoke
+  num_clips: 8
+  clip_len: 3
+
+train:
+  steps: 5
+  batch_size: 2
+  log_every: 1
+  checkpoint_every: 5
+
+wandb:
+  enabled: false

@@ -1,0 +1,112 @@
+# Packaging + all tool configuration in one place (ruff, pyright, pytest).
+# Decision log: docs/decisions.md (D1 PyTorch, D5 reuse-first/third_party, D8 packaging & tooling).
+
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scjepa"
+version = "0.0.1"
+description = "Causal Identification within JEPA Using a SPARTAN"
+readme = "README.md"
+authors = [{ name = "Jesse Hoekstra" }]
+# Pinned to the 3.12 line: newest CPython with universal wheel coverage for the
+# whole stack; a single minor version keeps environments reproducible across machines.
+requires-python = ">=3.12,<3.13"
+
+dependencies = [
+    # Core framework (D1). Lower bound = recent stable line; upper bound guards
+    # against an unreviewed jump to a new major.
+    "torch>=2.9,<3.0",
+    # Tensor rearrangement in models/losses; 0.8 is the current stable line.
+    "einops>=0.8,<0.9",
+    # Config system — matches the vendored reference repos (le-wm, visreg), which
+    # are both Hydra-based (D1/D5). 1.3.2 is the long-standing stable release.
+    "hydra-core>=1.3.2,<1.4",
+    # Experiment tracking.
+    "wandb>=0.19",
+    # scipy.optimize.linear_sum_assignment — Hungarian matching in the
+    # single-step predictive loss (D6).
+    "scipy>=1.14,<2.0",
+    # Used directly (assignment stacking in losses); already transitive via scipy.
+    "numpy>=1.26,<3",
+    # Marginal-recovery scatter plots (eval scripts).
+    "matplotlib>=3.9,<4",
+    # Shape-annotated tensor types (works with PyTorch), e.g. Float[Tensor, "b n d"].
+    # 0.3 line drops legacy Python and is the API the code targets.
+    "jaxtyping>=0.3,<0.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    # Keep in sync with the pinned ruff rev in .pre-commit-config.yaml.
+    "ruff>=0.12,<0.13",
+    "pyright>=1.1.403",
+    # Type stubs for scipy (linear_sum_assignment in losses) — scipy ships none.
+    "scipy-stubs>=1.14",
+    "pytest>=8.3,<9",
+    "pre-commit>=4.0,<5",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ---------------------------------------------------------------- ruff ------
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# Vendored code is exempt from lint/format gates (D5); keep upstream diffs minimal.
+extend-exclude = ["third_party"]
+
+[tool.ruff.lint]
+# Broad rule set (quality bar shared by all agents): pyflakes/pycodestyle, imports,
+# modernization, bugbear, simplification, docstrings, annotations, pytest style.
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "SIM",      # simplify
+    "RUF",      # ruff-specific
+    "D",        # pydocstyle — docstrings on public API
+    "ANN",      # flake8-annotations — full typing, incl. shape-annotated tensors
+    "PT",       # pytest style
+    "RET",      # return statements
+    "ARG",      # unused arguments
+    "TID",      # tidy imports
+    "NPY",      # numpy pitfalls
+]
+ignore = [
+    # jaxtyping shape strings (Float[Tensor, "b n d"]) parse as forward references
+    # and trip F722; ignoring it is the documented jaxtyping recommendation.
+    "F722",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["scjepa"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: docstrings on every test function add noise, not information.
+"tests/**" = ["D100", "D103", "D104"]
+
+# -------------------------------------------------------------- pyright -----
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.12"
+# Resolve imports against the project venv (created as .venv per README quickstart);
+# without this, pyright falls back to the ambient interpreter, which lacks torch.
+venvPath = "."
+venv = ".venv"
+include = ["src", "tests", "scripts"]
+# Vendored code is exempt from type gates (D5); wrappers in src/ are fully typed.
+exclude = ["**/third_party", "**/.venv", "**/__pycache__"]
+
+# --------------------------------------------------------------- pytest -----
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q --strict-markers"
