@@ -22,4 +22,8 @@ data:
 
 train:
   steps: 300000
-  lambda_logit: 1.0e-3 # their lambda_logit is unspecified ("small") — knob
+  # Their lambda_logit is unspecified ("small") — knob. Their F.4 warns that
+  # UNDERTUNING it makes the path loss plateau (observed: rung1_seed0,
+  # 2026-07-11, MCC ~0.01). If a short run shows loss/logit oscillating or
+  # loss/logit >> loss/pred after the first ~2k steps, raise this.
+  lambda_logit: 1.0e-3

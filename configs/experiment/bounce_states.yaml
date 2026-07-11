@@ -44,7 +44,9 @@ train:
   lambda_reg: 1.0
   # τ CALIBRATION (SPARTAN App. A.2): run with train.sparsity_enabled=false and
   # OTHERWISE IDENTICAL config (τ is scale/config-dependent, D12), read the
-  # held-out pred_loss via scripts/eval_identifiability.py, set τ ~1.2x that.
+  # held-out constraint_loss (= pred + lambda_logit·logit_penalty, the quantity
+  # the dual compares to τ; equals pred_loss when lambda_logit=0) via
+  # scripts/eval_identifiability.py, set τ ~1.2x that.
   # Measured 2026-07-10 (lambda_reg=1.0, 6k steps): FC pred_loss 0.050 -> τ 0.06.
   sparsity_tau: 0.06
   sparsity_step_size: 0.02 # dual moves visibly within ~10^4 steps (CPU-scale)
