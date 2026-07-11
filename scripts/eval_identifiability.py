@@ -60,6 +60,7 @@ def main() -> None:
         input_key=cfg.train.input_key,
         batch_size=args.batch_size,
         context_len=cfg.train.get("context_len", None),
+        lambda_logit=cfg.train.get("lambda_logit", 0.0),
     )
 
     print(f"identifiability report for {args.run_dir} (step {payload['step']}):")

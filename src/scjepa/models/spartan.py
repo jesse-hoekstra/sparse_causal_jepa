@@ -117,24 +117,58 @@ class SpartanLayer(nn.Module):
         k = self.project_k(normed)
         v = self.project_v(normed)
 
-        adjacency_logits = torch.einsum("bid,bjd->bij", q, k)  # Eq. 3: sigmoid(q_i·k_j)
+        # Eq. 3 writes sigmoid(q_i·k_j) with no 1/sqrt(d), but an unscaled
+        # 128-dim dot product is ~N(0, 4^2) at standard init: gates start
+        # saturated and the Eq. 11 exp-penalty starts at e^10, which destroys
+        # early training (bang-bang logit oscillation, Adam second-moment
+        # blow-up; run rung1_seed0 2026-07-11). We read q·k in Eqs. 3/11 as the
+        # conventionally scaled attention logit — the only init-trainable
+        # reading, and the only one under which Eq. 11's "keep logits small"
+        # aim is coherent. INTERPRETATION, not paper-literal (no public code).
+        adjacency_logits = torch.einsum("bid,bjd->bij", q, k) * self.scale
         adjacency = _sample_hard_adjacency(adjacency_logits, self.temperature, self.training)
 
-        # Eq. 4, masked BEFORE normalization (D10): softmax over unmasked j only.
-        attn_logits = adjacency_logits * self.scale
-        # Row-wise max subtraction: standard softmax stabilization (grad-neutral).
-        attn_logits = attn_logits - attn_logits.max(dim=-1, keepdim=True).values.detach()
-        weights = adjacency * attn_logits.exp()
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+        # Eq. 4, masked BEFORE normalization (D10): softmax over unmasked j
+        # only, sharing the scaled logits.
+        attn_logits = adjacency_logits
+        # Row-wise max subtraction over UNMASKED entries only (grad-neutral
+        # softmax stabilization). Using the global max here is wrong: when the
+        # row's largest logit is masked, every surviving term is exp(<<0), the
+        # denominator collapses to the 1e-8 floor, and gradients are amplified
+        # ~1e6x (observed as intermittent grad-norm spikes). With the unmasked
+        # max the denominator is always >= 1. Fully masked rows fall back to
+        # max 0, yielding weights 0 (h_i = 0, no information flow).
+        unmasked_max = attn_logits.masked_fill(adjacency == 0, float("-inf")).max(
+            dim=-1, keepdim=True
+        )
+        row_max = torch.where(
+            torch.isfinite(unmasked_max.values), unmasked_max.values, 0.0
+        ).detach()
+        # clamp(max=0) is a no-op for unmasked entries (their logits are
+        # <= row_max by construction); it only bounds the straight-through
+        # gradient into gates of MASKED entries whose logit exceeds the
+        # unmasked max, which would otherwise see exp(positive).
+        weights = adjacency * (attn_logits - row_max).clamp(max=0.0).exp()
+        denom = weights.sum(dim=-1, keepdim=True)
+        # Non-empty rows have denom >= 1 (their max entry contributes
+        # exp(0) = 1); only fully masked rows have denom == 0. Adding 1 there
+        # (instead of a 1e-8 floor) keeps h_i = 0 while bounding the
+        # straight-through gradient into the gates by exp(<=0) <= 1 — with the
+        # 1e-8 floor, every fully masked row amplified that gradient by ~1e8,
+        # firing exactly during the pruning phase when such rows are common.
+        weights = weights / (denom + (denom.detach() < 0.5).to(weights.dtype))
         h = torch.einsum("bij,bjd->bid", weights, v)
 
-        # Eq. 11 exactly within |logit| <= 10; linear continuation beyond
-        # (slope exp(10) ~ 2e4) so oversized logits keep a restoring gradient
-        # without exp() blow-ups (raw exp exploded to ~1e13; a hard clamp
-        # would zero the gradient exactly where it is needed most).
+        # Eq. 11 exactly within |logit| <= 30; linear continuation beyond
+        # (slope exp(30) ~ 1e13) keeps the penalty fp32-finite while acting as
+        # an effectively hard wall. The previous |logit| <= 10 cutoff (slope
+        # ~2e4) was soft enough for the task gradient to push logits out to
+        # ~100, causing the bang-bang logit-loss oscillation and grad-norm
+        # spikes to 1e13+ observed in run rung1_seed0 (2026-07-11); logits sit
+        # near 10 already at init, i.e. right at the old cutoff.
         magnitude = adjacency_logits.abs()
-        core = magnitude.clamp(max=10.0)
-        tail = (magnitude - 10.0).clamp(min=0.0)
+        core = magnitude.clamp(max=30.0)
+        tail = (magnitude - 30.0).clamp(min=0.0)
         logit_penalty = (core.exp() + (-core).exp() + core.exp() * tail).mean()
         return self.mlp(h + tokens), adjacency, logit_penalty  # ŝ_i = MLP(h_i + s_i)
 

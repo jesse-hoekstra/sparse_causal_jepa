@@ -39,10 +39,13 @@ echo "== step 1/3: tau calibration (fully connected, ${CALIB_STEPS} steps) =="
 "$PY" scripts/train.py experiment=bounce_states \
   "hydra.run.dir=${BASE}/calibration" ${HYDRA_ARGS[@]+"${HYDRA_ARGS[@]}"} \
   train.sparsity_enabled=false "train.steps=${CALIB_STEPS}"
+# tau must be calibrated on the SAME quantity the Lagrangian dual compares
+# against it: pred + lambda_logit * logit_penalty (Baumgartner Eq. 9), which
+# the eval harness reports as constraint_loss (== pred_loss when lambda_logit=0).
 FC_LOSS=$("$PY" scripts/eval_identifiability.py "${BASE}/calibration" --episodes 256 \
-  | awk '/pred_loss/ {print $2}')
+  | awk '/constraint_loss/ {print $2}')
 TAU=$("$PY" -c "print(round(float('${FC_LOSS}') * float('${TAU_FACTOR}'), 4))")
-echo "fully-connected held-out pred_loss=${FC_LOSS} -> tau=${TAU} (x${TAU_FACTOR})"
+echo "fully-connected held-out constraint_loss=${FC_LOSS} -> tau=${TAU} (x${TAU_FACTOR})"
 
 echo "== step 2/3: main run (sparsity on, tau=${TAU}) =="
 MAIN_STEPS_OVERRIDE=""

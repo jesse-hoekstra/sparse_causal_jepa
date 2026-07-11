@@ -54,6 +54,7 @@ def evaluate_identifiability(
     max_batches: int | None = None,
     device: str = "cpu",
     context_len: int | None = None,
+    lambda_logit: float = 0.0,
 ) -> IdentifiabilityReport:
     """Evaluate SHD / MCC / prediction error over the dataset.
 
@@ -67,11 +68,16 @@ def evaluate_identifiability(
         device: Device string.
         context_len: D15 sliding window (must match training); None = single
             transition per episode.
+        lambda_logit: Training's attention-logit weight; used to report
+            ``constraint_loss`` = pred + lambda_logit * logit_penalty, the
+            SAME quantity the Lagrangian dual compares against tau (Baumgartner
+            Eq. 9). tau calibration must read this, not ``pred_loss``.
     """
     model = model.to(device).eval()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     num_slots: int | None = None
     pred_losses: list[Tensor] = []
+    logit_penalties: list[Tensor] = []
     shd_state: list[Tensor] = []
     shd_param: list[Tensor] = []
     learned_params: list[Tensor] = []
@@ -85,6 +91,7 @@ def evaluate_identifiability(
         output: JepaOutput = model(inputs, context_len=context_len)
         num_slots = output.prediction.shape[1]
         pred_losses.append(hungarian_mse(output.prediction, output.target_slots).cpu())
+        logit_penalties.append(output.logit_penalty.cpu())
         # D15: with a sliding window, predictions cover transitions th-1 .. L-2;
         # build one gt graph per transition and flatten to match (B*K, ...).
         length = inputs.shape[1]
@@ -96,8 +103,10 @@ def evaluate_identifiability(
         state_learned, param_learned = read_learned_graphs(output.path_matrix, num_slots)
         shd_state.append(structural_hamming_distance(state_learned, state_gt).cpu())
         shd_param.append(structural_hamming_distance(param_learned, param_gt).cpu())
-        tokens = output.path_matrix.shape[-1]
-        path_density.append((output.sparsity / (tokens * tokens)).cpu())
+        # Fraction of thresholded path-matrix edges (same >= 0.5 rule as
+        # graph.py); entries of the path matrix are PATH COUNTS, so the old
+        # sum/(tokens^2) could exceed 1 and was not a density.
+        path_density.append((output.path_matrix >= 0.5).float().mean().cpu())
         learned_params.append(
             output.causal_params.reshape(-1, output.causal_params.shape[-1]).cpu()
         )
@@ -110,8 +119,12 @@ def evaluate_identifiability(
     per_slot_learned = learned_flat.reshape(-1, num_slots, learned_flat.shape[-1])
     per_slot_true = true_flat.reshape(-1, num_slots)
     best_dim, recovery_learned, recovery_true = marginal_recovery(learned_flat, true_flat)
+    pred_loss = torch.stack(pred_losses).mean().item()
+    logit_penalty = torch.stack(logit_penalties).mean().item()
     metrics = {
-        "pred_loss": torch.stack(pred_losses).mean().item(),
+        "pred_loss": pred_loss,
+        "logit_penalty": logit_penalty,
+        "constraint_loss": pred_loss + lambda_logit * logit_penalty,
         "shd_state": torch.stack(shd_state).mean().item(),
         "shd_param": torch.stack(shd_param).mean().item(),
         "mcc": nonlinear_mcc(learned_flat, true_flat).item(),

@@ -201,7 +201,6 @@ class Trainer:
         if self.config.sparsity_enabled:
             self.lagrangian.update(constraint_loss)
 
-        tokens = output.path_matrix.shape[-1]
         with torch.no_grad():
             # Collapse indicator: per-dimension std of target slots (D3 — nothing
             # architectural prevents collapse, so this must be watched).
@@ -213,7 +212,9 @@ class Trainer:
             "loss/sparsity": output.sparsity.item(),
             "loss/logit": logit_loss.item(),
             "sparsity/lambda": float(torch.exp(self.lagrangian.log_lambda).item()),
-            "sparsity/path_density": output.sparsity.item() / (tokens * tokens),
+            # Thresholded edge fraction (>= 0.5, as in eval/graph.py). Path-
+            # matrix entries are path COUNTS; the old sum/(tokens^2) exceeded 1.
+            "sparsity/path_density": (output.path_matrix >= 0.5).float().mean().item(),
             "health/target_slot_std_mean": slot_std.mean().item(),
             "health/target_slot_std_min": slot_std.min().item(),
             "health/grad_norm": float(grad_norm.item()),
@@ -252,6 +253,7 @@ class Trainer:
             batch_size=self.config.batch_size,
             device=self.config.device,
             context_len=self.config.context_len,
+            lambda_logit=self.config.lambda_logit,
         )
         self.model.train()  # the harness switches to eval mode
         return {f"eval/{key}": value for key, value in report.metrics.items()}
