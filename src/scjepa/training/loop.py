@@ -83,10 +83,12 @@ class TrainConfig:
     seed: int = 0
     device: str = "cpu"
     input_key: str = "frames"  # "frames" (vision, SCJepa) | "states" (StateJepa)
-    # D15 sliding window: pool one S^ph from the first context_len steps, then
-    # K = L - context_len shared-parameter single-step predictions per episode.
-    # None -> L-1 (K = 1, legacy single-transition behavior).
+    # Pool one S^ph from the first context_len steps; the remaining
+    # K = L - context_len transitions are predicted. None -> L-1 (K = 1).
     context_len: int | None = None
+    # D16 autoregressive rollout: chains of this length feed predictions back
+    # (must divide K); None -> one chain over all K (paper-literal S_Tp).
+    rollout_horizon: int | None = None
     # Periodic held-out identifiability eval (W&B curves "eval/*", the analog
     # of Baumgartner Fig. 17's MCC-over-steps). None = off. Requires an
     # eval_dataset passed to the Trainer; states regime only (slot i = object i).
@@ -175,6 +177,7 @@ class Trainer:
             inputs,
             aux.to(self.device) if aux is not None else None,
             context_len=self.config.context_len,
+            rollout_horizon=self.config.rollout_horizon,
         )
 
         pred_loss = hungarian_mse(output.prediction, output.target_slots)
@@ -253,6 +256,7 @@ class Trainer:
             batch_size=self.config.batch_size,
             device=self.config.device,
             context_len=self.config.context_len,
+            rollout_horizon=self.config.rollout_horizon,
             lambda_logit=self.config.lambda_logit,
         )
         self.model.train()  # the harness switches to eval mode

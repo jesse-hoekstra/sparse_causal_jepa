@@ -21,7 +21,7 @@ from scjepa.models.channel_split import (
     KinematicHead,
     build_pooling,
 )
-from scjepa.models.jepa import JepaOutput
+from scjepa.models.jepa import JepaOutput, resolve_chains, rollout_predictions
 from scjepa.models.spartan import Spartan
 
 
@@ -49,17 +49,20 @@ class StateJepa(nn.Module):
         states: Float[Tensor, "b length n k"],
         aux: Float[Tensor, "b m da"] | None = None,
         context_len: int | None = None,
+        rollout_horizon: int | None = None,
     ) -> JepaOutput:
-        """Sliding-window training (D15): one Ŝ^ph, K single-step predictions.
+        """Autoregressive rollout training (D16): one Ŝ^ph, chained predictions.
 
-        Ŝ^ph is pooled ONCE from the first ``context_len`` frames and held
-        fixed while the window slides: for every t in [context_len-1, L-2] the
-        model predicts frame t+1 from (S_t, Ŝ^ph) — K = L - context_len
-        single-step predictions (D6 per prediction) sharing one parameter
-        estimate, operationalizing the entanglement-map-independence premise.
-        ``context_len=None`` means L-1 (K = 1, the legacy single-transition
-        behavior). Flattened outputs: prediction/target/kinematic are
-        (B·K, N, d); causal_params stays (B, N, d) — one estimate per episode.
+        Ŝ^ph is pooled ONCE from the first ``context_len`` frames. The
+        remaining K = L - context_len transitions are covered by autoregressive
+        chains (my_paper p7: S_Tp = [S_t, f(S_t, Ŝ^ph), f∘f(S_t, Ŝ^ph), ...]):
+        each chain is anchored at a TRUE embedded state and then feeds its own
+        predictions back, reusing the same Ŝ^ph at every step — the structure
+        the identifiability theory (p16) is premised on. ``rollout_horizon``:
+        None -> one chain over all K transitions; Tp chunks K into K/Tp chains.
+        ``context_len=None`` means L-1 (K = 1: one single-step chain).
+        Flattened outputs: prediction/target are (B·K, N, d); causal_params
+        stays (B, N, d); kinematic_state carries the anchors (B·C, N, d).
         """
         if states.ndim != 4 or states.shape[1] < 2:
             raise ValueError(f"expected (B, L>=2, N, k), got {tuple(states.shape)}")
@@ -67,26 +70,25 @@ class StateJepa(nn.Module):
         th = context_len if context_len is not None else length - 1
         if not 1 <= th < length:
             raise ValueError(f"context_len={th} must be in [1, L-1={length - 1}]")
+        chain_len, num_chains = resolve_chains(length - th, rollout_horizon)
         context_slots = self.context_embed(states[:, :th])  # (B, Th, N, d)
         causal_params = self.pooling(context_slots)  # (B, N, d) — pooled ONCE
-        # S_t for every window position t = th-1 .. L-2 (memoryless embeds).
-        current = self.context_embed(states[:, th - 1 : length - 1])  # (B, K, N, d)
-        kinematic_state = self.kinematic_head.project(current)  # (B, K, N, d)
+        # Chain anchors: TRUE states at t = th-1, th-1+Tp, ... (memoryless embeds).
+        anchor_steps = [th - 1 + c * chain_len for c in range(num_chains)]
+        anchors = self.kinematic_head.project(self.context_embed(states[:, anchor_steps]))
         target_slots = self.target_embed(states[:, th:])  # (B, K, N, d)
-        num_transitions = target_slots.shape[1]
-        flat_state = kinematic_state.flatten(0, 1)
-        flat_params = causal_params.repeat_interleave(num_transitions, dim=0)
-        flat_aux = aux.repeat_interleave(num_transitions, dim=0) if aux is not None else None
-        predicted = self.predictor(flat_state, flat_params, flat_aux)
+        prediction, path_matrix, sparsity, logit_penalty = rollout_predictions(
+            self.predictor, anchors, causal_params, aux, chain_len
+        )
         return JepaOutput(
-            prediction=predicted.prediction,
+            prediction=prediction,
             target_slots=target_slots.flatten(0, 1),
             context_slots=context_slots,
             causal_params=causal_params,
-            kinematic_state=flat_state,
-            path_matrix=predicted.path_matrix,
-            sparsity=predicted.sparsity,
-            logit_penalty=predicted.logit_penalty,
+            kinematic_state=anchors.flatten(0, 1),
+            path_matrix=path_matrix,
+            sparsity=sparsity,
+            logit_penalty=logit_penalty,
         )
 
 
@@ -102,6 +104,7 @@ def build_state_jepa(
     spartan_mlp_layers: int = 3,
     spartan_temperature: float = 1.0,
     aux_dim: int | None = None,
+    spartan_dense: bool = False,
 ) -> StateJepa:
     """Build the GT-embedding variant from plain config values.
 
@@ -121,6 +124,7 @@ def build_state_jepa(
             mlp_num_layers=spartan_mlp_layers,
             temperature=spartan_temperature,
             aux_dim=aux_dim,
+            dense=spartan_dense,
         ),
     )
 

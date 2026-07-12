@@ -54,6 +54,7 @@ def evaluate_identifiability(
     max_batches: int | None = None,
     device: str = "cpu",
     context_len: int | None = None,
+    rollout_horizon: int | None = None,
     lambda_logit: float = 0.0,
 ) -> IdentifiabilityReport:
     """Evaluate SHD / MCC / prediction error over the dataset.
@@ -66,8 +67,11 @@ def evaluate_identifiability(
         batch_size: Eval batch size.
         max_batches: Optional cap for quick runs.
         device: Device string.
-        context_len: D15 sliding window (must match training); None = single
+        context_len: Context window Th (must match training); None = single
             transition per episode.
+        rollout_horizon: D16 autoregressive chain length (must match training
+            — pred_loss is then measured under the SAME rollout objective the
+            constraint uses); None = one chain over all K transitions.
         lambda_logit: Training's attention-logit weight; used to report
             ``constraint_loss`` = pred + lambda_logit * logit_penalty, the
             SAME quantity the Lagrangian dual compares against tau (Baumgartner
@@ -88,7 +92,7 @@ def evaluate_identifiability(
         if max_batches is not None and index >= max_batches:
             break
         inputs = batch[input_key].to(device)
-        output: JepaOutput = model(inputs, context_len=context_len)
+        output: JepaOutput = model(inputs, context_len=context_len, rollout_horizon=rollout_horizon)
         num_slots = output.prediction.shape[1]
         pred_losses.append(hungarian_mse(output.prediction, output.target_slots).cpu())
         logit_penalties.append(output.logit_penalty.cpu())
