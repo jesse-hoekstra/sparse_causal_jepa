@@ -84,6 +84,7 @@ def main(cfg: DictConfig) -> None:
         device=cfg.train.device,
         input_key=cfg.train.input_key,
         context_len=cfg.train.get("context_len", None),
+        rollout_horizon=cfg.train.get("rollout_horizon", None),
         eval_every=cfg.train.get("eval_every", None),
         log_every=cfg.train.log_every,
         checkpoint_every=cfg.train.checkpoint_every,

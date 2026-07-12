@@ -24,6 +24,7 @@ model:
   spartan_mlp_hidden: 512
   spartan_mlp_layers: 3
   spartan_temperature: 1.0
+  spartan_dense: false # true: A≡1 (SPARTAN's "fully connected model") — τ calibration ONLY
   aux_dim: null # Push-T: action dim; CLEVRER/synthetic: null
 
 data:
@@ -55,7 +56,11 @@ train:
   seed: 0
   device: cpu
   input_key: frames # frames (vision) | states (GT-embedding regime)
-  context_len: null # D15 sliding window: null -> single transition (K=1)
+  context_len: null # context window Th: null -> single transition (K=1)
+  # D16 autoregressive rollout: K = clip_len - context_len transitions are covered
+  # by chains of this length (must divide K); null -> one chain over all K
+  # (paper-literal S_Tp, my_paper p7/p16). Chains feed predictions back in.
+  rollout_horizon: null
   eval_every: null # periodic held-out identifiability eval (states regime only)
   eval_episodes: 128 # episodes per periodic eval (seed-offset 17 split)
   log_every: 10

@@ -152,3 +152,23 @@ def test_logit_penalty_finite_and_grows_with_logits(
         layer.project_q.weight.mul_(3.0)
     inflated = model(*inputs)
     assert inflated.logit_penalty > out.logit_penalty
+
+
+def test_dense_mode_is_fully_connected_and_deterministic(
+    inputs: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """A≡1 (audit F-8): the tau-calibration reference must be a TRUE dense
+    transformer — every path open, no Bernoulli sampling noise in train mode."""
+    torch.manual_seed(0)
+    dense = Spartan(slot_size=D, num_layers=2, embed_dim=None, mlp_hidden_size=16, dense=True)
+    dense.train()
+    first = dense(*inputs)
+    second = dense(*inputs)
+    torch.testing.assert_close(first.prediction, second.prediction)  # no sampling
+    assert (first.path_matrix >= 1).all()  # every token reaches every prediction
+    torch.manual_seed(0)
+    gated = Spartan(slot_size=D, num_layers=2, embed_dim=None, mlp_hidden_size=16)
+    gated.train()
+    a = gated(*inputs)
+    b = gated(*inputs)
+    assert not torch.allclose(a.prediction, b.prediction)  # gated model DOES sample

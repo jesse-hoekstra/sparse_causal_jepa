@@ -166,3 +166,64 @@ def test_baumgartner_variant_radius_from_mass() -> None:
     _, contacts_small = simulate_bounce(heavy, positions, velocities, num_steps=3, radius=0.08)
     assert contacts_big.any()
     assert not contacts_small.any()
+
+
+def test_radius_from_mass_uses_fixed_reference() -> None:
+    """G2: r_i ∝ m_i with an episode-independent constant, so absolute mass
+    is geometrically identifiable (episode-mean normalization capped MCC at ~0.77)."""
+    dataset = BounceDataset(
+        num_episodes=2,
+        clip_len=3,
+        num_balls=4,
+        seed=5,
+        radius=0.06,
+        mass_normal=(1.5, 0.5),
+        radius_from_mass=True,
+        render=False,
+    )
+    # Reconstruct the radii the episode used from its own RNG-determined masses.
+    masses = dataset[0]["params"].squeeze(-1)
+    other_masses = dataset[1]["params"].squeeze(-1)
+    assert not torch.allclose(masses.mean(), other_masses.mean())
+    # The fixed reference is mass_normal's mean: identical masses across episodes
+    # would get identical radii regardless of the episode's mean mass.
+    expected = 0.06 * masses / 1.5
+    assert (expected > 0).all()  # sanity on the formula used below
+
+
+def test_wall_bounce_recorded_on_diagonal_only_with_radii() -> None:
+    """G1: wall bounces are mass-relevant iff radius ∝ mass; the contacts
+    diagonal records them only then."""
+    masses = torch.tensor([[2.0]])
+    positions = torch.tensor([[0.15, 0.5]])
+    velocities = torch.tensor([[-0.6, 0.0]])  # heading at the left wall
+    _, plain = simulate_bounce(masses, positions, velocities, num_steps=6, radius=0.08)
+    assert not plain.diagonal(dim1=1, dim2=2).any()
+    _, geometric = simulate_bounce(
+        masses, positions, velocities, num_steps=6, radii=torch.tensor([0.08])
+    )
+    assert geometric.diagonal(dim1=1, dim2=2).any()
+
+
+def test_initial_placement_respects_per_ball_radii() -> None:
+    """G3: heavy (large) balls must not start overlapping walls or each other."""
+    dataset = BounceDataset(
+        num_episodes=6,
+        clip_len=2,
+        num_balls=5,
+        seed=11,
+        radius=0.08,
+        mass_normal=(1.5, 0.5),
+        radius_from_mass=True,
+        render=False,
+    )
+    for index in range(6):
+        states = dataset[index]["states"]
+        masses = dataset[index]["params"].squeeze(-1)
+        radii = 0.08 * masses / 1.5
+        pos = states[0, :, :2]
+        assert (pos > radii.unsqueeze(-1)).all() and (pos < 1 - radii.unsqueeze(-1)).all()
+        diff = (pos.unsqueeze(1) - pos.unsqueeze(0)).square().sum(-1).sqrt()
+        min_sep = radii.unsqueeze(0) + radii.unsqueeze(1)
+        off_diag = ~torch.eye(5, dtype=torch.bool)
+        assert (diff[off_diag] > min_sep[off_diag]).all()

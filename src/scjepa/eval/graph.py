@@ -5,7 +5,8 @@ Conventions come from one source of truth each:
   (context ending at frame t, target frame t+1) the relevant local graph is the
   LAST transition's contacts. State edge j→i iff contact (+ self-edges: free
   flight); parameter edge mass_j → state_i iff a contact involving i and j —
-  including a ball's own mass, which matters only while colliding.
+  including a ball's own mass at ball-ball collisions, and at wall bounces in
+  the radius∝mass variant (recorded on the contacts diagonal; audit G1).
 - Learned graph: ``scjepa.models.spartan`` (D10). Token order [state | params |
   aux]; token j is a local causal parent of prediction i iff path_matrix[i, j]
   >= 1. The state→state block is ``[:N, :N]``, the parameter→state block is
@@ -35,7 +36,8 @@ def gt_graphs_from_contacts(
     Returns:
         state_graph[b, i, j]: state j influences state i (contact or i == j).
         param_graph[b, i, j]: mass j influences state i (any contact involving
-            i and j; the diagonal is True iff ball i is in some contact).
+            i and j; the diagonal is True iff ball i is in some contact —
+            ball-ball, or a wall bounce recorded on the contacts diagonal).
     """
     if contacts.ndim != 4:
         raise ValueError(f"expected (B, T-1, N, N), got {tuple(contacts.shape)}")

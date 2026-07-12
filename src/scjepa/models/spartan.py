@@ -73,7 +73,12 @@ class SpartanLayer(nn.Module):
     """One sparse-attention transformer layer (Eqs. 3-4)."""
 
     def __init__(
-        self, dim: int, mlp_hidden_size: int, mlp_num_layers: int, temperature: float
+        self,
+        dim: int,
+        mlp_hidden_size: int,
+        mlp_num_layers: int,
+        temperature: float,
+        dense: bool = False,
     ) -> None:
         """Build the layer.
 
@@ -82,11 +87,17 @@ class SpartanLayer(nn.Module):
             mlp_hidden_size: Hidden width of the per-token MLP.
             mlp_num_layers: Number of Linear layers in the MLP (App. A.1: 3).
             temperature: Gumbel-softmax temperature for adjacency sampling.
+            dense: A ≡ 1 — no gate sampling, standard softmax attention. This
+                is SPARTAN's "fully connected model" (p.16), the reference
+                whose loss defines τ. The gated model with sparsity disabled is
+                NOT that reference: its gates keep sampling ~Bern(σ) and inject
+                masking noise, inflating the measured loss (audit F-8).
         """
         super().__init__()
         if mlp_num_layers < 2:
             raise ValueError("mlp_num_layers must be >= 2")
         self.temperature = temperature
+        self.dense = dense
         self.scale = 1.0 / math.sqrt(dim)
         self.norm = nn.LayerNorm(dim)
         self.project_q = nn.Linear(dim, dim, bias=False)
@@ -126,7 +137,11 @@ class SpartanLayer(nn.Module):
         # reading, and the only one under which Eq. 11's "keep logits small"
         # aim is coherent. INTERPRETATION, not paper-literal (no public code).
         adjacency_logits = torch.einsum("bid,bjd->bij", q, k) * self.scale
-        adjacency = _sample_hard_adjacency(adjacency_logits, self.temperature, self.training)
+        adjacency = (
+            torch.ones_like(adjacency_logits)
+            if self.dense
+            else _sample_hard_adjacency(adjacency_logits, self.temperature, self.training)
+        )
 
         # Eq. 4, masked BEFORE normalization (D10): softmax over unmasked j
         # only, sharing the scaled logits.
@@ -191,6 +206,7 @@ class Spartan(nn.Module):
         mlp_num_layers: int = 3,
         temperature: float = 1.0,
         aux_dim: int | None = None,
+        dense: bool = False,
     ) -> None:
         """Build the predictor.
 
@@ -206,6 +222,10 @@ class Spartan(nn.Module):
             temperature: Gumbel-softmax temperature (adjacency sampling).
             aux_dim: Dimension of auxiliary variables U_t; None disables the
                 auxiliary pathway entirely (CLEVRER: None, Push-T: action dim).
+            dense: A ≡ 1 in every layer — SPARTAN's "fully connected model"
+                (p.16), used ONLY for τ calibration (run with
+                train.sparsity_enabled=false; the sparsity loss is meaningless
+                here since |Ā| is a dense constant).
         """
         super().__init__()
         self.slot_size = slot_size
@@ -215,7 +235,7 @@ class Spartan(nn.Module):
         self.out_project = nn.Linear(dim, slot_size) if dim != slot_size else nn.Identity()
         self.layers = nn.ModuleList(
             [
-                SpartanLayer(dim, mlp_hidden_size, mlp_num_layers, temperature)
+                SpartanLayer(dim, mlp_hidden_size, mlp_num_layers, temperature, dense=dense)
                 for _ in range(num_layers)
             ]
         )

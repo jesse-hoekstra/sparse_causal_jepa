@@ -25,6 +25,7 @@ Framework is **PyTorch** (D1); reuse-first via vendored `third_party/` code (D5)
 | 4 | `data-pipeline-engineer` | `src/scjepa/data/` — CLEVRER, Push-T, synthetic ground-truth systems, loaders | reproducible batches |
 | 5 | `experiment-infra-engineer` | `training/`, `eval/`, `configs/`, `scripts/` — le-wm-based loop, loss assembly, SHD/MCC + CLEVRER + Push-T evals | wiring runnable experiments |
 | 6 | `test-and-ci-engineer` | `tests/`, `.github/workflows/` | fast CPU tests + CI |
+| 7 | `run-forensics` | W&B/run diagnosis, failure-mode naming | a run failed or looks wrong — BEFORE editing code |
 
 ## Architecture facts every agent must respect (from the paper)
 - Context & target SAVi encoders **jointly trained** — **no EMA target, no frozen encoder, no

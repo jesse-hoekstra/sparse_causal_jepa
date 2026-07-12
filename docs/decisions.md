@@ -410,3 +410,48 @@ batch. ``context_len=None`` = legacy K=1. Flattened outputs (B·K, N, d); causal
 empirical check of the Lemma-1 premise, worth a paper plot; explicit constancy loss only if the
 diagnostic shows drift. **Caveat noted:** nonlinear MCC needs ≥ a few hundred samples (tiny
 validation splits make max-over-dims R² spuriously high; standard evals use ~2.5k samples).
+## D16 — Autoregressive rollout is THE training objective; dense τ reference (decided 2026-07-12, Jesse — implemented by Claude per instruction)
+
+**Why.** The v2 run (W&B qqye6ug1) failed with the graph pruned to identity and MCC at the eval
+noise floor despite a healthy optimizer. Root cause (docs/audits/2026-07-12-*.md): D15's
+teacher-forced single-step objective forgives a mass/interaction error at the very next step, so
+edges were worth only ~7% of MSE (forced-FC 0.0596 vs forced-identity 0.0639 at equal budget) —
+the empty graph satisfied ANY realistic τ, and the papers' scheme prunes until the constraint
+binds. The theory this repo exists to test is premised on rollouts: my_paper p7/p16 defines
+S_Tp = [S_t, f(S_t,Ŝ^ph), f∘f(S_t,Ŝ^ph), …] and the invariance proof assumes autoregression;
+Baumgartner's decoder reconstructs whole trajectories from (x₀, θ̂) (§3.1, App. B.4). Jesse
+2026-07-12: "This is VERY much needed and indeed what the entire identification is built on …
+Make this standard, no flag."
+
+**Decision.** Both model forwards now ALWAYS roll out: chains anchored at true encoded states
+feed their own predictions back, reusing one Ŝ^ph (kinematic-anchor vs target-space mismatch is
+tied together by the predictive loss; documented in ``rollout_predictions``). New
+``train.rollout_horizon`` sets chain length Tp; must divide K; None = one chain over all K
+(paper-literal); **Tp=1 reproduces the old D15 behavior and is the ablation path.** Default for
+bounce: Tp=15 (2 chains of 15 for L=40/ctx=10) — Baumgartner leave trajectory length unspecified
+(D13 email item); at Tp=15, ~90% of chains contain an own-ball collision (1−(1−0.1425)^15) and
+BPTT depth stays manageable (~0.08 s/step CPU, same order as teacher-forced).
+
+**τ protocol (with F-8/F-9 fixes).** ``model.spartan_dense=true`` gives A≡1 — SPARTAN's actual
+"fully connected model" (p.16); the gated model with sparsity off is NOT that reference (its
+gates keep sampling; audit F-8). run_bounce_example.sh: calibration runs dense, calibration
+length defaults to the MAIN run's length (an undertrained reference inflated τ in v2:
+6k-step 0.085 vs 0.045 achievable), TAU_FACTOR default 1.1 (slack is spent on gate-closure
+depth via the logit term inside the constraint — audit F-9). Dual step for 300k runs: 1e-3
+(bounce_baumgartner; SPARTAN Fig. 5 λ timescale — audit F-10).
+
+**Environment fixes (audit G1–G3).** radii = radius·m/mass_ref with an episode-INDEPENDENT
+reference (mass_normal mean, else mass_range midpoint) — episode-mean normalization made
+absolute mass unidentifiable by any model (MCC ceiling 0.775). Wall bounces are recorded on the
+contacts diagonal iff radius∝mass (bounce point depends on r_i ⇒ GT param self-edge); the D11
+equal-radius regime keeps a False diagonal. Initial placement uses per-ball radii. NOTE:
+episode RNG consumption changed ⇒ same (seed, index) yields different episodes than pre-D16;
+shd_param baselines shift (the old zero-param-edge constant 1.4595 no longer applies).
+
+**Verified (smokes, 2026-07-12).** 78 tests green incl. new rollout/dense/env tests; training
+stable (grad_norm < 0.4 through 15-step BPTT). Edge economics under rollout at 1500 steps:
+identity floor 0.0973 vs FC 0.0812 (20% gap, was 7%) — state-edge pruning is no longer free.
+**Open, and the v3 go/no-go check:** a mass-blind-but-interaction-aware arm still matched FC at
+1500 steps (param-edge value emerges only once the model has learned to exploit masses — the
+converged dense calibration run must beat the mass-blind floor, else no τ can force param edges;
+watch eval/shd_param and the pred/logit constraint split early in the main run).
