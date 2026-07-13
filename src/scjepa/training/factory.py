@@ -35,6 +35,7 @@ def build_model(model_cfg: DictConfig) -> nn.Module:
             spartan_temperature=model_cfg.spartan_temperature,
             aux_dim=model_cfg.aux_dim,
             spartan_dense=bool(model_cfg.get("spartan_dense", False)),
+            spartan_identity=bool(model_cfg.get("spartan_identity", False)),
         )
     if model_cfg.type == "states":
         return build_state_jepa(
@@ -50,6 +51,7 @@ def build_model(model_cfg: DictConfig) -> nn.Module:
             spartan_temperature=model_cfg.spartan_temperature,
             aux_dim=model_cfg.aux_dim,
             spartan_dense=bool(model_cfg.get("spartan_dense", False)),
+            spartan_identity=bool(model_cfg.get("spartan_identity", False)),
         )
     raise ValueError(f"unknown model.type {model_cfg.type!r} (vision | states)")
 

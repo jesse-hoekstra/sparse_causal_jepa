@@ -79,6 +79,7 @@ class SpartanLayer(nn.Module):
         mlp_num_layers: int,
         temperature: float,
         dense: bool = False,
+        identity: bool = False,
     ) -> None:
         """Build the layer.
 
@@ -92,12 +93,22 @@ class SpartanLayer(nn.Module):
                 whose loss defines τ. The gated model with sparsity disabled is
                 NOT that reference: its gates keep sampling ~Bern(σ) and inject
                 masking noise, inflating the measured loss (audit F-8).
+            identity: A ≡ 0 — attention output is zero for every token; only
+                the residual + MLP path survives, so each token is predicted
+                from itself alone (path matrix exactly I). This is the
+                mass-blind reference of the D16 go/no-go: its converged loss is
+                the best any model without cross-token (incl. param→state)
+                edges can achieve, the floor τ must sit BELOW for sparsity to
+                be forced to keep true edges. Mutually exclusive with dense.
         """
         super().__init__()
         if mlp_num_layers < 2:
             raise ValueError("mlp_num_layers must be >= 2")
+        if dense and identity:
+            raise ValueError("dense and identity are mutually exclusive")
         self.temperature = temperature
         self.dense = dense
+        self.identity = identity
         self.scale = 1.0 / math.sqrt(dim)
         self.norm = nn.LayerNorm(dim)
         self.project_q = nn.Linear(dim, dim, bias=False)
@@ -137,11 +148,16 @@ class SpartanLayer(nn.Module):
         # reading, and the only one under which Eq. 11's "keep logits small"
         # aim is coherent. INTERPRETATION, not paper-literal (no public code).
         adjacency_logits = torch.einsum("bid,bjd->bij", q, k) * self.scale
-        adjacency = (
-            torch.ones_like(adjacency_logits)
-            if self.dense
-            else _sample_hard_adjacency(adjacency_logits, self.temperature, self.training)
-        )
+        if self.dense:
+            adjacency = torch.ones_like(adjacency_logits)
+        elif self.identity:
+            # A ≡ 0: every row fully masked -> h_i = 0 downstream (the
+            # fully-masked-row path of the softmax below), tokens pass through
+            # residual + MLP only. q/k still feed the Eq. 11 penalty so
+            # constraint_loss stays the same quantity as in the other modes.
+            adjacency = torch.zeros_like(adjacency_logits)
+        else:
+            adjacency = _sample_hard_adjacency(adjacency_logits, self.temperature, self.training)
 
         # Eq. 4, masked BEFORE normalization (D10): softmax over unmasked j
         # only, sharing the scaled logits.
@@ -207,6 +223,7 @@ class Spartan(nn.Module):
         temperature: float = 1.0,
         aux_dim: int | None = None,
         dense: bool = False,
+        identity: bool = False,
     ) -> None:
         """Build the predictor.
 
@@ -226,8 +243,16 @@ class Spartan(nn.Module):
                 (p.16), used ONLY for τ calibration (run with
                 train.sparsity_enabled=false; the sparsity loss is meaningless
                 here since |Ā| is a dense constant).
+            identity: A ≡ 0 in every layer — path matrix exactly I, each state
+                token predicted from its own past only: the mass-blind
+                reference for the D16 go/no-go (run with
+                train.sparsity_enabled=false, matched budget vs the dense
+                reference; the gap between their constraint losses is the τ
+                window). Mutually exclusive with dense.
         """
         super().__init__()
+        if dense and identity:
+            raise ValueError("dense and identity are mutually exclusive")
         self.slot_size = slot_size
         self.aux_dim = aux_dim
         dim = embed_dim if embed_dim is not None else slot_size
@@ -235,7 +260,14 @@ class Spartan(nn.Module):
         self.out_project = nn.Linear(dim, slot_size) if dim != slot_size else nn.Identity()
         self.layers = nn.ModuleList(
             [
-                SpartanLayer(dim, mlp_hidden_size, mlp_num_layers, temperature, dense=dense)
+                SpartanLayer(
+                    dim,
+                    mlp_hidden_size,
+                    mlp_num_layers,
+                    temperature,
+                    dense=dense,
+                    identity=identity,
+                )
                 for _ in range(num_layers)
             ]
         )
