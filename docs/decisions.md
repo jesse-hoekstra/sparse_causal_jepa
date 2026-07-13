@@ -440,6 +440,14 @@ length defaults to the MAIN run's length (an undertrained reference inflated τ 
 depth via the logit term inside the constraint — audit F-9). Dual step for 300k runs: 1e-3
 (bounce_baumgartner; SPARTAN Fig. 5 λ timescale — audit F-10).
 
+**Amended 2026-07-13 (Jesse): default rollout_horizon = null (one chain over all K=30).**
+Matched-budget reference runs under the Tp=15 objective (identity A≡0, W&B 9q18lw7r, vs dense
+A≡1, cakn11ye) measured the mass-blind margin at only ~0.010 constraint (identity floor 0.170
+vs dense 0.160 at matched steps 40k–105k) — smaller than the gated model's ~0.022 logit share
+inside the constraint, so no reliably placeable τ exists at Tp=15. Longer chains compound
+mass-blind rollout error; τ and both reference floors must be re-measured at the new horizon
+(H=15 numbers do not transfer, D12). Tp=15 is retained as an ablation value only.
+
 **Environment fixes (audit G1–G3).** radii = radius·m/mass_ref with an episode-INDEPENDENT
 reference (mass_normal mean, else mass_range midpoint) — episode-mean normalization made
 absolute mass unidentifiable by any model (MCC ceiling 0.775). Wall bounces are recorded on the
