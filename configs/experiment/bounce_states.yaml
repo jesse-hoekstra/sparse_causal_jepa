@@ -35,12 +35,14 @@ train:
   lr: 3.0e-4 # small model, no CNN — faster than the SPARTAN A.1 default
   input_key: states
   context_len: 10 # one S^ph from 10 steps, K = 30 predicted transitions
-  # D16 autoregressive rollout: 2 chains of 15 (must divide K=30). Tp=15 keeps
-  # BPTT depth manageable while ~90% of chains contain an own-ball collision
-  # (1-(1-0.1425)^15, measured contact stats) — the compounding-error window
-  # that makes mass-blind dynamics unable to satisfy tau. Baumgartner leave
-  # their trajectory length unspecified (D13 email item).
-  rollout_horizon: 15
+  # D16 autoregressive rollout, one chain over all K=30 (null; paper-literal
+  # S_Tp / Baumgartner full-trajectory). Decided 2026-07-13 (Jesse): at Tp=15
+  # the measured mass-blind margin was too thin to place tau in — identity
+  # reference (A≡0, W&B 9q18lw7r) floor 0.170 vs dense (A≡1, cakn11ye) 0.160
+  # at matched steps, a ~0.01 gap vs a ~0.022 gated logit share. Longer chains
+  # compound mass-blind rollout error, widening the gap. Tp=15 remains as an
+  # ablation value (2 chains; ~90% contain an own-ball collision).
+  rollout_horizon: null
   # MUST stay strong: with trainable embeddings, the Lagrangian's tau is
   # scale-dependent, and a weak regularizer lets the model satisfy the
   # constraint by SHRINKING the target embeddings (partial collapse) instead of
