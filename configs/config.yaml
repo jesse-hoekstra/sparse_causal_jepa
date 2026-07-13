@@ -25,6 +25,7 @@ model:
   spartan_mlp_layers: 3
   spartan_temperature: 1.0
   spartan_dense: false # true: A≡1 (SPARTAN's "fully connected model") — τ calibration ONLY
+  spartan_identity: false # true: A≡0 (mass-blind reference, path matrix = I) — D16 go/no-go ONLY
   aux_dim: null # Push-T: action dim; CLEVRER/synthetic: null
 
 data:

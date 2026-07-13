@@ -172,3 +172,34 @@ def test_dense_mode_is_fully_connected_and_deterministic(
     a = gated(*inputs)
     b = gated(*inputs)
     assert not torch.allclose(a.prediction, b.prediction)  # gated model DOES sample
+
+
+def test_identity_mode_is_mass_blind_and_deterministic(
+    inputs: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """A≡0 (D16 go/no-go): the mass-blind reference must have NO cross-token
+    flow — path matrix exactly I, predictions insensitive to param tokens and
+    to every other slot — and no Bernoulli sampling noise in train mode."""
+    torch.manual_seed(0)
+    model = Spartan(slot_size=D, num_layers=2, embed_dim=None, mlp_hidden_size=16, identity=True)
+    model.train()
+    state, params = inputs
+    first = model(state, params)
+    second = model(state, params)
+    torch.testing.assert_close(first.prediction, second.prediction)  # no sampling
+    eye = torch.eye(2 * N).expand(B, -1, -1)
+    torch.testing.assert_close(first.path_matrix, eye)  # residual paths only
+    # Mass-blind: perturbing the param tokens must not move any prediction.
+    blind = model(state, torch.randn_like(params))
+    torch.testing.assert_close(first.prediction, blind.prediction)
+    # Slot-local: perturbing slot j must leave every other slot's prediction unchanged.
+    poked_state = state.clone()
+    poked_state[:, 0] += 1.0
+    poked = model(poked_state, params)
+    torch.testing.assert_close(first.prediction[:, 1:], poked.prediction[:, 1:])
+    assert not torch.allclose(first.prediction[:, 0], poked.prediction[:, 0])
+
+
+def test_dense_identity_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        Spartan(slot_size=D, embed_dim=None, mlp_hidden_size=16, dense=True, identity=True)

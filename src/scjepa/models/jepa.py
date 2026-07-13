@@ -218,6 +218,7 @@ def build_scjepa(
     spartan_temperature: float = 1.0,
     aux_dim: int | None = None,
     spartan_dense: bool = False,
+    spartan_identity: bool = False,
 ) -> SCJepa:
     """Build the full model from plain config values (Hydra-friendly).
 
@@ -257,6 +258,7 @@ def build_scjepa(
             temperature=spartan_temperature,
             aux_dim=aux_dim,
             dense=spartan_dense,
+            identity=spartan_identity,
         ),
     )
 

@@ -91,7 +91,12 @@ def main(cfg: DictConfig) -> None:
         out_dir=str(out_dir),
     )
     experiment = HydraConfig.get().runtime.choices.get("experiment") or cfg.data.name
-    phase = "sparse" if cfg.train.sparsity_enabled else "fc-calibration"
+    if cfg.model.get("spartan_identity", False):
+        phase = "identity-reference"
+    elif cfg.train.sparsity_enabled:
+        phase = "sparse"
+    else:
+        phase = "fc-calibration"
     run_name = f"{experiment}-{phase}-seed{cfg.train.seed}"
     logger: MetricLogger = (
         WandbLogger(project=cfg.wandb.project, mode=cfg.wandb.mode, config=resolved, name=run_name)

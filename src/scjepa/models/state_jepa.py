@@ -105,6 +105,7 @@ def build_state_jepa(
     spartan_temperature: float = 1.0,
     aux_dim: int | None = None,
     spartan_dense: bool = False,
+    spartan_identity: bool = False,
 ) -> StateJepa:
     """Build the GT-embedding variant from plain config values.
 
@@ -125,6 +126,7 @@ def build_state_jepa(
             temperature=spartan_temperature,
             aux_dim=aux_dim,
             dense=spartan_dense,
+            identity=spartan_identity,
         ),
     )
 
