@@ -97,7 +97,10 @@ def main(cfg: DictConfig) -> None:
         phase = "sparse"
     else:
         phase = "fc-calibration"
-    run_name = f"{experiment}-{phase}-seed{cfg.train.seed}"
+    context_len = cfg.train.get("context_len", None)
+    num_transitions = cfg.data.clip_len - context_len if context_len else 1  # K (legacy: 1)
+    chain_len = cfg.train.get("rollout_horizon", None) or num_transitions  # Tp (null = one chain)
+    run_name = f"{experiment}-{phase}-Tp{chain_len}-K{num_transitions}-seed{cfg.train.seed}"
     logger: MetricLogger = (
         WandbLogger(project=cfg.wandb.project, mode=cfg.wandb.mode, config=resolved, name=run_name)
         if cfg.wandb.enabled

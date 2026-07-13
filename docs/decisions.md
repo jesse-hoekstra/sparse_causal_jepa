@@ -448,6 +448,16 @@ inside the constraint, so no reliably placeable τ exists at Tp=15. Longer chain
 mass-blind rollout error; τ and both reference floors must be re-measured at the new horizon
 (H=15 numbers do not transfer, D12). Tp=15 is retained as an ablation value only.
 
+**Amended 2026-07-13 (Jesse): context_len 10 → 30, clip_len 40 → 60 (K stays 30).**
+At 0.1425 contacts/ball/step (measured), a 10-step context leaves ~22% of ball-slots with no
+ball-ball collision — no mass evidence in Ŝ^ph, capping MCC (~0.8-ish vs Baumgartner's ~0.9)
+and dragging the dense reference floor toward the mass-blind floor (narrowing the τ window).
+30 steps ⇒ ~99% collision coverage. Verified upstream difference: Baumgartner's parameter
+encoder p_φ(θ̂|τ) conditions on the FULL trajectory (dynamical_system.pdf p.6, p.22); our
+context-window Ŝ^ph is the JEPA-side deviation, so the context must at least carry the
+evidence. All reference floors and τ re-measured at (Tp=30, K=30, ctx=30); W&B run names now
+carry -Tp{}-K{}- for disambiguation.
+
 **Environment fixes (audit G1–G3).** radii = radius·m/mass_ref with an episode-INDEPENDENT
 reference (mass_normal mean, else mass_range midpoint) — episode-mean normalization made
 absolute mass unidentifiable by any model (MCC ceiling 0.775). Wall bounces are recorded on the
