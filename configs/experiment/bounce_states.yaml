@@ -22,7 +22,7 @@ model:
 data:
   name: bounce
   num_clips: 4000
-  clip_len: 40 # episode length L (D13: their bounce uses long sequences)
+  clip_len: 60 # episode length L (D13; raised 40->60 with context 10->30, 2026-07-13: see train.context_len)
   num_balls: 5
   speed: 0.7 # higher collision rate -> more mass evidence per window
   seed: 0
@@ -34,7 +34,14 @@ train:
   batch_size: 16 # x30 transitions/episode = 480 predictions per step (D15)
   lr: 3.0e-4 # small model, no CNN — faster than the SPARTAN A.1 default
   input_key: states
-  context_len: 10 # one S^ph from 10 steps, K = 30 predicted transitions
+  # Context 30 (2026-07-13, Jesse; was 10): S^ph needs ball-ball collisions to
+  # carry mass evidence. At the measured 0.1425 contacts/ball/step, a 10-step
+  # context leaves ~22% of ball-slots collision-free (mass unidentifiable that
+  # episode, capping MCC and dragging the dense tau-reference floor toward the
+  # mass-blind floor); 30 steps -> ~99% coverage. Baumgartner's parameter
+  # encoder p(theta|tau) sees the FULL trajectory (their p.6/p.22), so a short
+  # context was a handicap they never had. K = clip_len - context_len = 30.
+  context_len: 30
   # D16 autoregressive rollout, one chain over all K=30 (null; paper-literal
   # S_Tp / Baumgartner full-trajectory). Decided 2026-07-13 (Jesse): at Tp=15
   # the measured mass-blind margin was too thin to place tau in — identity
