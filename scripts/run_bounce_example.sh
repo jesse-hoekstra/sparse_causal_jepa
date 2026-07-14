@@ -16,6 +16,10 @@
 #                      failure: 6k-step reference at 0.085 vs 0.045 achievable).
 #                      Short values are for smoke tests only.
 #   --main-steps=300000  MAIN run length only (default: config value)
+#   --tau-max=0.85     abort BEFORE the main run if the calibrated tau exceeds
+#                      this (D17 go/no-go guard: tau at or above the mass-blind
+#                      identity floor cannot force param edges — set it a
+#                      little below the identity reference's constraint_loss)
 #   --run-tag=rung1_seed0  output dir suffix; REQUIRED for parallel launches
 #                          (the default timestamp collides across simultaneous starts)
 # The calibration run uses model.spartan_dense=true (A≡1, deterministic dense
@@ -30,11 +34,13 @@ set -euo pipefail
 PY=${PYTHON:-python}
 TAU_FACTOR=${TAU_FACTOR:-1.1}
 CALIB_STEPS=${CALIB_STEPS:-}
+TAU_MAX=${TAU_MAX:-}
 
 HYDRA_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --tau-factor=*)  TAU_FACTOR="${arg#*=}" ;;
+    --tau-max=*)     TAU_MAX="${arg#*=}" ;;
     --calib-steps=*) CALIB_STEPS="${arg#*=}" ;;
     --main-steps=*)  MAIN_STEPS="${arg#*=}" ;;
     --run-tag=*)     RUN_TAG="${arg#*=}" ;;
@@ -66,6 +72,12 @@ FC_LOSS=$("$PY" scripts/eval_identifiability.py "${BASE}/calibration" --episodes
   | awk '/constraint_loss/ {print $2}')
 TAU=$("$PY" -c "print(round(float('${FC_LOSS}') * float('${TAU_FACTOR}'), 4))")
 echo "dense-reference held-out constraint_loss=${FC_LOSS} -> tau=${TAU} (x${TAU_FACTOR})"
+if [ -n "${TAU_MAX}" ] && [ "$("$PY" -c "print(1 if float('${TAU}') > float('${TAU_MAX}') else 0)")" = "1" ]; then
+  echo "ABORT: tau=${TAU} > --tau-max=${TAU_MAX} (D17 go/no-go guard). A tau at or above" >&2
+  echo "the mass-blind identity floor is satisfiable by the empty graph and cannot force" >&2
+  echo "param edges — inspect the calibration run before spending the main-run compute." >&2
+  exit 3
+fi
 
 echo "== step 2/3: main run (sparsity on, tau=${TAU}) =="
 MAIN_STEPS_OVERRIDE=""

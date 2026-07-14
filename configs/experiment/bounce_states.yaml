@@ -57,15 +57,18 @@ train:
   # 5e-5, sparsity term dominated, SHD degraded). VISReg's scale term is the
   # anchor. SPARTAN never faces this - its embeddings are frozen.
   lambda_reg: 1.0
-  # τ CALIBRATION (SPARTAN App. A.2 + D16): run with model.spartan_dense=true
+  # τ CALIBRATION (SPARTAN App. A.2 + D16/D17): run with model.spartan_dense=true
   # (A≡1 — the actual "fully connected model", F-8) + train.sparsity_enabled=false,
-  # OTHERWISE IDENTICAL config (τ is scale/config-dependent, D12) and COMPARABLE
+  # OTHERWISE IDENTICAL config (τ is config-dependent, D12) and COMPARABLE
   # length (undertrained references inflated τ — the v2 failure). Read the
-  # held-out constraint_loss (= pred + lambda_logit·logit_penalty, the quantity
-  # the dual compares to τ) via scripts/eval_identifiability.py, set τ ~1.1x that.
-  # run_bounce_example.sh does all of this. The value below is a PLACEHOLDER for
-  # direct train.py runs — it predates D16's rollout objective; recalibrate.
-  sparsity_tau: 0.06
+  # held-out constraint_loss (D17 SCALE-FREE: pred/Var(target) + lambda_logit·
+  # logit_penalty — the quantity the dual compares to τ) via
+  # scripts/eval_identifiability.py, set τ ~1.1x that, and sanity-check it sits
+  # BELOW the mass-blind floor (model.spartan_identity=true reference; ~0.90 at
+  # Tp=30/ctx=30, W&B e2vwbrlo). run_bounce_example.sh does the dense leg.
+  # The value below is a PLACEHOLDER for direct train.py runs, in D17
+  # normalized units (1.0 ≈ predicting the batch mean); recalibrate per config.
+  sparsity_tau: 0.75
   sparsity_step_size: 0.02 # dual moves visibly within ~10^4 steps (CPU-scale)
   log_every: 100
   checkpoint_every: 2000

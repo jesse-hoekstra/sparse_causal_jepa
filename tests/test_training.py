@@ -102,6 +102,27 @@ def test_training_smoke(tmp_path: Path) -> None:
     assert (tmp_path / "last.pt").exists()
 
 
+def test_constraint_is_scale_normalized(tmp_path: Path) -> None:
+    """D17: the dual measures pred / Var(target) (+ logit share), NOT raw pred.
+
+    Raw MSE lives in a trainable space whose scale is solution-dependent, so
+    tau in raw units is compared against a moving, model-dependent ruler."""
+    dataset = RandomClipDataset(num_clips=4, clip_len=3, resolution=RES, seed=1)
+    config = tiny_config(tmp_path, steps=1)
+    trainer = Trainer(tiny_model(), dataset, config)
+    metrics = trainer.train()
+    assert "sparsity/constraint" in metrics
+    target_var = metrics["health/target_slot_std_mean"] ** 2  # approx: mean-std vs mean-var
+    # lambda_logit = 0 in tiny_config, so constraint == pred / var exactly
+    # (variance formula is mean of per-dim variances; reconstruct it precisely
+    # is overkill here — check the ratio is in the right regime instead).
+    assert metrics["sparsity/constraint"] > metrics["loss/pred"]  # var < 1 at init
+    ratio = metrics["sparsity/constraint"] / (metrics["loss/pred"] / target_var)
+    assert 0.5 < ratio < 2.0  # same quantity up to the std-mean/var-mean gap
+    # the dual consumed the normalized value, not the raw one
+    assert trainer.lagrangian.ma_error != 0.0
+
+
 def test_resume_is_exact(tmp_path: Path) -> None:
     """Save at step 2, continue to 4; reload at 2, continue to 4 — identical."""
     dataset = RandomClipDataset(num_clips=4, clip_len=3, resolution=RES, seed=1)

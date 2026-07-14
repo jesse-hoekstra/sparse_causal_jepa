@@ -9,10 +9,18 @@ collapse (D3/D7).
 Objective per step (D6 + SPARTAN App. A.2):
 
     total = hungarian_mse(Ŝ_{t+1}, S_{t+1})
+          + λ_logit · logit_penalty                                (Eq. 11)
           + λ_reg · [reg(context slots) + reg(target slots)]      (both branches)
           + (1/λ_s) · |Ā|                                          (if enabled)
 
-with λ_s driven by the GECO-style dual update in ``SparsityLagrangian``.
+with λ_s driven by the GECO-style dual update in ``SparsityLagrangian``. The
+dual compares the SCALE-FREE constraint (D17)
+
+    constraint = pred / Var(target batch, detached) + λ_logit · logit_penalty
+
+against τ — not raw pred (raw MSE lives in a trainable space whose scale is
+solution-dependent; see D17 in docs/decisions.md). τ is therefore a relative-
+error target; 1.0 ≈ predicting the batch mean.
 The ±sparsity ablation is the ``sparsity`` config toggle.
 
 Checkpoints carry model/optimizer/controller/step/RNG state; resume is exact
@@ -76,7 +84,8 @@ class TrainConfig:
     sparsity_momentum: float = 0.99
     # Attention-logit regularisation (Baumgartner Eq. 11): keeps softmax
     # gradients alive during the pruning phase; 0 disables. When enabled it is
-    # part of the Lagrangian constraint (their Eq. 9), so calibrate tau with it.
+    # part of the Lagrangian constraint (their Eq. 9), so calibrate tau with it
+    # (on the D17 scale-free constraint the eval harness reports).
     lambda_logit: float = 0.0
     regularizer: str = "visreg"  # D3: "visreg" | "sigreg"
     num_projections: int = 256
@@ -183,13 +192,28 @@ class Trainer:
         pred_loss = hungarian_mse(output.prediction, output.target_slots)
         reg_loss = self.regularizer(output.context_slots) + self.regularizer(output.target_slots)
         logit_loss = self.config.lambda_logit * output.logit_penalty
-        # Constraint side of the Lagrangian (Baumgartner Eq. 9): prediction +
-        # logit regularisation. VISReg stays OUTSIDE the constraint — it is the
+        # Gradient objective (Baumgartner Eq. 10): raw pred + logit
+        # regularisation. VISReg stays OUTSIDE the constraint — it is the
         # collapse/scale anchor (D12) and must not trade off against sparsity.
-        constraint_loss = pred_loss + logit_loss
-        total = constraint_loss + self.config.lambda_reg * reg_loss
+        total = pred_loss + logit_loss + self.config.lambda_reg * reg_loss
         if self.config.sparsity_enabled:
             total = total + self.lagrangian.penalty_weight * output.sparsity
+
+        with torch.no_grad():
+            # Collapse indicator: per-dimension std of target slots (D3 — nothing
+            # architectural prevents collapse, so this must be watched).
+            slot_std = output.target_slots.reshape(-1, output.target_slots.shape[-1]).std(dim=0)
+            # D17: the quantity the DUAL compares to τ is scale-free —
+            # pred / Var(target batch) + λ_logit·logit_penalty. Raw pred is an
+            # MSE in a TRAINABLE space whose scale is solution-dependent (the
+            # identity and dense references equilibrate at different stds), so
+            # a raw-MSE τ is measured with a moving, model-dependent ruler.
+            # Eq. 9's letter assumes a fixed ruler (Baumgartner: observation
+            # space; SPARTAN: frozen embeddings) — dividing by the detached
+            # target variance restores that property. Gradients are untouched:
+            # this quantity only drives the λ update and is logged/eval'd.
+            target_var = slot_std.pow(2).mean().clamp_min(1e-6)
+            constraint_loss = pred_loss.detach() / target_var + logit_loss.detach()
 
         if not torch.isfinite(total):
             raise RuntimeError(
@@ -204,16 +228,13 @@ class Trainer:
         if self.config.sparsity_enabled:
             self.lagrangian.update(constraint_loss)
 
-        with torch.no_grad():
-            # Collapse indicator: per-dimension std of target slots (D3 — nothing
-            # architectural prevents collapse, so this must be watched).
-            slot_std = output.target_slots.reshape(-1, output.target_slots.shape[-1]).std(dim=0)
         return {
             "loss/total": total.item(),
             "loss/pred": pred_loss.item(),
             "loss/reg": reg_loss.item(),
             "loss/sparsity": output.sparsity.item(),
             "loss/logit": logit_loss.item(),
+            "sparsity/constraint": constraint_loss.item(),
             "sparsity/lambda": float(torch.exp(self.lagrangian.log_lambda).item()),
             # Thresholded edge fraction (>= 0.5, as in eval/graph.py). Path-
             # matrix entries are path COUNTS; the old sum/(tokens^2) exceeded 1.

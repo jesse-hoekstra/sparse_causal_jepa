@@ -38,9 +38,12 @@ class SparsityLagrangian(nn.Module):
         """Build the controller.
 
         Args:
-            tau: Target prediction loss (SPARTAN sets it to the loss of a fully
+            tau: Target constraint value (SPARTAN sets it to the loss of a fully
                 connected model — calibrate under the IDENTICAL config with only
-                the sparsity toggle off; τ is scale- and config-dependent, D12).
+                the sparsity toggle off; τ is config-dependent, D12). Since D17
+                the caller feeds ``update`` the SCALE-FREE constraint
+                pred/Var(target) + λ_logit·logit_penalty, so τ is a relative-
+                error target (1.0 ≈ predicting the batch mean), not a raw MSE.
             step_size: alpha, dual ascent step size on log λ.
             momentum: Moving-average momentum for the (loss - τ) estimate.
             lambda_init: Initial λ (paper: high, so sparsity starts switched off).
