@@ -73,14 +73,20 @@ def evaluate_identifiability(
             — pred_loss is then measured under the SAME rollout objective the
             constraint uses); None = one chain over all K transitions.
         lambda_logit: Training's attention-logit weight; used to report
-            ``constraint_loss`` = pred + lambda_logit * logit_penalty, the
-            SAME quantity the Lagrangian dual compares against tau (Baumgartner
-            Eq. 9). tau calibration must read this, not ``pred_loss``.
+            ``constraint_loss`` = pred / Var(target batch) + lambda_logit *
+            logit_penalty — the SAME scale-free quantity the Lagrangian dual
+            compares against tau (Baumgartner Eq. 9 with the D17 variance
+            normalization; raw MSE lives in a trainable space whose scale is
+            solution-dependent, see docs/decisions.md D17). tau calibration
+            must read this, not ``pred_loss``. Raw ``pred_loss`` and
+            ``target_var`` are reported alongside for diagnostics.
     """
     model = model.to(device).eval()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     num_slots: int | None = None
     pred_losses: list[Tensor] = []
+    pred_losses_normalized: list[Tensor] = []
+    target_vars: list[Tensor] = []
     logit_penalties: list[Tensor] = []
     shd_state: list[Tensor] = []
     shd_param: list[Tensor] = []
@@ -94,7 +100,19 @@ def evaluate_identifiability(
         inputs = batch[input_key].to(device)
         output: JepaOutput = model(inputs, context_len=context_len, rollout_horizon=rollout_horizon)
         num_slots = output.prediction.shape[1]
-        pred_losses.append(hungarian_mse(output.prediction, output.target_slots).cpu())
+        batch_pred = hungarian_mse(output.prediction, output.target_slots).cpu()
+        pred_losses.append(batch_pred)
+        # D17: per-batch target variance, same formula as the trainer's dual
+        # measurement (mean per-dim variance of the target slots, floored).
+        target_var = (
+            output.target_slots.reshape(-1, output.target_slots.shape[-1])
+            .var(dim=0)
+            .mean()
+            .clamp_min(1e-6)
+            .cpu()
+        )
+        target_vars.append(target_var)
+        pred_losses_normalized.append(batch_pred / target_var)
         logit_penalties.append(output.logit_penalty.cpu())
         # D15: with a sliding window, predictions cover transitions th-1 .. L-2;
         # build one gt graph per transition and flatten to match (B*K, ...).
@@ -124,11 +142,16 @@ def evaluate_identifiability(
     per_slot_true = true_flat.reshape(-1, num_slots)
     best_dim, recovery_learned, recovery_true = marginal_recovery(learned_flat, true_flat)
     pred_loss = torch.stack(pred_losses).mean().item()
+    pred_loss_normalized = torch.stack(pred_losses_normalized).mean().item()
     logit_penalty = torch.stack(logit_penalties).mean().item()
     metrics = {
         "pred_loss": pred_loss,
+        "pred_loss_normalized": pred_loss_normalized,
+        "target_var": torch.stack(target_vars).mean().item(),
         "logit_penalty": logit_penalty,
-        "constraint_loss": pred_loss + lambda_logit * logit_penalty,
+        # D17 scale-free constraint — the τ quantity (mean of per-batch ratios,
+        # matching what the trainer's dual EMA averages).
+        "constraint_loss": pred_loss_normalized + lambda_logit * logit_penalty,
         "shd_state": torch.stack(shd_state).mean().item(),
         "shd_param": torch.stack(shd_param).mean().item(),
         "mcc": nonlinear_mcc(learned_flat, true_flat).item(),

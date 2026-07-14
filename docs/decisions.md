@@ -473,3 +473,34 @@ identity floor 0.0973 vs FC 0.0812 (20% gap, was 7%) — state-edge pruning is n
 1500 steps (param-edge value emerges only once the model has learned to exploit masses — the
 converged dense calibration run must beat the mass-blind floor, else no τ can force param edges;
 watch eval/shd_param and the pred/logit constraint split early in the main run).
+
+## D17 — The dual's constraint is scale-free: pred / Var(target) (decided 2026-07-14, Jesse — implemented by Claude per instruction)
+
+**Why.** Raw pred loss is an MSE in a TRAINABLE target space; its scale is a solution-dependent
+equilibrium between the pred loss (pushes std down) and VISReg's unit-variance pull (D3). The
+Tp=30/ctx=30 reference pair proved the confound: identity (A≡0, W&B e2vwbrlo) equilibrates at
+std ≈ 0.46 while dense (A≡1, j2h9xc2m) climbs to ≈ 0.54 and is still rising at 50k — so the RAW
+floors differ by only +0.008 (0.191 vs 0.183, within eval noise; every τ is then either
+unsatisfiable or empty-graph-satisfiable, the v2/v3 collapses), while the SCALE-FREE floors
+separate decisively: identity 0.90 ± 0.01 (flat from 10k; ≈ predicting the batch mean, as
+mass-blind chaos should) vs dense 0.63–0.66 and still improving — mass/interaction information
+is worth ~30% of relative prediction error. Both upstream papers had a fixed ruler for free
+(Baumgartner: observation space, Eq. 9 p.7 verified; SPARTAN: frozen embeddings); the trainable
+JEPA target space broke an assumption their constraint never had to state.
+
+**Decision.** The quantity the dual compares to τ — and the eval harness's `constraint_loss` —
+is `pred / Var(target batch, detached, floored 1e-6) + λ_logit·logit_penalty` (variance = mean
+per-dim variance of the batch's target slots; same formula in trainer and harness, mean of
+per-batch ratios). τ is a relative-error target: 1.0 ≈ predicting the batch mean. The GRADIENT
+objective is unchanged (raw pred + λ_logit·logit + λ_reg·reg + (1/λ)·|Ā|): the normalization
+only drives the λ update, so pred/reg balance and scale equilibria are untouched, and the model
+cannot game the constraint by inflating variance through a gradient path. L_logit STAYS inside
+the constraint per Eq. 9's letter — its ~0.022 gated-model share was fatal in a 0.008-wide raw
+window but is affordable in the ~0.26-wide normalized one. This is the project's one deliberate
+deviation from Eq. 9 as printed and is flagged here and in loop.py/harness.py comments.
+
+**Consequences.** eval/constraint_loss and sparsity/constraint are in normalized units from
+D17 on — NOT comparable to any earlier run. τ protocol: 1.1× the dense reference's converged
+normalized constraint (dense leg of run_bounce_example.sh, same length as main, D16), with the
+sanity check τ < mass-blind floor (identity reference; 0.90 at Tp=30/ctx=30 — this transfers,
+identity converged flat from 10k). Raw pred_loss and target_var stay logged for diagnostics.

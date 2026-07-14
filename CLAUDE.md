@@ -53,9 +53,16 @@ Failure catalog (all observed, all diagnosed — don't re-derive):
   sparsity off (F-8) or on a short run (v2 failure).
 - v3 go/no-go: the converged dense reference must beat a mass-blind model's loss — if it
   doesn't, no τ can force param edges (see D16 "Open" note; watch eval/shd_param early).
-- Constraint the dual compares to τ is `pred + lambda_logit·logit_penalty` (Baumgartner Eq. 9);
-  the eval harness reports it as `constraint_loss` — calibrate τ on THAT, never bare pred_loss.
-  Watch the logit share: at equilibrium it consumes constraint budget (v2: 0.12 of τ=0.17).
+  RESOLVED 2026-07-14 in NORMALIZED units (D17): identity floor 0.90 flat vs dense 0.63–0.66
+  at Tp=30/ctx=30 — the raw floors differ by only 0.008 because the two models equilibrate at
+  different embedding scales (raw comparisons across models are scale-confounded; never use them).
+- Constraint the dual compares to τ is SCALE-FREE since D17:
+  `pred / Var(target batch, detached) + lambda_logit·logit_penalty` (Baumgartner Eq. 9 + the
+  one deliberate deviation, variance normalization — rationale in decisions.md D17). The eval
+  harness reports it as `constraint_loss` — calibrate τ on THAT, never bare pred_loss; 1.0 ≈
+  predicting the batch mean; pre-D17 constraint values are NOT comparable. Watch the logit
+  share: at equilibrium it consumes constraint budget (~0.022 for gated models; fine inside
+  the ~0.26 normalized window, fatal inside the 0.008 raw one).
 - Gate/penalty logits are the SCALED q·k/√d (interpretation — papers write unscaled q·k, which
   is untrainable at init; flagged in `src/scjepa/models/spartan.py`).
 - Path matrix entries are path COUNTS (∏(A_l+I)); `path_density` = fraction of entries ≥ 0.5;

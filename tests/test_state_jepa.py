@@ -103,9 +103,25 @@ def test_identifiability_harness_end_to_end() -> None:
     report = evaluate_identifiability(
         tiny_state_model(), dataset, input_key="states", batch_size=6, max_batches=2
     )
-    for key in ("pred_loss", "shd_state", "shd_param", "mcc", "path_density", "num_samples"):
+    for key in (
+        "pred_loss",
+        "pred_loss_normalized",
+        "target_var",
+        "constraint_loss",
+        "shd_state",
+        "shd_param",
+        "mcc",
+        "path_density",
+        "num_samples",
+    ):
         assert key in report.metrics
         assert torch.isfinite(torch.tensor(report.metrics[key])), key
+    # D17: constraint_loss is the SCALE-FREE quantity (lambda_logit=0 here, so
+    # it equals normalized pred; mean of per-batch ratios, so it only
+    # approximates pred_loss / mean target_var).
+    assert report.metrics["constraint_loss"] == report.metrics["pred_loss_normalized"]
+    approx = report.metrics["pred_loss"] / report.metrics["target_var"]
+    assert 0.5 * approx < report.metrics["pred_loss_normalized"] < 2.0 * approx
     assert 0 <= report.metrics["mcc"] <= 1 + 1e-6
     assert report.metrics["num_samples"] == 12 * N
     assert report.recovery_learned.shape == report.recovery_true.shape
