@@ -504,3 +504,32 @@ D17 on — NOT comparable to any earlier run. τ protocol: 1.1× the dense refer
 normalized constraint (dense leg of run_bounce_example.sh, same length as main, D16), with the
 sanity check τ < mass-blind floor (identity reference; 0.90 at Tp=30/ctx=30 — this transfers,
 identity converged flat from 10k). Raw pred_loss and target_var stay logged for diagnostics.
+
+## D18 — Grad-spike skip guard, non-finite-grad failure, rolling checkpoints (decided 2026-07-17, Jesse — implemented by Claude per instruction)
+
+**Why (post-mortem of run 7wupt6pw).** At step ~67.1k a rare batch kicked the predictor
+(pre-clip grad norms 3.8e5 → 3.3e8) into a >1 per-step gain regime; the Tp=30 autoregressive
+chain amplified it exponentially (gain ~3 ⇒ outputs ~1e15, MSE ~1e30 — FINITE, so the
+`isfinite(total)` guard passed); BPTT through the chain overflowed to grad_norm = inf, and
+`clip_grad_norm_`'s coefficient max_norm/inf = 0 silently multiplied every gradient by zero.
+The run finished its remaining 230k steps as a frozen zombie (47 byte-identical evals), and
+because `last.pt` is overwritten every 2k steps, no pre-explosion state survived. The same
+spike family appeared ~5 times in the dense calibration (peaks ~7e4) and recovered by luck.
+It died ~1k steps before crossing τ: the D17 objective and τ=0.584 are vindicated, not
+implicated — this is optimizer robustness, not objective design.
+
+**Decision.** In `Trainer._train_step`: if the PRE-clip grad norm (clip_grad_norm_'s return)
+is non-finite OR above `train.grad_skip_threshold` (default 1e3; healthy grads here are <1
+with rare transients <25), the batch's update is rejected entirely — no optimizer step, no
+dual/EMA update (a pathological batch must not jolt the λ controller). After
+`grad_skip_max_consecutive` (default 50) consecutive skips the trainer RAISES: the model is no
+longer trainable and must die loudly, not finish. Cumulative skips are logged as
+`health/skipped_steps` and ride along in checkpoints (exact resume). Additionally
+`train.checkpoint_keep_every` (bounce: 25000) keeps step-tagged `step_<N>.pt` fallbacks so a
+late failure is a resume, not a rerun. Applies identically to calibration and main runs
+(D12-safe); no objective term changes; τ=0.584 remains valid.
+
+**Watch.** `health/skipped_steps` should stay 0 or near-0 (isolated skips = the guard doing
+its job on known spike episodes); a climbing counter or the consecutive-skip RuntimeError
+means the instability got through anyway — diagnose the episode (suspect: exp logit-penalty
+wall × rare batch × 30-step BPTT) rather than raising the threshold.

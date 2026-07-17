@@ -102,8 +102,23 @@ class TrainConfig:
     # of Baumgartner Fig. 17's MCC-over-steps). None = off. Requires an
     # eval_dataset passed to the Trainer; states regime only (slot i = object i).
     eval_every: int | None = None
+    # D18 grad-spike guards (post-mortem of run 7wupt6pw, 2026-07-17): a rare
+    # batch kicked the predictor into a >1 per-step rollout gain, the Tp=30
+    # chain amplified it to a FINITE ~1e30 loss (passes the isfinite guard),
+    # BPTT overflowed to grad_norm=inf, and clip_grad_norm_'s inf denominator
+    # silently multiplied every gradient by ZERO — the run finished 230k steps
+    # as a frozen zombie. Guards: skip the optimizer step (and dual update)
+    # when the pre-clip grad norm is non-finite or above the threshold; raise
+    # after too many consecutive skips (weights are then already broken —
+    # fail loudly, resume from a rolling checkpoint).
+    grad_skip_threshold: float = 1e3
+    grad_skip_max_consecutive: int = 50
     log_every: int = 10
     checkpoint_every: int = 200
+    # Also keep a step-tagged checkpoint every N steps (None = only last.pt).
+    # last.pt is OVERWRITTEN every checkpoint_every, so without this a late
+    # failure leaves no healthy state to resume from (the 7wupt6pw lesson).
+    checkpoint_keep_every: int | None = None
     out_dir: str = "outputs"
 
 
@@ -149,6 +164,8 @@ class Trainer:
         # ONE optimizer over everything (D7: encoders + heads + predictor jointly).
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr)
         self.step = 0
+        self.total_skips = 0  # D18: batches whose update was rejected
+        self.consecutive_skips = 0
 
     # ------------------------------------------------------------- data ----
     def _epoch_loader(self, epoch: int) -> DataLoader[dict[str, Tensor]]:
@@ -224,9 +241,32 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         total.backward()  # pyright: ignore[reportUnknownMemberType]
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-        self.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
-        if self.config.sparsity_enabled:
-            self.lagrangian.update(constraint_loss)
+        # D18 skip guard: clip_grad_norm_ returns the PRE-clip norm. A
+        # non-finite norm means clip's coefficient max_norm/inf is 0 — every
+        # gradient is already zeroed and stepping would freeze the model
+        # silently; an absurd finite norm is the batch kick that starts the
+        # explosion spiral. Either way: reject this batch's update entirely
+        # (optimizer AND dual — a pathological batch must not jolt the EMA).
+        skip = (not bool(torch.isfinite(grad_norm))) or (
+            float(grad_norm) > self.config.grad_skip_threshold
+        )
+        if skip:
+            self.optimizer.zero_grad(set_to_none=True)
+            self.total_skips += 1
+            self.consecutive_skips += 1
+            if self.consecutive_skips >= self.config.grad_skip_max_consecutive:
+                raise RuntimeError(
+                    f"{self.consecutive_skips} consecutive grad-spike skips at step "
+                    f"{self.step} (grad_norm={float(grad_norm):.3g}, threshold="
+                    f"{self.config.grad_skip_threshold:.3g}): the model is no longer "
+                    "trainable — weights are likely already broken. Resume from the "
+                    "last healthy step-tagged checkpoint instead of continuing."
+                )
+        else:
+            self.consecutive_skips = 0
+            self.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+            if self.config.sparsity_enabled:
+                self.lagrangian.update(constraint_loss)
 
         return {
             "loss/total": total.item(),
@@ -242,6 +282,7 @@ class Trainer:
             "health/target_slot_std_mean": slot_std.mean().item(),
             "health/target_slot_std_min": slot_std.min().item(),
             "health/grad_norm": float(grad_norm.item()),
+            "health/skipped_steps": float(self.total_skips),
         }
 
     def train(self) -> dict[str, float]:
@@ -264,6 +305,13 @@ class Trainer:
                 self.logger.log(self.step, self._eval_step())
             if self.step % self.config.checkpoint_every == 0:
                 self.save_checkpoint(out_dir / "last.pt")
+            if (
+                self.config.checkpoint_keep_every is not None
+                and self.step % self.config.checkpoint_keep_every == 0
+            ):
+                # D18: last.pt gets overwritten — keep dated fallbacks so a
+                # late-run failure is a resume, not a rerun.
+                self.save_checkpoint(out_dir / f"step_{self.step}.pt")
         self.save_checkpoint(out_dir / "last.pt")
         return metrics
 
@@ -293,6 +341,8 @@ class Trainer:
                 "optimizer": self.optimizer.state_dict(),
                 "lagrangian": self.lagrangian.state_dict(),
                 "step": self.step,
+                "total_skips": self.total_skips,
+                "consecutive_skips": self.consecutive_skips,
                 "rng_python": random.getstate(),
                 "rng_numpy": np.random.get_state(),  # noqa: NPY002
                 "rng_torch": torch.get_rng_state(),
@@ -307,6 +357,8 @@ class Trainer:
         self.optimizer.load_state_dict(payload["optimizer"])
         self.lagrangian.load_state_dict(payload["lagrangian"])
         self.step = int(payload["step"])
+        self.total_skips = int(payload.get("total_skips", 0))  # absent pre-D18
+        self.consecutive_skips = int(payload.get("consecutive_skips", 0))
         random.setstate(payload["rng_python"])
         np.random.set_state(payload["rng_numpy"])  # noqa: NPY002
         torch.set_rng_state(payload["rng_torch"])

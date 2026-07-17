@@ -19,6 +19,8 @@ Subagent roster and shared conventions: `.claude/agents/README.md`.
 
 ## Run-health signatures (states regime, bounce)
 Healthy: `loss/logit` ≈ 0.003–0.12 and smooth · `health/grad_norm` mostly < 1 ·
+`health/skipped_steps` 0 or near-0 and NOT climbing (D18 guard; isolated skips = known
+grad-spike episodes being absorbed) ·
 `sparsity/lambda` responsive in BOTH directions (settling ~40–5000 is fine) ·
 `health/target_slot_std_min` ≥ ~0.1 · `eval/path_density` strictly between 1/T and 1 and still
 moving after 5k steps · `eval/constraint_loss` hovering near τ (the dual holds it AT the
@@ -42,6 +44,12 @@ Failure catalog (all observed, all diagnosed — don't re-derive):
    step 0.02 crosses its range in ~2k steps vs the papers' 10⁵–10⁶-step λ trajectories.
 3. **Scale collapse via weak lambda_reg** (pre-2026-07-10, see bounce_states.yaml comment):
    target embeddings shrink to satisfy the constraint; VISReg at lambda_reg=1.0 is the anchor.
+4. **Zombie freeze via finite blow-up** (run 7wupt6pw, 2026-07-17): grad-spike episode →
+   predictor per-step gain > 1 → Tp=30 rollout amplifies to FINITE ~1e30 MSE (passes the
+   isfinite guard) → BPTT overflows, grad_norm = inf → clip_grad_norm_ multiplies all grads by
+   max_norm/inf = 0 → weights frozen, run "finishes" (47 byte-identical evals from 70k–300k).
+   Fixed by D18 (skip guard + consecutive-skip raise + rolling checkpoints). Signature:
+   `health/grad_norm` = inf, byte-identical eval rows, `health/skipped_steps` climbing.
 
 ## Key mechanics (verified against papers 2026-07-11/12)
 - The training objective is an AUTOREGRESSIVE ROLLOUT (D16, 2026-07-12): chains feed their own
