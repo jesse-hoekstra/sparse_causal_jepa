@@ -86,8 +86,11 @@ def main(cfg: DictConfig) -> None:
         context_len=cfg.train.get("context_len", None),
         rollout_horizon=cfg.train.get("rollout_horizon", None),
         eval_every=cfg.train.get("eval_every", None),
+        grad_skip_threshold=cfg.train.get("grad_skip_threshold", 1e3),
+        grad_skip_max_consecutive=cfg.train.get("grad_skip_max_consecutive", 50),
         log_every=cfg.train.log_every,
         checkpoint_every=cfg.train.checkpoint_every,
+        checkpoint_keep_every=cfg.train.get("checkpoint_keep_every", None),
         out_dir=str(out_dir),
     )
     experiment = HydraConfig.get().runtime.choices.get("experiment") or cfg.data.name

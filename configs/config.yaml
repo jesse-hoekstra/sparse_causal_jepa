@@ -64,8 +64,14 @@ train:
   rollout_horizon: null
   eval_every: null # periodic held-out identifiability eval (states regime only)
   eval_episodes: 128 # episodes per periodic eval (seed-offset 17 split)
+  # D18 grad-spike guards: skip the update (optimizer + dual) when the pre-clip
+  # grad norm is non-finite or above the threshold; raise after this many
+  # consecutive skips (run 7wupt6pw froze silently for 230k steps without them).
+  grad_skip_threshold: 1.0e3
+  grad_skip_max_consecutive: 50
   log_every: 10
   checkpoint_every: 200
+  checkpoint_keep_every: null # ALSO keep step_<N>.pt every N steps (last.pt is overwritten)
 
 wandb:
   enabled: false # keep CI/dev offline by default; enable per-run

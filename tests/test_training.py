@@ -144,6 +144,37 @@ def test_resume_is_exact(tmp_path: Path) -> None:
         torch.testing.assert_close(value, final_b[key], msg=f"mismatch in {key}")
 
 
+def test_grad_skip_guard_rejects_updates_and_raises_when_persistent(tmp_path: Path) -> None:
+    """D18: over-threshold batches must not touch weights or the dual, and a
+    permanently untrainable model must die loudly instead of finishing as a
+    zombie (run 7wupt6pw: 230k frozen steps behind a finite 1e30 loss)."""
+    dataset = RandomClipDataset(num_clips=4, clip_len=3, resolution=RES, seed=1)
+    config = tiny_config(tmp_path, steps=1)
+    config.grad_skip_threshold = 0.0  # every real gradient counts as a spike
+    config.grad_skip_max_consecutive = 3
+    trainer = Trainer(tiny_model(), dataset, config)
+    before = {k: v.clone() for k, v in trainer.model.state_dict().items()}
+    metrics = trainer.train()  # 1 step < 3 consecutive: skips but does not raise
+    assert metrics["health/skipped_steps"] == 1.0
+    assert trainer.lagrangian.ma_error == 0.0  # dual not fed the spike batch
+    for key, value in trainer.model.state_dict().items():
+        torch.testing.assert_close(value, before[key], msg=f"weights moved: {key}")
+    trainer.config.steps = 10
+    with pytest.raises(RuntimeError, match="consecutive grad-spike skips"):
+        trainer.train()
+
+
+def test_rolling_checkpoints_are_kept(tmp_path: Path) -> None:
+    """D18: step-tagged checkpoints survive alongside the overwritten last.pt."""
+    dataset = RandomClipDataset(num_clips=4, clip_len=3, resolution=RES, seed=1)
+    config = tiny_config(tmp_path, steps=4)
+    config.checkpoint_keep_every = 2
+    Trainer(tiny_model(), dataset, config).train()
+    assert (tmp_path / "last.pt").exists()
+    assert (tmp_path / "step_2.pt").exists()
+    assert (tmp_path / "step_4.pt").exists()
+
+
 def test_sparsity_ablation_toggle(tmp_path: Path) -> None:
     """±sparsity is a config flag: disabled ⇒ λ never updated, term not in total."""
     dataset = RandomClipDataset(num_clips=4, clip_len=3, resolution=RES, seed=1)

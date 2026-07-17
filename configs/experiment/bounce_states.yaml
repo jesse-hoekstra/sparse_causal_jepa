@@ -72,6 +72,7 @@ train:
   sparsity_step_size: 0.02 # dual moves visibly within ~10^4 steps (CPU-scale)
   log_every: 100
   checkpoint_every: 2000
+  checkpoint_keep_every: 25000 # D18: rolling fallbacks; a late explosion cost a full rerun once
 
 wandb:
   enabled: false
