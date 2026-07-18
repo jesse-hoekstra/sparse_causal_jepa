@@ -522,15 +522,17 @@ implicated — this is optimizer robustness, not objective design.
 is non-finite OR above `train.grad_skip_threshold` (default 1e3; healthy grads here are <1
 with rare transients <25), the batch's update is rejected entirely — no optimizer step, no
 dual/EMA update (a pathological batch must not jolt the λ controller). After
-`grad_skip_max_consecutive` (default 500; amended 2026-07-17, was 50) consecutive skips the
+`grad_skip_max_consecutive` (default 2000; amended 2026-07-17, was 50) consecutive skips the
 trainer RAISES: the model is no longer trainable and must die loudly, not finish. The limit is
-a provably-stuck test, not a broken-weights heuristic: weights are FROZEN during skips, so
-patience is free, and once a full epoch of distinct batches (~250 at bounce config) has spiked
-against unchanging weights no future batch can differ — 500 ≈ two epochs. Evidence for the
-amendment: run 0ta5ymcw's first episode (step ~4000) recovered after 149 skips interleaved
-with calm batches, but the original limit of 50 executed its second episode (step 6594)
-mid-burst; deterministic data order means a resume replays the identical death, so the limit
-had to change, not the seed. Cumulative skips are logged as
+a stuck-run test, not a broken-weights heuristic: weights are FROZEN during skips (patience is
+free), every retry is a fresh draw (epoch reshuffles + per-forward gate sampling), and the
+counter resets on ANY calm batch — so reaching N consecutive means the calm-batch rate is
+below ~1/N. At 2000 (~8 bounce epochs, ~10 wall-clock minutes) that is a dead run, not an
+unlucky one, while a true zombie still dies within minutes instead of finishing 230k frozen
+steps. Evidence for the amendment: run 0ta5ymcw's first episode (step ~4000) recovered after
+149 skips interleaved with calm batches (~50% pass rate), but the original limit of 50
+executed its second episode (step 6594) mid-burst; deterministic data order means a resume
+replays the identical death, so the limit had to change, not the seed. Cumulative skips are logged as
 `health/skipped_steps` and ride along in checkpoints (exact resume). Additionally
 `train.checkpoint_keep_every` (bounce: 25000) keeps step-tagged `step_<N>.pt` fallbacks so a
 late failure is a resume, not a rerun. Applies identically to calibration and main runs
@@ -540,3 +542,54 @@ late failure is a resume, not a rerun. Applies identically to calibration and ma
 its job on known spike episodes); a climbing counter or the consecutive-skip RuntimeError
 means the instability got through anyway — diagnose the episode (suspect: exp logit-penalty
 wall × rare batch × 30-step BPTT) rather than raising the threshold.
+
+## D19 — Per-chain gate-noise coupling in rollouts (decided 2026-07-17, Jesse — implemented by Claude per instruction)
+
+**The problem.** Three consecutive main runs (7wupt6pw, 0ta5ymcw, u94wqvcb) died in the same
+regime: once train path_density enters ~0.55–0.7, straight-through gradients explode
+(1e4–1e6) on essentially every batch (u94wqvcb: 100/100 batches skipped for 1600 straight
+steps, weights frozen by the D18 guard). Reproduced locally in 3000 CPU steps: healthy grads
+(~0.1) until density ~0.6, then the spike regime. Mechanism: a D16 chain calls the predictor
+Tp=30 times, and each of the 2 layers redrew fresh Bernoulli noise per call — 60 independent
+hard-mask resamplings inside ONE backward graph. At mid density gates flicker i.i.d. at
+unchanged state, the chain's step-Jacobians are randomly rewired 30x, and their product is
+heavy-tailed. Forward stays healthy; only backward detonates.
+
+**What the sources say (all three PDFs read 2026-07-17).** Nothing — the situation cannot
+arise upstream. SPARTAN's objective is single-transition (Eq. 6, p.5); rollouts are eval-only
+(Table 1, Fig. 2); no public code exists (D1); its Gumbel-softmax reference (Jang et al.)
+defines the trick for a single sampling site. Baumgartner's decoder "performs one-step
+prediction" (Fig. 1 caption, p.2) and the paper nowhere states free-running training; App. E/F
+contain no rollout-training mechanics. my_paper defines the S_Tp chain but says nothing about
+gate sampling (its adjacencies are deterministic theory objects). No upstream gradient ever
+crosses more than one sampling round, so the cross-step coupling of the noise is genuinely
+unprescribed design space.
+
+**Decision.** `Spartan.sample_gate_noise` draws each layer's logistic thresholds ONCE per
+rollout chain; `rollout_predictions` passes them to every step of that chain. Precisely:
+per-step Bernoulli marginals are preserved (P(open) = σ(logit) at every step — Eq. 3 exact,
+so E|Ā| and the τ protocol are untouched); within-chain independence is deliberately replaced
+by common-threshold coupling (a gate flips mid-chain only when its state-dependent logit
+crosses the chain's fixed threshold — collision-driven local-graph switching fully preserved);
+across-chain/batch independence is preserved (exploration volume unchanged). Honest note: the
+chain loss is nonlinear, so changing the coupling changes the expected objective — this is a
+choice between two unprescribed objectives, not a pure variance trick. The correlated one
+matches the theory's semantics (one fixed f_θ generates the whole trajectory: Baumgartner
+Eq. 27, my_paper S_Tp) and is optimizable; the i.i.d. one is demonstrably not. Each chain is
+also a cleaner experiment: one coherent graph hypothesis held for the horizon, so the loss
+verdict a logit learns from measures the 30-step value of an edge instead of a smear over
+2^30 flicker patterns. Unchanged by construction: Tp=1 (bit-identical), dense/identity
+references (sample nothing), eval (deterministic thresholding), τ = 0.584.
+
+**Validation (repro: τ=0.55, dual step 5e-3 — pushes density 5x faster than production).**
+Pre-D19: every-batch spike regime on first contact with density ~0.6. Post-D19: trains through
+density 0.50 → 0.78 with grads 0.1–0.4 and λ responsive; residual rare spiky batches remain
+(86/3000 ≈ 3%, isolated singles/pairs, zero consecutive runs) and are absorbed by the D18 skip
+guard — D19 removes the systemic explosion, D18 handles the tail. 86 tests green, incl. new:
+frozen-noise forward is deterministic; dense/identity draw nothing; a Tp=4 chain consumes
+exactly the RNG of a Tp=1 chain.
+
+**Watch.** During the mid-density transit, `health/skipped_steps` climbing SLOWLY (a few per
+1k steps) is expected post-D19; the fatal signatures are consecutive-run growth or every-batch
+skipping — if seen, D19 was insufficient and the next lever is the Gumbel temperature
+(softer ST gradients), not the skip limit.

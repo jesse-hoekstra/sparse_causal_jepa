@@ -19,8 +19,9 @@ Subagent roster and shared conventions: `.claude/agents/README.md`.
 
 ## Run-health signatures (states regime, bounce)
 Healthy: `loss/logit` ≈ 0.003–0.12 and smooth · `health/grad_norm` mostly < 1 ·
-`health/skipped_steps` 0 or near-0 and NOT climbing (D18 guard; isolated skips = known
-grad-spike episodes being absorbed) ·
+`health/skipped_steps` flat or slowly accumulating isolated skips (D18 guard; a few per 1k
+steps during the mid-density transit is expected post-D19 — consecutive-run growth is the
+fatal signature) ·
 `sparsity/lambda` responsive in BOTH directions (settling ~40–5000 is fine) ·
 `health/target_slot_std_min` ≥ ~0.1 · `eval/path_density` strictly between 1/T and 1 and still
 moving after 5k steps · `eval/constraint_loss` hovering near τ (the dual holds it AT the
@@ -50,6 +51,15 @@ Failure catalog (all observed, all diagnosed — don't re-derive):
    max_norm/inf = 0 → weights frozen, run "finishes" (47 byte-identical evals from 70k–300k).
    Fixed by D18 (skip guard + consecutive-skip raise + rolling checkpoints). Signature:
    `health/grad_norm` = inf, byte-identical eval rows, `health/skipped_steps` climbing.
+5. **Mid-density gradient detonation** (runs 0ta5ymcw/u94wqvcb + local repro, 2026-07-17): at
+   train path_density ~0.55–0.7, grads 1e4–1e6 on ~every batch (u94wqvcb: 100/100 skipped for
+   1600 steps). Cause: pre-D19, each of the Tp=30 chain steps redrew fresh Bernoulli gate noise
+   per layer — 60 i.i.d. hard-mask resamplings in ONE backward graph; the randomly rewired
+   step-Jacobian product is heavy-tailed. Forward loss stays healthy; only backward explodes.
+   Fixed by D19 (per-chain gate thresholds). Post-D19 residual: rare isolated spike batches
+   (~3% during the mid-density transit, absorbed by the D18 skip guard) are EXPECTED; the fatal
+   signatures are consecutive-run skip growth or every-batch skipping (then: Gumbel temperature
+   is the next lever, not the skip limit).
 
 ## Key mechanics (verified against papers 2026-07-11/12)
 - The training objective is an AUTOREGRESSIVE ROLLOUT (D16, 2026-07-12): chains feed their own
@@ -73,6 +83,11 @@ Failure catalog (all observed, all diagnosed — don't re-derive):
   the ~0.26 normalized window, fatal inside the 0.008 raw one).
 - Gate/penalty logits are the SCALED q·k/√d (interpretation — papers write unscaled q·k, which
   is untrainable at init; flagged in `src/scjepa/models/spartan.py`).
+- Rollout gate noise is drawn ONCE per chain and reused across its steps (D19): per-step
+  Bernoulli marginals exactly Eq. 3, common-threshold coupling within a chain, independent
+  across chains. The papers are silent (their gradients never cross one sampling round —
+  SPARTAN Eq. 6 is single-transition, Baumgartner's decoder is one-step per Fig. 1); i.i.d.
+  per-step redraws detonate under Tp=30 BPTT (failure #5).
 - Path matrix entries are path COUNTS (∏(A_l+I)); `path_density` = fraction of entries ≥ 0.5;
   identity-only matrix ⇒ density = 1/T (T=10 for 5-ball states regime ⇒ 0.100 exactly).
 - `shd_param` = 1.4595 constant ⇔ zero learned param edges (both failed runs); any real
