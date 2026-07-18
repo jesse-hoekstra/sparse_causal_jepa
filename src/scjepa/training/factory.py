@@ -52,6 +52,7 @@ def build_model(model_cfg: DictConfig) -> nn.Module:
             aux_dim=model_cfg.aux_dim,
             spartan_dense=bool(model_cfg.get("spartan_dense", False)),
             spartan_identity=bool(model_cfg.get("spartan_identity", False)),
+            gt_states=bool(model_cfg.get("gt_states", False)),
         )
     raise ValueError(f"unknown model.type {model_cfg.type!r} (vision | states)")
 

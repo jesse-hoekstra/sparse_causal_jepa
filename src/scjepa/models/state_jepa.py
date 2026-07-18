@@ -33,11 +33,23 @@ class StateJepa(nn.Module):
         context_embed: nn.Module,
         target_embed: nn.Module,
         pooling: AttnPooling | CrossSlotAttnPooling,
-        kinematic_head: KinematicHead,
+        kinematic_head: KinematicHead | None,
         predictor: Spartan,
+        gt_states: bool = False,
     ) -> None:
-        """Compose the modules; embeddings are per-object, shared across objects."""
+        """Compose the modules; embeddings are per-object, shared across objects.
+
+        ``gt_states`` (D20): the rollout state space is the RAW ground-truth
+        states — Baumgartner's observation-space ruler. Anchors and targets are
+        the untouched ``states`` tensor (no kinematic head, no target embed),
+        so the constraint's MSE is measured against a fixed, non-trainable
+        reference and the D17 denominator becomes a data constant. Only the
+        parameter path (context embed + pooling) and the predictor train.
+        """
         super().__init__()
+        if not gt_states and kinematic_head is None:
+            raise ValueError("kinematic_head is required unless gt_states=True")
+        self.gt_states = gt_states
         self.context_embed = context_embed
         self.target_embed = target_embed
         self.pooling = pooling
@@ -75,8 +87,16 @@ class StateJepa(nn.Module):
         causal_params = self.pooling(context_slots)  # (B, N, d) — pooled ONCE
         # Chain anchors: TRUE states at t = th-1, th-1+Tp, ... (memoryless embeds).
         anchor_steps = [th - 1 + c * chain_len for c in range(num_chains)]
-        anchors = self.kinematic_head.project(self.context_embed(states[:, anchor_steps]))
-        target_slots = self.target_embed(states[:, th:])  # (B, K, N, d)
+        if self.gt_states:
+            # D20: anchors/targets are the raw GT states — the rollout happens
+            # entirely in the fixed observation space (one space, exactly
+            # Baumgartner Eq. 21's h(x0, θ)); nothing on this path trains.
+            anchors = states[:, anchor_steps]  # (B, C, N, k)
+            target_slots = states[:, th:]  # (B, K, N, k)
+        else:
+            assert self.kinematic_head is not None
+            anchors = self.kinematic_head.project(self.context_embed(states[:, anchor_steps]))
+            target_slots = self.target_embed(states[:, th:])  # (B, K, N, d)
         prediction, path_matrix, sparsity, logit_penalty = rollout_predictions(
             self.predictor, anchors, causal_params, aux, chain_len
         )
@@ -106,28 +126,37 @@ def build_state_jepa(
     aux_dim: int | None = None,
     spartan_dense: bool = False,
     spartan_identity: bool = False,
+    gt_states: bool = False,
 ) -> StateJepa:
     """Build the GT-embedding variant from plain config values.
 
     Context and target embeddings are separate linear maps (mirroring the
     separate encoders of the vision regime, D9 default).
+
+    ``gt_states`` (D20): rollout in the raw GT state space instead — the
+    predictor's state tokens are ``state_dim``-dim (predictions are literal
+    next states), Ŝ^ph stays ``slot_size``-dim via Spartan's ``param_size``,
+    and the target/kinematic modules are dropped (nothing on the state path
+    trains, so the constraint's ruler is fixed).
     """
     return StateJepa(
         context_embed=nn.Linear(state_dim, slot_size),
-        target_embed=nn.Linear(state_dim, slot_size),
+        target_embed=nn.Identity() if gt_states else nn.Linear(state_dim, slot_size),
         pooling=build_pooling(pooling_type, slot_size, pooling_heads, max_history),
-        kinematic_head=KinematicHead(slot_size=slot_size),
+        kinematic_head=None if gt_states else KinematicHead(slot_size=slot_size),
         predictor=Spartan(
-            slot_size=slot_size,
+            slot_size=state_dim if gt_states else slot_size,
             num_layers=spartan_layers,
             embed_dim=spartan_embed_dim,
             mlp_hidden_size=spartan_mlp_hidden,
             mlp_num_layers=spartan_mlp_layers,
             temperature=spartan_temperature,
             aux_dim=aux_dim,
+            param_size=slot_size if gt_states else None,
             dense=spartan_dense,
             identity=spartan_identity,
         ),
+        gt_states=gt_states,
     )
 
 

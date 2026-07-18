@@ -253,13 +253,19 @@ class Spartan(nn.Module):
         mlp_num_layers: int = 3,
         temperature: float = 1.0,
         aux_dim: int | None = None,
+        param_size: int | None = None,
         dense: bool = False,
         identity: bool = False,
     ) -> None:
         """Build the predictor.
 
         Args:
-            slot_size: d, dimension of state and parameter tokens (= slot dim).
+            slot_size: d_s, dimension of the STATE tokens (= prediction dim).
+            param_size: Dimension of the parameter tokens Ŝ^ph when it differs
+                from ``slot_size`` (D20 gt_states regime: state tokens are raw
+                k-dim GT states while Ŝ^ph stays in slot space). None = params
+                share ``slot_size`` and the state input projection (existing
+                behavior; state_dict unchanged).
             num_layers: L, number of stacked sparse-attention layers (A.1: 3).
             embed_dim: Working dimension inside the transformer (App. A.1
                 separates "token dimension" from a larger "embedding dimension",
@@ -285,11 +291,19 @@ class Spartan(nn.Module):
         if dense and identity:
             raise ValueError("dense and identity are mutually exclusive")
         self.slot_size = slot_size
+        self.param_size = param_size if param_size is not None else slot_size
         self.aux_dim = aux_dim
         self.dense = dense
         self.identity = identity
         dim = embed_dim if embed_dim is not None else slot_size
         self.in_project = nn.Linear(slot_size, dim) if dim != slot_size else nn.Identity()
+        # Separate param-token projection ONLY when Ŝ^ph lives in a different
+        # space (D20); None keeps the shared projection and an unchanged
+        # state_dict, so pre-D20 checkpoints load strictly.
+        if param_size is None or param_size == slot_size:
+            self.param_project: nn.Module | None = None
+        else:
+            self.param_project = nn.Linear(param_size, dim) if dim != param_size else nn.Identity()
         self.out_project = nn.Linear(dim, slot_size) if dim != slot_size else nn.Identity()
         self.layers = nn.ModuleList(
             [
@@ -364,15 +378,23 @@ class Spartan(nn.Module):
             (B, N, d) at state positions; Ā over the full token set with order
             [state 0..N-1 | params N..2N-1 | aux 2N..]; |Ā| averaged over batch.
         """
-        if state.shape != params.shape or state.ndim != 3:
+        if (
+            state.ndim != 3
+            or params.ndim != 3
+            or state.shape[:2] != params.shape[:2]
+            or state.shape[2] != self.slot_size
+            or params.shape[2] != self.param_size
+        ):
             raise ValueError(
-                f"state/params must both be (B, N, d), got "
-                f"{tuple(state.shape)} vs {tuple(params.shape)}"
+                f"state must be (B, N, {self.slot_size}) and params "
+                f"(B, N, {self.param_size}), got {tuple(state.shape)} vs "
+                f"{tuple(params.shape)}"
             )
         num_slots = state.shape[1]
+        param_project = self.param_project if self.param_project is not None else self.in_project
         pieces = [
             self.in_project(state) + self.state_embed,
-            self.in_project(params) + self.param_embed,
+            param_project(params) + self.param_embed,
         ]
         if aux is not None:
             if self.aux_project is None or self.aux_embed is None:
