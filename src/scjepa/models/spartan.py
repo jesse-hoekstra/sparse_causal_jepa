@@ -18,6 +18,14 @@ Mechanics traceable to the SPARTAN paper:
             its weight (App. A.2) lives in the training loop, not here.
 
 Choices the paper leaves open (flagged per project policy, decisions D10):
+    * D19 rollout gate coupling: the paper's objective (Eq. 6) is
+      single-transition, so it prescribes only the per-step Bernoulli MARGINAL
+      of Eq. 3 and is silent on how draws couple across a D16 rollout chain
+      (a situation that does not exist upstream). We draw each layer's
+      logistic thresholds once per chain and reuse them across its steps
+      (``sample_gate_noise``): same marginals, common-threshold coupling
+      within a chain, independent across chains. I.i.d. per-step redraws are
+      catastrophically unstable under Tp=30 BPTT (decisions.md D19).
     * Eq. 4's printed normalization is ambiguous; we renormalize the softmax
       over the UNMASKED entries only. Masking after normalization would leak
       masked tokens' information through the denominator, contradicting the
@@ -53,17 +61,31 @@ class SpartanOutput(NamedTuple):
     logit_penalty: Float[Tensor, ""]
 
 
-def _sample_hard_adjacency(logits: Tensor, temperature: float, training: bool) -> Tensor:
+def _logistic_noise(like: Tensor) -> Tensor:
+    """Logistic(0,1) threshold noise (= difference of two Gumbels), shaped like ``like``."""
+    uniform = torch.rand_like(like).clamp(1e-6, 1 - 1e-6)
+    return uniform.log() - (-uniform).log1p()
+
+
+def _sample_hard_adjacency(
+    logits: Tensor, temperature: float, training: bool, noise: Tensor | None = None
+) -> Tensor:
     """Hard {0,1} adjacency from Bernoulli logits (Eq. 3).
 
     Training: binary Gumbel-softmax (Logistic reparameterization) with a
     straight-through estimator — forward is exactly 0/1, gradients flow
-    through the relaxed sigmoid. Eval: deterministic threshold sigmoid(logit) > 1/2.
+    through the relaxed sigmoid. ``noise`` optionally injects the logistic
+    threshold tensor; None draws fresh noise (the single-transition behavior
+    of the paper). D19 rollout chains draw the noise ONCE per chain and pass
+    it to every step, so P(open) = sigmoid(logit) at every step (marginals
+    exactly Eq. 3) but within one chain a gate flips only when its
+    state-dependent logit crosses the chain's fixed threshold.
+    Eval: deterministic threshold sigmoid(logit) > 1/2 (noise ignored).
     """
     if training:
-        uniform = torch.rand_like(logits).clamp(1e-6, 1 - 1e-6)
-        logistic_noise = uniform.log() - (-uniform).log1p()  # Logistic(0, 1)
-        soft = torch.sigmoid((logits + logistic_noise) / temperature)
+        if noise is None:
+            noise = _logistic_noise(logits)
+        soft = torch.sigmoid((logits + noise) / temperature)
         hard = (soft > 0.5).to(logits.dtype)
         return hard + soft - soft.detach()  # straight-through
     return (logits > 0).to(logits.dtype)
@@ -123,9 +145,16 @@ class SpartanLayer(nn.Module):
         self.mlp = nn.Sequential(*mlp_layers)
 
     def forward(
-        self, tokens: Float[Tensor, "b t d"]
+        self,
+        tokens: Float[Tensor, "b t d"],
+        gate_noise: Float[Tensor, "b t t"] | None = None,
     ) -> tuple[Float[Tensor, "b t d"], Float[Tensor, "b t t"], Float[Tensor, ""]]:
         """Apply hard-masked attention; return (tokens, adjacency A_l, logit penalty).
+
+        ``gate_noise``: optional pre-drawn logistic thresholds for this layer's
+        gates (D19: one draw per rollout chain, reused across its steps);
+        None = fresh draw (single-step behavior). Ignored in dense/identity
+        modes and in eval mode.
 
         The logit penalty is Baumgartner et al. Eq. 11 per layer:
         mean_ij [exp(q_i·k_j) + exp(-q_i·k_j)] — penalises large attention
@@ -157,7 +186,9 @@ class SpartanLayer(nn.Module):
             # constraint_loss stays the same quantity as in the other modes.
             adjacency = torch.zeros_like(adjacency_logits)
         else:
-            adjacency = _sample_hard_adjacency(adjacency_logits, self.temperature, self.training)
+            adjacency = _sample_hard_adjacency(
+                adjacency_logits, self.temperature, self.training, noise=gate_noise
+            )
 
         # Eq. 4, masked BEFORE normalization (D10): softmax over unmasked j
         # only, sharing the scaled logits.
@@ -255,6 +286,8 @@ class Spartan(nn.Module):
             raise ValueError("dense and identity are mutually exclusive")
         self.slot_size = slot_size
         self.aux_dim = aux_dim
+        self.dense = dense
+        self.identity = identity
         dim = embed_dim if embed_dim is not None else slot_size
         self.in_project = nn.Linear(slot_size, dim) if dim != slot_size else nn.Identity()
         self.out_project = nn.Linear(dim, slot_size) if dim != slot_size else nn.Identity()
@@ -284,11 +317,37 @@ class Spartan(nn.Module):
             self.aux_project = None
             self.aux_embed = None
 
+    def sample_gate_noise(
+        self,
+        state: Float[Tensor, "b n d"],
+        params: Float[Tensor, "b n d"],
+        aux: Float[Tensor, "b m da"] | None = None,
+    ) -> list[Tensor] | None:
+        """Draw one logistic-threshold tensor per layer for a rollout chain (D19).
+
+        The rollout caller draws this ONCE per chain and passes it to every
+        ``forward`` of that chain. Per-step marginals are exactly Eq. 3's
+        Bernoulli — P(open) = sigmoid(logit) at every step — but the chain's
+        draws share one threshold (common random numbers) instead of being
+        independent: a gate then flips mid-chain only when its state-dependent
+        logit crosses the fixed threshold (collision physics), never from
+        re-rolled noise at unchanged state. The i.i.d. per-step coupling makes
+        straight-through gradients through Tp x L stacked resampled masks
+        explode at mid density (runs 7wupt6pw / 0ta5ymcw / u94wqvcb; decisions
+        D19). Returns None in dense/identity mode — nothing is sampled there.
+        """
+        if self.dense or self.identity:
+            return None
+        num_tokens = 2 * state.shape[1] + (aux.shape[1] if aux is not None else 0)
+        template = state.new_empty(state.shape[0], num_tokens, num_tokens)
+        return [_logistic_noise(template) for _ in self.layers]
+
     def forward(
         self,
         state: Float[Tensor, "b n d"],
         params: Float[Tensor, "b n d"],
         aux: Float[Tensor, "b m da"] | None = None,
+        gate_noise: list[Tensor] | None = None,
     ) -> SpartanOutput:
         """Predict next-step state slots and expose the causal graph.
 
@@ -296,6 +355,9 @@ class Spartan(nn.Module):
             state: Kinematic state S_t, (B, N, d).
             params: Causal parameters Ŝ^ph, (B, N, d).
             aux: Optional auxiliary variables U_t, (B, M, aux_dim).
+            gate_noise: Optional per-layer gate thresholds from
+                ``sample_gate_noise`` (D19 rollout chains); None = fresh noise
+                per layer call (single-transition behavior, paper-literal).
 
         Returns:
             ``SpartanOutput(prediction, path_matrix, sparsity)`` — prediction
@@ -318,10 +380,16 @@ class Spartan(nn.Module):
             pieces.append(self.aux_project(aux) + self.aux_embed)
         tokens = torch.cat(pieces, dim=1)  # (B, T, embed_dim)
 
+        if gate_noise is not None and len(gate_noise) != len(self.layers):
+            raise ValueError(
+                f"gate_noise has {len(gate_noise)} tensors for {len(self.layers)} layers"
+            )
         adjacencies: list[Tensor] = []
         logit_penalties: list[Tensor] = []
-        for layer in self.layers:
-            tokens, adjacency, layer_logit_penalty = layer(tokens)
+        for index, layer in enumerate(self.layers):
+            tokens, adjacency, layer_logit_penalty = layer(
+                tokens, gate_noise=gate_noise[index] if gate_noise is not None else None
+            )
             adjacencies.append(adjacency)
             logit_penalties.append(layer_logit_penalty)
 

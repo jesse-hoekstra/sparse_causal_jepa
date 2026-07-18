@@ -99,8 +99,14 @@ def rollout_predictions(
     path_matrices: list[Tensor] = []
     sparsities: list[Tensor] = []
     logit_penalties: list[Tensor] = []
+    # D19: ONE gate-noise draw per chain, shared by all its steps — per-step
+    # Bernoulli marginals unchanged, but gates flip mid-chain only when their
+    # state-dependent logits cross the chain's fixed thresholds. Independent
+    # per-step redraws make the straight-through gradients through Tp x L
+    # stacked masks explode at mid density (decisions.md D19).
+    gate_noise = predictor.sample_gate_noise(state, flat_params, flat_aux)
     for _ in range(chain_len):
-        out = predictor(state, flat_params, flat_aux)
+        out = predictor(state, flat_params, flat_aux, gate_noise=gate_noise)
         predictions.append(out.prediction)
         path_matrices.append(out.path_matrix)
         sparsities.append(out.sparsity)

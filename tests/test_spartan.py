@@ -203,3 +203,54 @@ def test_identity_mode_is_mass_blind_and_deterministic(
 def test_dense_identity_mutually_exclusive() -> None:
     with pytest.raises(ValueError, match="mutually exclusive"):
         Spartan(slot_size=D, embed_dim=None, mlp_hidden_size=16, dense=True, identity=True)
+
+
+def test_gate_noise_reuse_is_deterministic(
+    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    """D19: with a fixed noise draw the gated forward is deterministic — a
+    chain reusing one draw cannot flicker at unchanged state — while the
+    default (no noise passed) still samples freshly per call."""
+    model.train()
+    noise = model.sample_gate_noise(*inputs)
+    assert noise is not None and len(noise) == 2
+    assert noise[0].shape == (B, T, T)
+    first = model(*inputs, gate_noise=noise)
+    second = model(*inputs, gate_noise=noise)
+    torch.testing.assert_close(first.prediction, second.prediction)
+    torch.testing.assert_close(first.path_matrix, second.path_matrix)
+    fresh_a = model(*inputs)
+    fresh_b = model(*inputs)
+    assert not torch.allclose(fresh_a.prediction, fresh_b.prediction)
+    with pytest.raises(ValueError, match="gate_noise"):
+        model(*inputs, gate_noise=noise[:1])
+
+
+def test_gate_noise_none_for_dense_and_identity(
+    inputs: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """Dense (A≡1) and identity (A≡0) modes sample nothing — no noise to draw."""
+    for kwargs in ({"dense": True}, {"identity": True}):
+        ref = Spartan(slot_size=D, num_layers=2, embed_dim=None, mlp_hidden_size=16, **kwargs)
+        assert ref.sample_gate_noise(*inputs) is None
+
+
+def test_rollout_draws_gate_noise_once_per_chain(
+    inputs: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """D19: a Tp=4 chain consumes exactly as much RNG as a Tp=1 chain — the
+    thresholds are drawn once per chain, never per step."""
+    from scjepa.models.jepa import rollout_predictions
+
+    state, params = inputs
+    anchors = state.unsqueeze(1)  # (B, 1 chain, N, D)
+    torch.manual_seed(7)
+    predictor = Spartan(slot_size=D, num_layers=2, embed_dim=None, mlp_hidden_size=16)
+    predictor.train()
+    torch.manual_seed(123)
+    rollout_predictions(predictor, anchors, params, None, 1)
+    rng_after_short = torch.get_rng_state()
+    torch.manual_seed(123)
+    rollout_predictions(predictor, anchors, params, None, 4)
+    rng_after_long = torch.get_rng_state()
+    assert torch.equal(rng_after_short, rng_after_long)
