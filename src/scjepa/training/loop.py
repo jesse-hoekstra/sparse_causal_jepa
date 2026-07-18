@@ -112,7 +112,13 @@ class TrainConfig:
     # after too many consecutive skips (weights are then already broken —
     # fail loudly, resume from a rolling checkpoint).
     grad_skip_threshold: float = 1e3
-    grad_skip_max_consecutive: int = 50
+    # Weights are FROZEN during consecutive skips, so patience is free — the
+    # model cannot degrade while the guard holds. One epoch of distinct batches
+    # (~250 at bounce config) all spiking against unchanging weights = provably
+    # stuck (no future batch can differ); 500 ≈ two epochs. The original 50
+    # executed run 0ta5ymcw for an episode that was ~15s of patience away from
+    # passing (its first episode recovered after 149 interleaved skips).
+    grad_skip_max_consecutive: int = 500
     log_every: int = 10
     checkpoint_every: int = 200
     # Also keep a step-tagged checkpoint every N steps (None = only last.pt).

@@ -68,7 +68,10 @@ train:
   # grad norm is non-finite or above the threshold; raise after this many
   # consecutive skips (run 7wupt6pw froze silently for 230k steps without them).
   grad_skip_threshold: 1.0e3
-  grad_skip_max_consecutive: 50
+  # Skipped steps freeze the weights, so patience is free; ~one epoch of all-
+  # spiking batches = provably stuck. 500 ~= two epochs at the bounce config
+  # (50 killed run 0ta5ymcw mid-episode ~15s before it could have passed).
+  grad_skip_max_consecutive: 500
   log_every: 10
   checkpoint_every: 200
   checkpoint_keep_every: null # ALSO keep step_<N>.pt every N steps (last.pt is overwritten)
