@@ -522,8 +522,15 @@ implicated — this is optimizer robustness, not objective design.
 is non-finite OR above `train.grad_skip_threshold` (default 1e3; healthy grads here are <1
 with rare transients <25), the batch's update is rejected entirely — no optimizer step, no
 dual/EMA update (a pathological batch must not jolt the λ controller). After
-`grad_skip_max_consecutive` (default 50) consecutive skips the trainer RAISES: the model is no
-longer trainable and must die loudly, not finish. Cumulative skips are logged as
+`grad_skip_max_consecutive` (default 500; amended 2026-07-17, was 50) consecutive skips the
+trainer RAISES: the model is no longer trainable and must die loudly, not finish. The limit is
+a provably-stuck test, not a broken-weights heuristic: weights are FROZEN during skips, so
+patience is free, and once a full epoch of distinct batches (~250 at bounce config) has spiked
+against unchanging weights no future batch can differ — 500 ≈ two epochs. Evidence for the
+amendment: run 0ta5ymcw's first episode (step ~4000) recovered after 149 skips interleaved
+with calm batches, but the original limit of 50 executed its second episode (step 6594)
+mid-burst; deterministic data order means a resume replays the identical death, so the limit
+had to change, not the seed. Cumulative skips are logged as
 `health/skipped_steps` and ride along in checkpoints (exact resume). Additionally
 `train.checkpoint_keep_every` (bounce: 25000) keeps step-tagged `step_<N>.pt` fallbacks so a
 late failure is a resume, not a rerun. Applies identically to calibration and main runs
