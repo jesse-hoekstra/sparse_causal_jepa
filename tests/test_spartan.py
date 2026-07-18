@@ -129,10 +129,28 @@ def test_embed_dim_projection() -> None:
 
 def test_input_guards(model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
     state, params = inputs
-    with pytest.raises(ValueError, match="both"):
+    with pytest.raises(ValueError, match="params"):
         model(state, torch.randn(B, N + 1, D))
     with pytest.raises(ValueError, match="aux_dim=None"):
         model(state, params, aux=torch.randn(B, 2, 4))
+
+
+def test_param_size_split_token_dims() -> None:
+    """D20: state tokens k-dim, param tokens d-dim, predictions back in k-dim."""
+    torch.manual_seed(5)  # pyright: ignore[reportUnknownMemberType]
+    model = Spartan(slot_size=4, num_layers=1, embed_dim=32, mlp_hidden_size=16, param_size=D)
+    state, params = torch.randn(B, N, 4), torch.randn(B, N, D)
+    out = model(state, params)
+    assert out.prediction.shape == (B, N, 4)
+    assert out.path_matrix.shape == (B, T, T)
+    out.prediction.square().mean().backward()  # pyright: ignore[reportUnknownMemberType]
+    assert model.param_project is not None
+    with pytest.raises(ValueError, match="params"):
+        model(state, torch.randn(B, N, 4))  # params must be param_size-dim
+    # param_size=None keeps the shared projection (pre-D20 state_dict intact).
+    shared = Spartan(slot_size=D, num_layers=1, embed_dim=None, mlp_hidden_size=16)
+    assert shared.param_project is None
+    assert not any("param_project" in k for k in shared.state_dict())
 
 
 def test_logit_penalty_finite_and_grows_with_logits(

@@ -97,6 +97,115 @@ def test_state_jepa_trains_on_bounce(tmp_path: Path) -> None:
     assert all(torch.isfinite(torch.tensor(v)) for v in metrics.values())
 
 
+def tiny_gt_model(**overrides: bool) -> StateJepa:
+    torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
+    return build_state_jepa(
+        state_dim=4,
+        slot_size=16,
+        pooling_heads=2,
+        spartan_layers=1,
+        spartan_embed_dim=None,
+        spartan_mlp_hidden=32,
+        spartan_mlp_layers=2,
+        gt_states=True,
+        **overrides,
+    )
+
+
+def test_gt_states_forward_contract() -> None:
+    """D20: predictions/targets/anchors live in the raw 4-dim GT state space."""
+    model = tiny_gt_model()
+    states = torch.randn(2, 5, N, 4)
+    out = model(states)
+    assert out.prediction.shape == (2, N, 4)
+    assert out.target_slots.shape == (2, N, 4)
+    torch.testing.assert_close(out.target_slots, states[:, 4])  # RAW states, untouched
+    torch.testing.assert_close(out.kinematic_state, states[:, 3])  # raw anchor
+    assert out.context_slots.shape == (2, 4, N, 16)  # param path stays in slot space
+    assert out.causal_params.shape == (2, N, 16)
+    assert out.path_matrix.shape == (2, 2 * N, 2 * N)
+
+
+def test_gt_states_rollout_is_autoregressive_in_state_space() -> None:
+    model = tiny_gt_model().eval()
+    states = torch.randn(1, 8, N, 4)
+    with torch.no_grad():
+        chained = model(states, context_len=4, rollout_horizon=4)
+        forced = model(states, context_len=4, rollout_horizon=1)
+    assert chained.prediction.shape == (4, N, 4)
+    torch.testing.assert_close(chained.prediction[0], forced.prediction[0])
+    assert not torch.allclose(chained.prediction[1], forced.prediction[1])
+
+
+def test_gt_states_grads_reach_param_path_only_on_state_path() -> None:
+    """The GT ruler must be fixed.
+
+    No trainable module feeds anchors/targets, while the pooled Ŝ^ph still
+    gets gradient from late rollout steps.
+    """
+    model = tiny_gt_model()
+    states = torch.randn(1, 6, N, 4)
+    out = model(states, context_len=4, rollout_horizon=2)
+    hungarian = (out.prediction - out.target_slots).square().mean()
+    hungarian.backward()  # pyright: ignore[reportUnknownMemberType]
+    pool_grads = [p.grad for p in model.pooling.parameters() if p.grad is not None]
+    assert any(g.abs().sum() > 0 for g in pool_grads)
+    embed_grads = [p.grad for p in model.context_embed.parameters() if p.grad is not None]
+    assert any(g.abs().sum() > 0 for g in embed_grads)
+    assert not any(True for _ in model.target_embed.parameters())  # Identity: no params
+    assert model.kinematic_head is None
+
+
+def test_gt_states_teacher_forcing_anchors_every_transition_at_true_state() -> None:
+    """D21: Tp=1 + gt_states — every transition's input is the raw TRUE state.
+
+    The anchors must be states[th-1 .. L-2] verbatim (rolling ground truth,
+    never a fed-back prediction), and each prediction targets the next state.
+    """
+    model = tiny_gt_model()
+    states = torch.randn(2, 8, N, 4)  # Th=4, K=4
+    out = model(states, context_len=4, rollout_horizon=1)
+    expected_anchors = states[:, 3:7].reshape(2 * 4, N, 4)
+    torch.testing.assert_close(out.kinematic_state, expected_anchors)
+    torch.testing.assert_close(out.target_slots, states[:, 4:].reshape(2 * 4, N, 4))
+
+
+def test_gt_states_dense_and_identity_references_build() -> None:
+    """The τ-calibration (dense) and go/no-go (identity) variants compose with D20."""
+    for kwargs in ({"spartan_dense": True}, {"spartan_identity": True}):
+        model = tiny_gt_model(**kwargs)
+        out = model(torch.randn(2, 5, N, 4))
+        assert out.prediction.shape == (2, N, 4)
+
+
+def test_gt_states_trains_on_bounce(tmp_path: Path) -> None:
+    dataset = BounceDataset(num_episodes=8, clip_len=4, num_balls=N, resolution=16, seed=2)
+    config = TrainConfig(
+        steps=3,
+        batch_size=4,
+        input_key="states",
+        num_projections=16,
+        sparsity_tau=0.5,
+        log_every=1,
+        checkpoint_every=1000,
+        out_dir=str(tmp_path),
+    )
+    metrics = Trainer(tiny_gt_model(), dataset, config).train()
+    assert all(torch.isfinite(torch.tensor(v)) for v in metrics.values())
+
+
+def test_gt_states_harness_reports_fixed_ruler() -> None:
+    """target_var must be the GT data constant, not a trainable quantity."""
+    dataset = BounceDataset(num_episodes=12, clip_len=4, num_balls=N, resolution=16, seed=3)
+    report = evaluate_identifiability(
+        tiny_gt_model(), dataset, input_key="states", batch_size=6, max_batches=2
+    )
+    states = torch.stack([dataset[i]["states"][-1] for i in range(6)])  # first eval batch targets
+    gt_var = states.reshape(-1, 4).var(dim=0).mean()
+    assert abs(report.metrics["target_var"] - gt_var.item()) < 0.05
+    assert report.per_slot_learned.shape == (12, N, 16)
+
+
 def test_identifiability_harness_end_to_end() -> None:
     """Untrained StateJepa on bounce: harness returns bounded, finite metrics."""
     dataset = BounceDataset(num_episodes=12, clip_len=4, num_balls=N, resolution=16, seed=3)

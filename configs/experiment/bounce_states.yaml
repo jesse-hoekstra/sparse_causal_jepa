@@ -9,6 +9,14 @@
 model:
   type: states
   state_dim: 4 # [x, y, vx, vy]
+  # D20: rollout in the RAW GT state space (Baumgartner's observation-space
+  # ruler) — no target embed, no kinematic head; predictions are literal next
+  # states, S^ph stays in slot space. Fixes the 2026-07-18 audit finding that
+  # the D17 constraint was a variance thermostat (raw pred pinned ~0.18 in
+  # every model while all quality lived in the trainable target variance).
+  # With gt_states the D17 denominator is a data constant (~0.15), so tau
+  # calibrated on the dense reference finally transfers.
+  gt_states: false
   slot_size: 32
   pooling_heads: 4
   max_history: 64

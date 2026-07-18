@@ -16,12 +16,33 @@
 defaults:
   - bounce_states
 
+model:
+  # SPARTAN App. A.1 Table 3, Interventional Pong column: 3 transformer layers,
+  # embedding dim 512, MLP hidden 512, 3 MLP layers (bounce_states shrinks these
+  # for CPU smokes — the exact comparison must not inherit that). Their token
+  # dim 32 = our param-token dim (slot_size); state tokens are the raw 4-dim GT
+  # states under gt_states, lifted 4->512 by the input projection.
+  spartan_layers: 3
+  spartan_embed_dim: 512
+  spartan_mlp_hidden: 512
+  # D21: rollout state space = raw GT states (fixed ruler, D20) — only the
+  # parameter path (context embed + pooling) and the predictor train.
+  gt_states: true
+
 data:
   mass_normal: [1.5, 0.5] # UNSPECIFIED upstream — our choice
   radius_from_mass: true
 
 train:
   steps: 300000
+  lr: 5.0e-5 # SPARTAN App. A.1 Table 3 (Adam) — overrides bounce_states' CPU value
+  # D21: teacher-forced one-step objective (SPARTAN Eq. 7; Baumgartner's Markov
+  # MLE factorization — decoder "performs one-step prediction", their Fig. 1).
+  # Every transition is anchored at the TRUE state; measured mass-blind floor
+  # on the fixed ruler at Tp=1 is 0.199 normalized (scratch audit 2026-07-19),
+  # so tau CAN force param edges without the D16 rollout — which remains the
+  # ablation via rollout_horizon=null (see D21 for the BPTT stability history).
+  rollout_horizon: 1
   # Their lambda_logit is unspecified ("small") — knob. Their F.4 warns that
   # UNDERTUNING it makes the path loss plateau (observed: rung1_seed0,
   # 2026-07-11, MCC ~0.01). If a short run shows loss/logit oscillating or

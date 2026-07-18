@@ -593,3 +593,87 @@ exactly the RNG of a Tp=1 chain.
 1k steps) is expected post-D19; the fatal signatures are consecutive-run growth or every-batch
 skipping — if seen, D19 was insufficient and the next lever is the Gumbel temperature
 (softer ST gradients), not the skip limit.
+
+## D20 — gt_states: rollout in the raw GT state space (decided 2026-07-18, Jesse — implemented by Claude per instruction)
+
+**The problem (2026-07-18 full-source audit, after run pxibnvjr).** The D17 constraint
+`pred / Var(target)` turned out to be a variance thermostat, not a prediction-quality
+measure: raw pred MSE is pinned at ~0.176–0.19 in EVERY model (dense kn8g9xgu from 10k to
+175k steps; gated pxibnvjr; identity — the "raw floors differ by only 0.008" observation) by
+the VISReg-vs-MSE scale equilibrium, so ALL quality information lives in the trainable
+target variance (dense: 0.26 → 0.342 over 150k steps, still drifting at kill time — the
+reference constraint never converges). τ from a dense reference therefore demanded the gated
+model reach ~92% of the dense model's own variance ceiling; the dual railed λ for 15k steps
+and the run died in the (independently fatal, see below) high-density Tp=30 BPTT detonation
+— which the DENSE calibration run also suffered (grads 1.3e9 at 100k, terminal explosion at
+180k), proving the horizon, not the gates, is the root instability. Root cause of the
+measurement problem: SPARTAN's constrained optimization presumes a FIXED-scale loss space
+(frozen embeddings; Baumgartner: observation space) and a jointly-trained JEPA target space
+has none — D17 normalized by a ruler the model itself controls.
+
+**Decision.** `model.gt_states=true` (StateJepa only): the rollout state space is the raw
+ground-truth states — exactly Baumgartner's observation-space decoder (their Eq. 21,
+h(x0, θ) autoregressive in x-space). Anchors and targets are the untouched `states` tensor;
+`target_embed` and `kinematic_head` are dropped (nn.Identity / None); the predictor's state
+tokens are k=4-dim (predictions are literal next states) while Ŝ^ph stays in slot space via
+Spartan's new `param_size` (separate input projection; `param_size=None` keeps the shared
+projection and a pre-D20-identical state_dict). Only the parameter path (context embed +
+pooling) and the predictor train. Consequences: the constraint's MSE has a fixed ruler
+(D17's denominator becomes the data constant Var(GT batch) ≈ 0.15 — kept for continuity of
+the τ protocol, now harmless); τ from the dense reference transfers; scale collapse
+(failure #3) and the two-space rollout (anchor space ≠ target space) are impossible by
+construction; VISReg on target_slots contributes a constant with zero gradient (loss/reg
+carries a fixed GT-shape offset in this mode — cosmetic only).
+
+**Not addressed here.** The Tp=30 full-horizon BPTT instability is orthogonal and remains
+(the dense run's explosions prove it needs no gates); if gt_states runs still detonate
+during the density transit, the lever is `train.rollout_horizon` (Tp=5–10 chains keep D16
+mass-blindness pressure with 3–6x fewer chained Jacobians), not the skip guard.
+
+## D21 — Teacher-forced one-step objective on the GT ruler for bounce_baumgartner (decided 2026-07-19, Jesse — implemented by Claude per instruction)
+
+**Supersedes D16's default for this experiment** (the rollout machinery stays available via
+`train.rollout_horizon=null` as the ablation; D16's reasoning is preserved below).
+
+**The change.** `bounce_baumgartner` now trains with `model.gt_states=true` (D20) +
+`train.rollout_horizon=1`: every one of the K=30 transitions is predicted from the TRUE raw
+state at its own timestep (teacher forcing), losses (Hungarian MSE, |Ā|, logit penalty) are
+computed per transition and averaged, Ŝ^ph is pooled once per episode and shared across all
+transitions, and the predictor weights are one shared module across time. Gate noise is
+drawn fresh per transition (a Tp=1 chain = one draw), which is exactly SPARTAN Eq. 3's
+i.i.d. Bernoulli — D19 is untouched and vacuous here. Hyperparameters restored to SPARTAN
+App. A.1 Table 3 (Interventional Pong): 3 layers, embed 512, MLP hidden 512, lr 5e-5.
+
+**Why teacher forcing is now safe (and D16's rollout was compensating for a bug we fixed).**
+D16 existed because teacher-forced single-step was mass-blind: forced-FC 0.0596 vs
+forced-identity 0.0639 (a 0.008 raw window) — measured PRE-D17 in the TRAINABLE embedding
+space, where the encoder could smooth collisions into near-linear latent paths. On the fixed
+GT ruler the picture inverts (scratch measurement 2026-07-19, 128 episodes, exact replication
+of simulate_bounce verified at error 0.000000): the STRONGEST mass-blind one-step predictor
+(true physics, nominal mass/radius) has normalized MSE 0.199 vs 0.0 for the oracle —
+0.332 on ball-ball-contact transitions (32% of transitions), 0.135 even on contact-free ones
+(nominal-radius wall-bounce timing errors; radius ∝ mass). A ~0.2 τ window at Tp=1 dwarfs
+the pre-D17 0.008 one. Mass-blindness was a representation-shortcut artifact, not a property
+of one-step prediction.
+
+**Source fidelity.** This is the MOST paper-faithful configuration yet: SPARTAN's objective
+is literally single-transition (Eq. 7, App. A.2); Baumgartner's decoder likelihood
+factorizes over one-step Markov transitions conditioned on true states (their Fig. 1
+caption: the decoder "performs one-step prediction"; free-running rollouts appear only at
+generation/eval, their Fig. 4); my_paper p16's autoregressive-rollout argument constrains
+the GENERATIVE model h(S_t, Ŝ^ph), which a Markov model trained by exact MLE defines
+identically — the theory does not require the training gradient to flow through 30 chained
+predictions. Bonus: with Tp=1 there is NO BPTT chain, so the Tp=30 detonation (which hit
+even the dense reference — see D20 audit) is structurally impossible, and the 30
+transitions are computed in ONE batched predictor call instead of 30 sequential ones.
+
+**Context/prediction windows (empirically re-validated 2026-07-19).** Ball-ball contact
+rate 0.1438/ball/transition (config comment's 0.1425 confirmed). Ball-slots with zero
+ball-ball contact in context: Th=10 → 19.7%, Th=20 → 5.6%, **Th=30 → 1.41%**, Th=40 → 0.62%.
+Th=30 stays: near-full mass-evidence coverage without cutting K below 30. K=30 at Tp=1 is
+just 30 supervised transitions/episode (~4.3 ball-ball collision transitions per ball) —
+there is no longer a stability reason to shrink it.
+
+**Watch.** The empty-graph signature to watch is unchanged (eval/path_density = 1/T,
+shd_param frozen at its constant) — but with the 0.199 window, if the graph STILL prunes
+param edges under a sane τ, that would now be evidence against the method, not the plumbing.
