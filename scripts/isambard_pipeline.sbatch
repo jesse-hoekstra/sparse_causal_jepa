@@ -16,11 +16,14 @@
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=64
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=logs/slurm-%j.out
-# workq reports MaxTime=UNLIMITED (checked 2026-07-19); 48h is a self-imposed
-# cap so a hung job cannot squat on a GH200 forever. If sbatch rejects the
-# submission with an account error, find yours via
+# workq_qos caps MaxWall at 1-00:00:00 (48h was rejected, 2026-07-19); ask
+# for the full 24h. Expected runtime is ~6-9h (2x 1.9h training + ~60
+# periodic evals + final evals + pregen), but train.py has NO resume: a job
+# killed at the wall loses its in-flight stage entirely, while over-asking
+# costs only backfill priority on a busy queue.
+# If sbatch rejects with an ACCOUNT error, find yours via
 #   sacctmgr show assoc user=$USER format=account%20
 # and submit with --account=<it>.
 
