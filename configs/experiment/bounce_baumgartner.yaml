@@ -43,6 +43,14 @@ train:
   # so tau CAN force param edges without the D16 rollout — which remains the
   # ablation via rollout_horizon=null (see D21 for the BPTT stability history).
   rollout_horizon: 1
+  # Periodic held-out identifiability eval. The base default is null and earlier
+  # launches passed it on the CLI — run 8xjg7ra5 (2026-07-19) silently ran
+  # without eval curves because of that. A 300k main run without eval/shd/mcc
+  # curves violates the "a metric that CAN leave its failure value MUST be
+  # watched" rule, so it is pinned in the experiment config now. Eval is
+  # no_grad + shuffle=false and consumes no training RNG: enabling it does not
+  # perturb the training trajectory (D12-safe).
+  eval_every: 5000
   # Their lambda_logit is unspecified ("small") — knob. Their F.4 warns that
   # UNDERTUNING it makes the path loss plateau (observed: rung1_seed0,
   # 2026-07-11, MCC ~0.01). If a short run shows loss/logit oscillating or
