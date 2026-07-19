@@ -60,7 +60,12 @@ def build_model(model_cfg: DictConfig) -> nn.Module:
 def build_dataset(data_cfg: DictConfig, seed_offset: int = 0) -> Dataset[dict[str, Tensor]]:
     """Build the dataset named in the config; ``seed_offset`` gives eval splits."""
     if data_cfg.name == "bounce":
+        # preload applies ONLY to the train split (seed_offset 0): eval splits
+        # use a shifted seed, and serving them from the train file would leak
+        # training episodes into every eval metric.
+        preload = data_cfg.get("preload") if seed_offset == 0 else None
         return BounceDataset(
+            preload=preload,
             num_episodes=data_cfg.num_clips,
             clip_len=data_cfg.clip_len,
             num_balls=data_cfg.num_balls,

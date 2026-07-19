@@ -171,6 +171,7 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
         seed: int = 0,
         render: bool = True,
         cache: bool = False,
+        preload: str | None = None,
     ) -> None:
         """Configure the generator (nothing is simulated until indexed).
 
@@ -178,6 +179,15 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
         ``states``/``params``/``contacts`` are consumed; big CPU saving).
         ``cache=True`` memoizes generated episodes (worth it for multi-epoch
         training; states-only episodes are tiny).
+        ``preload``: path to a ``scripts/pregenerate_bounce.py`` file. Items
+        are then served from its stacked tensors instead of simulated (the
+        single-threaded python sim costs ~0.27 s/episode on a Grace core —
+        7.6h for 100k, measured 2026-07-19). The file's generation settings
+        must MATCH this constructor's (checked; a mismatch raises — silently
+        serving episodes from a different physics config would break the D12
+        identical-config rule between calibration and main). ``num_episodes``
+        may be smaller than the file holds (a prefix is used); ``render`` must
+        be False (frames are not stored).
 
         Baumgartner-exact variant (their App. E bounce): ``mass_normal=(mean,
         std)`` samples masses from a non-zero-mean normal (clamped to
@@ -201,6 +211,36 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
         self.render = render
         self.cache = cache
         self._cached: dict[int, dict[str, Tensor]] = {}
+        self._preloaded: dict[str, Tensor] | None = None
+        if preload is not None:
+            if render:
+                raise ValueError("preload stores no frames; requires render=False")
+            payload = torch.load(preload, weights_only=True)
+            meta, expected = payload["meta"], self.generation_meta()
+            stored_n = int(meta.pop("num_episodes"))
+            expected.pop("num_episodes")
+            if meta != expected:
+                raise ValueError(
+                    f"preload {preload} was generated with {meta}, "
+                    f"but this dataset wants {expected} (D12: refuse silent drift)"
+                )
+            if num_episodes > stored_n:
+                raise ValueError(f"preload holds {stored_n} episodes, need {num_episodes}")
+            self._preloaded = payload["tensors"]
+
+    def generation_meta(self) -> dict[str, object]:
+        """Every setting that influences generated episodes (preload identity)."""
+        return {
+            "num_episodes": self.num_episodes,
+            "clip_len": self.clip_len,
+            "num_balls": self.num_balls,
+            "radius": self.radius,
+            "mass_range": tuple(self.mass_range),
+            "mass_normal": tuple(self.mass_normal) if self.mass_normal is not None else None,
+            "radius_from_mass": self.radius_from_mass,
+            "speed": self.speed,
+            "seed": self.seed,
+        }
 
     def __len__(self) -> int:
         """Number of episodes."""
@@ -231,6 +271,10 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
         """Generate episode ``index``: sample params/state, simulate, render."""
+        if self._preloaded is not None:
+            if not 0 <= index < self.num_episodes:
+                raise IndexError(index)
+            return {key: tensor[index] for key, tensor in self._preloaded.items()}
         if self.cache and index in self._cached:
             return self._cached[index]
         generator = torch.Generator().manual_seed(self.seed * 1_000_003 + index)

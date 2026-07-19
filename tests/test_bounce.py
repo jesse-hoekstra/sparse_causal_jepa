@@ -1,5 +1,6 @@
 """Physics and contract tests for the bounce synthetic ground-truth system."""
 
+import pytest
 import torch
 from torch.utils.data import DataLoader
 
@@ -227,3 +228,96 @@ def test_initial_placement_respects_per_ball_radii() -> None:
         min_sep = radii.unsqueeze(0) + radii.unsqueeze(1)
         off_diag = ~torch.eye(5, dtype=torch.bool)
         assert (diff[off_diag] > min_sep[off_diag]).all()
+
+
+def _tiny_kwargs() -> dict[str, object]:
+    return {
+        "num_episodes": 6,
+        "clip_len": 5,
+        "num_balls": 3,
+        "resolution": 16,
+        "speed": 0.7,
+        "seed": 11,
+        "render": False,
+    }
+
+
+def _write_preload(path: str) -> None:
+    source = BounceDataset(**_tiny_kwargs())  # pyright: ignore[reportArgumentType]
+    items = [source[i] for i in range(len(source))]
+    tensors = {
+        key: torch.stack([item[key] for item in items])
+        for key in ("states", "params", "contacts")
+    }
+    torch.save({"meta": source.generation_meta(), "tensors": tensors}, path)
+
+
+def test_preload_serves_identical_episodes(tmp_path) -> None:  # noqa: ANN001
+    """D12: a preload file must be indistinguishable from on-the-fly generation."""
+    path = str(tmp_path / "pre.pt")
+    _write_preload(path)
+    direct = BounceDataset(**_tiny_kwargs())  # pyright: ignore[reportArgumentType]
+    loaded = BounceDataset(**_tiny_kwargs(), preload=path)  # pyright: ignore[reportArgumentType]
+    for i in range(len(direct)):
+        for key in ("states", "params", "contacts"):
+            torch.testing.assert_close(loaded[i][key], direct[i][key])
+    # A prefix subset is allowed (num_episodes smaller than the file holds).
+    subset_kwargs = {**_tiny_kwargs(), "num_episodes": 4}
+    subset = BounceDataset(**subset_kwargs, preload=path)  # pyright: ignore[reportArgumentType]
+    assert len(subset) == 4
+    torch.testing.assert_close(subset[3]["states"], direct[3]["states"])
+
+
+def test_preload_refuses_mismatched_generation_settings(tmp_path) -> None:  # noqa: ANN001
+    path = str(tmp_path / "pre.pt")
+    _write_preload(path)
+    drifted = {**_tiny_kwargs(), "speed": 0.5}
+    with pytest.raises(ValueError, match="D12"):
+        BounceDataset(**drifted, preload=path)  # pyright: ignore[reportArgumentType]
+    too_many = {**_tiny_kwargs(), "num_episodes": 7}
+    with pytest.raises(ValueError, match="holds"):
+        BounceDataset(**too_many, preload=path)  # pyright: ignore[reportArgumentType]
+
+
+def test_preload_requires_states_regime(tmp_path) -> None:  # noqa: ANN001
+    path = str(tmp_path / "pre.pt")
+    _write_preload(path)
+    rendered = {**_tiny_kwargs(), "render": True}
+    with pytest.raises(ValueError, match="render"):
+        BounceDataset(**rendered, preload=path)  # pyright: ignore[reportArgumentType]
+
+
+def test_factory_never_preloads_eval_splits(tmp_path) -> None:  # noqa: ANN001
+    """seed_offset != 0 must ignore preload.
+
+    Serving eval splits from the train file would leak training episodes
+    into every eval metric.
+    """
+    from omegaconf import OmegaConf
+
+    from scjepa.training.factory import build_dataset
+
+    path = str(tmp_path / "pre.pt")
+    _write_preload(path)
+    kwargs = _tiny_kwargs()
+    cfg = OmegaConf.create(
+        {
+            "name": "bounce",
+            "num_clips": kwargs["num_episodes"],
+            "clip_len": kwargs["clip_len"],
+            "num_balls": kwargs["num_balls"],
+            "resolution": kwargs["resolution"],
+            "radius": 0.08,
+            "mass_range": [0.5, 3.0],
+            "speed": kwargs["speed"],
+            "seed": kwargs["seed"],
+            "render": False,
+            "cache": False,
+            "preload": path,
+        }
+    )
+    train_split = build_dataset(cfg, seed_offset=0)
+    eval_split = build_dataset(cfg, seed_offset=17)
+    assert train_split._preloaded is not None  # pyright: ignore[reportPrivateUsage]
+    assert eval_split._preloaded is None  # pyright: ignore[reportPrivateUsage]
+    assert not torch.allclose(train_split[0]["states"], eval_split[0]["states"])
