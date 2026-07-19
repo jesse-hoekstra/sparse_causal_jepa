@@ -32,6 +32,16 @@ model:
 data:
   mass_normal: [1.5, 0.5] # UNSPECIFIED upstream — our choice
   radius_from_mass: true
+  # 2026-07-19: 4000 was the initial-commit CPU-era default (20k-step runs,
+  # 2x128 model) and was never rescaled. At 300k steps x batch 16 it means
+  # ~1200 views per episode; run jkslgj4o showed the Pong-scale model
+  # memorizing them (train pred 0.0011 vs held-out 0.0216, eval flat from
+  # step 5k) — which poisons tau (held-out-calibrated tau vs a dual driven by
+  # memorized train loss). 100k episodes = 3M unique transitions (~48 views
+  # each), ~0.7GB cached states-only, one-off generation absorbed into the
+  # first epoch. MUST be identical for calibration and main (D12) — pinned
+  # here, not on the CLI, so it cannot be forgotten.
+  num_clips: 100000
 
 train:
   steps: 300000

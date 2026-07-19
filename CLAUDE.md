@@ -25,7 +25,11 @@ fatal signature) ·
 `sparsity/lambda` responsive in BOTH directions (settling ~40–5000 is fine) ·
 `health/target_slot_std_min` ≥ ~0.1 · `eval/path_density` strictly between 1/T and 1 and still
 moving after 5k steps · `eval/constraint_loss` hovering near τ (the dual holds it AT the
-boundary; far below τ = over-pruned, far above = under-pruned).
+boundary; far below τ = over-pruned, far above = under-pruned) ·
+train `loss/pred` vs `eval/pred_loss` gap < ~3x AND eval still improving (train falling with
+eval flat = memorization — run jkslgj4o 2026-07-19: 14x gap, 1200 views/episode at
+num_clips=4000; τ calibrated held-out is then meaningless to the train-driven dual. Rescale
+`data.num_clips` whenever model capacity or steps change).
 Failure catalog (all observed, all diagnosed — don't re-derive):
 1. **Logit-penalty explosion** (run n5zq9nct, 2026-07-11): loss/logit ≫ loss/pred, grad spikes
    1e5–1e15, lambda railed at 1e6 → fixed by 1/√d on gate logits + masked-softmax numerics +
