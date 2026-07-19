@@ -1,5 +1,8 @@
 # --- Never committed: data, checkpoints, run outputs (see .claude/agents/README.md) ---
-data/
+# Anchored to the repo root: the unanchored `data/` also matched
+# src/scjepa/data/ at any depth, so the whole data MODULE was never committed
+# (discovered 2026-07-19 when the Isambard clone came up without it).
+/data/
 checkpoints/
 wandb/
 # Hydra run dirs / sweep dirs (no inline comments — git treats them as pattern text)
