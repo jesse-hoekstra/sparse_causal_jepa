@@ -13,16 +13,24 @@
 # GPU smoke shows the two stages cannot fit the partition's MaxTime, split
 # into two jobs at the tau boundary instead of raising --time blindly.
 #SBATCH --job-name=scjepa-bounce
+#SBATCH --partition=workq
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=logs/slurm-%j.out
+# workq reports MaxTime=UNLIMITED (checked 2026-07-19); 48h is a self-imposed
+# cap so a hung job cannot squat on a GH200 forever. If sbatch rejects the
+# submission with an account error, find yours via
+#   sacctmgr show assoc user=$USER format=account%20
+# and submit with --account=<it>.
 
 set -euo pipefail
 RUN_TAG=${1:-d21_isambard_seed0}
 mkdir -p logs
 
-source .venv/bin/activate
+# Isambard-AI login/compute nodes offer at most cray-python/3.11; the project
+# pins >=3.12,<3.13, so the env lives in Miniforge (aarch64) instead of .venv.
+source ~/miniforge3/bin/activate scjepa
 export PYTHON=python
 # Sanity: fail fast if the node/torch build has no CUDA (aarch64 wheel issue).
 python -c "import torch; assert torch.cuda.is_available(), 'no CUDA'; print(torch.cuda.get_device_name(0))"
