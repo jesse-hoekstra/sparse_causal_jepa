@@ -28,7 +28,10 @@
 # and submit with --account=<it>.
 
 set -euo pipefail
-RUN_TAG=${1:-d21_isambard_seed0}
+# tau-factor 1.2 (D22): 1.1 made tau reachable only at ~step 300k (phase 2
+# got zero budget, run maj7im56); 1.2 is crossable ~180k, leaving ~120k for
+# pruning while staying below the learned state-only floor (<=0.125 observed).
+RUN_TAG=${1:-d22_seed0}
 mkdir -p logs
 
 # Isambard-AI login/compute nodes offer at most cray-python/3.11; the project
@@ -51,6 +54,7 @@ bash scripts/run_bounce_example.sh \
   "--run-tag=${RUN_TAG}" \
   --main-steps=300000 \
   --tau-max=0.19 \
+  --tau-factor=1.2 \
   experiment=bounce_baumgartner \
   wandb.enabled=true \
   train.device=cuda \

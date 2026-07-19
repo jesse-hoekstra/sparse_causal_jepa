@@ -677,3 +677,42 @@ there is no longer a stability reason to shrink it.
 **Watch.** The empty-graph signature to watch is unchanged (eval/path_density = 1/T,
 shd_param frozen at its constant) — but with the 0.199 window, if the graph STILL prunes
 param edges under a sane τ, that would now be evidence against the method, not the plumbing.
+
+## D22 — Fit the two-phase dual schedule into 300k steps (decided 2026-07-19, Jesse+Claude after run maj7im56)
+
+**The evidence.** The first full D20/D21 pipeline (calibration fybk7ukv, main maj7im56, Isambard
+GH200) was healthy end to end — zero skips, train/eval gap ~5%, τ=0.0923 passed the guard —
+but the main run spent ALL 300k steps in GECO phase 1: the gated constraint converged ONTO τ
+from above (0.0947 at 300k, still declining), λ rose monotonically to 3.8e5, sparsity weight
+1/λ never exceeded ~3e-6, train density drifted to 0.977 unpruned. Yet the identifiability
+signal had begun anyway: eval MCC bottomed at 0.026 (init-artifact washout) then climbed to
+0.109, mcc_linear 0.15→0.291 monotone over the last 150k, real param edges appearing in the
+thresholded graph. The movie was cut at the start of act two.
+
+**The two mis-calibrations it exposed.**
+(a) τ = 1.1 × (dense reference trained the SAME length) is only reachable at ~the end of the
+main run BY CONSTRUCTION — the reference crossed the equivalent level at ~130k of its own
+300k, and the gated model tracks the same curve ~10-15% higher (gate noise). Phase 2 is
+scheduled at t ≈ end. (b) sparsity_step_size=1e-3 (F-10) was tuned to SPARTAN Fig. 5's λ
+trajectories — which are Pong/CREATE at 4e6 steps. Baumgartner's bounce (Fig. 17 x-axis,
+verified) completes BOTH phases in 300k. NOTE: the paper specifies NONE of these numbers
+(no L* protocol, no dual step, no clamps, no lr/batch — only the GECO citation, the
+qualitative two-phase description, and Fig. 17's 300k/8-seed scale); every value is our own
+bridge, so the schedule SHAPE is the only fidelity target available.
+
+**Decision.** For bounce_baumgartner: `sparsity_step_size: 3e-3` (two-phase arc fits 300k;
+still 7x below F-10's disaster 0.02), `sparsity_lambda_max: 3e4` (newly wired through
+TrainConfig — GECO's ascent is unbounded but its descent is rate-limited by the model's
+bounded undershoot of τ; capping the overshoot makes the reversal immediate at crossing),
+launch with `--tau-factor=1.2` (τ ≈ 0.10: crossable ~step 180k → ~120k of pruning budget;
+kept below the observed learned state-only level ≤0.125 to limit F-8/F-9-style slack).
+
+**Open risk (unchanged).** The learned no-param-edge floor (velocity→mass leak) is not
+precisely measured; if it lies below τ, pruning can delete param edges and satisfy the
+constraint (the outcome that would indict the setup, not the plumbing). A dense-but-
+params-masked reference would measure it directly if the D22 run prunes param edges away.
+
+**Watch.** After the constraint crosses τ (~180k): λ must reverse within ~20-30k steps,
+train density must stop rising then FALL, shd_param must descend from its spurious-edge
+peak toward the GT graphs, MCC must continue the ramp maj7im56 started. λ pinned at the 3e4
+clamp for >50k steps post-crossing = the clamp is too low or τ still too tight.

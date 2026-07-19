@@ -66,8 +66,16 @@ train:
   # 2026-07-11, MCC ~0.01). If a short run shows loss/logit oscillating or
   # loss/logit >> loss/pred after the first ~2k steps, raise this.
   lambda_logit: 1.0e-3
-  # Dual timescale for 300k-step runs (audit F-10): bounce_states' 0.02 was
-  # tuned for 20k CPU runs and crossed the whole lambda range in ~2k steps,
-  # pruning before dynamics were learned. SPARTAN Fig. 5 lambda trajectories
-  # evolve over 1e5-1e6 steps; 1e-3 reproduces that timescale here.
-  sparsity_step_size: 1.0e-3
+  # Dual timescale (D22, supersedes the F-10 value): 1e-3 was tuned to mimic
+  # SPARTAN Fig. 5's lambda trajectories — but that figure is Pong/CREATE at
+  # 4e6 steps. Baumgartner's bounce (Fig. 17 x-axis) completes BOTH phases in
+  # 300k; run maj7im56 showed 1e-3 spends the entire 300k in phase 1 (lambda
+  # monotone to 3.8e5, pruning never engaged, MCC ramp cut off mid-rise at
+  # 0.109/0.291). 3e-3 fits the two-phase arc into 300k; still 7x below the
+  # F-10 disaster setting (0.02).
+  sparsity_step_size: 3.0e-3
+  # D22: cap the dual's overshoot. Ascent is unbounded while constraint > tau,
+  # but descent is rate-limited by the model's bounded UNDERSHOOT of tau —
+  # from 3.8e5 the walk down costs more steps than the run has. 3e4 keeps the
+  # reversal within striking distance the moment tau is crossed.
+  sparsity_lambda_max: 3.0e4

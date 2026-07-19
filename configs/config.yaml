@@ -51,6 +51,7 @@ train:
   sparsity_tau: 0.1 # target pred loss (paper: fully-connected model's loss)
   sparsity_step_size: 1.0e-3
   sparsity_lambda_init: 1.0e3
+  sparsity_lambda_max: 1.0e6 # upper dual clamp (D22: cap overshoot; descent is undershoot-rate-limited)
   sparsity_momentum: 0.99
   regularizer: visreg # D3: visreg | sigreg
   num_projections: 256
