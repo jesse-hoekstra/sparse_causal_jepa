@@ -81,6 +81,12 @@ class TrainConfig:
     sparsity_tau: float = 0.1
     sparsity_step_size: float = 1e-3
     sparsity_lambda_init: float = 1e3
+    # Upper clamp on the dual λ (D22): GECO's ascent is unbounded while the
+    # constraint sits above τ, but the descent is rate-limited by how far the
+    # model can UNDERSHOOT τ — run maj7im56 peaked at λ=3.8e5 and pruning
+    # never engaged in 300k steps. Clamping caps the overshoot so the
+    # reversal is immediate once τ is crossed.
+    sparsity_lambda_max: float = 1e6
     sparsity_momentum: float = 0.99
     # Attention-logit regularisation (Baumgartner Eq. 11): keeps softmax
     # gradients alive during the pruning phase; 0 disables. When enabled it is
@@ -167,6 +173,7 @@ class Trainer:
             tau=config.sparsity_tau,
             step_size=config.sparsity_step_size,
             lambda_init=config.sparsity_lambda_init,
+            lambda_max=config.sparsity_lambda_max,
             momentum=config.sparsity_momentum,
         ).to(self.device)
         # ONE optimizer over everything (D7: encoders + heads + predictor jointly).

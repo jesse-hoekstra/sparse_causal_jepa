@@ -76,6 +76,7 @@ def main(cfg: DictConfig) -> None:
         sparsity_tau=cfg.train.sparsity_tau,
         sparsity_step_size=cfg.train.sparsity_step_size,
         sparsity_lambda_init=cfg.train.sparsity_lambda_init,
+        sparsity_lambda_max=cfg.train.get("sparsity_lambda_max", 1e6),
         sparsity_momentum=cfg.train.sparsity_momentum,
         lambda_logit=cfg.train.get("lambda_logit", 0.0),
         regularizer=cfg.train.regularizer,

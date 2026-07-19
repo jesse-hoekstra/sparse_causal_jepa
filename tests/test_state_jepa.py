@@ -237,3 +237,20 @@ def test_identifiability_harness_end_to_end() -> None:
     assert 0 <= report.recovery_best_dim < 16
     assert report.per_slot_learned.shape == (12, N, 16)  # (episodes, N, d)
     assert report.per_slot_true.shape == (12, N)
+
+
+def test_lambda_max_config_reaches_the_dual(tmp_path: Path) -> None:
+    """D22: sparsity_lambda_max must actually clamp the Lagrangian."""
+    import math
+
+    dataset = BounceDataset(num_episodes=8, clip_len=4, num_balls=N, resolution=16, seed=2)
+    config = TrainConfig(
+        steps=1,
+        batch_size=4,
+        input_key="states",
+        sparsity_lambda_init=10.0,
+        sparsity_lambda_max=50.0,
+        out_dir=str(tmp_path),
+    )
+    trainer = Trainer(tiny_gt_model(), dataset, config)
+    assert math.isclose(trainer.lagrangian.log_lambda_max, math.log(50.0))
