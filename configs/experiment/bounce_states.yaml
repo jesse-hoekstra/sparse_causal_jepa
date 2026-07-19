@@ -36,6 +36,11 @@ data:
   seed: 0
   render: false # states regime: skip frame rendering (big CPU saving)
   cache: true # episodes memoized across epochs (states-only items are tiny)
+  # Optional scripts/pregenerate_bounce.py file for the TRAIN split (eval
+  # splits always simulate on the fly). The sim is ~0.27s/episode on one HPC
+  # core — pregenerate + share across pipeline stages instead of paying it
+  # twice. The file embeds its generation settings; a mismatch raises (D12).
+  preload: null
 
 train:
   steps: 20000

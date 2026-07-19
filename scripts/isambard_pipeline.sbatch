@@ -15,7 +15,7 @@
 #SBATCH --job-name=scjepa-bounce
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=64
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/slurm-%j.out
 # workq reports MaxTime=UNLIMITED (checked 2026-07-19); 48h is a self-imposed
@@ -35,10 +35,21 @@ export PYTHON=python
 # Sanity: fail fast if the node/torch build has no CUDA (aarch64 wheel issue).
 python -c "import torch; assert torch.cuda.is_available(), 'no CUDA'; print(torch.cuda.get_device_name(0))"
 
+# Pre-generate the train split in parallel (idempotent: skips if the file
+# exists). Single-threaded generation costs 7.6h per stage on a Grace core
+# (measured 2026-07-19); on 64 workers this is ~10 min, paid once, shared by
+# BOTH stages via data.preload (same override to both = D12 by construction;
+# --cpus-per-task=64 above exists for this step — training itself needs few).
+NUM_CLIPS=100000
+PRELOAD="data/bounce_train_${NUM_CLIPS}.pt"
+python scripts/pregenerate_bounce.py experiment=bounce_baumgartner "data.num_clips=${NUM_CLIPS}"
+
 bash scripts/run_bounce_example.sh \
   "--run-tag=${RUN_TAG}" \
   --main-steps=300000 \
   --tau-max=0.19 \
   experiment=bounce_baumgartner \
   wandb.enabled=true \
-  train.device=cuda
+  train.device=cuda \
+  "data.num_clips=${NUM_CLIPS}" \
+  "data.preload=${PRELOAD}"
