@@ -11,7 +11,10 @@
 # Their scale: ~300k steps, 8 seeds (Fig. 17) -> GPU/overnight, not laptop.
 # Their reference results (Fig. 3, bounce): SPARTAN MCC ~0.9+.
 # The MODEL is still ours (JEPA, D6-D9) — that difference is the experiment.
-# Run via: TAU_FACTOR=2.0 bash scripts/run_bounce_example.sh experiment=bounce_baumgartner
+# D23: schedule is now paper-faithful (tau = 1.0x dense ref, no functional dual
+# clamp, alpha = the one free knob). Run the main leg via
+# scripts/isambard_main_only.sbatch (reuses the dense-ref tau), or the full
+# same-pipeline lineage via scripts/isambard_pipeline.sbatch --tau-factor=1.0.
 
 defaults:
   - bounce_states
@@ -66,16 +69,23 @@ train:
   # 2026-07-11, MCC ~0.01). If a short run shows loss/logit oscillating or
   # loss/logit >> loss/pred after the first ~2k steps, raise this.
   lambda_logit: 1.0e-3
-  # Dual timescale (D22, supersedes the F-10 value): 1e-3 was tuned to mimic
-  # SPARTAN Fig. 5's lambda trajectories — but that figure is Pong/CREATE at
-  # 4e6 steps. Baumgartner's bounce (Fig. 17 x-axis) completes BOTH phases in
-  # 300k; run maj7im56 showed 1e-3 spends the entire 300k in phase 1 (lambda
-  # monotone to 3.8e5, pruning never engaged, MCC ramp cut off mid-rise at
-  # 0.109/0.291). 3e-3 fits the two-phase arc into 300k; still 7x below the
-  # F-10 disaster setting (0.02).
-  sparsity_step_size: 3.0e-3
-  # D22: cap the dual's overshoot. Ascent is unbounded while constraint > tau,
-  # but descent is rate-limited by the model's bounded UNDERSHOOT of tau —
-  # from 3.8e5 the walk down costs more steps than the run has. 3e4 keeps the
-  # reversal within striking distance the moment tau is crossed.
-  sparsity_lambda_max: 3.0e4
+  # Dual timescale (D23, supersedes D22's 3e-3): the ONLY schedule number the
+  # papers leave free (SPARTAN A.2 / Baumgartner Eq. 10 give plain GECO, no
+  # step, no clamp, no tau factor — every other knob is now pinned to the
+  # paper). D22's 3e-3 spent all 300k barely moving after crossing tau (run
+  # m5bje3yt: lambda 30k->26k, eval density flat 0.128 for 200k steps). Offline
+  # dual sim on the run's own constraint magnitudes: 3e-3 leaves 1/lambda at
+  # ~1e-5 at 300k (no prune), 2e-2 completes the descent with budget to spare.
+  # 2e-2 = the value bounce_states already validated ("moves visibly in ~1e4
+  # steps"); F-10 flagged 0.02 as "too fast" but against SPARTAN's 4e6-step
+  # Pong horizon — for Baumgartner's 300k bounce it is the right timescale.
+  sparsity_step_size: 2.0e-2
+  # D23: D22's functional clamp REMOVED. Baumgartner/SPARTAN prescribe NO dual
+  # clamp; more concretely, 3e4 floored 1/lambda at 3.3e-5 => ~0.03 of standing
+  # sparsity pressure that pinned pred loss ~0.0975, ABOVE the dense floor, so a
+  # tight tau could never be crossed (the run's actual failure). Reverting to
+  # config.yaml's 1e6 cuts standing pressure ~33x, letting the model reach
+  # ~dense loss and cross tau, THEN prune. 1e6 is NOT the D22 reversal cap: it
+  # is a recovery guard (an unbounded lambda climbs to ~1e19 in phase 1 under
+  # 2e-2 and no feasible alpha brings it back in 300k). Left at the base 1e6.
+  sparsity_lambda_max: 1.0e6
