@@ -27,12 +27,16 @@ def build_model(model_cfg: DictConfig) -> nn.Module:
             enc_out_channels=model_cfg.enc_out_channels,
             pooling_heads=model_cfg.pooling_heads,
             pooling_type=str(model_cfg.get("pooling_type", "cross_slot")),
+            param_dim=model_cfg.get("param_dim", None),
             max_history=model_cfg.max_history,
             spartan_layers=model_cfg.spartan_layers,
             spartan_embed_dim=model_cfg.spartan_embed_dim,
             spartan_mlp_hidden=model_cfg.spartan_mlp_hidden,
             spartan_mlp_layers=model_cfg.spartan_mlp_layers,
             spartan_temperature=model_cfg.spartan_temperature,
+            spartan_paired_object_attention=bool(
+                model_cfg.get("spartan_paired_object_attention", False)
+            ),
             aux_dim=model_cfg.aux_dim,
             spartan_dense=bool(model_cfg.get("spartan_dense", False)),
             spartan_identity=bool(model_cfg.get("spartan_identity", False)),
@@ -43,12 +47,16 @@ def build_model(model_cfg: DictConfig) -> nn.Module:
             slot_size=model_cfg.slot_size,
             pooling_heads=model_cfg.pooling_heads,
             pooling_type=str(model_cfg.get("pooling_type", "cross_slot")),
+            param_dim=model_cfg.get("param_dim", None),
             max_history=model_cfg.max_history,
             spartan_layers=model_cfg.spartan_layers,
             spartan_embed_dim=model_cfg.spartan_embed_dim,
             spartan_mlp_hidden=model_cfg.spartan_mlp_hidden,
             spartan_mlp_layers=model_cfg.spartan_mlp_layers,
             spartan_temperature=model_cfg.spartan_temperature,
+            spartan_paired_object_attention=bool(
+                model_cfg.get("spartan_paired_object_attention", False)
+            ),
             aux_dim=model_cfg.aux_dim,
             spartan_dense=bool(model_cfg.get("spartan_dense", False)),
             spartan_identity=bool(model_cfg.get("spartan_identity", False)),

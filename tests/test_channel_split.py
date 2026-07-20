@@ -3,7 +3,13 @@
 import pytest
 import torch
 
-from scjepa.models import AttnPooling, CrossSlotAttnPooling, KinematicHead
+from scjepa.models import (
+    AttnPooling,
+    CrossSlotAttnPooling,
+    KinematicHead,
+    TrackAwareAttnPooling,
+)
+from scjepa.models.channel_split import build_pooling
 
 B, T, N, D = 2, 5, 4, 16
 
@@ -163,9 +169,102 @@ def test_cross_slot_time_order_aware(
 
 
 def test_build_pooling_dispatch() -> None:
-    from scjepa.models.channel_split import build_pooling
-
     assert isinstance(build_pooling("cross_slot", D, 2, 8), CrossSlotAttnPooling)
     assert isinstance(build_pooling("per_slot", D, 2, 8), AttnPooling)
+    track_aware = build_pooling("track_aware", D, 2, 8, param_dim=1)
+    assert isinstance(track_aware, TrackAwareAttnPooling)
+    assert track_aware.param_dim == 1
     with pytest.raises(ValueError, match="pooling_type"):
         build_pooling("nope", D, 2, 8)
+
+
+@pytest.fixture
+def track_aware_pooling() -> TrackAwareAttnPooling:
+    torch.manual_seed(7)  # pyright: ignore[reportUnknownMemberType]
+    return TrackAwareAttnPooling(
+        slot_size=D,
+        num_heads=2,
+        max_history=8,
+        param_dim=1,
+    )
+
+
+def test_track_aware_scalar_shape_and_gradients(
+    track_aware_pooling: TrackAwareAttnPooling, history: torch.Tensor
+) -> None:
+    out = track_aware_pooling(history)
+    assert out.shape == (B, N, 1)
+    assert torch.isfinite(out).all()
+    out.square().mean().backward()  # pyright: ignore[reportUnknownMemberType]
+    for name, param in track_aware_pooling.named_parameters():
+        assert param.grad is not None, f"no gradient for {name}"
+
+
+def test_track_aware_slot_permutation_equivariance(
+    track_aware_pooling: TrackAwareAttnPooling, history: torch.Tensor
+) -> None:
+    """A joint object permutation must produce the same output permutation."""
+    track_aware_pooling.eval()
+    perm = torch.tensor([2, 0, 3, 1])
+    with torch.no_grad():
+        expected = track_aware_pooling(history)[:, perm]
+        actual = track_aware_pooling(history[:, :, perm])
+    torch.testing.assert_close(actual, expected)
+
+
+def test_track_aware_mixes_evidence_across_objects(
+    track_aware_pooling: TrackAwareAttnPooling, history: torch.Tensor
+) -> None:
+    """Changing one trajectory can inform another object's parameter estimate."""
+    track_aware_pooling.eval()
+    changed_track = history.clone()
+    changed_track[:, :, 1] += 5.0
+    with torch.no_grad():
+        original = track_aware_pooling(history)
+        changed = track_aware_pooling(changed_track)
+    other_slots = torch.tensor([0, 2, 3])
+    assert not torch.allclose(original[:, other_slots], changed[:, other_slots])
+
+
+def test_track_aware_retains_tracks_across_time(
+    track_aware_pooling: TrackAwareAttnPooling, history: torch.Tensor
+) -> None:
+    """A one-frame slot shuffle changes trajectories and therefore parameters.
+
+    Flattening ``time x slots`` into a set would be invariant to this operation;
+    per-track temporal pooling must not be.
+    """
+    track_aware_pooling.eval()
+    transient_shuffle = history.clone()
+    transient_shuffle[:, 1] = transient_shuffle[:, 1, torch.tensor([1, 0, 3, 2])]
+    with torch.no_grad():
+        original = track_aware_pooling(history)
+        shuffled = track_aware_pooling(transient_shuffle)
+    assert not torch.allclose(original, shuffled)
+
+
+def test_track_aware_has_no_final_state_residual_shortcut(
+    track_aware_pooling: TrackAwareAttnPooling, history: torch.Tensor
+) -> None:
+    """The final state reaches the result only through temporal attention.
+
+    Zeroing that attention makes the learned temporal query constant. Changing
+    the last state must then have no effect; a projected-last-state residual,
+    like the legacy cross-slot pooler uses, would fail this test.
+    """
+    track_aware_pooling.eval()
+    with torch.no_grad():
+        for parameter in track_aware_pooling.temporal_pool.mha.parameters():
+            parameter.zero_()
+        changed_last = history.clone()
+        changed_last[:, -1] += 100.0
+        original = track_aware_pooling(history)
+        changed = track_aware_pooling(changed_last)
+    torch.testing.assert_close(original, changed)
+
+
+def test_track_aware_validates_param_dim() -> None:
+    with pytest.raises(ValueError, match="param_dim"):
+        TrackAwareAttnPooling(slot_size=D, num_heads=2, param_dim=0)
+    with pytest.raises(ValueError, match="track_aware"):
+        build_pooling("cross_slot", D, 2, 8, param_dim=1)

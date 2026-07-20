@@ -17,13 +17,17 @@ model:
   enc_channels: [3, 64, 64, 64, 64]
   enc_out_channels: 128
   pooling_heads: 4
-  pooling_type: cross_slot # D14 default | per_slot (D4 ablation)
+  pooling_type: cross_slot # cross_slot (D14) | per_slot (D4) | track_aware
+  param_dim: null # StateJepa causal width; null preserves slot_size
   max_history: 64
   spartan_layers: 3 # SPARTAN App. A.1
   spartan_embed_dim: 512 # SPARTAN App. A.1
   spartan_mlp_hidden: 512
   spartan_mlp_layers: 3
   spartan_temperature: 1.0
+  # Relative parameter_i -> state_i relation. Joint object permutations remain
+  # equivariant, while an independent parameter reassignment becomes observable.
+  spartan_paired_object_attention: false
   spartan_dense: false # true: A≡1 (SPARTAN's "fully connected model") — τ calibration ONLY
   spartan_identity: false # true: A≡0 (mass-blind reference, path matrix = I) — D16 go/no-go ONLY
   aux_dim: null # Push-T: action dim; CLEVRER/synthetic: null
@@ -48,6 +52,9 @@ train:
   grad_clip: 1.0
   lambda_reg: 1.0 # weight of the VISReg/SIGReg term (both branches)
   sparsity_enabled: true # the ±sparsity ablation toggle
+  # During warm-up gates still train through prediction/logit gradients, but the
+  # path penalty and dual update are disabled so dynamics can be learned first.
+  sparsity_warmup_steps: 0
   sparsity_tau: 0.1 # target pred loss (paper: fully-connected model's loss)
   sparsity_step_size: 1.0e-3
   sparsity_lambda_init: 1.0e3
@@ -58,6 +65,12 @@ train:
   seed: 0
   device: cpu
   input_key: frames # frames (vision) | states (GT-embedding regime)
+  # auto = aligned MSE for StateJepa's persistent object rows; visual learned
+  # slots use Hungarian only as a temporary set-prediction fallback.
+  prediction_matching: auto # auto | aligned | hungarian
+  # auto = raw MSE on literal GT states (paper's fixed ruler), detached
+  # target-variance normalization when the learned target space can rescale.
+  constraint_normalization: auto # auto | raw | target_variance
   context_len: null # context window Th: null -> single transition (K=1)
   # D16 autoregressive rollout: K = clip_len - context_len transitions are covered
   # by chains of this length (must divide K); null -> one chain over all K

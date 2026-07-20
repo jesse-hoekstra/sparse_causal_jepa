@@ -328,10 +328,12 @@ probing the method's edge. Config: `experiment/bounce_baumgartner.yaml`.
    mean of exp(q·k)+exp(−q·k), logits clamped ±30 for finiteness); included in the Lagrangian
    CONSTRAINT (their Eq. 9: non-causal losses ≤ L*), so τ must be calibrated with it enabled.
    VISReg stays OUTSIDE the constraint (D12 — the collapse anchor must not trade against sparsity).
-3. **MCC = their F.1 metric**: per (true param, learned dim) pair, a 1-hidden-layer MLP (width
-   32, ≤5000 samples, 90/10 held-out split) gives nonlinear R²; MCC = mean-max. Implemented as
-   `nonlinear_mcc` (R² clamped at 0 = no explanatory power), reported as `mcc` by the harness;
-   Pearson `mcc_linear` kept as a fast proxy. Verified: planted tanh diffeomorphism scores 0.955
+3. **MCC = their F.1 metric**: one sample per episode (`E x 5` learned versus `E x 5` true
+   in the scalar bounce baseline); per (true param, learned dim) pair, a 1-hidden-layer MLP
+   (width 32, ≤5000 samples, 90/10 held-out split) gives nonlinear R²; MCC = mean-max.
+   Implemented as `nonlinear_mcc` (R² clamped at 0 = no explanatory power), reported as
+   `mcc`; the former pooled episode-object probe is `mcc_pooled`, and Pearson `mcc_linear`
+   is the fast proxy. Verified: planted tanh diffeomorphism scores 0.955
    (nonlinear) vs 0.886 (Pearson) — the metric is diffeomorphism-invariant as required.
 
 **Known intentional differences (the experiment itself):** their model is a conditional VAE
@@ -637,7 +639,7 @@ mass-blindness pressure with 3–6x fewer chained Jacobians), not the skip guard
 
 **The change.** `bounce_baumgartner` now trains with `model.gt_states=true` (D20) +
 `train.rollout_horizon=1`: every one of the K=30 transitions is predicted from the TRUE raw
-state at its own timestep (teacher forcing), losses (Hungarian MSE, |Ā|, logit penalty) are
+state at its own timestep (teacher forcing), losses (aligned MSE, |Ā|, logit penalty) are
 computed per transition and averaged, Ŝ^ph is pooled once per episode and shared across all
 transitions, and the predictor weights are one shared module across time. Gate noise is
 drawn fresh per transition (a Tp=1 chain = one draw), which is exactly SPARTAN Eq. 3's
@@ -728,3 +730,56 @@ clamp for >50k steps post-crossing = the clamp is too low or τ still too tight.
 **Open risk (the one that now decides the run).** D22 measured the *gated* model tracking the dense reference ~10–15% higher (stochastic gate noise). τ=1.0× therefore sits near/below the gated constraint floor: it is only crossable if, at 1/λ→0, gates open enough to shed that noise and reach ~dense loss. If `eval/constraint_loss` plateaus above 0.0839 through the first ~60k steps, τ=1.0× is unsatisfiable — and the culprit is gate commitment (Gumbel temperature, `lambda_logit`), NOT the schedule. Fallbacks in order: (1) re-calibrate the dense reference in-pipeline under the exact config (fybk7ukv is from a previous pipeline; at factor 1.0 any mismatch breaks the constraint directly), (2) only then consider the minimal gate-noise slack (~1.05×).
 
 **Watch.** First 2–3 eval points (per the "check the first two eval points" rule): `eval/constraint_loss` must fall toward 0.0839 and cross it by ~100–150k. Once crossed: λ descends off 1e6, `eval/path_density` falls off 0.128, `shd_param` descends from its spurious-edge peak, MCC ramps. Failure signatures: constraint_loss stuck >0.0839 (τ unsatisfiable → gate-noise problem); or λ crashes to `lambda_min` with density→1/T and MCC at the noise floor (over-prune / empty-graph collapse #2 → α too high or τ too loose).
+
+## D24 — Correct the true-state mass-identification contract (decided 2026-07-20, Codex audit; accepted by Jesse)
+
+**Scope correction.** D20/D21 correctly fix the prediction ruler with `gt_states=true`; the
+pipeline-calibrated τ, rather than the inherited smoke placeholder, remains the operative
+constraint. The remaining failure was not evidence against the raw-state rung: its parameter
+encoder and decoder did not represent five clean, paired masses.
+
+**Decision.** `bounce_baumgartner` now uses `pooling_type=track_aware` and `param_dim=1`.
+Each simulator track is pooled temporally before permutation-equivariant cross-object mixing,
+then a shared scalar head emits exactly one latent per ball. SPARTAN receives a relative
+parameter-i → state-i relation (`spartan_paired_object_attention=true`), which preserves joint
+object-permutation equivariance but makes an independent reassignment of mass tokens visible.
+Absolute slot labels remain absent. Prediction loss is aligned MSE in the literal GT-state
+regime; learned slots retain set matching only as a temporary fallback pending a persistent
+tracking/trajectory-level assignment.
+
+**Sparsity phase.** The path objective now sums only paths ending at decoded state outputs.
+The Stage-1 run starts λ at its 1e6 ceiling and uses a 10k-step non-sparsity warm-up: gates
+still learn through prediction and logit gradients (with VISReg active), while the path term
+and dual update are disabled.
+This implements the papers' intended dynamics-first phase instead of allowing the raw path-count
+gradient to close gates during the first few updates.
+
+The primary `path_density` now uses those same decoded state rows; the former whole-token
+density remains available as `path_density_full`. Parameter-token output rows are not decoded
+and therefore are neither optimized nor allowed to make the main pruning curve look stuck.
+
+**Constraint and feasibility.** D17 remains the default for trainable target embeddings, but
+literal GT states already provide the papers' fixed ruler. This rung therefore uses raw aligned
+MSE (plus the logit term) in both the primal and dual, superseding D17's normalization for this
+regime. Tau is exactly `1.0 x` the converged dense-reference loss, as prescribed in SPARTAN
+App. A.2; non-unit factors are permitted only as explicitly labelled slack ablations. All pre-D24
+numeric tau and identity floors are invalid. The reporting launchers now run
+a matched `spartan_identity=true` reference and abort unless the freshly calibrated tau is below
+its held-out raw constraint loss.
+
+**Simulator correction.** The old overlap detector changed event timing only in discrete
+substep jumps: on a fixed collision branch, recorded positions were locally independent of
+radius, leaving common mass scale non-identifiable despite `radius_from_mass=true`. Wall
+overshoot is now reflected about the radius-dependent contact surface, and pair penetration is
+projected to the exact radius-dependent surface before the elastic impulse. Pre-generated data
+is versioned (`simulator_version=2`); old preloads are rejected and must be regenerated.
+
+**Evaluation and reproducibility.** `mcc` is now Baumgartner App. F.1 shaped: one row per
+episode (`E x 5` learned versus `E x 5` true for the scalar baseline). The previous pooled
+episode-object diagnostic is retained as `mcc_pooled`. Model construction is seeded, and the
+complete evaluation harness preserves training RNG state.
+
+**Next rung.** When visual encoders are enabled, ordered loss is valid only if state and
+parameter tokens descend from the same recurrent slot track and future targets retain that
+track. Otherwise use one assignment over a complete trajectory, never independent per-frame
+Hungarian assignments.

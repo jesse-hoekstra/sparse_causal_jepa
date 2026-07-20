@@ -51,6 +51,11 @@ _PALETTE = torch.tensor(
     ]
 )
 
+# Increment whenever simulator dynamics change. Pre-generated trajectories are
+# part of an experiment's data-generating process, so silently loading states
+# from older collision rules would invalidate dense/main calibration matching.
+_SIMULATOR_VERSION = 2
+
 
 def simulate_bounce(
     masses: Float[Tensor, "n 1"],
@@ -90,34 +95,96 @@ def simulate_bounce(
     contacts = torch.zeros(num_steps - 1, num_balls, num_balls, dtype=torch.bool)
     states[0] = torch.cat([pos, vel], dim=-1)
 
+    def resolve_walls(step: int) -> None:
+        """Reflect boundary overshoot and outward velocity at each radius wall.
+
+        Mirroring ``x`` about ``r`` (or ``1-r``) is the exact remainder-of-step
+        position for a linear wall impact. It also makes the recorded position a
+        continuous function of a mass-dependent radius on a fixed bounce branch.
+        A short loop handles unusually large overshoots without affecting the
+        normal small-substep path.
+        """
+        for _ in range(4):
+            any_violation = False
+            for axis in (0, 1):
+                low = pos[:, axis] < r
+                high = pos[:, axis] > 1 - r
+                violated = low | high
+                if not bool(violated.any()):
+                    continue
+                any_violation = True
+
+                # Preserve the distance travelled beyond the contact surface.
+                pos[low, axis] = 2 * r[low] - pos[low, axis]
+                pos[high, axis] = 2 * (1 - r[high]) - pos[high, axis]
+
+                # Pair projection can rarely push a center through a wall while
+                # its velocity already points inward. Correct its position but
+                # only reflect velocity that is actually travelling outward.
+                outward_low = low & (vel[:, axis] < 0)
+                outward_high = high & (vel[:, axis] > 0)
+                vel[outward_low | outward_high, axis] *= -1
+                if radii is not None:
+                    contacts[step].diagonal()[violated] = True
+            if not any_violation:
+                break
+
     sub_dt = dt / substeps
     for step in range(num_steps - 1):
         for _ in range(substeps):
             pos = pos + vel * sub_dt
-            # Wall reflections (unit box). The velocity rule is mass-independent,
-            # but WHEN/WHERE the bounce happens depends on r_i — with r ∝ m that
-            # makes ∂x_{t+1}/∂m_i ≠ 0, i.e. a GT param self-edge (audit G1).
-            for axis in (0, 1):
-                low = (pos[:, axis] < r) & (vel[:, axis] < 0)
-                high = (pos[:, axis] > 1 - r) & (vel[:, axis] > 0)
-                bounced = low | high
-                vel[bounced, axis] = -vel[bounced, axis]
-                if radii is not None:
-                    contacts[step].diagonal()[bounced] = True
-            # Pairwise elastic collisions (impulse exchange on approach).
-            diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # (N, N, 2): x_i - x_j
-            dist = diff.square().sum(dim=-1).sqrt() + torch.eye(num_balls) * 1e9
-            touching = dist < r.unsqueeze(0) + r.unsqueeze(1)
-            for pair in torch.nonzero(torch.triu(touching, diagonal=1)):
-                i, j = int(pair[0].item()), int(pair[1].item())
-                normal = diff[i, j] / dist[i, j]
-                rel_speed = torch.dot(vel[i] - vel[j], normal)
-                if rel_speed < 0:  # approaching — exchange impulse (e = 1)
-                    impulse = -2.0 * rel_speed / (1.0 / m[i] + 1.0 / m[j])
-                    vel[i] = vel[i] + (impulse / m[i]) * normal
-                    vel[j] = vel[j] - (impulse / m[j]) * normal
+            resolve_walls(step)
+
+            # Pairwise elastic collisions. First project penetrations back to
+            # the exact contact surface, splitting the correction by inverse
+            # mass so the pair's center of mass is unchanged. Then apply the
+            # e=1 impulse on approach. A few sequential passes resolve short
+            # contact chains; ordinary no-contact substeps exit after one cheap
+            # vectorized overlap check.
+            for _ in range(max(4, 4 * num_balls)):
+                diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # x_i - x_j
+                dist = diff.square().sum(dim=-1).sqrt()
+                min_dist = r.unsqueeze(0) + r.unsqueeze(1)
+                touching = torch.triu(dist < min_dist, diagonal=1)
+                pairs = torch.nonzero(touching)
+                if pairs.numel() == 0:
+                    break
+
+                for pair in pairs:
+                    i, j = int(pair[0].item()), int(pair[1].item())
+                    delta = pos[i] - pos[j]
+                    distance: Tensor = delta.square().sum().sqrt()
+                    contact_distance = r[i] + r[j]
+                    if distance >= contact_distance:
+                        continue  # an earlier correction in this pass separated it
+                    if float(distance) > 1e-12:
+                        normal = delta / distance
+                    else:  # degenerate coincidence: choose a deterministic separator
+                        relative = vel[i] - vel[j]
+                        relative_norm: Tensor = relative.square().sum().sqrt()
+                        normal: Tensor = (
+                            -relative / relative_norm
+                            if float(relative_norm) > 1e-12
+                            else pos.new_tensor([1.0, 0.0])
+                        )
+
+                    penetration: Tensor = contact_distance - distance
+                    inv_i, inv_j = 1.0 / m[i], 1.0 / m[j]
+                    inv_total = inv_i + inv_j
+                    pos[i] = pos[i] + normal * penetration * (inv_i / inv_total)
+                    pos[j] = pos[j] - normal * penetration * (inv_j / inv_total)
+
+                    rel_speed = torch.dot(vel[i] - vel[j], normal)
+                    if rel_speed < 0:  # approaching — exchange impulse (e = 1)
+                        impulse = -2.0 * rel_speed / inv_total
+                        vel[i] = vel[i] + (impulse / m[i]) * normal
+                        vel[j] = vel[j] - (impulse / m[j]) * normal
                     contacts[step, i, j] = True
                     contacts[step, j, i] = True
+
+                # A correction near a boundary can create a wall violation;
+                # resolving it here may in turn require one more pair pass.
+                resolve_walls(step)
         states[step + 1] = torch.cat([pos, vel], dim=-1)
     return states, contacts
 
@@ -189,7 +256,7 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
         may be smaller than the file holds (a prefix is used); ``render`` must
         be False (frames are not stored).
 
-        Baumgartner-exact variant (their App. E bounce): ``mass_normal=(mean,
+        Baumgartner-aligned variant (their App. E bounce): ``mass_normal=(mean,
         std)`` samples masses from a non-zero-mean normal (clamped to
         mass_range) instead of uniform, and ``radius_from_mass=True`` scales
         each ball's radius ∝ its mass (mean radius = ``radius``): mass then
@@ -231,6 +298,7 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
     def generation_meta(self) -> dict[str, object]:
         """Every setting that influences generated episodes (preload identity)."""
         return {
+            "simulator_version": _SIMULATOR_VERSION,
             "num_episodes": self.num_episodes,
             "clip_len": self.clip_len,
             "num_balls": self.num_balls,

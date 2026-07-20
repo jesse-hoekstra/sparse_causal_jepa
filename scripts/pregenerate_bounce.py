@@ -7,10 +7,10 @@ once per stage while the GPU idles. Episodes are deterministic per
 
     python scripts/pregenerate_bounce.py experiment=bounce_baumgartner
 
-writes ``data/bounce_train_<num_clips>.pt`` (~630MB at 100k; data/ is
+writes ``data/bounce_train_v<simulator>_<num_clips>.pt`` (~630MB at 100k; data/ is
 gitignored) unless it already exists. Point the runs at it with
-``data.preload=data/bounce_train_<num_clips>.pt`` — the SAME hydra overrides
-must go to calibration and main (D12); the file embeds its generation
+``data.preload=data/bounce_train_v<simulator>_<num_clips>.pt`` — the SAME hydra overrides
+must go to every reference and main run (D12); the file embeds its generation
 settings and BounceDataset refuses a mismatch. Eval splits (seed offset)
 always generate on the fly — the factory never applies ``preload`` to them.
 
@@ -64,9 +64,22 @@ def main(cfg: DictConfig) -> None:
     """Generate the train split in parallel and save it with its identity."""
     kwargs = _dataset_kwargs(cfg)
     num = int(kwargs["num_episodes"])  # pyright: ignore[reportArgumentType]
-    out = Path(hydra.utils.get_original_cwd()) / "data" / f"bounce_train_{num}.pt"
+    meta = BounceDataset(**kwargs).generation_meta()  # pyright: ignore[reportArgumentType]
+    simulator_version = int(meta["simulator_version"])  # pyright: ignore[reportArgumentType]
+    out = (
+        Path(hydra.utils.get_original_cwd())
+        / "data"
+        / f"bounce_train_v{simulator_version}_{num}.pt"
+    )
     if out.exists():
-        print(f"{out} already exists — nothing to do (delete it to regenerate)")
+        try:
+            BounceDataset(**kwargs, preload=str(out))  # pyright: ignore[reportArgumentType]
+        except ValueError as error:
+            raise RuntimeError(
+                f"existing preload {out} does not match this run; move or delete it, "
+                "then regenerate"
+            ) from error
+        print(f"{out} already exists and matches — nothing to do")
         return
     workers = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
     bound = max(1, num // (workers * 4))  # small shards: even load, bounded worker RAM
@@ -78,7 +91,6 @@ def main(cfg: DictConfig) -> None:
         key: torch.cat([shard[key] for shard in results])
         for key in ("states", "params", "contacts")
     }
-    meta = BounceDataset(**kwargs).generation_meta()  # pyright: ignore[reportArgumentType]
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"meta": meta, "tensors": tensors}, out)
     size = out.stat().st_size / 1e6

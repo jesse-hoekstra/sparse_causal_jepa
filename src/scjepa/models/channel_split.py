@@ -7,6 +7,11 @@ Implements the exact spec in docs/decisions.md D4:
   positional encodings; collapses the time axis inside the attention:
   ``(B, Th, N, d) → Ŝ^ph ∈ (B, N, d)``. Strictly slot-local: no cross-slot mixing —
   relational effects are SPARTAN's job.
+- ``TrackAwareAttnPooling`` — first forms one temporal summary for each tracked
+  object, then mixes those summaries with permutation-equivariant set attention
+  and projects each result to a configurable parameter dimension. Unlike
+  ``CrossSlotAttnPooling``, object identity is retained throughout the temporal
+  stage and no final-state query is added as a residual shortcut.
 - ``KinematicHead`` — linear layer on the *last-step* slots (which have seen all
   frames via SAVi's recurrence): ``(B, Th, N, d) → S_t ∈ (B, N, d)``.
 
@@ -168,6 +173,71 @@ class CrossSlotAttnPooling(nn.Module):
         return self.norm_mlp(pooled + self.mlp(pooled))
 
 
+class TrackAwareAttnPooling(nn.Module):
+    """Track-preserving parameter encoder with equivariant object mixing.
+
+    The temporal and relational axes have deliberately separate stages:
+
+    1. ``AttnPooling`` processes each object's tracked history independently,
+       with shared weights and temporal positional encodings.
+    2. Self-attention over the resulting object summaries lets collision
+       partners exchange evidence. With no object-index positional embedding,
+       this stage is permutation equivariant.
+    3. A shared linear head emits ``param_dim`` values per object.
+
+    The temporal query is learned and shared rather than projected from the
+    final state. Consequently there is no last-state residual path by which
+    instantaneous kinematics can bypass temporal parameter inference.
+    """
+
+    def __init__(
+        self,
+        slot_size: int,
+        num_heads: int = 4,
+        mlp_hidden_size: int | None = None,
+        max_history: int = 64,
+        param_dim: int | None = None,
+    ) -> None:
+        """Build the temporal-pooling, object-mixing, and parameter-head stages."""
+        super().__init__()
+        if slot_size % num_heads != 0:
+            raise ValueError(f"num_heads={num_heads} must divide slot_size={slot_size}")
+        if param_dim is not None and param_dim <= 0:
+            raise ValueError(f"param_dim must be positive, got {param_dim}")
+        if mlp_hidden_size is None:
+            mlp_hidden_size = 2 * slot_size
+
+        self.param_dim = slot_size if param_dim is None else param_dim
+        self.temporal_pool = AttnPooling(
+            slot_size=slot_size,
+            num_heads=num_heads,
+            mlp_hidden_size=mlp_hidden_size,
+            max_history=max_history,
+        )
+        self.cross_slot_mha = nn.MultiheadAttention(slot_size, num_heads, batch_first=True)
+        self.norm_attn = nn.LayerNorm(slot_size)
+        self.norm_mlp = nn.LayerNorm(slot_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(slot_size, mlp_hidden_size),
+            nn.ReLU(),
+            nn.Linear(mlp_hidden_size, slot_size),
+        )
+        # Keep this projection unconstrained: identifiability is only up to an
+        # element-wise diffeomorphism, so the learned scalar need not equal mass
+        # numerically. In particular, do not put LayerNorm after a 1-D head.
+        self.param_head = nn.Linear(slot_size, self.param_dim)
+
+    def forward(self, slot_history: Float[Tensor, "b t n d"]) -> Float[Tensor, "b n p"]:
+        """Encode tracked histories as per-object parameter vectors."""
+        track_summaries = self.temporal_pool(slot_history)  # (B, N, d)
+        mixed, _ = self.cross_slot_mha(
+            track_summaries, track_summaries, track_summaries, need_weights=False
+        )
+        mixed = self.norm_attn(track_summaries + mixed)
+        mixed = self.norm_mlp(mixed + self.mlp(mixed))
+        return self.param_head(mixed)
+
+
 class KinematicHead(nn.Module):
     """Linear kinematic-state head: last-step slots → S_t.
 
@@ -198,16 +268,44 @@ class KinematicHead(nn.Module):
 
 
 def build_pooling(
-    pooling_type: str, slot_size: int, num_heads: int, max_history: int
-) -> "AttnPooling | CrossSlotAttnPooling":
-    """Config-selectable pooling: "cross_slot" (D14 default) | "per_slot" (D4)."""
+    pooling_type: str,
+    slot_size: int,
+    num_heads: int,
+    max_history: int,
+    param_dim: int | None = None,
+) -> "AttnPooling | CrossSlotAttnPooling | TrackAwareAttnPooling":
+    """Build a parameter pooling module selected by configuration.
+
+    ``param_dim`` is used by ``track_aware``. The legacy poolers retain their
+    original ``slot_size`` output and reject an incompatible explicit value.
+    """
+    if pooling_type == "track_aware":
+        return TrackAwareAttnPooling(
+            slot_size=slot_size,
+            num_heads=num_heads,
+            max_history=max_history,
+            param_dim=param_dim,
+        )
+    if param_dim is not None and param_dim != slot_size:
+        raise ValueError(
+            f"pooling_type={pooling_type!r} outputs slot_size={slot_size}; "
+            "set pooling_type='track_aware' to use a different param_dim"
+        )
     if pooling_type == "cross_slot":
         return CrossSlotAttnPooling(
             slot_size=slot_size, num_heads=num_heads, max_history=max_history
         )
     if pooling_type == "per_slot":
         return AttnPooling(slot_size=slot_size, num_heads=num_heads, max_history=max_history)
-    raise ValueError(f"unknown pooling_type {pooling_type!r} (cross_slot | per_slot)")
+    raise ValueError(
+        f"unknown pooling_type {pooling_type!r} (cross_slot | per_slot | track_aware)"
+    )
 
 
-__all__ = ["AttnPooling", "CrossSlotAttnPooling", "KinematicHead", "build_pooling"]
+__all__ = [
+    "AttnPooling",
+    "CrossSlotAttnPooling",
+    "KinematicHead",
+    "TrackAwareAttnPooling",
+    "build_pooling",
+]

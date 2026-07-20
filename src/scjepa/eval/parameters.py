@@ -7,13 +7,15 @@ correlation| between the right learned dimension and the true parameter is the
 standard proxy (perfect only for affine maps — the marginal-recovery scatter is
 the honest picture for nonlinear ones).
 
-Sample convention: parameters are per-object with shared weights, so every
-(episode, object) pair is one sample. Callers flatten to ``learned (S, d)`` and
-``target (S, P)``. Slot↔object alignment is the caller's job (see graph.py).
+Sample convention is chosen by the caller. For Baumgartner-comparable MCC the
+eval harness uses one sample per episode: learned ``(E, N*d)`` and true
+``(E, N)`` (exactly ``E x 5`` versus ``E x 5`` when ``d=1``). The harness also
+reports the older pooled ``(episode, object)`` probe under an explicit name.
+Slot↔object alignment is the caller's job (see graph.py).
 
 Metrics:
     ``nonlinear_mcc``         — THE MCC (mean-max correlation coefficient) as
-        defined by Baumgartner et al. App. F.1, used for exact comparison to
+        defined by Baumgartner et al. App. F.1, used for metric comparison to
         their results: for every (true param i, learned dim j) pair, fit a
         one-hidden-layer MLP (width 32) predicting θ_i from θ̂_j on a 90%
         split, score nonlinear R² on the held-out 10%; MCC = mean_i max_j R².
@@ -80,8 +82,35 @@ def nonlinear_mcc(
     Adam, full batch), R² scored on a held-out split; returns
     ``mean_i max_j R²_ij``. Deterministic given ``seed``. Slower than the
     Pearson proxy but invariant to element-wise diffeomorphisms — use this for
-    reported numbers.
+    reported numbers. The metric's local model initialization is isolated from
+    the caller's global torch RNG, so periodic evaluation cannot alter the
+    subsequent training trajectory.
     """
+    # The MLPs below are CPU modules. Fork only the CPU generator, and seed that
+    # generator directly rather than calling torch.manual_seed (which also
+    # mutates accelerator generators). The caller's state is restored on exit.
+    with torch.random.fork_rng(devices=[]):  # pyright: ignore[reportUnknownMemberType]
+        return _nonlinear_mcc_impl(
+            learned,
+            target,
+            hidden=hidden,
+            max_samples=max_samples,
+            epochs=epochs,
+            val_fraction=val_fraction,
+            seed=seed,
+        )
+
+
+def _nonlinear_mcc_impl(
+    learned: Float[Tensor, "s d"],
+    target: Float[Tensor, "s p"],
+    hidden: int,
+    max_samples: int,
+    epochs: int,
+    val_fraction: float,
+    seed: int,
+) -> Float[Tensor, ""]:
+    """Fit the pairwise regressors inside an RNG-isolated caller context."""
     corr_input = correlation_matrix(learned, target)  # validates shapes cheaply
     del corr_input
     generator = torch.Generator().manual_seed(seed)
@@ -93,7 +122,7 @@ def nonlinear_mcc(
     r2 = torch.zeros(target.shape[1], learned.shape[1])
     for i in range(target.shape[1]):
         for j in range(learned.shape[1]):
-            torch.manual_seed(seed * 7919 + i * 131 + j)  # pyright: ignore[reportUnknownMemberType]
+            torch.default_generator.manual_seed(seed * 7919 + i * 131 + j)
             x, y = learned[:, j : j + 1], target[:, i : i + 1]
             x = (x - x.mean()) / (x.std() + 1e-6)
             y_mean, y_std = y.mean(), y.std() + 1e-6

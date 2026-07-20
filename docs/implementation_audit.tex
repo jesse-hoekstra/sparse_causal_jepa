@@ -24,6 +24,15 @@ mapped to the source papers and to the code (state as of 2026-07-17, post D1--D1
 \begin{document}
 \maketitle
 
+\section*{Status notice (2026-07-20)}
+This document is intentionally a historical D1--D19 snapshot and is not the current D24
+implementation contract. D24 changes the rollout to raw GT states with aligned MSE, emits one
+scalar parameter per ball, adds a relative parameter-to-state pairing relation, scopes sparsity
+and primary path density to decoded state rows, uses raw-MSE tau calibration plus a freshly
+trained identity reference, and corrects/version-tags collision surfaces. See
+\code{docs/decisions.md} D24 and the resolved
+\code{configs/experiment/bounce\_baumgartner.yaml} before using any number below.
+
 \section*{How to read this document}
 Every equation is tagged with its provenance:
 \paper{SPARTAN Eq.~$n$} / \paper{Baum.\ Eq.~$n$} / \paper{my\_paper p.~$n$} = implements the

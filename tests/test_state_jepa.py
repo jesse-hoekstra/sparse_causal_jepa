@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from scjepa.data import BounceDataset
@@ -66,18 +67,15 @@ def test_rollout_gradient_reaches_params_through_chain() -> None:
     out = model(states, context_len=4, rollout_horizon=2)
     out.prediction[-1].sum().backward()  # pyright: ignore[reportUnknownMemberType]
     grads = [p.grad for p in model.pooling.parameters() if p.grad is not None]
-    assert grads and any(g.abs().sum() > 0 for g in grads)
+    assert grads
+    assert any(g.abs().sum() > 0 for g in grads)
 
 
 def test_rollout_horizon_must_divide_transitions() -> None:
     model = tiny_state_model()
     states = torch.randn(1, 9, N, 4)  # Th=4 -> K=5
-    try:
+    with pytest.raises(ValueError, match="divide"):
         model(states, context_len=4, rollout_horizon=2)
-    except ValueError as err:
-        assert "divide" in str(err)
-    else:  # pragma: no cover
-        raise AssertionError("expected ValueError for K % Tp != 0")
 
 
 def test_state_jepa_trains_on_bounce(tmp_path: Path) -> None:
@@ -97,7 +95,9 @@ def test_state_jepa_trains_on_bounce(tmp_path: Path) -> None:
     assert all(torch.isfinite(torch.tensor(v)) for v in metrics.values())
 
 
-def tiny_gt_model(**overrides: bool) -> StateJepa:
+def tiny_gt_model(
+    *, spartan_dense: bool = False, spartan_identity: bool = False
+) -> StateJepa:
     torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
     return build_state_jepa(
         state_dim=4,
@@ -108,7 +108,26 @@ def tiny_gt_model(**overrides: bool) -> StateJepa:
         spartan_mlp_hidden=32,
         spartan_mlp_layers=2,
         gt_states=True,
-        **overrides,
+        spartan_dense=spartan_dense,
+        spartan_identity=spartan_identity,
+    )
+
+
+def tiny_gt_scalar_model() -> StateJepa:
+    """Small version of the corrected Baumgartner true-state architecture."""
+    torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
+    return build_state_jepa(
+        state_dim=4,
+        slot_size=16,
+        pooling_heads=2,
+        pooling_type="track_aware",
+        param_dim=1,
+        spartan_layers=1,
+        spartan_embed_dim=None,
+        spartan_mlp_hidden=32,
+        spartan_mlp_layers=2,
+        spartan_paired_object_attention=True,
+        gt_states=True,
     )
 
 
@@ -123,6 +142,17 @@ def test_gt_states_forward_contract() -> None:
     torch.testing.assert_close(out.kinematic_state, states[:, 3])  # raw anchor
     assert out.context_slots.shape == (2, 4, N, 16)  # param path stays in slot space
     assert out.causal_params.shape == (2, N, 16)
+    assert out.path_matrix.shape == (2, 2 * N, 2 * N)
+
+
+def test_gt_states_track_aware_scalar_parameter_contract() -> None:
+    """Baumgartner baseline emits exactly one causal scalar for each object."""
+    model = tiny_gt_scalar_model()
+    states = torch.randn(2, 5, N, 4)
+    out = model(states)
+    assert out.causal_params.shape == (2, N, 1)
+    assert model.predictor.param_size == 1
+    assert out.prediction.shape == (2, N, 4)
     assert out.path_matrix.shape == (2, 2 * N, 2 * N)
 
 
@@ -172,8 +202,10 @@ def test_gt_states_teacher_forcing_anchors_every_transition_at_true_state() -> N
 
 def test_gt_states_dense_and_identity_references_build() -> None:
     """The τ-calibration (dense) and go/no-go (identity) variants compose with D20."""
-    for kwargs in ({"spartan_dense": True}, {"spartan_identity": True}):
-        model = tiny_gt_model(**kwargs)
+    for model in (
+        tiny_gt_model(spartan_dense=True),
+        tiny_gt_model(spartan_identity=True),
+    ):
         out = model(torch.randn(2, 5, N, 4))
         assert out.prediction.shape == (2, N, 4)
 
@@ -194,23 +226,41 @@ def test_gt_states_trains_on_bounce(tmp_path: Path) -> None:
     assert all(torch.isfinite(torch.tensor(v)) for v in metrics.values())
 
 
+def test_prediction_matching_auto_resolves_from_tracked_state_contract(tmp_path: Path) -> None:
+    """Literal tracked states select aligned MSE and a raw dual constraint."""
+    dataset = BounceDataset(num_episodes=4, clip_len=4, num_balls=N, resolution=16, seed=2)
+    config = TrainConfig(steps=1, batch_size=2, input_key="states", out_dir=str(tmp_path))
+    gt_trainer = Trainer(tiny_gt_model(), dataset, config)
+    assert gt_trainer.prediction_matching == "aligned"
+    assert gt_trainer.constraint_normalization == "raw"
+    embedded_trainer = Trainer(tiny_state_model(), dataset, config)
+    assert embedded_trainer.prediction_matching == "aligned"
+    assert embedded_trainer.constraint_normalization == "target_variance"
+    config.prediction_matching = "hungarian"
+    assert Trainer(tiny_gt_model(), dataset, config).prediction_matching == "hungarian"
+
+
 def test_gt_states_harness_reports_fixed_ruler() -> None:
     """target_var must be the GT data constant, not a trainable quantity."""
     dataset = BounceDataset(num_episodes=12, clip_len=4, num_balls=N, resolution=16, seed=3)
+    model = tiny_gt_scalar_model()
+    rng_before = torch.get_rng_state().clone()
     report = evaluate_identifiability(
-        tiny_gt_model(), dataset, input_key="states", batch_size=6, max_batches=2
+        model, dataset, input_key="states", batch_size=6, max_batches=2
     )
+    assert torch.equal(torch.get_rng_state(), rng_before)
     states = torch.stack([dataset[i]["states"][-1] for i in range(6)])  # first eval batch targets
     gt_var = states.reshape(-1, 4).var(dim=0).mean()
     assert abs(report.metrics["target_var"] - gt_var.item()) < 0.05
-    assert report.per_slot_learned.shape == (12, N, 16)
+    assert report.metrics["constraint_loss"] == pytest.approx(report.metrics["pred_loss"])
+    assert report.per_slot_learned.shape == (12, N, 1)
 
 
 def test_identifiability_harness_end_to_end() -> None:
     """Untrained StateJepa on bounce: harness returns bounded, finite metrics."""
     dataset = BounceDataset(num_episodes=12, clip_len=4, num_balls=N, resolution=16, seed=3)
     report = evaluate_identifiability(
-        tiny_state_model(), dataset, input_key="states", batch_size=6, max_batches=2
+        tiny_gt_scalar_model(), dataset, input_key="states", batch_size=6, max_batches=2
     )
     for key in (
         "pred_loss",
@@ -220,22 +270,25 @@ def test_identifiability_harness_end_to_end() -> None:
         "shd_state",
         "shd_param",
         "mcc",
-        "path_density",
-        "num_samples",
+            "mcc_pooled",
+            "path_density",
+            "path_density_full",
+            "num_samples",
+        "num_pooled_samples",
     ):
         assert key in report.metrics
         assert torch.isfinite(torch.tensor(report.metrics[key])), key
-    # D17: constraint_loss is the SCALE-FREE quantity (lambda_logit=0 here, so
-    # it equals normalized pred; mean of per-batch ratios, so it only
-    # approximates pred_loss / mean target_var).
-    assert report.metrics["constraint_loss"] == report.metrics["pred_loss_normalized"]
+    # Literal GT states use Baumgartner's raw observation-space MSE as the
+    # constraint (lambda_logit=0 here). The normalized value remains diagnostic.
+    assert report.metrics["constraint_loss"] == report.metrics["pred_loss"]
     approx = report.metrics["pred_loss"] / report.metrics["target_var"]
     assert 0.5 * approx < report.metrics["pred_loss_normalized"] < 2.0 * approx
     assert 0 <= report.metrics["mcc"] <= 1 + 1e-6
-    assert report.metrics["num_samples"] == 12 * N
+    assert report.metrics["num_samples"] == 12
+    assert report.metrics["num_pooled_samples"] == 12 * N
     assert report.recovery_learned.shape == report.recovery_true.shape
-    assert 0 <= report.recovery_best_dim < 16
-    assert report.per_slot_learned.shape == (12, N, 16)  # (episodes, N, d)
+    assert report.recovery_best_dim == 0
+    assert report.per_slot_learned.shape == (12, N, 1)  # (episodes, N, d)
     assert report.per_slot_true.shape == (12, N)
 
 

@@ -67,22 +67,22 @@ ground-truth object states — slot i ≡ ball i by construction — so the iden
 are directly meaningful.
 
 **One command runs the whole procedure** — τ calibration (fully-connected reference, sparsity
-off), the main sparsity run with the calibrated τ, and the identifiability evaluation:
+off), the main sparsity run with the calibrated τ, and identifiability evaluation. Add
+`--identity-check` for a matched mass-blind reference and automatic feasibility guard:
 
 ```bash
 bash scripts/run_bounce_example.sh                                   # 5-ball default
+bash scripts/run_bounce_example.sh --identity-check                 # paper-grade guard
 bash scripts/run_bounce_example.sh data.num_balls=3 train.steps=25000  # smaller/faster instance
 #    -> prints the calibrated tau, then pred_loss, shd_state, shd_param, mcc, path_density
 #    -> saves recovery_grid.png (Fig.-5/12-style: true mass i vs slot j) in the run dir
 ```
 
-Hydra overrides are passed to BOTH runs, so the calibration and the main run can never diverge
+Hydra overrides are passed to every run, so the references and main run cannot diverge
 in config (the D12 rule). Knobs are script flags — `--tau-factor` (τ = factor ×
-fully-connected held-out pred_loss, default 1.5), `--calib-steps`, `--main-steps` (main run
-only), `--run-tag` (required for parallel launches) — a mistyped flag errors loudly; the
-equivalent env vars still work as a fallback. The two underlying commands, for doing it manually, are
-`scripts/train.py experiment=bounce_states [train.sparsity_enabled=false]` and
-`scripts/eval_identifiability.py <run_dir>`.
+fully-connected held-out constraint loss, default 1.0), `--identity-check`, `--calib-steps`,
+`--main-steps` (main run only), and `--run-tag` (required for parallel launches) — a mistyped
+flag errors loudly; the equivalent env vars still work as a fallback.
 
 **What to watch (two failure modes we hit while tuning this — see decisions.md D12):**
 
@@ -96,8 +96,9 @@ equivalent env vars still work as a fallback. The two underlying commands, for d
    engages (symptom: `sparsity/lambda` huge, `sparsity/path_density` never falls). Recalibrate
    after any config change.
 
-Healthy training shows the SPARTAN A.2 dynamics: `loss/pred` drops below τ first, then
-`sparsity/lambda` falls and `sparsity/path_density` shrinks while `loss/pred` stays ≈ τ.
+Healthy training shows the SPARTAN A.2 dynamics: `sparsity/constraint` drops below τ first,
+then `sparsity/lambda` falls and decoded-state `sparsity/path_density` shrinks while the
+constraint stays near τ.
 Reference run (2026-07-10, `data.num_balls=3 train.steps=25000`, `TAU_FACTOR=2.0`, ~1 h CPU):
 FC pred_loss 0.026 → τ 0.051; main run ends with λ 1000→436 (pruning engaged, still in
 progress), target-slot std 0.83 (no collapse), held-out pred_loss 0.039, shd_state 4.4.
@@ -110,31 +111,37 @@ paper-grade numbers. Step counts per phase: `--calib-steps` always sets the cali
 
 Every rung uses the same one-command runner (τ auto-calibrated per rung; overrides apply to both
 runs); repeat with `train.seed=0..7` for seeded statistics. Each run prints
-`pred_loss, shd_state, shd_param, mcc, mcc_linear, path_density` on a held-out split and saves
+`pred_loss, shd_state, shd_param, mcc, mcc_linear, mcc_pooled, path_density` on a held-out
+split and saves
 `recovery_grid.png`. Healthy training always shows: `loss/logit` falls early (when enabled),
-`loss/pred` drops below τ, then `sparsity/lambda` falls and `sparsity/path_density` shrinks while
-`health/target_slot_std_*` stays ≈ 0.7–1.0 (D12: falling std + falling pred = collapse-gaming).
+`sparsity/constraint` drops below τ, then `sparsity/lambda` falls and the decoded-state-row
+`sparsity/path_density` shrinks. In learned-target runs, monitor
+`health/target_slot_std_*` for collapse; in the raw-state rung it is a fixed data statistic.
 
 ```bash
-# Rung 1 — Baumgartner-exact (states, radius∝mass, logit loss). Target: their
-# Fig. 3 bounce, MCC ≈ 0.9+; recovery scatter = sharp monotone curves (their Fig. 12).
-bash scripts/run_bounce_example.sh --tau-factor=2.0 experiment=bounce_baumgartner
+# Rung 1 — Baumgartner-aligned environment with a true-state JEPA (radius∝mass,
+# logit loss). Their Fig. 3 MCC ≈ 0.9+ is context, not a like-for-like target:
+# the encoder/objective differ. Successful recovery still gives sharp marginals.
+bash scripts/run_bounce_example.sh --identity-check --tau-factor=1.0 \
+  experiment=bounce_baumgartner
 
 # Rung 1-ablation — ±sparsity (their MLP/Transformer comparison; note their own
 # finding: on bounce even an unregularised Transformer disentangles, so expect a
 # smaller gap here than on dual particle):
-bash scripts/run_bounce_example.sh --tau-factor=2.0 experiment=bounce_baumgartner \
+bash scripts/run_bounce_example.sh --identity-check --tau-factor=1.0 \
+  experiment=bounce_baumgartner \
   train.sparsity_enabled=false
 
 # Rung 2 — invisible mass (equal radii, uniform masses): identical otherwise, so
 # any MCC drop vs rung 1 isolates the weaker sufficient-variability (mass acts
 # only through collision impulses). MCC ≈ rung 1 -> method robust; MCC ≈ 0 -> edge found.
-bash scripts/run_bounce_example.sh --tau-factor=2.0 experiment=bounce_baumgartner \
+bash scripts/run_bounce_example.sh --identity-check --tau-factor=1.0 \
+  experiment=bounce_baumgartner \
   data.radius_from_mass=false data.mass_normal=null
 
-# (Comparability note, D13: Baumgartner's bounce uses LONG trajectories — add
-#  data.clip_len=40 to rungs 1-2 for the like-for-like runs. Rung 2.5 — states +
-#  recurrent per-object encoder, isolating the recurrence leak — is planned.)
+# The resolved Stage-1 config already uses 60-step trajectories with a
+# 30-step inference context. Rung 2.5 — a recurrent per-object encoder that
+# isolates representation learning — remains planned.
 
 # Rung 3 — pixels, invisible mass (the paper's claim; SAVi from pixels):
 python scripts/train.py data.name=bounce data.clip_len=10 train.steps=...   # vision regime

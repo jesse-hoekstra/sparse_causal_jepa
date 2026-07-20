@@ -1,5 +1,7 @@
 """Physics and contract tests for the bounce synthetic ground-truth system."""
 
+from pathlib import Path
+
 import pytest
 import torch
 from torch.utils.data import DataLoader
@@ -57,6 +59,71 @@ def test_balls_stay_in_box_and_speed_preserved_on_walls() -> None:
     speeds = states[..., 2:].square().sum(dim=-1).sqrt()
     torch.testing.assert_close(speeds, speeds[0].expand_as(speeds))
     assert states[-1, 0, 2] > 0  # reflected back to the right
+
+
+def test_wall_overshoot_reflects_about_radius_boundary() -> None:
+    """The remainder after impact is preserved and varies smoothly with radius."""
+    masses = torch.tensor([[1.0]])
+    positions = torch.tensor([[0.15, 0.5]])
+    velocities = torch.tensor([[-0.8, 0.0]])
+    small, small_contacts = simulate_bounce(
+        masses,
+        positions,
+        velocities,
+        num_steps=2,
+        dt=0.1,
+        substeps=1,
+        radii=torch.tensor([0.08]),
+    )
+    large, large_contacts = simulate_bounce(
+        masses,
+        positions,
+        velocities,
+        num_steps=2,
+        dt=0.1,
+        substeps=1,
+        radii=torch.tensor([0.09]),
+    )
+    # Integrated center is x=0.07. Reflection about x=r gives 2r-0.07.
+    torch.testing.assert_close(small[-1, 0, 0], torch.tensor(0.09))
+    torch.testing.assert_close(large[-1, 0, 0], torch.tensor(0.11))
+    torch.testing.assert_close(large[-1, 0, 0] - small[-1, 0, 0], torch.tensor(0.02))
+    torch.testing.assert_close(small[-1, 0, 2:], large[-1, 0, 2:])
+    assert small_contacts[0, 0, 0]
+    assert large_contacts[0, 0, 0]
+
+
+def test_pair_projection_exposes_common_mass_scale_through_radii() -> None:
+    """Common mass scaling leaves impulses fixed but moves the contact surface."""
+    positions = torch.tensor([[0.38, 0.5], [0.62, 0.5]])
+    velocities = torch.tensor([[0.2, 0.0], [-0.2, 0.0]])
+
+    trajectories: list[torch.Tensor] = []
+    for scale in (1.0, 1.001, 1.002):
+        masses = scale * torch.tensor([[1.0], [2.0]])
+        radii = scale * torch.tensor([0.07, 0.14])
+        states, contacts = simulate_bounce(
+            masses,
+            positions,
+            velocities,
+            num_steps=2,
+            dt=0.1,
+            substeps=1,
+            radii=radii,
+        )
+        assert contacts[0, 0, 1]
+        assert contacts[0, 1, 0]
+        separation = (states[-1, 0, :2] - states[-1, 1, :2]).square().sum().sqrt()
+        torch.testing.assert_close(separation, radii.sum(), atol=2e-7, rtol=0)
+        trajectories.append(states)
+
+    # Elastic velocities depend only on mass ratios, while corrected positions
+    # vary linearly with the absolute radius/mass scale on this fixed branch.
+    torch.testing.assert_close(trajectories[0][-1, :, 2:], trajectories[2][-1, :, 2:])
+    first_delta = trajectories[1][-1, :, :2] - trajectories[0][-1, :, :2]
+    second_delta = trajectories[2][-1, :, :2] - trajectories[1][-1, :, :2]
+    assert first_delta.abs().max() > 0
+    torch.testing.assert_close(first_delta, second_delta, atol=2e-7, rtol=0)
 
 
 def test_contacts_symmetric_no_diagonal() -> None:
@@ -230,6 +297,32 @@ def test_initial_placement_respects_per_ball_radii() -> None:
         assert (diff[off_diag] > min_sep[off_diag]).all()
 
 
+def test_recorded_states_respect_all_contact_surfaces() -> None:
+    """Wall and pair projection leave every recorded Baumgartner state feasible."""
+    dataset = BounceDataset(
+        num_episodes=6,
+        clip_len=20,
+        num_balls=5,
+        seed=19,
+        radius=0.08,
+        mass_normal=(1.5, 0.5),
+        radius_from_mass=True,
+        render=False,
+    )
+    for index in range(len(dataset)):
+        item = dataset[index]
+        radii = 0.08 * item["params"].squeeze(-1) / 1.5
+        positions = item["states"][..., :2]
+        assert (positions >= radii.view(1, -1, 1) - 1e-6).all()
+        assert (positions <= 1 - radii.view(1, -1, 1) + 1e-6).all()
+        distances = (
+            positions.unsqueeze(2) - positions.unsqueeze(1)
+        ).square().sum(dim=-1).sqrt()
+        minimum = radii.unsqueeze(0) + radii.unsqueeze(1)
+        off_diagonal = ~torch.eye(dataset.num_balls, dtype=torch.bool)
+        assert (distances[:, off_diagonal] >= minimum[off_diagonal] - 1e-6).all()
+
+
 def _tiny_kwargs() -> dict[str, object]:
     return {
         "num_episodes": 6,
@@ -277,6 +370,17 @@ def test_preload_refuses_mismatched_generation_settings(tmp_path) -> None:  # no
     too_many = {**_tiny_kwargs(), "num_episodes": 7}
     with pytest.raises(ValueError, match="holds"):
         BounceDataset(**too_many, preload=path)  # pyright: ignore[reportArgumentType]
+
+
+def test_preload_refuses_legacy_simulator_version(tmp_path: Path) -> None:
+    """Collision-rule changes invalidate pre-generated trajectories."""
+    path = str(tmp_path / "legacy.pt")
+    _write_preload(path)
+    payload = torch.load(path, weights_only=True)
+    payload["meta"].pop("simulator_version")
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="D12"):
+        BounceDataset(**_tiny_kwargs(), preload=path)  # pyright: ignore[reportArgumentType]
 
 
 def test_preload_requires_states_regime(tmp_path) -> None:  # noqa: ANN001
