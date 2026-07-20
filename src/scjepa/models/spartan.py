@@ -13,9 +13,10 @@ Mechanics traceable to the SPARTAN paper:
     Eq. 4   masked scaled dot-product attention; ŝ_i = MLP(h_i + s_i).
     Eq. 5   path matrix  Ā = (A_L + I)···(A_1 + I); token j is a local causal
             parent of output i  iff  Ā_ij ≥ 1 (I from the residual paths).
-    Eq. 6   sparsity penalty |Ā| (sum of entries) — returned as
-            ``SpartanOutput.sparsity``; the Lagrangian-relaxation schedule for
-            its weight (App. A.2) lives in the training loop, not here.
+    Eq. 6   sparsity penalty |Ā| (sum of paths into decoded outputs) —
+            returned as ``SpartanOutput.sparsity``; the Lagrangian-relaxation
+            schedule for its weight (App. A.2) lives in the training loop, not
+            here. The full-token path matrix is retained for graph diagnostics.
 
 Choices the paper leaves open (flagged per project policy, decisions D10):
     * D19 rollout gate coupling: the paper's objective (Eq. 6) is
@@ -34,6 +35,11 @@ Choices the paper leaves open (flagged per project policy, decisions D10):
     * Eval mode is deterministic: A_ij = 1 iff sigmoid(q_i·k_j) > 1/2.
     * Learned role embeddings (state/param/aux) are added to the tokens so the
       roles are distinguishable while slot-permutation equivariance is kept.
+    * ``paired_object_attention=True`` adds a learned relation bias for the
+      entry state i ← parameter i. This preserves
+      equivariance to a JOINT object permutation while making an independent
+      reassignment of parameter tokens observable to the decoder. It is off by
+      default so existing configurations and checkpoints retain their behavior.
 
 Symbol table:
     S_t     state tokens       (B, N, d)     ``state``
@@ -102,6 +108,7 @@ class SpartanLayer(nn.Module):
         temperature: float,
         dense: bool = False,
         identity: bool = False,
+        paired_object_attention: bool = False,
     ) -> None:
         """Build the layer.
 
@@ -113,7 +120,7 @@ class SpartanLayer(nn.Module):
             dense: A ≡ 1 — no gate sampling, standard softmax attention. This
                 is SPARTAN's "fully connected model" (p.16), the reference
                 whose loss defines τ. The gated model with sparsity disabled is
-                NOT that reference: its gates keep sampling ~Bern(σ) and inject
+                NOT that reference: its gates keep sampling Bernoulli masks and inject
                 masking noise, inflating the measured loss (audit F-8).
             identity: A ≡ 0 — attention output is zero for every token; only
                 the residual + MLP path survives, so each token is predicted
@@ -122,6 +129,10 @@ class SpartanLayer(nn.Module):
                 the best any model without cross-token (incl. param→state)
                 edges can achieve, the floor τ must sit BELOW for sparsity to
                 be forced to keep true edges. Mutually exclusive with dense.
+            paired_object_attention: Add a learned bias to the gate/attention
+                logit for state i ← parameter i. The caller supplies the
+                relation mask because
+                only ``Spartan`` knows the state/parameter/aux token layout.
         """
         super().__init__()
         if mlp_num_layers < 2:
@@ -131,11 +142,20 @@ class SpartanLayer(nn.Module):
         self.temperature = temperature
         self.dense = dense
         self.identity = identity
+        self.paired_object_attention = paired_object_attention
         self.scale = 1.0 / math.sqrt(dim)
         self.norm = nn.LayerNorm(dim)
         self.project_q = nn.Linear(dim, dim, bias=False)
         self.project_k = nn.Linear(dim, dim, bias=False)
         self.project_v = nn.Linear(dim, dim, bias=False)
+        if paired_object_attention:
+            # A non-zero initialization makes the newly exposed relation usable
+            # immediately without privileging the reverse scratchpad direction.
+            self.state_from_param_bias: nn.Parameter | None = nn.Parameter(torch.tensor(1.0))
+        else:
+            # Keep the legacy state_dict exactly unchanged when the feature is
+            # disabled (the backward-compatible default).
+            self.register_parameter("state_from_param_bias", None)
         widths = [dim] + [mlp_hidden_size] * (mlp_num_layers - 1) + [dim]
         mlp_layers: list[nn.Module] = []
         for i in range(mlp_num_layers):
@@ -148,6 +168,7 @@ class SpartanLayer(nn.Module):
         self,
         tokens: Float[Tensor, "b t d"],
         gate_noise: Float[Tensor, "b t t"] | None = None,
+        paired_state_from_param: Float[Tensor, "t t"] | None = None,
     ) -> tuple[Float[Tensor, "b t d"], Float[Tensor, "b t t"], Float[Tensor, ""]]:
         """Apply hard-masked attention; return (tokens, adjacency A_l, logit penalty).
 
@@ -156,12 +177,18 @@ class SpartanLayer(nn.Module):
         None = fresh draw (single-step behavior). Ignored in dense/identity
         modes and in eval mode.
 
+        ``paired_state_from_param`` identifies state i ← parameter i entries
+        in the full token matrix. It is added to both the Bernoulli gate logits
+        and masked-attention logits. The reverse direction is deliberately not
+        privileged: parameter tokens should not become state scratchpads.
+        Auxiliary-token rows and columns remain zero in the relation mask.
+
         The logit penalty is Baumgartner et al. Eq. 11 per layer:
         mean_ij [exp(q_i·k_j) + exp(-q_i·k_j)] — penalises large attention
         logits so the softmax keeps gradient during the pruning phase (their
-        F.4 ablation: without it the path loss plateaus). Logits are clamped
-        at ±10 inside the penalty only, to keep exp() finite; the gradient
-        still pushes oversized logits down.
+        F.4 ablation: without it the path loss plateaus). The exact exponential
+        is used through absolute logit 30 and continued linearly beyond that point to
+        keep fp32 finite while retaining a strong restoring gradient.
         """
         normed = self.norm(tokens)
         q = self.project_q(normed)
@@ -177,6 +204,21 @@ class SpartanLayer(nn.Module):
         # reading, and the only one under which Eq. 11's "keep logits small"
         # aim is coherent. INTERPRETATION, not paper-literal (no public code).
         adjacency_logits = torch.einsum("bid,bjd->bij", q, k) * self.scale
+        if self.paired_object_attention:
+            if paired_state_from_param is None:
+                raise ValueError("paired-object attention requires its relation mask")
+            expected_shape = (tokens.shape[1], tokens.shape[1])
+            if paired_state_from_param.shape != expected_shape:
+                raise ValueError(
+                    "paired-object relation masks must match the token matrix "
+                    f"{expected_shape}, got {tuple(paired_state_from_param.shape)}"
+                )
+            assert self.state_from_param_bias is not None
+            adjacency_logits = (
+                adjacency_logits + self.state_from_param_bias * paired_state_from_param
+            )
+        elif paired_state_from_param is not None:
+            raise ValueError("relation masks passed while paired-object attention is disabled")
         if self.dense:
             adjacency = torch.ones_like(adjacency_logits)
         elif self.identity:
@@ -256,6 +298,7 @@ class Spartan(nn.Module):
         param_size: int | None = None,
         dense: bool = False,
         identity: bool = False,
+        paired_object_attention: bool = False,
     ) -> None:
         """Build the predictor.
 
@@ -286,6 +329,12 @@ class Spartan(nn.Module):
                 train.sparsity_enabled=false, matched budget vs the dense
                 reference; the gap between their constraint losses is the τ
                 window). Mutually exclusive with dense.
+            paired_object_attention: Expose the index-level relation between
+                parameter i → state i as a learned relation bias in every
+                layer's gate and attention logits. This relation is equivariant
+                to a joint permutation of state/parameter pairs, but makes an
+                independent parameter reassignment visible. False preserves
+                legacy behavior and checkpoint structure.
         """
         super().__init__()
         if dense and identity:
@@ -295,6 +344,7 @@ class Spartan(nn.Module):
         self.aux_dim = aux_dim
         self.dense = dense
         self.identity = identity
+        self.paired_object_attention = paired_object_attention
         dim = embed_dim if embed_dim is not None else slot_size
         self.in_project = nn.Linear(slot_size, dim) if dim != slot_size else nn.Identity()
         # Separate param-token projection ONLY when Ŝ^ph lives in a different
@@ -314,6 +364,7 @@ class Spartan(nn.Module):
                     temperature,
                     dense=dense,
                     identity=identity,
+                    paired_object_attention=paired_object_attention,
                 )
                 for _ in range(num_layers)
             ]
@@ -350,6 +401,11 @@ class Spartan(nn.Module):
         explode at mid density (runs 7wupt6pw / 0ta5ymcw / u94wqvcb; decisions
         D19). Returns None in dense/identity mode — nothing is sampled there.
         """
+        if state.shape[:2] != params.shape[:2]:
+            raise ValueError(
+                "state and params must share batch/slot axes, got "
+                f"{tuple(state.shape[:2])} vs {tuple(params.shape[:2])}"
+            )
         if self.dense or self.identity:
             return None
         num_tokens = 2 * state.shape[1] + (aux.shape[1] if aux is not None else 0)
@@ -376,7 +432,8 @@ class Spartan(nn.Module):
         Returns:
             ``SpartanOutput(prediction, path_matrix, sparsity)`` — prediction
             (B, N, d) at state positions; Ā over the full token set with order
-            [state 0..N-1 | params N..2N-1 | aux 2N..]; |Ā| averaged over batch.
+            [state 0..N-1 | params N..2N-1 | aux 2N..]; the sum of Ā's
+            decoded state rows, averaged over the batch, as ``sparsity``.
         """
         if (
             state.ndim != 3
@@ -402,6 +459,16 @@ class Spartan(nn.Module):
             pieces.append(self.aux_project(aux) + self.aux_embed)
         tokens = torch.cat(pieces, dim=1)  # (B, T, embed_dim)
 
+        paired_state_from_param: Tensor | None = None
+        if self.paired_object_attention:
+            # Token order is [state_0..N-1 | param_0..N-1 | aux_0..M-1].
+            # These index relations commute with a JOINT permutation of the
+            # state and parameter blocks. Aux entries deliberately stay zero.
+            relation_shape = (tokens.shape[1], tokens.shape[1])
+            paired_state_from_param = tokens.new_zeros(relation_shape)
+            object_index = torch.arange(num_slots, device=tokens.device)
+            paired_state_from_param[object_index, num_slots + object_index] = 1
+
         if gate_noise is not None and len(gate_noise) != len(self.layers):
             raise ValueError(
                 f"gate_noise has {len(gate_noise)} tensors for {len(self.layers)} layers"
@@ -410,7 +477,9 @@ class Spartan(nn.Module):
         logit_penalties: list[Tensor] = []
         for index, layer in enumerate(self.layers):
             tokens, adjacency, layer_logit_penalty = layer(
-                tokens, gate_noise=gate_noise[index] if gate_noise is not None else None
+                tokens,
+                gate_noise=gate_noise[index] if gate_noise is not None else None,
+                paired_state_from_param=paired_state_from_param,
             )
             adjacencies.append(adjacency)
             logit_penalties.append(layer_logit_penalty)
@@ -421,9 +490,14 @@ class Spartan(nn.Module):
         for adjacency in adjacencies:
             path_matrix = (adjacency + eye) @ path_matrix
 
-        # Eq. 6: |Ā| — includes the constant pure-residual diagonal contribution,
-        # which carries zero gradient (documented; matches the paper's |Ā|).
-        sparsity = path_matrix.sum(dim=(1, 2)).mean()
+        # Eq. 6 adapted to this project's heterogeneous token layout: only the
+        # first N rows are decoded as predictions. Paths ending at parameter or
+        # auxiliary rows after the final layer cannot affect the loss, so
+        # charging for them distorts the graph objective. Keep the complete
+        # path matrix above for graph readout/debugging, but penalize precisely
+        # the paths into decoded state outputs. The residual state diagonal is
+        # constant and therefore contributes no gradient.
+        sparsity = path_matrix[:, :num_slots].sum(dim=(1, 2)).mean()
 
         return SpartanOutput(
             prediction=self.out_project(tokens[:, :num_slots]),

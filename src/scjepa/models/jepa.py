@@ -28,6 +28,7 @@ from scjepa.models.channel_split import (
     AttnPooling,
     CrossSlotAttnPooling,
     KinematicHead,
+    TrackAwareAttnPooling,
     build_pooling,
 )
 from scjepa.models.savi import SAViEncoder
@@ -137,7 +138,7 @@ class SCJepa(nn.Module):
         self,
         context_encoder: SAViEncoder,
         target_encoder: SAViEncoder,
-        pooling: AttnPooling | CrossSlotAttnPooling,
+        pooling: AttnPooling | CrossSlotAttnPooling | TrackAwareAttnPooling,
         kinematic_head: KinematicHead,
         predictor: Spartan,
     ) -> None:
@@ -216,12 +217,14 @@ def build_scjepa(
     enc_out_channels: int = 128,
     pooling_heads: int = 4,
     pooling_type: str = "cross_slot",  # D14 default; "per_slot" = D4 ablation
+    param_dim: int | None = None,
     max_history: int = 64,
     spartan_layers: int = 3,
     spartan_embed_dim: int | None = 512,
     spartan_mlp_hidden: int = 512,
     spartan_mlp_layers: int = 3,
     spartan_temperature: float = 1.0,
+    spartan_paired_object_attention: bool = False,
     aux_dim: int | None = None,
     spartan_dense: bool = False,
     spartan_identity: bool = False,
@@ -250,10 +253,17 @@ def build_scjepa(
         enc_out_channels=enc_out_channels,
         single_frame=True,
     )
+    resolved_param_dim = slot_size if param_dim is None else param_dim
     return SCJepa(
         context_encoder=context_encoder,
         target_encoder=target_encoder,
-        pooling=build_pooling(pooling_type, slot_size, pooling_heads, max_history),
+        pooling=build_pooling(
+            pooling_type,
+            slot_size,
+            pooling_heads,
+            max_history,
+            param_dim=param_dim,
+        ),
         kinematic_head=KinematicHead(slot_size=slot_size),  # state_size = d (D9)
         predictor=Spartan(
             slot_size=slot_size,
@@ -262,7 +272,9 @@ def build_scjepa(
             mlp_hidden_size=spartan_mlp_hidden,
             mlp_num_layers=spartan_mlp_layers,
             temperature=spartan_temperature,
+            paired_object_attention=spartan_paired_object_attention,
             aux_dim=aux_dim,
+            param_size=resolved_param_dim if resolved_param_dim != slot_size else None,
             dense=spartan_dense,
             identity=spartan_identity,
         ),

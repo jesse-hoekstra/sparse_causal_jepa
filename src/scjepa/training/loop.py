@@ -8,19 +8,19 @@ collapse (D3/D7).
 
 Objective per step (D6 + SPARTAN App. A.2):
 
-    total = hungarian_mse(Ŝ_{t+1}, S_{t+1})
+    total = prediction_mse(Ŝ_{t+1}, S_{t+1})
           + λ_logit · logit_penalty                                (Eq. 11)
           + λ_reg · [reg(context slots) + reg(target slots)]      (both branches)
           + (1/λ_s) · |Ā|                                          (if enabled)
 
-with λ_s driven by the GECO-style dual update in ``SparsityLagrangian``. The
-dual compares the SCALE-FREE constraint (D17)
+with λ_s driven by the GECO-style dual update in ``SparsityLagrangian``. For
+learned targets the dual compares the scale-free D17 constraint
 
     constraint = pred / Var(target batch, detached) + λ_logit · logit_penalty
 
-against τ — not raw pred (raw MSE lives in a trainable space whose scale is
-solution-dependent; see D17 in docs/decisions.md). τ is therefore a relative-
-error target; 1.0 ≈ predicting the batch mean.
+against τ because raw MSE lives in a trainable representation. Literal GT
+states instead use raw MSE, matching Baumgartner/SPARTAN's fixed observation-
+space constraint. ``constraint_normalization=auto`` selects between them.
 The ±sparsity ablation is the ``sparsity`` config toggle.
 
 Checkpoints carry model/optimizer/controller/step/RNG state; resume is exact
@@ -40,7 +40,13 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
 from scjepa.eval.harness import evaluate_identifiability
-from scjepa.losses import SlotRegularizer, hungarian_mse
+from scjepa.losses import (
+    SlotRegularizer,
+    prediction_constraint,
+    prediction_mse,
+    resolve_constraint_normalization,
+    resolve_prediction_matching,
+)
 from scjepa.models.jepa import JepaOutput, SCJepa
 from scjepa.models.state_jepa import StateJepa
 from scjepa.training.lagrangian import SparsityLagrangian
@@ -78,6 +84,7 @@ class TrainConfig:
     grad_clip: float = 1.0
     lambda_reg: float = 1.0
     sparsity_enabled: bool = True  # the ±sparsity ablation toggle
+    sparsity_warmup_steps: int = 0
     sparsity_tau: float = 0.1
     sparsity_step_size: float = 1e-3
     sparsity_lambda_init: float = 1e3
@@ -91,13 +98,19 @@ class TrainConfig:
     # Attention-logit regularisation (Baumgartner Eq. 11): keeps softmax
     # gradients alive during the pruning phase; 0 disables. When enabled it is
     # part of the Lagrangian constraint (their Eq. 9), so calibrate tau with it
-    # (on the D17 scale-free constraint the eval harness reports).
+    # on the configured raw/normalized scale reported by the eval harness.
     lambda_logit: float = 0.0
     regularizer: str = "visreg"  # D3: "visreg" | "sigreg"
     num_projections: int = 256
     seed: int = 0
     device: str = "cpu"
     input_key: str = "frames"  # "frames" (vision, SCJepa) | "states" (StateJepa)
+    # "auto": aligned MSE for StateJepa's tracked object rows; visual learned-
+    # slot targets remain unordered and use Hungarian matching.
+    prediction_matching: str = "auto"  # "auto" | "aligned" | "hungarian"
+    # "auto": raw MSE on literal GT states; variance-normalized MSE when the
+    # target representation itself is trainable.
+    constraint_normalization: str = "auto"  # auto | raw | target_variance
     # Pool one S^ph from the first context_len steps; the remaining
     # K = L - context_len transitions are predicted. None -> L-1 (K = 1).
     context_len: int | None = None
@@ -149,8 +162,18 @@ class Trainer:
     ) -> None:
         """Build optimizer, regularizer, and sparsity controller around the model."""
         seed_everything(config.seed)
+        if config.sparsity_warmup_steps < 0:
+            raise ValueError("sparsity_warmup_steps must be non-negative")
         self.config = config
         self.eval_dataset = eval_dataset
+        self.prediction_matching = resolve_prediction_matching(
+            config.prediction_matching,
+            object_aligned=isinstance(model, StateJepa),
+        )
+        self.constraint_normalization = resolve_constraint_normalization(
+            config.constraint_normalization,
+            gt_states=isinstance(model, StateJepa) and model.gt_states,
+        )
         if config.eval_every is not None:
             if eval_dataset is None:
                 raise ValueError("eval_every set but no eval_dataset provided")
@@ -221,31 +244,32 @@ class Trainer:
             rollout_horizon=self.config.rollout_horizon,
         )
 
-        pred_loss = hungarian_mse(output.prediction, output.target_slots)
+        pred_loss = prediction_mse(
+            output.prediction, output.target_slots, self.prediction_matching
+        )
         reg_loss = self.regularizer(output.context_slots) + self.regularizer(output.target_slots)
         logit_loss = self.config.lambda_logit * output.logit_penalty
         # Gradient objective (Baumgartner Eq. 10): raw pred + logit
         # regularisation. VISReg stays OUTSIDE the constraint — it is the
         # collapse/scale anchor (D12) and must not trade off against sparsity.
         total = pred_loss + logit_loss + self.config.lambda_reg * reg_loss
-        if self.config.sparsity_enabled:
+        sparsity_active = (
+            self.config.sparsity_enabled and self.step >= self.config.sparsity_warmup_steps
+        )
+        if sparsity_active:
             total = total + self.lagrangian.penalty_weight * output.sparsity
 
         with torch.no_grad():
             # Collapse indicator: per-dimension std of target slots (D3 — nothing
             # architectural prevents collapse, so this must be watched).
             slot_std = output.target_slots.reshape(-1, output.target_slots.shape[-1]).std(dim=0)
-            # D17: the quantity the DUAL compares to τ is scale-free —
-            # pred / Var(target batch) + λ_logit·logit_penalty. Raw pred is an
-            # MSE in a TRAINABLE space whose scale is solution-dependent (the
-            # identity and dense references equilibrate at different stds), so
-            # a raw-MSE τ is measured with a moving, model-dependent ruler.
-            # Eq. 9's letter assumes a fixed ruler (Baumgartner: observation
-            # space; SPARTAN: frozen embeddings) — dividing by the detached
-            # target variance restores that property. Gradients are untouched:
-            # this quantity only drives the λ update and is logged/eval'd.
+            # Learned target spaces use D17's detached variance normalization;
+            # literal GT states already are Baumgartner's fixed ruler and use
+            # raw MSE. This quantity only drives the dual update and logging.
             target_var = slot_std.pow(2).mean().clamp_min(1e-6)
-            constraint_loss = pred_loss.detach() / target_var + logit_loss.detach()
+            constraint_loss = prediction_constraint(
+                pred_loss.detach(), target_var, self.constraint_normalization
+            ) + logit_loss.detach()
 
         if not torch.isfinite(total):
             raise RuntimeError(
@@ -280,7 +304,7 @@ class Trainer:
         else:
             self.consecutive_skips = 0
             self.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
-            if self.config.sparsity_enabled:
+            if sparsity_active:
                 self.lagrangian.update(constraint_loss)
 
         return {
@@ -291,9 +315,17 @@ class Trainer:
             "loss/logit": logit_loss.item(),
             "sparsity/constraint": constraint_loss.item(),
             "sparsity/lambda": float(torch.exp(self.lagrangian.log_lambda).item()),
-            # Thresholded edge fraction (>= 0.5, as in eval/graph.py). Path-
-            # matrix entries are path COUNTS; the old sum/(tokens^2) exceeded 1.
-            "sparsity/path_density": (output.path_matrix >= 0.5).float().mean().item(),
+            "sparsity/active": float(sparsity_active),
+            # Primary density covers the same decoded state rows optimized by
+            # output.sparsity. Keep the full-token density only as a diagnostic:
+            # final parameter rows are not decoded and need not prune.
+            "sparsity/path_density": (
+                output.path_matrix[:, : output.prediction.shape[1]] >= 0.5
+            )
+            .float()
+            .mean()
+            .item(),
+            "sparsity/path_density_full": (output.path_matrix >= 0.5).float().mean().item(),
             "health/target_slot_std_mean": slot_std.mean().item(),
             "health/target_slot_std_min": slot_std.min().item(),
             "health/grad_norm": float(grad_norm.item()),
@@ -342,6 +374,8 @@ class Trainer:
             context_len=self.config.context_len,
             rollout_horizon=self.config.rollout_horizon,
             lambda_logit=self.config.lambda_logit,
+            prediction_matching=self.prediction_matching,
+            constraint_normalization=self.constraint_normalization,
         )
         self.model.train()  # the harness switches to eval mode
         return {f"eval/{key}": value for key, value in report.metrics.items()}

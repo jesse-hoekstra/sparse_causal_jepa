@@ -10,7 +10,12 @@ Owner: model-architecture-engineer (method-faithfulness reviewed by
 paper-to-code-translator).
 """
 
-from scjepa.models.channel_split import AttnPooling, CrossSlotAttnPooling, KinematicHead
+from scjepa.models.channel_split import (
+    AttnPooling,
+    CrossSlotAttnPooling,
+    KinematicHead,
+    TrackAwareAttnPooling,
+)
 from scjepa.models.jepa import JepaOutput, SCJepa
 from scjepa.models.savi import SAViEncoder
 from scjepa.models.spartan import Spartan, SpartanOutput
@@ -26,4 +31,5 @@ __all__ = [
     "Spartan",
     "SpartanOutput",
     "StateJepa",
+    "TrackAwareAttnPooling",
 ]

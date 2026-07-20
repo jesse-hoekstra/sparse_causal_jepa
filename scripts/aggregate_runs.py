@@ -51,7 +51,7 @@ def main() -> None:
 
     seeds = [r.get("seed") for r in records]
     print(f"aggregating {len(records)} runs (seeds {seeds}):\n")
-    skip = {"seed", "step", "recovery_best_dim", "num_samples"}
+    skip = {"seed", "step", "recovery_best_dim", "num_samples", "num_pooled_samples"}
     aggregate: dict[str, dict[str, float]] = {}
     header = (
         f"{'metric':>14} | {'mean':>8} {'sd':>8} | "

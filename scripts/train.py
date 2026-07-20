@@ -15,7 +15,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from scjepa.models.jepa import SCJepa
 from scjepa.models.state_jepa import StateJepa
-from scjepa.training import MetricLogger, NoopLogger, TrainConfig, Trainer
+from scjepa.training import MetricLogger, NoopLogger, TrainConfig, Trainer, seed_everything
 from scjepa.training.factory import build_dataset, build_model
 
 
@@ -52,6 +52,9 @@ def _git_sha() -> str:
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig) -> None:
     """Build model + data + trainer from the config and run."""
+    # Trainer.__init__ seeds the training stream, but that is too late for
+    # reproducible dataset/model construction. Seed before either is built.
+    seed_everything(int(cfg.train.seed))
     out_dir = Path(str(HydraConfig.get().runtime.output_dir))
     resolved: dict[str, Any] = OmegaConf.to_container(cfg, resolve=True)  # pyright: ignore[reportAssignmentType]
     resolved["git_sha"] = _git_sha()
@@ -73,6 +76,7 @@ def main(cfg: DictConfig) -> None:
         grad_clip=cfg.train.grad_clip,
         lambda_reg=cfg.train.lambda_reg,
         sparsity_enabled=cfg.train.sparsity_enabled,
+        sparsity_warmup_steps=int(cfg.train.get("sparsity_warmup_steps", 0)),
         sparsity_tau=cfg.train.sparsity_tau,
         sparsity_step_size=cfg.train.sparsity_step_size,
         sparsity_lambda_init=cfg.train.sparsity_lambda_init,
@@ -84,6 +88,8 @@ def main(cfg: DictConfig) -> None:
         seed=cfg.train.seed,
         device=cfg.train.device,
         input_key=cfg.train.input_key,
+        prediction_matching=str(cfg.train.get("prediction_matching", "auto")),
+        constraint_normalization=str(cfg.train.get("constraint_normalization", "auto")),
         context_len=cfg.train.get("context_len", None),
         rollout_horizon=cfg.train.get("rollout_horizon", None),
         eval_every=cfg.train.get("eval_every", None),

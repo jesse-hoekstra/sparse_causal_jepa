@@ -36,7 +36,12 @@ def main() -> None:
     parser.add_argument(
         "run_dir", type=Path, help="Hydra run dir with resolved_config.yaml + last.pt"
     )
-    parser.add_argument("--episodes", type=int, default=512, help="held-out eval episodes")
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=5000,
+        help="held-out trajectories (5000 matches Baumgartner App. F.1)",
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     args = parser.parse_args()
 
@@ -62,6 +67,8 @@ def main() -> None:
         context_len=cfg.train.get("context_len", None),
         rollout_horizon=cfg.train.get("rollout_horizon", None),
         lambda_logit=cfg.train.get("lambda_logit", 0.0),
+        prediction_matching=str(cfg.train.get("prediction_matching", "auto")),
+        constraint_normalization=str(cfg.train.get("constraint_normalization", "auto")),
     )
 
     print(f"identifiability report for {args.run_dir} (step {payload['step']}):")

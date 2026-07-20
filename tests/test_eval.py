@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 from scjepa.data import BounceDataset
 from scjepa.eval import (
     correlation_matrix,
+    evaluate_identifiability,
     gt_graphs_from_contacts,
     marginal_recovery,
     mean_max_correlation,
@@ -16,6 +17,27 @@ from scjepa.eval import (
 from scjepa.models.jepa import build_scjepa
 
 N = 3
+
+
+def test_visual_identifiability_refuses_framewise_unaligned_slots() -> None:
+    """MCC/SHD are undefined until visual slots have persistent track alignment."""
+    model = build_scjepa(
+        resolution=64,
+        num_slots=N,
+        slot_size=16,
+        slot_mlp_size=32,
+        num_iterations=1,
+        enc_channels=(3, 8, 8),
+        enc_out_channels=16,
+        pooling_heads=2,
+        spartan_layers=1,
+        spartan_embed_dim=None,
+        spartan_mlp_hidden=32,
+        spartan_mlp_layers=2,
+    )
+    dataset = BounceDataset(num_episodes=1, clip_len=3, num_balls=N, resolution=64)
+    with pytest.raises(ValueError, match="trajectory-level"):
+        evaluate_identifiability(model, dataset, input_key="frames")
 
 
 def test_gt_graph_derivation() -> None:
@@ -76,6 +98,18 @@ def test_correlation_low_for_independent_noise() -> None:
     assert mean_max_correlation(learned, theta) < 0.2
 
 
+def test_episode_level_mcc_allows_one_global_parameter_permutation() -> None:
+    """Paper-shaped E x N MCC accepts a fixed learned-coordinate permutation."""
+    torch.manual_seed(7)  # pyright: ignore[reportUnknownMemberType]
+    theta = torch.randn(500, 5)
+    learned = theta[:, [2, 4, 1, 0, 3]]
+    assert mean_max_correlation(learned, theta) > 0.999
+    # Pooling episode and object destroys the coordinate relation and is not
+    # invariant to this legitimate learned-factor permutation.
+    pooled = mean_max_correlation(learned.reshape(-1, 1), theta.reshape(-1, 1))
+    assert pooled < 0.2
+
+
 def test_correlation_matrix_guards() -> None:
     with pytest.raises(ValueError, match="equal S"):
         correlation_matrix(torch.randn(4, 2), torch.randn(5, 1))
@@ -131,3 +165,15 @@ def test_nonlinear_mcc_beats_pearson_on_diffeomorphism() -> None:
     # And near-zero relationship stays near zero (no overfitting inflation).
     noise_score = nonlinear_mcc(torch.randn(800, 4), theta, epochs=200)
     assert noise_score < 0.3
+
+
+def test_nonlinear_mcc_preserves_global_torch_rng() -> None:
+    """Periodic evaluation must not change subsequent stochastic training draws."""
+    from scjepa.eval import nonlinear_mcc
+
+    torch.manual_seed(17)  # pyright: ignore[reportUnknownMemberType]
+    target = torch.randn(40, 1)
+    learned = torch.cat((target.square(), torch.randn(40, 1)), dim=1)
+    before = torch.get_rng_state().clone()
+    nonlinear_mcc(learned, target, epochs=2, seed=9)
+    assert torch.equal(torch.get_rng_state(), before)

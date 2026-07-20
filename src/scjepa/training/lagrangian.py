@@ -41,9 +41,10 @@ class SparsityLagrangian(nn.Module):
             tau: Target constraint value (SPARTAN sets it to the loss of a fully
                 connected model — calibrate under the IDENTICAL config with only
                 the sparsity toggle off; τ is config-dependent, D12). Since D17
-                the caller feeds ``update`` the SCALE-FREE constraint
-                pred/Var(target) + λ_logit·logit_penalty, so τ is a relative-
-                error target (1.0 ≈ predicting the batch mean), not a raw MSE.
+                the caller feeds ``update`` either raw prediction MSE (literal
+                GT-state ruler) or D17's variance-normalized prediction error
+                (trainable target space), plus the logit term. Tau must be
+                calibrated with the same configured normalization.
             step_size: alpha, dual ascent step size on log λ.
             momentum: Moving-average momentum for the (loss - τ) estimate.
             lambda_init: Initial λ (paper: high, so sparsity starts switched off).
@@ -55,8 +56,8 @@ class SparsityLagrangian(nn.Module):
         super().__init__()
         if lambda_init <= 0:
             raise ValueError("lambda_init must be positive")
-        if not lambda_min < lambda_init < lambda_max:
-            raise ValueError("need lambda_min < lambda_init < lambda_max")
+        if not lambda_min <= lambda_init <= lambda_max:
+            raise ValueError("need lambda_min <= lambda_init <= lambda_max")
         self.tau = tau
         self.step_size = step_size
         self.momentum = momentum

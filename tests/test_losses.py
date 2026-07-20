@@ -3,7 +3,17 @@
 import pytest
 import torch
 
-from scjepa.losses import RegularizerKind, SlotRegularizer, hungarian_mse, match_slots
+from scjepa.losses import (
+    RegularizerKind,
+    SlotRegularizer,
+    aligned_mse,
+    hungarian_mse,
+    match_slots,
+    prediction_constraint,
+    prediction_mse,
+    resolve_constraint_normalization,
+    resolve_prediction_matching,
+)
 
 B, N, D = 4, 5, 16
 
@@ -31,6 +41,37 @@ def test_permutation_invariance(pred: torch.Tensor, target: torch.Tensor) -> Non
     for _ in range(3):
         perm = torch.randperm(N)
         torch.testing.assert_close(hungarian_mse(pred, target[:, perm]), baseline)
+
+
+def test_aligned_loss_keeps_known_object_correspondence() -> None:
+    """Tracked GT rows must not be silently relabelled to lower the error."""
+    pred = torch.tensor([[[0.0], [2.0]]])
+    permuted_target = torch.tensor([[[2.0], [0.0]]])
+    torch.testing.assert_close(hungarian_mse(pred, permuted_target), torch.tensor(0.0))
+    torch.testing.assert_close(aligned_mse(pred, permuted_target), torch.tensor(4.0))
+    torch.testing.assert_close(
+        prediction_mse(pred, permuted_target, "aligned"), torch.tensor(4.0)
+    )
+
+
+def test_prediction_matching_auto_policy() -> None:
+    assert resolve_prediction_matching("auto", object_aligned=True) == "aligned"
+    assert resolve_prediction_matching("auto", object_aligned=False) == "hungarian"
+    assert resolve_prediction_matching("hungarian", object_aligned=True) == "hungarian"
+    with pytest.raises(ValueError, match="unknown prediction matching"):
+        resolve_prediction_matching("nearest", object_aligned=True)
+
+
+def test_constraint_normalization_auto_policy() -> None:
+    assert resolve_constraint_normalization("auto", gt_states=True) == "raw"
+    assert resolve_constraint_normalization("auto", gt_states=False) == "target_variance"
+    loss, variance = torch.tensor(0.3), torch.tensor(0.1)
+    torch.testing.assert_close(prediction_constraint(loss, variance, "raw"), loss)
+    torch.testing.assert_close(
+        prediction_constraint(loss, variance, "target_variance"), torch.tensor(3.0)
+    )
+    with pytest.raises(ValueError, match="unknown constraint normalization"):
+        resolve_constraint_normalization("batch_mean", gt_states=True)
 
 
 def test_matches_aligned_mse_when_slots_correspond(pred: torch.Tensor) -> None:

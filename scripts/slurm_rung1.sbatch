@@ -1,5 +1,5 @@
 #!/bin/bash
-# Rung 1 (Baumgartner-exact bounce, D13): 8 seeds in parallel, one per task.
+# Rung 1 (Baumgartner-aligned true-state JEPA, D24): 8 seeds in parallel.
 # Submit from the repo root:   sbatch scripts/slurm_rung1.sbatch
 #
 # Prerequisites on the cluster (once):
@@ -26,7 +26,8 @@ srun --ntasks=8 bash -c '
   SEED=${SLURM_PROCID}
   export PYTHON=.venv/bin/python
   bash scripts/run_bounce_example.sh \
-    --run-tag="rung1_seed${SEED}" --tau-factor=2.0 --calib-steps=6000 --main-steps=300000 \
+    --run-tag="rung1_seed${SEED}" --tau-factor=1.0 --main-steps=300000 \
+    --eval-episodes=5000 --identity-check \
     experiment=bounce_baumgartner \
     train.seed=${SEED} data.seed=${SEED} \
     wandb.enabled=true train.eval_every=5000 train.eval_episodes=128 \

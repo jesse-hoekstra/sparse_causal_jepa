@@ -58,6 +58,31 @@ def test_scjepa_forward_contract() -> None:
         model(torch.randn(2, 1, 3, RES, RES))  # needs at least context + target
 
 
+def test_scjepa_supports_track_aware_scalar_parameters() -> None:
+    """The future learned-slot rung can retain the same scalar/pairing contract."""
+    model = build_scjepa(
+        resolution=RES,
+        num_slots=3,
+        slot_size=16,
+        slot_mlp_size=32,
+        num_iterations=1,
+        enc_channels=(3, 8, 8),
+        enc_out_channels=16,
+        pooling_heads=2,
+        pooling_type="track_aware",
+        param_dim=1,
+        spartan_layers=1,
+        spartan_embed_dim=None,
+        spartan_mlp_hidden=32,
+        spartan_mlp_layers=2,
+        spartan_paired_object_attention=True,
+    )
+    out = model(torch.randn(2, 4, 3, RES, RES))
+    assert out.causal_params.shape == (2, 3, 1)
+    assert model.predictor.param_size == 1
+    assert model.predictor.paired_object_attention
+
+
 def test_lagrangian_dual_dynamics() -> None:
     """λ must grow while error > τ (sparsity off) and shrink once error < τ."""
     controller = SparsityLagrangian(tau=1.0, step_size=0.1, lambda_init=10.0, momentum=0.0)
@@ -78,6 +103,8 @@ def test_lagrangian_dual_dynamics() -> None:
     for _ in range(50):
         clamped.update(torch.tensor(5.0))
     assert torch.exp(clamped.log_lambda) <= 100.0 + 1e-4
+    at_ceiling = SparsityLagrangian(tau=1.0, lambda_init=100.0, lambda_max=100.0)
+    torch.testing.assert_close(torch.exp(at_ceiling.log_lambda), torch.tensor(100.0))
 
 
 def test_training_smoke(tmp_path: Path) -> None:
@@ -92,6 +119,7 @@ def test_training_smoke(tmp_path: Path) -> None:
         "loss/sparsity",
         "sparsity/lambda",
         "sparsity/path_density",
+        "sparsity/path_density_full",
         "health/target_slot_std_mean",
         "health/target_slot_std_min",
         "health/grad_norm",
@@ -187,6 +215,33 @@ def test_sparsity_ablation_toggle(tmp_path: Path) -> None:
     assert abs(metrics["loss/total"] - expected_total) < 1e-5 * abs(expected_total)
 
 
+def test_sparsity_warmup_delays_path_penalty_and_dual(tmp_path: Path) -> None:
+    """Warm-up learns gated dynamics without applying path pressure or moving λ."""
+
+    class CaptureLogger:
+        def __init__(self) -> None:
+            self.records: list[dict[str, float]] = []
+
+        def log(self, step: int, metrics: dict[str, float]) -> None:
+            del step
+            self.records.append(metrics)
+
+    dataset = RandomClipDataset(num_clips=4, clip_len=3, resolution=RES, seed=1)
+    config = tiny_config(tmp_path, steps=2)
+    config.sparsity_warmup_steps = 1
+    logger = CaptureLogger()
+    trainer = Trainer(tiny_model(), dataset, config, logger)
+    trainer.train()
+
+    assert logger.records[0]["sparsity/active"] == 0.0
+    warmup_total = (
+        logger.records[0]["loss/pred"] + config.lambda_reg * logger.records[0]["loss/reg"]
+    )
+    assert abs(logger.records[0]["loss/total"] - warmup_total) < 1e-5 * abs(warmup_total)
+    assert logger.records[1]["sparsity/active"] == 1.0
+    assert trainer.lagrangian.ma_error != 0.0
+
+
 def test_periodic_eval_logs_metrics(tmp_path: Path) -> None:
     """eval_every emits held-out eval/* metrics through the logger (W&B path)."""
     from scjepa.data import BounceDataset
@@ -203,10 +258,13 @@ def test_periodic_eval_logs_metrics(tmp_path: Path) -> None:
     model = build_state_jepa(
         slot_size=16,
         pooling_heads=2,
+        pooling_type="track_aware",
+        param_dim=1,
         spartan_layers=1,
         spartan_embed_dim=None,
         spartan_mlp_hidden=32,
         spartan_mlp_layers=2,
+        gt_states=True,
     )
     dataset = BounceDataset(num_episodes=6, clip_len=6, num_balls=3, seed=1, render=False)
     eval_dataset = BounceDataset(num_episodes=4, clip_len=6, num_balls=3, seed=99, render=False)

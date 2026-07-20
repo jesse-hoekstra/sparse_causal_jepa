@@ -19,6 +19,7 @@ from scjepa.models.channel_split import (
     AttnPooling,
     CrossSlotAttnPooling,
     KinematicHead,
+    TrackAwareAttnPooling,
     build_pooling,
 )
 from scjepa.models.jepa import JepaOutput, resolve_chains, rollout_predictions
@@ -32,7 +33,7 @@ class StateJepa(nn.Module):
         self,
         context_embed: nn.Module,
         target_embed: nn.Module,
-        pooling: AttnPooling | CrossSlotAttnPooling,
+        pooling: AttnPooling | CrossSlotAttnPooling | TrackAwareAttnPooling,
         kinematic_head: KinematicHead | None,
         predictor: Spartan,
         gt_states: bool = False,
@@ -74,7 +75,7 @@ class StateJepa(nn.Module):
         None -> one chain over all K transitions; Tp chunks K into K/Tp chains.
         ``context_len=None`` means L-1 (K = 1: one single-step chain).
         Flattened outputs: prediction/target are (B·K, N, d); causal_params
-        stays (B, N, d); kinematic_state carries the anchors (B·C, N, d).
+        stays (B, N, p); kinematic_state carries the anchors (B·C, N, d).
         """
         if states.ndim != 4 or states.shape[1] < 2:
             raise ValueError(f"expected (B, L>=2, N, k), got {tuple(states.shape)}")
@@ -84,7 +85,7 @@ class StateJepa(nn.Module):
             raise ValueError(f"context_len={th} must be in [1, L-1={length - 1}]")
         chain_len, num_chains = resolve_chains(length - th, rollout_horizon)
         context_slots = self.context_embed(states[:, :th])  # (B, Th, N, d)
-        causal_params = self.pooling(context_slots)  # (B, N, d) — pooled ONCE
+        causal_params = self.pooling(context_slots)  # (B, N, p) — pooled ONCE
         # Chain anchors: TRUE states at t = th-1, th-1+Tp, ... (memoryless embeds).
         anchor_steps = [th - 1 + c * chain_len for c in range(num_chains)]
         if self.gt_states:
@@ -117,12 +118,14 @@ def build_state_jepa(
     slot_size: int = 32,
     pooling_heads: int = 4,
     pooling_type: str = "cross_slot",  # D14 default; "per_slot" = D4 ablation
+    param_dim: int | None = None,
     max_history: int = 64,
     spartan_layers: int = 3,
     spartan_embed_dim: int | None = 512,
     spartan_mlp_hidden: int = 512,
     spartan_mlp_layers: int = 3,
     spartan_temperature: float = 1.0,
+    spartan_paired_object_attention: bool = False,
     aux_dim: int | None = None,
     spartan_dense: bool = False,
     spartan_identity: bool = False,
@@ -135,24 +138,37 @@ def build_state_jepa(
 
     ``gt_states`` (D20): rollout in the raw GT state space instead — the
     predictor's state tokens are ``state_dim``-dim (predictions are literal
-    next states), Ŝ^ph stays ``slot_size``-dim via Spartan's ``param_size``,
-    and the target/kinematic modules are dropped (nothing on the state path
-    trains, so the constraint's ruler is fixed).
+    next states), and the target/kinematic modules are dropped (nothing on the
+    state path trains, so the constraint's ruler is fixed). ``param_dim`` is
+    the per-object causal bottleneck width; ``None`` preserves the historical
+    ``slot_size``-dimensional output. A scalar bottleneck is obtained with
+    ``pooling_type="track_aware", param_dim=1``.
     """
+    resolved_param_dim = slot_size if param_dim is None else param_dim
+    predictor_state_dim = state_dim if gt_states else slot_size
     return StateJepa(
         context_embed=nn.Linear(state_dim, slot_size),
         target_embed=nn.Identity() if gt_states else nn.Linear(state_dim, slot_size),
-        pooling=build_pooling(pooling_type, slot_size, pooling_heads, max_history),
+        pooling=build_pooling(
+            pooling_type,
+            slot_size,
+            pooling_heads,
+            max_history,
+            param_dim=param_dim,
+        ),
         kinematic_head=None if gt_states else KinematicHead(slot_size=slot_size),
         predictor=Spartan(
-            slot_size=state_dim if gt_states else slot_size,
+            slot_size=predictor_state_dim,
             num_layers=spartan_layers,
             embed_dim=spartan_embed_dim,
             mlp_hidden_size=spartan_mlp_hidden,
             mlp_num_layers=spartan_mlp_layers,
             temperature=spartan_temperature,
+            paired_object_attention=spartan_paired_object_attention,
             aux_dim=aux_dim,
-            param_size=slot_size if gt_states else None,
+            param_size=(
+                resolved_param_dim if resolved_param_dim != predictor_state_dim else None
+            ),
             dense=spartan_dense,
             identity=spartan_identity,
         ),

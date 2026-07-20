@@ -1,20 +1,20 @@
 # @package _global_
-# EXACT-COMPARISON config: Baumgartner et al. (dynamical_system.pdf) bounce,
-# their App. E environment matched as closely as their paper specifies:
+# STAGE-1 JEPA config aligned to Baumgartner et al. (dynamical_system.pdf)
+# bounce, matching their App. E environment as closely as specified:
 #   - 5 balls, elastic collisions, object-level (state) observations
 #   - masses ~ non-zero-mean normal (exact params UNSPECIFIED upstream; ours
 #     below, clamped to mass_range — flag in any writeup)
 #   - radius proportional to mass ("for ease of observation" + variability;
 #     deliberately departs from D11 invisibility for this comparison)
 #   - attention-logit loss (their Eq. 11; F.4: required against path plateau)
-#   - MCC = their F.1 MLP-R² metric (reported as `mcc` by the eval harness)
+#   - MCC = their F.1 episode-level MLP-R² metric (`mcc`); the former
+#     episode-object probe remains available separately as `mcc_pooled`
 # Their scale: ~300k steps, 8 seeds (Fig. 17) -> GPU/overnight, not laptop.
-# Their reference results (Fig. 3, bounce): SPARTAN MCC ~0.9+.
-# The MODEL is still ours (JEPA, D6-D9) — that difference is the experiment.
-# D23: schedule is now paper-faithful (tau = 1.0x dense ref, no functional dual
-# clamp, alpha = the one free knob). Run the main leg via
-# scripts/isambard_main_only.sbatch (reuses the dense-ref tau), or the full
-# same-pipeline lineage via scripts/isambard_pipeline.sbatch --tau-factor=1.0.
+# Their Fig. 3 SPARTAN MCC (~0.9+) is context, not a like-for-like target: the
+# MODEL is ours (JEPA, D6-D9), and only the environment/metric are aligned.
+# D24 changes the simulator, parameter encoder, pairing, loss, and path objective,
+# so every reported run must recalibrate tau under this exact config. Use the
+# full same-pipeline lineage in scripts/isambard_pipeline.sbatch.
 
 defaults:
   - bounce_states
@@ -22,15 +22,21 @@ defaults:
 model:
   # SPARTAN App. A.1 Table 3, Interventional Pong column: 3 transformer layers,
   # embedding dim 512, MLP hidden 512, 3 MLP layers (bounce_states shrinks these
-  # for CPU smokes — the exact comparison must not inherit that). Their token
-  # dim 32 = our param-token dim (slot_size); state tokens are the raw 4-dim GT
-  # states under gt_states, lifted 4->512 by the input projection.
+  # for CPU smokes — this paper-aligned run must not inherit that). Our latent
+  # mass itself is scalar (`param_dim: 1` below); it and the raw 4-D GT state
+  # tokens are separately projected into the 512-D transformer workspace.
   spartan_layers: 3
   spartan_embed_dim: 512
   spartan_mlp_hidden: 512
   # D21: rollout state space = raw GT states (fixed ruler, D20) — only the
   # parameter path (context embed + pooling) and the predictor train.
   gt_states: true
+  # Preserve each object's trajectory while pooling temporal evidence, exchange
+  # collision evidence equivariantly across objects, then impose Baumgartner's
+  # known q=5 latent dimensionality: one scalar parameter for each of 5 balls.
+  pooling_type: track_aware
+  param_dim: 1
+  spartan_paired_object_attention: true
 
 data:
   mass_normal: [1.5, 0.5] # UNSPECIFIED upstream — our choice
@@ -47,14 +53,28 @@ data:
   num_clips: 100000
 
 train:
+  # Raw states retain simulator object identity. Do not let a per-transition
+  # assignment erase that known correspondence in the diagnostic baseline.
+  prediction_matching: aligned
+  # Raw-state observations already provide the fixed ruler used in
+  # Baumgartner/SPARTAN's reconstruction constraint; use their raw MSE.
+  constraint_normalization: raw
+  # The unnormalised multi-layer path count otherwise dominates q/k gradients
+  # before the GECO controller can react. Train the gated dynamics first, then
+  # let the constraint controller begin pruning.
+  sparsity_warmup_steps: 10000
+  sparsity_lambda_init: 1.0e6
+  # Inherited only as a bare-train.py smoke placeholder, now in raw-MSE units.
+  # The reporting pipeline always replaces it with the fresh dense reference.
+  sparsity_tau: 0.75
   steps: 300000
   lr: 5.0e-5 # SPARTAN App. A.1 Table 3 (Adam) — overrides bounce_states' CPU value
   # D21: teacher-forced one-step objective (SPARTAN Eq. 7; Baumgartner's Markov
   # MLE factorization — decoder "performs one-step prediction", their Fig. 1).
-  # Every transition is anchored at the TRUE state; measured mass-blind floor
-  # on the fixed ruler at Tp=1 is 0.199 normalized (scratch audit 2026-07-19),
-  # so tau CAN force param edges without the D16 rollout — which remains the
-  # ablation via rollout_horizon=null (see D21 for the BPTT stability history).
+  # Every transition is anchored at the TRUE state. D24 now uses raw MSE and a
+  # corrected collision surface, so pre-D24 numeric floors are invalid. The
+  # reporting runner trains a matched A≡0 reference (--identity-check) and
+  # requires tau below that measured floor before the sparse run begins.
   rollout_horizon: 1
   # Periodic held-out identifiability eval. The base default is null and earlier
   # launches passed it on the CLI — run 8xjg7ra5 (2026-07-19) silently ran
@@ -69,23 +89,13 @@ train:
   # 2026-07-11, MCC ~0.01). If a short run shows loss/logit oscillating or
   # loss/logit >> loss/pred after the first ~2k steps, raise this.
   lambda_logit: 1.0e-3
-  # Dual timescale (D23, supersedes D22's 3e-3): the ONLY schedule number the
-  # papers leave free (SPARTAN A.2 / Baumgartner Eq. 10 give plain GECO, no
-  # step, no clamp, no tau factor — every other knob is now pinned to the
-  # paper). D22's 3e-3 spent all 300k barely moving after crossing tau (run
-  # m5bje3yt: lambda 30k->26k, eval density flat 0.128 for 200k steps). Offline
-  # dual sim on the run's own constraint magnitudes: 3e-3 leaves 1/lambda at
-  # ~1e-5 at 300k (no prune), 2e-2 completes the descent with budget to spare.
-  # 2e-2 = the value bounce_states already validated ("moves visibly in ~1e4
-  # steps"); F-10 flagged 0.02 as "too fast" but against SPARTAN's 4e6-step
-  # Pong horizon — for Baumgartner's 300k bounce it is the right timescale.
+  # SPARTAN A.2 / Baumgartner Eq. 10 leave this numerical step unspecified.
+  # Keep D23's 2e-2 as a conservative first pilot value, but do NOT treat its
+  # old timing evidence as transferable: D24 changed normalized loss to raw
+  # MSE and changed the path objective's scale. Watch how quickly lambda leaves
+  # 1e6 after the raw constraint crosses tau, then tune before the seed sweep.
   sparsity_step_size: 2.0e-2
-  # D23: D22's functional clamp REMOVED. Baumgartner/SPARTAN prescribe NO dual
-  # clamp; more concretely, 3e4 floored 1/lambda at 3.3e-5 => ~0.03 of standing
-  # sparsity pressure that pinned pred loss ~0.0975, ABOVE the dense floor, so a
-  # tight tau could never be crossed (the run's actual failure). Reverting to
-  # config.yaml's 1e6 cuts standing pressure ~33x, letting the model reach
-  # ~dense loss and cross tau, THEN prune. 1e6 is NOT the D22 reversal cap: it
-  # is a recovery guard (an unbounded lambda climbs to ~1e19 in phase 1 under
-  # 2e-2 and no feasible alpha brings it back in 300k). Left at the base 1e6.
+  # The papers specify no clamp. We retain the base 1e6 only as a numerical
+  # recovery guard; unlike D22's 3e4 cap its initial path weight is just 1e-6.
+  # D24 starts at this ceiling and adds the explicit warm-up above.
   sparsity_lambda_max: 1.0e6

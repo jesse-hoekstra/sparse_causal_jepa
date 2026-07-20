@@ -1,18 +1,15 @@
 #!/bin/bash
-# Isambard-AI: MAIN sparse run only — for when tau is already known and the
-# dense calibration does not need re-running (the dual-schedule / clamp changes
-# are inert for a sparsity-disabled reference, so fybk7ukv's dense number is
-# reused: D23 tau = 1.0 x 0.0839 = 0.0839, the paper-faithful factor).
+# Isambard-AI: MAIN sparse run only — for when tau was calibrated under the
+# exact current architecture and verified below a matched identity reference.
+# D24 changed the simulator, parameter bottleneck, pairing, prediction-loss
+# units, and path objective, so pre-D24 values such as 0.0839 are invalid and
+# deliberately have no default here.
 #
 # Submit FROM THE REPO ROOT:
 #   sbatch scripts/isambard_main_only.sbatch [run_tag] [tau] [steps]
-# Defaults: d23_seed0 / 0.0839 / 300000.
+# The tau argument is mandatory. Prefer scripts/isambard_pipeline.sbatch.
 #
-# PROVENANCE NOTE: the run's tau traces to a PREVIOUS pipeline's calibration,
-# not a sibling run. At factor 1.0 the dense reference IS the target — a stale
-# or config-mismatched reference now breaks the constraint directly (no slack
-# absorbs it). For a paper-headline run, re-calibrate in-pipeline via
-# scripts/isambard_pipeline.sbatch --tau-factor=1.0 (clean D12 lineage).
+# PROVENANCE NOTE: record the sibling calibration run and factor for every tau.
 #SBATCH --job-name=scjepa-main
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
@@ -21,8 +18,13 @@
 #SBATCH --output=logs/slurm-%j.out
 
 set -euo pipefail
-RUN_TAG=${1:-d23_seed0}
-TAU=${2:-0.0839}
+RUN_TAG=${1:-d24_seed0}
+if [ "$#" -lt 2 ]; then
+  echo "usage: sbatch $0 RUN_TAG CALIBRATED_TAU [STEPS]" >&2
+  echo "prefer scripts/isambard_pipeline.sbatch so tau is recalibrated in-pipeline" >&2
+  exit 2
+fi
+TAU=$2
 STEPS=${3:-300000}
 OUT_DIR="outputs/bounce_example_${RUN_TAG}/main"
 mkdir -p logs
@@ -37,9 +39,9 @@ python scripts/train.py \
   train.device=cuda \
   "train.sparsity_tau=${TAU}" \
   "train.steps=${STEPS}" \
-  data.preload=data/bounce_train_100000.pt \
+  data.preload=data/bounce_train_v2_100000.pt \
   "hydra.run.dir=${OUT_DIR}"
 
 echo "== final identifiability evaluation =="
-python scripts/eval_identifiability.py "${OUT_DIR}" --episodes 512
+python scripts/eval_identifiability.py "${OUT_DIR}" --episodes 5000
 echo "artifacts in ${OUT_DIR} (checkpoint, resolved config, recovery_grid.png)"
