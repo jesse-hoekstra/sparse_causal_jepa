@@ -1,16 +1,18 @@
 #!/bin/bash
 # Isambard-AI: MAIN sparse run only — for when tau is already known and the
-# dense calibration does not need re-running (e.g. D22: the dual-schedule
-# changes are inert for a sparsity-disabled reference, so fybk7ukv's number
-# is reused: tau = 1.2 x 0.0839 = 0.1007).
+# dense calibration does not need re-running (the dual-schedule / clamp changes
+# are inert for a sparsity-disabled reference, so fybk7ukv's dense number is
+# reused: D23 tau = 1.0 x 0.0839 = 0.0839, the paper-faithful factor).
 #
 # Submit FROM THE REPO ROOT:
 #   sbatch scripts/isambard_main_only.sbatch [run_tag] [tau] [steps]
-# Defaults: d22_seed0 / 0.1007 / 300000.
+# Defaults: d23_seed0 / 0.0839 / 300000.
 #
 # PROVENANCE NOTE: the run's tau traces to a PREVIOUS pipeline's calibration,
-# not a sibling run. Fine for schedule iteration; for a paper-headline run,
-# use scripts/isambard_pipeline.sbatch for a clean same-pipeline lineage (D12).
+# not a sibling run. At factor 1.0 the dense reference IS the target — a stale
+# or config-mismatched reference now breaks the constraint directly (no slack
+# absorbs it). For a paper-headline run, re-calibrate in-pipeline via
+# scripts/isambard_pipeline.sbatch --tau-factor=1.0 (clean D12 lineage).
 #SBATCH --job-name=scjepa-main
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
@@ -19,8 +21,8 @@
 #SBATCH --output=logs/slurm-%j.out
 
 set -euo pipefail
-RUN_TAG=${1:-d22_seed0}
-TAU=${2:-0.1007}
+RUN_TAG=${1:-d23_seed0}
+TAU=${2:-0.0839}
 STEPS=${3:-300000}
 OUT_DIR="outputs/bounce_example_${RUN_TAG}/main"
 mkdir -p logs
