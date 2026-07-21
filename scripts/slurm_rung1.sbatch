@@ -1,6 +1,7 @@
 #!/bin/bash
 # Rung 1 (Baumgartner-aligned true-state JEPA, D24): 8 seeds in parallel.
-# Submit from the repo root:   sbatch scripts/slurm_rung1.sbatch
+# Submit from the repo root after the dense sweep:
+#   sbatch --export=ALL,LAMBDA_LOGIT=YOUR_SELECTED_VALUE scripts/slurm_rung1.sbatch
 #
 # Prerequisites on the cluster (once):
 #   python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"
@@ -22,6 +23,8 @@
 
 # module load cray-python   # only if the cluster requires it for the venv
 
+: "${LAMBDA_LOGIT:?set LAMBDA_LOGIT to the dense-sweep selection}"
+
 srun --ntasks=8 bash -c '
   SEED=${SLURM_PROCID}
   export PYTHON=.venv/bin/python
@@ -29,6 +32,7 @@ srun --ntasks=8 bash -c '
     --run-tag="rung1_seed${SEED}" --tau-factor=1.0 --main-steps=300000 \
     --eval-episodes=5000 --identity-check \
     experiment=bounce_baumgartner \
+    train.lambda_logit=${LAMBDA_LOGIT} train.sparsity_warmup_steps=0 \
     train.seed=${SEED} data.seed=${SEED} \
     wandb.enabled=true train.eval_every=5000 train.eval_episodes=128 \
     > "outputs/rung1_seed${SEED}.log" 2>&1

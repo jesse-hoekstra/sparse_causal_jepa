@@ -27,6 +27,7 @@ from torch import Tensor, nn
 from scjepa.models.channel_split import (
     AttnPooling,
     CrossSlotAttnPooling,
+    GlobalLatentAttnPooling,
     KinematicHead,
     TrackAwareAttnPooling,
     build_pooling,
@@ -46,6 +47,9 @@ class JepaOutput(NamedTuple):
     path_matrix: Float[Tensor, "b t t"]
     sparsity: Float[Tensor, ""]
     logit_penalty: Float[Tensor, ""]
+    mean_abs_logit: Float[Tensor, ""]
+    mean_gate_probability: Float[Tensor, ""]
+    gate_entropy: Float[Tensor, ""]
 
 
 def resolve_chains(num_transitions: int, rollout_horizon: int | None) -> tuple[int, int]:
@@ -77,7 +81,7 @@ def rollout_predictions(
     causal_params: Float[Tensor, "b n d"],
     aux: Float[Tensor, "b m da"] | None,
     chain_len: int,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Autoregressive rollout (my_paper p7/p16): S_Tp = [f, f∘f, ..., f^Tp].
 
     Each chain starts from a TRUE encoded state (its anchor) and then feeds the
@@ -100,6 +104,9 @@ def rollout_predictions(
     path_matrices: list[Tensor] = []
     sparsities: list[Tensor] = []
     logit_penalties: list[Tensor] = []
+    mean_abs_logits: list[Tensor] = []
+    mean_gate_probabilities: list[Tensor] = []
+    gate_entropies: list[Tensor] = []
     # D19: ONE gate-noise draw per chain, shared by all its steps — per-step
     # Bernoulli marginals unchanged, but gates flip mid-chain only when their
     # state-dependent logits cross the chain's fixed thresholds. Independent
@@ -112,6 +119,9 @@ def rollout_predictions(
         path_matrices.append(out.path_matrix)
         sparsities.append(out.sparsity)
         logit_penalties.append(out.logit_penalty)
+        mean_abs_logits.append(out.mean_abs_logit)
+        mean_gate_probabilities.append(out.mean_gate_probability)
+        gate_entropies.append(out.gate_entropy)
         state = out.prediction  # f∘f: the model's own output is the next input
     # (B·C, Tp, ...) -> (B, C·Tp = K, ...): trajectory order, matching both the
     # flattened targets and the eval harness's per-transition contact slices.
@@ -123,6 +133,9 @@ def rollout_predictions(
         path_matrix.flatten(0, 1),
         torch.stack(sparsities).mean(),
         torch.stack(logit_penalties).mean(),
+        torch.stack(mean_abs_logits).mean(),
+        torch.stack(mean_gate_probabilities).mean(),
+        torch.stack(gate_entropies).mean(),
     )
 
 
@@ -138,7 +151,9 @@ class SCJepa(nn.Module):
         self,
         context_encoder: SAViEncoder,
         target_encoder: SAViEncoder,
-        pooling: AttnPooling | CrossSlotAttnPooling | TrackAwareAttnPooling,
+        pooling: (
+            AttnPooling | CrossSlotAttnPooling | TrackAwareAttnPooling | GlobalLatentAttnPooling
+        ),
         kinematic_head: KinematicHead,
         predictor: Spartan,
     ) -> None:
@@ -192,9 +207,15 @@ class SCJepa(nn.Module):
         anchors = self.kinematic_head.project(all_context_slots[:, anchor_steps])
         target_frames = frames[:, th:].flatten(0, 1).unsqueeze(1)  # (B*K, 1, C, H, W)
         target_slots = self.target_encoder(target_frames).squeeze(1)  # (B*K, N, d)
-        prediction, path_matrix, sparsity, logit_penalty = rollout_predictions(
-            self.predictor, anchors, causal_params, aux, chain_len
-        )
+        (
+            prediction,
+            path_matrix,
+            sparsity,
+            logit_penalty,
+            mean_abs_logit,
+            mean_gate_probability,
+            gate_entropy,
+        ) = rollout_predictions(self.predictor, anchors, causal_params, aux, chain_len)
         return JepaOutput(
             prediction=prediction,
             target_slots=target_slots,
@@ -204,6 +225,9 @@ class SCJepa(nn.Module):
             path_matrix=path_matrix,
             sparsity=sparsity,
             logit_penalty=logit_penalty,
+            mean_abs_logit=mean_abs_logit,
+            mean_gate_probability=mean_gate_probability,
+            gate_entropy=gate_entropy,
         )
 
 
@@ -224,7 +248,7 @@ def build_scjepa(
     spartan_mlp_hidden: int = 512,
     spartan_mlp_layers: int = 3,
     spartan_temperature: float = 1.0,
-    spartan_paired_object_attention: bool = False,
+    spartan_node_embeddings: bool = False,
     aux_dim: int | None = None,
     spartan_dense: bool = False,
     spartan_identity: bool = False,
@@ -263,6 +287,7 @@ def build_scjepa(
             pooling_heads,
             max_history,
             param_dim=param_dim,
+            num_slots=num_slots,
         ),
         kinematic_head=KinematicHead(slot_size=slot_size),  # state_size = d (D9)
         predictor=Spartan(
@@ -272,7 +297,8 @@ def build_scjepa(
             mlp_hidden_size=spartan_mlp_hidden,
             mlp_num_layers=spartan_mlp_layers,
             temperature=spartan_temperature,
-            paired_object_attention=spartan_paired_object_attention,
+            node_embeddings=spartan_node_embeddings,
+            num_slots=num_slots if spartan_node_embeddings else None,
             aux_dim=aux_dim,
             param_size=resolved_param_dim if resolved_param_dim != slot_size else None,
             dense=spartan_dense,

@@ -24,13 +24,15 @@ mapped to the source papers and to the code (state as of 2026-07-17, post D1--D1
 \begin{document}
 \maketitle
 
-\section*{Status notice (2026-07-20)}
-This document is intentionally a historical D1--D19 snapshot and is not the current D24
-implementation contract. D24 changes the rollout to raw GT states with aligned MSE, emits one
-scalar parameter per ball, adds a relative parameter-to-state pairing relation, scopes sparsity
-and primary path density to decoded state rows, uses raw-MSE tau calibration plus a freshly
-trained identity reference, and corrects/version-tags collision surfaces. See
-\code{docs/decisions.md} D24 and the resolved
+\section*{Status notice (2026-07-21)}
+This document is intentionally a historical D1--D19 snapshot and is not the current D25
+implementation contract. D24 introduced raw GT states with aligned MSE, decoded-state-row
+sparsity, raw-MSE tau calibration, and the corrected collision surfaces; those pieces remain.
+D25 supersedes D24's per-ball scalar head and explicit parameter-to-state pairing: the active
+model instead emits five persistent global scalar coordinates, gives the state and parameter
+nodes independent learned addresses, and leaves all 25 cross-block relations for sparsity to
+discover. The pairing option has been removed from the implementation. See
+\code{docs/decisions.md} D24--D25 and the resolved
 \code{configs/experiment/bounce\_baumgartner.yaml} before using any number below.
 
 \section*{How to read this document}

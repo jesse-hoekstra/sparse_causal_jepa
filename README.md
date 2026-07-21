@@ -74,8 +74,8 @@ off), the main sparsity run with the calibrated τ, and identifiability evaluati
 bash scripts/run_bounce_example.sh                                   # 5-ball default
 bash scripts/run_bounce_example.sh --identity-check                 # paper-grade guard
 bash scripts/run_bounce_example.sh data.num_balls=3 train.steps=25000  # smaller/faster instance
-#    -> prints the calibrated tau, then pred_loss, shd_state, shd_param, mcc, path_density
-#    -> saves recovery_grid.png (Fig.-5/12-style: true mass i vs slot j) in the run dir
+#    -> prints calibrated tau, then pred_loss, graph scores, mass_mcc, path_density
+#    -> saves recovery_grid.png with all mass/latent pairs and the global assignment
 ```
 
 Hydra overrides are passed to every run, so the references and main run cannot diverge
@@ -110,26 +110,31 @@ paper-grade numbers. Step counts per phase: `--calib-steps` always sets the cali
 ## The experiment ladder (bounce; decisions.md D13)
 
 Every rung uses the same one-command runner (τ auto-calibrated per rung; overrides apply to both
-runs); repeat with `train.seed=0..7` for seeded statistics. Each run prints
-`pred_loss, shd_state, shd_param, mcc, mcc_linear, mcc_pooled, path_density` on a held-out
-split and saves
-`recovery_grid.png`. Healthy training always shows: `loss/logit` falls early (when enabled),
+runs); repeat with `train.seed=0..7` for seeded statistics. Periodic W&B evaluation contains only
+the core curves: `pred_loss`, `constraint_loss`, `mean_abs_logit`, `gate_entropy`, `mass_mcc`,
+`shd_state`, `shd_param_aligned`, and `path_density`. The final report also saves the full
+permutation-aware recovery matrix and assignment in `recovery_grid.png` and
+`recovery_alignment.json`. Healthy training always shows: `loss/logit` falls early (when enabled),
 `sparsity/constraint` drops below τ, then `sparsity/lambda` falls and the decoded-state-row
 `sparsity/path_density` shrinks. In learned-target runs, monitor
 `health/target_slot_std_*` for collapse; in the raw-state rung it is a fixed data statistic.
 
 ```bash
+# Use the coefficient selected by the dense sweep described below.
+LAMBDA_LOGIT=YOUR_SELECTED_VALUE
+
 # Rung 1 — Baumgartner-aligned environment with a true-state JEPA (radius∝mass,
 # logit loss). Their Fig. 3 MCC ≈ 0.9+ is context, not a like-for-like target:
 # the encoder/objective differ. Successful recovery still gives sharp marginals.
 bash scripts/run_bounce_example.sh --identity-check --tau-factor=1.0 \
-  experiment=bounce_baumgartner
+  experiment=bounce_baumgartner "train.lambda_logit=${LAMBDA_LOGIT}"
 
 # Rung 1-ablation — ±sparsity (their MLP/Transformer comparison; note their own
 # finding: on bounce even an unregularised Transformer disentangles, so expect a
 # smaller gap here than on dual particle):
 bash scripts/run_bounce_example.sh --identity-check --tau-factor=1.0 \
   experiment=bounce_baumgartner \
+  "train.lambda_logit=${LAMBDA_LOGIT}" \
   train.sparsity_enabled=false
 
 # Rung 2 — invisible mass (equal radii, uniform masses): identical otherwise, so
@@ -137,6 +142,7 @@ bash scripts/run_bounce_example.sh --identity-check --tau-factor=1.0 \
 # only through collision impulses). MCC ≈ rung 1 -> method robust; MCC ≈ 0 -> edge found.
 bash scripts/run_bounce_example.sh --identity-check --tau-factor=1.0 \
   experiment=bounce_baumgartner \
+  "train.lambda_logit=${LAMBDA_LOGIT}" \
   data.radius_from_mass=false data.mass_normal=null
 
 # The resolved Stage-1 config already uses 60-step trajectories with a
@@ -155,12 +161,24 @@ python scripts/train.py data.name=bounce data.clip_len=10 train.steps=...   # vi
 python scripts/train.py data.name=bounce data.radius_from_mass=true ...
 ```
 
-Scale: their setting is ~300k steps × 8 seeds (their Fig. 17/3) — the full grid wants a
-cluster: `sbatch scripts/slurm_rung1.sbatch` runs all 8 seeds in parallel (one srun task per
-seed, τ re-calibrated per seed, W&B runs named `bounce_baumgartner-{phase}-seed{N}`). If compute
-nodes have no internet, add `wandb.mode=offline` and `wandb sync outputs/...` afterwards. For
-parallel launches the runner needs `RUN_TAG` set per task (the sbatch script does this) — the
-default timestamped output dir collides across simultaneous starts. Every eval writes
-`metrics.json` into its run dir; aggregate the seeded grid (mean ± SD plus the five-number
-summary behind their Fig.-3-style box plots) with:
+Scale: their setting is ~300k steps × 8 seeds (their Fig. 17/3). Baumgartner does not specify
+the numerical `lambda_logit`, so first run the controlled dense-model sweep on Isambard:
+
+```bash
+sbatch --account=<PROJECT> scripts/isambard_logit_sweep.sbatch logit_seed0 0
+# The job prints selected_lambda_logit and writes it to sweep_summary.json.
+SWEEP=outputs/lambda_logit_sweep_logit_seed0/sweep_summary.json
+LAMBDA_LOGIT=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["selected_lambda_logit"])' "$SWEEP")
+sbatch --account=<PROJECT> scripts/isambard_pipeline.sbatch full_seed0 "$LAMBDA_LOGIT" 0
+```
+
+The sweep compares prediction against the `lambda_logit=0` control, rejects values degrading it
+by more than 5%, and selects the smallest Pareto coefficient that obtains 90% of the best
+admissible reduction in the excess logit penalty above its theoretical floor of 2. Mass recovery
+is displayed as a validation diagnostic, not used by that rule. Dense attention can only screen
+the coefficient; the gated pipeline must still reach τ, move λ away from its ceiling, reduce path
+density/SHD, and retain `mass_mcc`.
+
+If compute nodes have no internet, add `wandb.mode=offline` and sync afterwards. Every final eval
+writes `metrics.json`; aggregate seeded runs with
 `python scripts/aggregate_runs.py 'outputs/bounce_example_rung1_seed*/main'`.

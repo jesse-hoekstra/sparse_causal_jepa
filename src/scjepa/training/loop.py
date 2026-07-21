@@ -244,9 +244,7 @@ class Trainer:
             rollout_horizon=self.config.rollout_horizon,
         )
 
-        pred_loss = prediction_mse(
-            output.prediction, output.target_slots, self.prediction_matching
-        )
+        pred_loss = prediction_mse(output.prediction, output.target_slots, self.prediction_matching)
         reg_loss = self.regularizer(output.context_slots) + self.regularizer(output.target_slots)
         logit_loss = self.config.lambda_logit * output.logit_penalty
         # Gradient objective (Baumgartner Eq. 10): raw pred + logit
@@ -267,9 +265,10 @@ class Trainer:
             # literal GT states already are Baumgartner's fixed ruler and use
             # raw MSE. This quantity only drives the dual update and logging.
             target_var = slot_std.pow(2).mean().clamp_min(1e-6)
-            constraint_loss = prediction_constraint(
-                pred_loss.detach(), target_var, self.constraint_normalization
-            ) + logit_loss.detach()
+            constraint_loss = (
+                prediction_constraint(pred_loss.detach(), target_var, self.constraint_normalization)
+                + logit_loss.detach()
+            )
 
         if not torch.isfinite(total):
             raise RuntimeError(
@@ -313,15 +312,16 @@ class Trainer:
             "loss/reg": reg_loss.item(),
             "loss/sparsity": output.sparsity.item(),
             "loss/logit": logit_loss.item(),
+            "attention/logit_penalty": output.logit_penalty.item(),
+            "attention/mean_abs_logit": output.mean_abs_logit.item(),
+            "attention/gate_entropy": output.gate_entropy.item(),
             "sparsity/constraint": constraint_loss.item(),
             "sparsity/lambda": float(torch.exp(self.lagrangian.log_lambda).item()),
             "sparsity/active": float(sparsity_active),
             # Primary density covers the same decoded state rows optimized by
             # output.sparsity. Keep the full-token density only as a diagnostic:
             # final parameter rows are not decoded and need not prune.
-            "sparsity/path_density": (
-                output.path_matrix[:, : output.prediction.shape[1]] >= 0.5
-            )
+            "sparsity/path_density": (output.path_matrix[:, : output.prediction.shape[1]] >= 0.5)
             .float()
             .mean()
             .item(),
@@ -378,7 +378,20 @@ class Trainer:
             constraint_normalization=self.constraint_normalization,
         )
         self.model.train()  # the harness switches to eval mode
-        return {f"eval/{key}": value for key, value in report.metrics.items()}
+        metrics = report.metrics
+        # Dense references have a fixed all-open graph: SHD and density are
+        # constants, not diagnostics. Keep their W&B panels focused on the
+        # coefficient sweep; sparse runs retain all graph curves.
+        if self.model.predictor.dense:
+            dense_keys = {
+                "pred_loss",
+                "constraint_loss",
+                "mean_abs_logit",
+                "gate_entropy",
+                "mass_mcc",
+            }
+            metrics = {key: value for key, value in metrics.items() if key in dense_keys}
+        return {f"eval/{key}": value for key, value in metrics.items()}
 
     # ------------------------------------------------------- checkpoints ----
     def save_checkpoint(self, path: Path) -> None:

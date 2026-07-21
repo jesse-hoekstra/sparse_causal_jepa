@@ -35,12 +35,11 @@ Choices the paper leaves open (flagged per project policy, decisions D10):
     * Eval mode is deterministic: A_ij = 1 iff sigmoid(q_i·k_j) > 1/2.
     * Learned role embeddings (state/param/aux) are added to the tokens so the
       roles are distinguishable while slot-permutation equivariance is kept.
-    * ``paired_object_attention=True`` adds a learned relation bias for the
-      entry state i ← parameter i. This preserves
-      equivariance to a JOINT object permutation while making an independent
-      reassignment of parameter tokens observable to the decoder. It is off by
-      default so existing configurations and checkpoints retain their behavior.
-
+    * Optional learned state-node and parameter-coordinate embeddings give
+      persistent graph nodes distinct addresses.  The two tables are
+      independent and encode no state-i/parameter-i correspondence; fixed node
+      identities are appropriate for ordered GT states but require tracking or
+      recurrent slot continuation before use with anonymous visual slots.
 Symbol table:
     S_t     state tokens       (B, N, d)     ``state``
     Ŝ^ph    parameter tokens   (B, N, d)     ``params``
@@ -56,6 +55,7 @@ from typing import NamedTuple
 import torch
 from jaxtyping import Float
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 
 class SpartanOutput(NamedTuple):
@@ -65,6 +65,9 @@ class SpartanOutput(NamedTuple):
     path_matrix: Float[Tensor, "b t t"]
     sparsity: Float[Tensor, ""]
     logit_penalty: Float[Tensor, ""]
+    mean_abs_logit: Float[Tensor, ""]
+    mean_gate_probability: Float[Tensor, ""]
+    gate_entropy: Float[Tensor, ""]
 
 
 def _logistic_noise(like: Tensor) -> Tensor:
@@ -108,7 +111,6 @@ class SpartanLayer(nn.Module):
         temperature: float,
         dense: bool = False,
         identity: bool = False,
-        paired_object_attention: bool = False,
     ) -> None:
         """Build the layer.
 
@@ -129,10 +131,6 @@ class SpartanLayer(nn.Module):
                 the best any model without cross-token (incl. param→state)
                 edges can achieve, the floor τ must sit BELOW for sparsity to
                 be forced to keep true edges. Mutually exclusive with dense.
-            paired_object_attention: Add a learned bias to the gate/attention
-                logit for state i ← parameter i. The caller supplies the
-                relation mask because
-                only ``Spartan`` knows the state/parameter/aux token layout.
         """
         super().__init__()
         if mlp_num_layers < 2:
@@ -142,20 +140,11 @@ class SpartanLayer(nn.Module):
         self.temperature = temperature
         self.dense = dense
         self.identity = identity
-        self.paired_object_attention = paired_object_attention
         self.scale = 1.0 / math.sqrt(dim)
         self.norm = nn.LayerNorm(dim)
         self.project_q = nn.Linear(dim, dim, bias=False)
         self.project_k = nn.Linear(dim, dim, bias=False)
         self.project_v = nn.Linear(dim, dim, bias=False)
-        if paired_object_attention:
-            # A non-zero initialization makes the newly exposed relation usable
-            # immediately without privileging the reverse scratchpad direction.
-            self.state_from_param_bias: nn.Parameter | None = nn.Parameter(torch.tensor(1.0))
-        else:
-            # Keep the legacy state_dict exactly unchanged when the feature is
-            # disabled (the backward-compatible default).
-            self.register_parameter("state_from_param_bias", None)
         widths = [dim] + [mlp_hidden_size] * (mlp_num_layers - 1) + [dim]
         mlp_layers: list[nn.Module] = []
         for i in range(mlp_num_layers):
@@ -168,20 +157,20 @@ class SpartanLayer(nn.Module):
         self,
         tokens: Float[Tensor, "b t d"],
         gate_noise: Float[Tensor, "b t t"] | None = None,
-        paired_state_from_param: Float[Tensor, "t t"] | None = None,
-    ) -> tuple[Float[Tensor, "b t d"], Float[Tensor, "b t t"], Float[Tensor, ""]]:
-        """Apply hard-masked attention; return (tokens, adjacency A_l, logit penalty).
+    ) -> tuple[
+        Float[Tensor, "b t d"],
+        Float[Tensor, "b t t"],
+        Float[Tensor, ""],
+        Float[Tensor, ""],
+        Float[Tensor, ""],
+        Float[Tensor, ""],
+    ]:
+        """Apply hard-masked attention and return outputs plus logit diagnostics.
 
         ``gate_noise``: optional pre-drawn logistic thresholds for this layer's
         gates (D19: one draw per rollout chain, reused across its steps);
         None = fresh draw (single-step behavior). Ignored in dense/identity
         modes and in eval mode.
-
-        ``paired_state_from_param`` identifies state i ← parameter i entries
-        in the full token matrix. It is added to both the Bernoulli gate logits
-        and masked-attention logits. The reverse direction is deliberately not
-        privileged: parameter tokens should not become state scratchpads.
-        Auxiliary-token rows and columns remain zero in the relation mask.
 
         The logit penalty is Baumgartner et al. Eq. 11 per layer:
         mean_ij [exp(q_i·k_j) + exp(-q_i·k_j)] — penalises large attention
@@ -204,21 +193,6 @@ class SpartanLayer(nn.Module):
         # reading, and the only one under which Eq. 11's "keep logits small"
         # aim is coherent. INTERPRETATION, not paper-literal (no public code).
         adjacency_logits = torch.einsum("bid,bjd->bij", q, k) * self.scale
-        if self.paired_object_attention:
-            if paired_state_from_param is None:
-                raise ValueError("paired-object attention requires its relation mask")
-            expected_shape = (tokens.shape[1], tokens.shape[1])
-            if paired_state_from_param.shape != expected_shape:
-                raise ValueError(
-                    "paired-object relation masks must match the token matrix "
-                    f"{expected_shape}, got {tuple(paired_state_from_param.shape)}"
-                )
-            assert self.state_from_param_bias is not None
-            adjacency_logits = (
-                adjacency_logits + self.state_from_param_bias * paired_state_from_param
-            )
-        elif paired_state_from_param is not None:
-            raise ValueError("relation masks passed while paired-object attention is disabled")
         if self.dense:
             adjacency = torch.ones_like(adjacency_logits)
         elif self.identity:
@@ -274,7 +248,23 @@ class SpartanLayer(nn.Module):
         core = magnitude.clamp(max=30.0)
         tail = (magnitude - 30.0).clamp(min=0.0)
         logit_penalty = (core.exp() + (-core).exp() + core.exp() * tail).mean()
-        return self.mlp(h + tokens), adjacency, logit_penalty  # ŝ_i = MLP(h_i + s_i)
+        # Read-only saturation diagnostics. Detaching avoids carrying an
+        # otherwise unused entropy graph through every training step. The
+        # stable Bernoulli identity is H(sigmoid(z)) = softplus(z) - z sigmoid(z).
+        with torch.no_grad():
+            diagnostic_logits = adjacency_logits.detach()
+            gate_probability = torch.sigmoid(diagnostic_logits)
+            gate_entropy = (
+                F.softplus(diagnostic_logits) - diagnostic_logits * gate_probability
+            ).mean()
+        return (
+            self.mlp(h + tokens),
+            adjacency,
+            logit_penalty,
+            magnitude.detach().mean(),
+            gate_probability.mean(),
+            gate_entropy,
+        )  # ŝ_i = MLP(h_i + s_i)
 
 
 class Spartan(nn.Module):
@@ -298,7 +288,8 @@ class Spartan(nn.Module):
         param_size: int | None = None,
         dense: bool = False,
         identity: bool = False,
-        paired_object_attention: bool = False,
+        node_embeddings: bool = False,
+        num_slots: int | None = None,
     ) -> None:
         """Build the predictor.
 
@@ -329,22 +320,25 @@ class Spartan(nn.Module):
                 train.sparsity_enabled=false, matched budget vs the dense
                 reference; the gap between their constraint losses is the τ
                 window). Mutually exclusive with dense.
-            paired_object_attention: Expose the index-level relation between
-                parameter i → state i as a learned relation bias in every
-                layer's gate and attention logits. This relation is equivariant
-                to a joint permutation of state/parameter pairs, but makes an
-                independent parameter reassignment visible. False preserves
-                legacy behavior and checkpoint structure.
+            node_embeddings: Add independent learned addresses to the state
+                nodes and parameter-coordinate nodes. This makes the nodes
+                distinguishable without privileging any state/parameter edge.
+            num_slots: Fixed number of state and parameter nodes. Required when
+                ``node_embeddings=True``; the current architecture uses the
+                same count for both blocks.
         """
         super().__init__()
         if dense and identity:
             raise ValueError("dense and identity are mutually exclusive")
+        if node_embeddings and (num_slots is None or num_slots <= 0):
+            raise ValueError("node_embeddings=True requires a positive num_slots")
         self.slot_size = slot_size
         self.param_size = param_size if param_size is not None else slot_size
         self.aux_dim = aux_dim
         self.dense = dense
         self.identity = identity
-        self.paired_object_attention = paired_object_attention
+        self.node_embeddings = node_embeddings
+        self.num_slots = num_slots
         dim = embed_dim if embed_dim is not None else slot_size
         self.in_project = nn.Linear(slot_size, dim) if dim != slot_size else nn.Identity()
         # Separate param-token projection ONLY when Ŝ^ph lives in a different
@@ -364,7 +358,6 @@ class Spartan(nn.Module):
                     temperature,
                     dense=dense,
                     identity=identity,
-                    paired_object_attention=paired_object_attention,
                 )
                 for _ in range(num_layers)
             ]
@@ -374,6 +367,22 @@ class Spartan(nn.Module):
         self.param_embed = nn.Parameter(torch.zeros(1, 1, dim))
         nn.init.normal_(self.state_embed, std=0.02)
         nn.init.normal_(self.param_embed, std=0.02)
+        if node_embeddings:
+            assert num_slots is not None
+            # Separate tables expose node addresses only.  They are neither
+            # shared nor initialized alike, so index equality carries no
+            # built-in state←parameter preference.
+            self.state_node_embed: nn.Parameter | None = nn.Parameter(
+                torch.empty(1, num_slots, dim)
+            )
+            self.param_node_embed: nn.Parameter | None = nn.Parameter(
+                torch.empty(1, num_slots, dim)
+            )
+            nn.init.normal_(self.state_node_embed, std=0.02)
+            nn.init.normal_(self.param_node_embed, std=0.02)
+        else:
+            self.register_parameter("state_node_embed", None)
+            self.register_parameter("param_node_embed", None)
         if aux_dim is not None:
             self.aux_project: nn.Linear | None = nn.Linear(aux_dim, dim)
             self.aux_embed: nn.Parameter | None = nn.Parameter(torch.zeros(1, 1, dim))
@@ -449,9 +458,20 @@ class Spartan(nn.Module):
             )
         num_slots = state.shape[1]
         param_project = self.param_project if self.param_project is not None else self.in_project
+        state_tokens = self.in_project(state) + self.state_embed
+        param_tokens = param_project(params) + self.param_embed
+        if self.node_embeddings:
+            if num_slots != self.num_slots:
+                raise ValueError(
+                    f"received {num_slots} slots, expected configured num_slots={self.num_slots}"
+                )
+            assert self.state_node_embed is not None
+            assert self.param_node_embed is not None
+            state_tokens = state_tokens + self.state_node_embed
+            param_tokens = param_tokens + self.param_node_embed
         pieces = [
-            self.in_project(state) + self.state_embed,
-            param_project(params) + self.param_embed,
+            state_tokens,
+            param_tokens,
         ]
         if aux is not None:
             if self.aux_project is None or self.aux_embed is None:
@@ -459,30 +479,32 @@ class Spartan(nn.Module):
             pieces.append(self.aux_project(aux) + self.aux_embed)
         tokens = torch.cat(pieces, dim=1)  # (B, T, embed_dim)
 
-        paired_state_from_param: Tensor | None = None
-        if self.paired_object_attention:
-            # Token order is [state_0..N-1 | param_0..N-1 | aux_0..M-1].
-            # These index relations commute with a JOINT permutation of the
-            # state and parameter blocks. Aux entries deliberately stay zero.
-            relation_shape = (tokens.shape[1], tokens.shape[1])
-            paired_state_from_param = tokens.new_zeros(relation_shape)
-            object_index = torch.arange(num_slots, device=tokens.device)
-            paired_state_from_param[object_index, num_slots + object_index] = 1
-
         if gate_noise is not None and len(gate_noise) != len(self.layers):
             raise ValueError(
                 f"gate_noise has {len(gate_noise)} tensors for {len(self.layers)} layers"
             )
         adjacencies: list[Tensor] = []
         logit_penalties: list[Tensor] = []
+        mean_abs_logits: list[Tensor] = []
+        mean_gate_probabilities: list[Tensor] = []
+        gate_entropies: list[Tensor] = []
         for index, layer in enumerate(self.layers):
-            tokens, adjacency, layer_logit_penalty = layer(
+            (
+                tokens,
+                adjacency,
+                layer_logit_penalty,
+                layer_mean_abs_logit,
+                layer_mean_gate_probability,
+                layer_gate_entropy,
+            ) = layer(
                 tokens,
                 gate_noise=gate_noise[index] if gate_noise is not None else None,
-                paired_state_from_param=paired_state_from_param,
             )
             adjacencies.append(adjacency)
             logit_penalties.append(layer_logit_penalty)
+            mean_abs_logits.append(layer_mean_abs_logit)
+            mean_gate_probabilities.append(layer_mean_gate_probability)
+            gate_entropies.append(layer_gate_entropy)
 
         # Eq. 5: Ā = (A_L + I)···(A_1 + I); Ā_ij = number of paths j → i.
         eye = torch.eye(tokens.shape[1], device=tokens.device, dtype=tokens.dtype)
@@ -504,6 +526,9 @@ class Spartan(nn.Module):
             path_matrix=path_matrix,
             sparsity=sparsity,
             logit_penalty=torch.stack(logit_penalties).mean(),
+            mean_abs_logit=torch.stack(mean_abs_logits).mean(),
+            mean_gate_probability=torch.stack(mean_gate_probabilities).mean(),
+            gate_entropy=torch.stack(gate_entropies).mean(),
         )
 
 

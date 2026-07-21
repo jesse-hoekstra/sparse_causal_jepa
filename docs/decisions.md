@@ -783,3 +783,40 @@ complete evaluation harness preserves training RNG state.
 parameter tokens descend from the same recurrent slot track and future targets retain that
 track. Otherwise use one assignment over a complete trajectory, never independent per-frame
 Hungarian assignments.
+
+## D25 — Replace paired mass slots with persistent global coordinates (decided 2026-07-21, Jesse+Codex)
+
+**Supersedes part of D24.** D24's raw-state ruler, aligned state prediction, simulator fix,
+decoded-row path objective, and fresh τ calibration remain. Its `track_aware` per-object mass
+head, learned same-index attention bias, 10k sparsity warm-up, and diagonal recovery diagnostic
+do not. Those choices made the desired state–mass binding available before sparsity and therefore
+could not test whether the graph discovered it. The same-index bias option and its learned
+parameter are removed from the implementation rather than retained as an ablation.
+
+**Architecture.** The parameter encoder now has five learned latent-coordinate queries. Each
+query attends to the complete context tensor (all times and all tracked GT objects), with temporal
+and source-track position embeddings, and emits one scalar. Thus the output is a persistent global
+vector \(\hat\theta\in\mathbb R^5\), not five values defined as belonging to input tracks 1–5.
+SPARTAN adds independent learned address tables to the five state nodes and five parameter nodes.
+The tables are neither shared nor initialized alike, and no \(i=j\) state–parameter term is added.
+They break within-episode coordinate exchangeability so a graph can learn a stable relation, while
+leaving all 25 parameter-to-state edges available to sparsity. This fixed-address construction is
+appropriate for ordered GT tracks; pixels still require recurrent slot continuation/tracking.
+
+**Evaluation.** Mass recovery permits one global coordinate permutation but not a different
+permutation per episode. Scalar MLP probes are fit on a probe-training fold for every
+\((\hat\theta_j,m_i)\) pair; nonlinear R² on a disjoint alignment fold chooses one Hungarian
+bijection; that frozen bijection is scored on a third fold and also aligns parameter columns before
+graph SHD. `mass_mcc` is the only periodic MCC curve. Linear MCC, target variance, full-token
+density, and the full pairwise matrices are final-only diagnostics. The recovery grid shows all
+25 relations and highlights the chosen global assignment instead of rewarding its diagonal.
+
+**Protocol.** The papers specify no explicit sparsity warm-up, so GECO/path pressure is active from
+step zero; the large initial \(\lambda=10^6\) already makes its initial weight small. Baumgartner
+calls `lambda_logit` only “small,” so `10^-3` is no longer treated as sourced: the experiment config
+contains a neutral zero placeholder and reporting launchers require a value from a controlled dense
+sweep. The sweep includes the zero control, uses a separate validation seed offset, and selects
+without mass labels: within 5% of zero-control prediction, choose the smallest Pareto coefficient
+that achieves 90% of the best admissible reduction of \(L_{logit}-2\). Final pipeline evaluation
+uses a different test offset. This is only a dense feasibility screen; the decisive evidence remains
+whether the gated run reaches τ and prunes while retaining prediction and `mass_mcc`.
