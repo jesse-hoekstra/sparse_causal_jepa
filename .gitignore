@@ -7,6 +7,7 @@ checkpoints/
 wandb/
 # Hydra run dirs / sweep dirs (no inline comments — git treats them as pattern text)
 outputs/
+logs/
 sources/
 multirun/
 *.ckpt
