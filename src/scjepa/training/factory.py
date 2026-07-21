@@ -34,9 +34,7 @@ def build_model(model_cfg: DictConfig) -> nn.Module:
             spartan_mlp_hidden=model_cfg.spartan_mlp_hidden,
             spartan_mlp_layers=model_cfg.spartan_mlp_layers,
             spartan_temperature=model_cfg.spartan_temperature,
-            spartan_paired_object_attention=bool(
-                model_cfg.get("spartan_paired_object_attention", False)
-            ),
+            spartan_node_embeddings=bool(model_cfg.get("spartan_node_embeddings", False)),
             aux_dim=model_cfg.aux_dim,
             spartan_dense=bool(model_cfg.get("spartan_dense", False)),
             spartan_identity=bool(model_cfg.get("spartan_identity", False)),
@@ -44,6 +42,7 @@ def build_model(model_cfg: DictConfig) -> nn.Module:
     if model_cfg.type == "states":
         return build_state_jepa(
             state_dim=model_cfg.state_dim,
+            num_slots=model_cfg.get("num_slots", None),
             slot_size=model_cfg.slot_size,
             pooling_heads=model_cfg.pooling_heads,
             pooling_type=str(model_cfg.get("pooling_type", "cross_slot")),
@@ -54,9 +53,7 @@ def build_model(model_cfg: DictConfig) -> nn.Module:
             spartan_mlp_hidden=model_cfg.spartan_mlp_hidden,
             spartan_mlp_layers=model_cfg.spartan_mlp_layers,
             spartan_temperature=model_cfg.spartan_temperature,
-            spartan_paired_object_attention=bool(
-                model_cfg.get("spartan_paired_object_attention", False)
-            ),
+            spartan_node_embeddings=bool(model_cfg.get("spartan_node_embeddings", False)),
             aux_dim=model_cfg.aux_dim,
             spartan_dense=bool(model_cfg.get("spartan_dense", False)),
             spartan_identity=bool(model_cfg.get("spartan_identity", False)),

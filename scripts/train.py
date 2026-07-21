@@ -58,7 +58,7 @@ def main(cfg: DictConfig) -> None:
     out_dir = Path(str(HydraConfig.get().runtime.output_dir))
     resolved: dict[str, Any] = OmegaConf.to_container(cfg, resolve=True)  # pyright: ignore[reportAssignmentType]
     resolved["git_sha"] = _git_sha()
-    OmegaConf.save(config=cfg, f=out_dir / "resolved_config.yaml")
+    OmegaConf.save(config=OmegaConf.create(resolved), f=out_dir / "resolved_config.yaml")
 
     dataset = build_dataset(cfg.data)
     eval_dataset = None
@@ -110,7 +110,13 @@ def main(cfg: DictConfig) -> None:
     context_len = cfg.train.get("context_len", None)
     num_transitions = cfg.data.clip_len - context_len if context_len else 1  # K (legacy: 1)
     chain_len = cfg.train.get("rollout_horizon", None) or num_transitions  # Tp (null = one chain)
-    run_name = f"{experiment}-{phase}-Tp{chain_len}-K{num_transitions}-seed{cfg.train.seed}"
+    lambda_logit = float(cfg.train.get("lambda_logit", 0.0))
+    run_name = (
+        f"{experiment}-{phase}-ll{lambda_logit:g}-"
+        f"Tp{chain_len}-K{num_transitions}-seed{cfg.train.seed}"
+    )
+    if cfg.wandb.get("run_tag") is not None:
+        run_name = f"{run_name}-{cfg.wandb.run_tag}"
     logger: MetricLogger = (
         WandbLogger(project=cfg.wandb.project, mode=cfg.wandb.mode, config=resolved, name=run_name)
         if cfg.wandb.enabled

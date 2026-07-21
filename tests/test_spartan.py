@@ -113,77 +113,63 @@ def test_slot_permutation_equivariance(
     torch.testing.assert_close(permuted, base[:, perm])
 
 
-def test_paired_object_attention_preserves_joint_permutation_equivariance(
+def test_independent_node_embeddings_expose_coordinates(
     inputs: tuple[torch.Tensor, torch.Tensor],
 ) -> None:
-    """The relation must commute with a joint permutation, including with aux."""
-    torch.manual_seed(9)  # pyright: ignore[reportUnknownMemberType]
-    model = Spartan(
-        slot_size=D,
-        num_layers=2,
-        embed_dim=None,
-        mlp_hidden_size=16,
-        aux_dim=4,
-        paired_object_attention=True,
-    )
-    model.eval()
-    state, params = inputs
-    aux = torch.randn(B, 2, 4)
-    perm = torch.tensor([2, 0, 1])
-    with torch.no_grad():
-        base = model(state, params, aux).prediction
-        permuted = model(state[:, perm], params[:, perm], aux).prediction
-    torch.testing.assert_close(permuted, base[:, perm])
-
-
-def test_paired_object_attention_makes_parameter_reassignment_observable(
-    inputs: tuple[torch.Tensor, torch.Tensor],
-) -> None:
-    """Legacy attention sees a parameter set; paired attention sees assignments."""
+    """Node addresses make reassignment visible without specifying i ← i."""
     state, params = inputs
     reassignment = torch.tensor([1, 2, 0])
 
-    def build(paired: bool) -> Spartan:
-        torch.manual_seed(12)  # pyright: ignore[reportUnknownMemberType]
-        predictor = Spartan(
-            slot_size=D,
-            num_layers=1,
-            embed_dim=None,
-            mlp_hidden_size=16,
-            dense=True,
-            paired_object_attention=paired,
-        )
-        predictor.eval()
-        # Remove content-dependent q·k logits so this isolates the explicit
-        # same-object relation rather than relying on random gating decisions.
-        layer = cast(SpartanLayer, predictor.layers[0])
-        with torch.no_grad():
-            layer.project_q.weight.zero_()
-            layer.project_k.weight.zero_()
-        return predictor
-
-    legacy = build(False)
-    paired = build(True)
-    with torch.no_grad():
-        legacy_base = legacy(state, params).prediction
-        legacy_reassigned = legacy(state, params[:, reassignment]).prediction
-        paired_base = paired(state, params).prediction
-        paired_reassigned = paired(state, params[:, reassignment]).prediction
-    torch.testing.assert_close(legacy_reassigned, legacy_base)
-    assert not torch.allclose(paired_reassigned, paired_base)
-
-
-def test_paired_object_attention_is_opt_in_for_checkpoint_compatibility() -> None:
-    legacy = Spartan(slot_size=D, num_layers=1, embed_dim=None, mlp_hidden_size=16)
-    paired = Spartan(
+    torch.manual_seed(14)  # pyright: ignore[reportUnknownMemberType]
+    anonymous = Spartan(
         slot_size=D,
         num_layers=1,
         embed_dim=None,
         mlp_hidden_size=16,
-        paired_object_attention=True,
+        dense=True,
+    ).eval()
+    torch.manual_seed(14)  # pyright: ignore[reportUnknownMemberType]
+    addressed = Spartan(
+        slot_size=D,
+        num_layers=1,
+        embed_dim=None,
+        mlp_hidden_size=16,
+        dense=True,
+        node_embeddings=True,
+        num_slots=N,
+    ).eval()
+
+    with torch.no_grad():
+        anonymous_base = anonymous(state, params).prediction
+        anonymous_reassigned = anonymous(state, params[:, reassignment]).prediction
+        addressed_base = addressed(state, params).prediction
+        addressed_reassigned = addressed(state, params[:, reassignment]).prediction
+    torch.testing.assert_close(anonymous_reassigned, anonymous_base)
+    assert not torch.allclose(addressed_reassigned, addressed_base)
+    assert addressed.state_node_embed is not None
+    assert addressed.param_node_embed is not None
+    assert not torch.equal(addressed.state_node_embed, addressed.param_node_embed)
+
+
+def test_node_embeddings_validate_fixed_slot_count(
+    inputs: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    with pytest.raises(ValueError, match="positive num_slots"):
+        Spartan(
+            slot_size=D,
+            embed_dim=None,
+            mlp_hidden_size=16,
+            node_embeddings=True,
+        )
+    addressed = Spartan(
+        slot_size=D,
+        embed_dim=None,
+        mlp_hidden_size=16,
+        node_embeddings=True,
+        num_slots=N + 1,
     )
-    assert not any("state_from_param_bias" in key for key in legacy.state_dict())
-    assert any("state_from_param_bias" in key for key in paired.state_dict())
+    with pytest.raises(ValueError, match="configured num_slots"):
+        addressed(*inputs)
 
 
 def test_auxiliary_tokens() -> None:
@@ -253,6 +239,18 @@ def test_logit_penalty_finite_and_grows_with_logits(
         layer.project_q.weight.mul_(3.0)
     inflated = model(*inputs)
     assert inflated.logit_penalty > out.logit_penalty
+
+
+def test_logit_diagnostics_are_finite_and_bounded(
+    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    out = model(*inputs)
+    assert torch.isfinite(out.mean_abs_logit)
+    assert torch.isfinite(out.mean_gate_probability)
+    assert torch.isfinite(out.gate_entropy)
+    assert out.mean_abs_logit >= 0
+    assert 0 <= out.mean_gate_probability <= 1
+    assert 0 <= out.gate_entropy <= torch.log(torch.tensor(2.0)) + 1e-6
 
 
 def test_dense_mode_is_fully_connected_and_deterministic(

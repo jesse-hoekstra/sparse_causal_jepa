@@ -6,11 +6,14 @@ from torch.utils.data import DataLoader
 
 from scjepa.data import BounceDataset
 from scjepa.eval import (
+    align_parameter_columns,
     correlation_matrix,
     evaluate_identifiability,
     gt_graphs_from_contacts,
     marginal_recovery,
     mean_max_correlation,
+    one_to_one_recovery,
+    optimal_one_to_one_assignment,
     read_learned_graphs,
     structural_hamming_distance,
 )
@@ -73,6 +76,18 @@ def test_learned_graph_readout_and_shd() -> None:
     assert structural_hamming_distance(state_graph, flipped).item() == 1
 
 
+def test_parameter_graph_columns_follow_global_recovery_assignment() -> None:
+    learned = torch.zeros(1, N, N, dtype=torch.bool)
+    learned[0, 0, 2] = True
+    learned[0, 1, 0] = True
+    learned[0, 2, 1] = True
+    # true mass 0 <- learned coordinate 2; mass 1 <- 0; mass 2 <- 1.
+    aligned = align_parameter_columns(learned, torch.tensor([2, 0, 1]))
+    assert torch.equal(aligned, torch.eye(N, dtype=torch.bool).unsqueeze(0))
+    with pytest.raises(ValueError, match="bijection"):
+        align_parameter_columns(learned, torch.tensor([0, 0, 1]))
+
+
 def test_correlation_recovers_planted_diffeomorphism() -> None:
     """ŝ = tanh(θ) in one dim + noise elsewhere ⇒ that dim wins, MCC high."""
     torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
@@ -108,6 +123,32 @@ def test_episode_level_mcc_allows_one_global_parameter_permutation() -> None:
     # invariant to this legitimate learned-factor permutation.
     pooled = mean_max_correlation(learned.reshape(-1, 1), theta.reshape(-1, 1))
     assert pooled < 0.2
+
+
+def test_strict_assignment_is_one_to_one() -> None:
+    """The same attractive learned coordinate cannot be reused for two masses."""
+    scores = torch.tensor(
+        [
+            [0.99, 0.98, 0.00],
+            [0.10, 0.20, 0.30],
+            [0.00, 0.10, 0.97],
+        ]
+    )
+    target_to_learned = optimal_one_to_one_assignment(scores)
+    assignment = [int(value) for value in target_to_learned]
+    assert assignment == [0, 1, 2]
+    assert len(set(assignment)) == 3
+
+
+def test_one_to_one_recovery_finds_one_global_permutation() -> None:
+    torch.manual_seed(8)  # pyright: ignore[reportUnknownMemberType]
+    target = torch.randn(600, 3)
+    learned = target[:, [2, 0, 1]]
+    recovery = one_to_one_recovery(learned, target, epochs=100)
+    assert [int(value) for value in recovery.target_to_learned] == [1, 2, 0]
+    assert recovery.nonlinear_score > 0.98
+    assert recovery.linear_score > 0.999
+    assert recovery.nonlinear_matrix.shape == (3, 3)
 
 
 def test_correlation_matrix_guards() -> None:

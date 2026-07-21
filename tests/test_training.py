@@ -59,7 +59,7 @@ def test_scjepa_forward_contract() -> None:
 
 
 def test_scjepa_supports_track_aware_scalar_parameters() -> None:
-    """The future learned-slot rung can retain the same scalar/pairing contract."""
+    """The future learned-slot rung can retain the same scalar parameter contract."""
     model = build_scjepa(
         resolution=RES,
         num_slots=3,
@@ -75,12 +75,10 @@ def test_scjepa_supports_track_aware_scalar_parameters() -> None:
         spartan_embed_dim=None,
         spartan_mlp_hidden=32,
         spartan_mlp_layers=2,
-        spartan_paired_object_attention=True,
     )
     out = model(torch.randn(2, 4, 3, RES, RES))
     assert out.causal_params.shape == (2, 3, 1)
     assert model.predictor.param_size == 1
-    assert model.predictor.paired_object_attention
 
 
 def test_lagrangian_dual_dynamics() -> None:
@@ -276,9 +274,18 @@ def test_periodic_eval_logs_metrics(tmp_path: Path) -> None:
     Trainer(model, dataset, config, logger, eval_dataset=eval_dataset).train()
     eval_records = [m for _, m in logger.records if any(k.startswith("eval/") for k in m)]
     assert len(eval_records) == 2  # one per step with eval_every=1
+    expected_eval_keys = {
+        "eval/pred_loss",
+        "eval/constraint_loss",
+        "eval/mean_abs_logit",
+        "eval/gate_entropy",
+        "eval/mass_mcc",
+        "eval/shd_state",
+        "eval/shd_param_aligned",
+        "eval/path_density",
+    }
     for record in eval_records:
-        assert "eval/mcc" in record
-        assert "eval/shd_param" in record
+        assert set(record) == expected_eval_keys
     bad = tiny_config(tmp_path, steps=1)
     bad.eval_every = 1
     bad.input_key = "states"

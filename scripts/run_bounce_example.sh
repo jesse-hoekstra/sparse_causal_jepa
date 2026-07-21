@@ -18,6 +18,9 @@
 #   --main-steps=300000  MAIN run length only (default: config value)
 #   --eval-episodes=5000 final identifiability sample size (default: 512;
 #                        use 5000 for the paper-comparable Baumgartner run)
+#   --final-seed-offset=29 held-out TEST split for the final report. Periodic
+#                          curves and tau calibration use validation offset 17.
+#   --eval-device=cpu    device used by evaluation model forwards
 #   --identity-check   train a matched A≡0 mass-blind reference and abort unless
 #                      calibrated tau is strictly below its held-out loss
 #   --tau-max=VALUE    optional additional numeric guard: abort before the main
@@ -31,7 +34,8 @@
 # All other arguments are hydra overrides, passed to every run (the D12
 # identical-config rule; the dense/sparsity toggles are the reference's DEFINITION).
 # The equivalent env vars (TAU_FACTOR, CALIB_STEPS, MAIN_STEPS, EVAL_EPISODES,
-# IDENTITY_CHECK, RUN_TAG, PYTHON) still work as a fallback; flags win.
+# FINAL_SEED_OFFSET, EVAL_DEVICE, IDENTITY_CHECK, RUN_TAG, PYTHON) still work as
+# a fallback; flags win.
 set -euo pipefail
 
 PY=${PYTHON:-python}
@@ -39,6 +43,8 @@ TAU_FACTOR=${TAU_FACTOR:-1.0}
 CALIB_STEPS=${CALIB_STEPS:-}
 TAU_MAX=${TAU_MAX:-}
 EVAL_EPISODES=${EVAL_EPISODES:-512}
+FINAL_SEED_OFFSET=${FINAL_SEED_OFFSET:-29}
+EVAL_DEVICE=${EVAL_DEVICE:-cpu}
 IDENTITY_CHECK=${IDENTITY_CHECK:-false}
 
 HYDRA_ARGS=()
@@ -49,6 +55,8 @@ for arg in "$@"; do
     --calib-steps=*) CALIB_STEPS="${arg#*=}" ;;
     --main-steps=*)  MAIN_STEPS="${arg#*=}" ;;
     --eval-episodes=*) EVAL_EPISODES="${arg#*=}" ;;
+    --final-seed-offset=*) FINAL_SEED_OFFSET="${arg#*=}" ;;
+    --eval-device=*) EVAL_DEVICE="${arg#*=}" ;;
     --identity-check) IDENTITY_CHECK=true ;;
     --run-tag=*)     RUN_TAG="${arg#*=}" ;;
     --*)             echo "unknown flag: $arg" >&2; exit 2 ;;
@@ -79,8 +87,9 @@ echo "== step 1/${TOTAL_PHASES}: tau calibration (dense A≡1 reference${CALIB_S
 # compares against it: raw or variance-normalized prediction error plus
 # lambda_logit * logit_penalty. The eval harness reports it as constraint_loss.
 FC_LOSS=$("$PY" scripts/eval_identifiability.py "${BASE}/calibration" --episodes 256 \
+  --seed-offset 17 --device "${EVAL_DEVICE}" \
   | awk '/constraint_loss/ {print $2}')
-TAU=$("$PY" -c "print(round(float('${FC_LOSS}') * float('${TAU_FACTOR}'), 4))")
+TAU=$("$PY" -c "print(float('${FC_LOSS}') * float('${TAU_FACTOR}'))")
 echo "dense-reference held-out constraint_loss=${FC_LOSS} -> tau=${TAU} (x${TAU_FACTOR})"
 if [ -n "${TAU_MAX}" ] && [ "$("$PY" -c "print(1 if float('${TAU}') > float('${TAU_MAX}') else 0)")" = "1" ]; then
   echo "ABORT: tau=${TAU} > --tau-max=${TAU_MAX} (D17 go/no-go guard). A tau at or above" >&2
@@ -97,6 +106,7 @@ if [ "${IDENTITY_CHECK}" = true ]; then
     model.spartan_dense=false model.spartan_identity=true \
     train.sparsity_enabled=false train.eval_every=null ${CALIB_STEPS_OVERRIDE}
   IDENTITY_LOSS=$("$PY" scripts/eval_identifiability.py "${BASE}/identity" --episodes 256 \
+    --seed-offset 17 --device "${EVAL_DEVICE}" \
     | awk '/constraint_loss/ {print $2}')
   echo "mass-blind held-out constraint_loss=${IDENTITY_LOSS}; calibrated tau=${TAU}"
   if [ "$("$PY" -c "print(1 if float('${TAU}') >= float('${IDENTITY_LOSS}') else 0)")" = "1" ]; then
@@ -116,5 +126,8 @@ if [ -n "${MAIN_STEPS:-}" ]; then MAIN_STEPS_OVERRIDE="train.steps=${MAIN_STEPS}
 
 FINAL_PHASE=$((MAIN_PHASE + 1))
 echo "== step ${FINAL_PHASE}/${TOTAL_PHASES}: identifiability evaluation =="
-"$PY" scripts/eval_identifiability.py "${BASE}/main" --episodes "${EVAL_EPISODES}"
+"$PY" scripts/eval_identifiability.py "${BASE}/main" \
+  --episodes "${EVAL_EPISODES}" \
+  --seed-offset "${FINAL_SEED_OFFSET}" \
+  --device "${EVAL_DEVICE}"
 echo "artifacts in ${BASE}/main (checkpoint, resolved config, recovery_grid.png)"

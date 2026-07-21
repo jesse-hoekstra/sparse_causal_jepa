@@ -13,14 +13,14 @@ Conventions come from one source of truth each:
   ``[:N, N:2N]``.
 
 SHD here is the Hamming distance between binary adjacency matrices (edge
-insertions + deletions; no orientation term since both graphs are directed with
-fixed node identity). Slot↔object alignment is the CALLER's job: with
-ground-truth embeddings slot i is object i by construction; with learned slots,
-align first (Hungarian / probe) and permute before calling.
+insertions + deletions; no orientation term since both graphs are directed).
+Node alignment is the CALLER's job. In the GT-state experiment the state rows
+already have object identity, while anonymous parameter-coordinate columns
+must be permuted by the one global recovery assignment before comparison.
 """
 
 import torch
-from jaxtyping import Bool, Float
+from jaxtyping import Bool, Float, Int64
 from torch import Tensor
 
 
@@ -73,4 +73,29 @@ def structural_hamming_distance(
     return (learned != target).sum(dim=(-2, -1)).float().mean()
 
 
-__all__ = ["gt_graphs_from_contacts", "read_learned_graphs", "structural_hamming_distance"]
+def align_parameter_columns(
+    learned: Bool[Tensor, "b n n"], target_to_learned: Int64[Tensor, " n"]
+) -> Bool[Tensor, "b n n"]:
+    """Put anonymous learned parameter columns into physical-parameter order.
+
+    ``target_to_learned[i] == j`` means learned column ``j`` was globally
+    assigned to physical parameter ``i``. The mapping must be one bijection;
+    episode-specific assignments are intentionally unsupported.
+    """
+    num_params = learned.shape[-1]
+    if target_to_learned.ndim != 1 or target_to_learned.shape[0] != num_params:
+        raise ValueError(
+            f"expected a length-{num_params} target-to-learned mapping, got "
+            f"{tuple(target_to_learned.shape)}"
+        )
+    if sorted(int(value) for value in target_to_learned) != list(range(num_params)):
+        raise ValueError("parameter alignment must be a bijection")
+    return learned[..., target_to_learned.to(learned.device)]
+
+
+__all__ = [
+    "align_parameter_columns",
+    "gt_graphs_from_contacts",
+    "read_learned_graphs",
+    "structural_hamming_distance",
+]

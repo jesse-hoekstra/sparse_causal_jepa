@@ -7,12 +7,13 @@
 #   - radius proportional to mass ("for ease of observation" + variability;
 #     deliberately departs from D11 invisibility for this comparison)
 #   - attention-logit loss (their Eq. 11; F.4: required against path plateau)
-#   - MCC = their F.1 episode-level MLP-R² metric (`mcc`); the former
-#     episode-object probe remains available separately as `mcc_pooled`
+#   - mass recovery = nonlinear MLP-R² under one global one-to-one coordinate
+#     permutation, with the assignment selected and scored on disjoint folds
 # Their scale: ~300k steps, 8 seeds (Fig. 17) -> GPU/overnight, not laptop.
 # Their Fig. 3 SPARTAN MCC (~0.9+) is context, not a like-for-like target: the
-# MODEL is ours (JEPA, D6-D9), and only the environment/metric are aligned.
-# D24 changes the simulator, parameter encoder, pairing, loss, and path objective,
+# model is ours (JEPA, D6-D9), and our one-to-one held-out score is stricter
+# than their mean-max metric even though it uses the same nonlinear R² probes.
+# D24/D25 change the simulator, parameter encoder, loss, and path objective,
 # so every reported run must recalibrate tau under this exact config. Use the
 # full same-pipeline lineage in scripts/isambard_pipeline.sbatch.
 
@@ -31,12 +32,15 @@ model:
   # D21: rollout state space = raw GT states (fixed ruler, D20) — only the
   # parameter path (context embed + pooling) and the predictor train.
   gt_states: true
-  # Preserve each object's trajectory while pooling temporal evidence, exchange
-  # collision evidence equivariantly across objects, then impose Baumgartner's
-  # known q=5 latent dimensionality: one scalar parameter for each of 5 balls.
-  pooling_type: track_aware
+  num_slots: 5
+  # Five persistent learned coordinate queries encode the complete trajectory
+  # into Baumgartner's known q=5 latent vector. Unlike track_aware pooling,
+  # output coordinate j is not defined as the parameter of input track j.
+  pooling_type: global_latent
   param_dim: 1
-  spartan_paired_object_attention: true
+  # Give graph nodes distinct addresses, but do not privilege any of the 25
+  # parameter-to-state relations. A global latent permutation remains valid.
+  spartan_node_embeddings: true
 
 data:
   mass_normal: [1.5, 0.5] # UNSPECIFIED upstream — our choice
@@ -59,10 +63,6 @@ train:
   # Raw-state observations already provide the fixed ruler used in
   # Baumgartner/SPARTAN's reconstruction constraint; use their raw MSE.
   constraint_normalization: raw
-  # The unnormalised multi-layer path count otherwise dominates q/k gradients
-  # before the GECO controller can react. Train the gated dynamics first, then
-  # let the constraint controller begin pruning.
-  sparsity_warmup_steps: 10000
   sparsity_lambda_init: 1.0e6
   # Inherited only as a bare-train.py smoke placeholder, now in raw-MSE units.
   # The reporting pipeline always replaces it with the fresh dense reference.
@@ -84,11 +84,12 @@ train:
   # no_grad + shuffle=false and consumes no training RNG: enabling it does not
   # perturb the training trajectory (D12-safe).
   eval_every: 5000
-  # Their lambda_logit is unspecified ("small") — knob. Their F.4 warns that
-  # UNDERTUNING it makes the path loss plateau (observed: rung1_seed0,
-  # 2026-07-11, MCC ~0.01). If a short run shows loss/logit oscillating or
-  # loss/logit >> loss/pred after the first ~2k steps, raise this.
-  lambda_logit: 1.0e-3
+  # Their lambda_logit is unspecified ("small"). Zero is a neutral placeholder
+  # for bare train.py calls, not the reported setting: first run
+  # isambard_logit_sweep.sbatch, then pass its selected value explicitly to
+  # isambard_pipeline.sbatch. Their F.4 shows that leaving it at zero can make
+  # the path objective plateau in the actual gated model.
+  lambda_logit: 0.0
   # SPARTAN A.2 / Baumgartner Eq. 10 leave this numerical step unspecified.
   # Keep D23's 2e-2 as a conservative first pilot value, but do NOT treat its
   # old timing evidence as transferable: D24 changed normalized loss to raw
@@ -97,5 +98,6 @@ train:
   sparsity_step_size: 2.0e-2
   # The papers specify no clamp. We retain the base 1e6 only as a numerical
   # recovery guard; unlike D22's 3e4 cap its initial path weight is just 1e-6.
-  # D24 starts at this ceiling and adds the explicit warm-up above.
+  # There is no explicit warm-up: the large initial lambda supplies the
+  # dynamics-first phase described in the papers.
   sparsity_lambda_max: 1.0e6

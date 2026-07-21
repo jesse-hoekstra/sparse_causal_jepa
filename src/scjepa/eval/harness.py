@@ -1,14 +1,14 @@
-"""Identifiability evaluation harness: run a model over episodes, report metrics.
+"""Identifiability evaluation for globally indexed latent coordinates.
 
 Consumes any JEPA variant with the ``JepaOutput`` contract plus a dataset whose
 items carry the bounce-style ground truth (``params``, ``contacts``). Returns
-scalar metrics and the marginal-recovery scatter data.
+the compact scalar metrics used during training and the full held-out recovery
+matrix used for final analysis.
 
-Alignment caveat (see graph.py): metrics assume slot i ≡ object i. That holds
-by construction in the GT-embedding regime (StateJepa). In the vision regime
-learned slots are NOT aligned to objects; numbers computed there without an
-alignment step are meaningless, so this harness refuses them until persistent
-trajectory-level alignment is implemented.
+State rows are object-aligned in the GT-state regime. Parameter coordinates are
+*not* assumed to have the same order as masses: one global Hungarian mapping is
+learned on a held-out alignment split, frozen on the final score split, and
+also used to align parameter-graph columns before SHD is computed.
 """
 
 from typing import NamedTuple
@@ -18,11 +18,12 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
 from scjepa.eval.graph import (
+    align_parameter_columns,
     gt_graphs_from_contacts,
     read_learned_graphs,
     structural_hamming_distance,
 )
-from scjepa.eval.parameters import marginal_recovery, mean_max_correlation, nonlinear_mcc
+from scjepa.eval.parameters import one_to_one_recovery
 from scjepa.losses import (
     prediction_mse,
     resolve_constraint_normalization,
@@ -33,21 +34,31 @@ from scjepa.models.state_jepa import StateJepa
 
 
 class IdentifiabilityReport(NamedTuple):
-    """Scalar metrics + recovery scatter data.
+    """Periodic metrics plus final-only recovery diagnostics.
 
-    ``recovery_*``: pooled (episode, object) samples for the single best-dim
-    scatter. ``per_slot_learned`` (E, N, d) / ``per_slot_true`` (E, N): kept
-    unpooled for the Baumgartner-Fig.-5/12-style grid (true mass of ball i vs
-    slot j's learned parameter — diagonal sharp + off-diagonal blobs = each
-    mass identified in ITS OWN slot).
+    ``metrics`` is deliberately compact because every entry becomes a W&B
+    curve. ``diagnostics`` contains useful final scalars that should not create
+    redundant periodic curves. Recovery matrices use
+    ``[learned_coordinate, true_mass]`` order; ``target_to_learned[i]`` is the
+    one globally assigned learned coordinate for mass ``i``.
     """
 
     metrics: dict[str, float]
-    recovery_best_dim: int
-    recovery_learned: Tensor
-    recovery_true: Tensor
-    per_slot_learned: Tensor
-    per_slot_true: Tensor
+    diagnostics: dict[str, float]
+    learned_coordinates: Tensor
+    true_parameters: Tensor
+    recovery_matrix: Tensor
+    recovery_linear_matrix: Tensor
+    target_to_learned: Tensor
+
+
+def _weighted_mean(values: list[Tensor], weights: list[int]) -> float:
+    """Average per-batch scalar values without overweighting the last batch."""
+    if len(values) != len(weights) or not values:
+        raise ValueError("weighted mean requires one positive weight per value")
+    denominator = float(sum(weights))
+    numerator = sum(float(value) * weight for value, weight in zip(values, weights, strict=True))
+    return numerator / denominator
 
 
 @torch.random.fork_rng(devices=[])  # pyright: ignore[reportUnknownMemberType]
@@ -117,21 +128,25 @@ def evaluate_identifiability(
     target_vars: list[Tensor] = []
     logit_penalties: list[Tensor] = []
     shd_state: list[Tensor] = []
-    shd_param: list[Tensor] = []
-    learned_params: list[Tensor] = []
-    true_params: list[Tensor] = []
+    learned_param_graphs: list[Tensor] = []
+    true_param_graphs: list[Tensor] = []
+    learned_coordinates: list[Tensor] = []
+    true_parameters: list[Tensor] = []
     path_density: list[Tensor] = []
     path_density_full: list[Tensor] = []
+    mean_abs_logits: list[Tensor] = []
+    mean_gate_probabilities: list[Tensor] = []
+    gate_entropies: list[Tensor] = []
+    batch_weights: list[int] = []
 
     for index, batch in enumerate(loader):
         if max_batches is not None and index >= max_batches:
             break
         inputs = batch[input_key].to(device)
         output: JepaOutput = model(inputs, context_len=context_len, rollout_horizon=rollout_horizon)
+        batch_weights.append(inputs.shape[0])
         num_slots = output.prediction.shape[1]
-        batch_pred = prediction_mse(
-            output.prediction, output.target_slots, resolved_matching
-        ).cpu()
+        batch_pred = prediction_mse(output.prediction, output.target_slots, resolved_matching).cpu()
         pred_losses.append(batch_pred)
         # D17: per-batch target variance, same formula as the trainer's dual
         # measurement (mean per-dim variance of the target slots, floored).
@@ -155,66 +170,78 @@ def evaluate_identifiability(
         state_gt, param_gt = gt_graphs_from_contacts(flat_contacts)
         state_learned, param_learned = read_learned_graphs(output.path_matrix, num_slots)
         shd_state.append(structural_hamming_distance(state_learned, state_gt).cpu())
-        shd_param.append(structural_hamming_distance(param_learned, param_gt).cpu())
+        learned_param_graphs.append(param_learned.cpu())
+        true_param_graphs.append(param_gt.cpu())
         # Primary density mirrors the optimized state-output rows. Parameter
         # rows after the last layer are not decoded, so report their inclusion
         # only under the explicit full-token diagnostic.
-        path_density.append(
-            (output.path_matrix[:, :num_slots] >= 0.5).float().mean().cpu()
-        )
+        path_density.append((output.path_matrix[:, :num_slots] >= 0.5).float().mean().cpu())
         path_density_full.append((output.path_matrix >= 0.5).float().mean().cpu())
-        learned_params.append(
-            output.causal_params.reshape(-1, output.causal_params.shape[-1]).cpu()
-        )
-        true_params.append(batch["params"].reshape(-1, batch["params"].shape[-1]).cpu())
+        mean_abs_logits.append(output.mean_abs_logit.cpu())
+        mean_gate_probabilities.append(output.mean_gate_probability.cpu())
+        gate_entropies.append(output.gate_entropy.cpu())
+        # One row per episode. Coordinate order is persistent but deliberately
+        # not assumed to match the physical mass order.
+        learned_coordinates.append(output.causal_params.flatten(1).cpu())
+        true_parameters.append(batch["params"].flatten(1).cpu())
 
     if num_slots is None:
         raise ValueError("dataset yielded no batches")
-    learned_flat = torch.cat(learned_params)
-    true_flat = torch.cat(true_params)
-    per_slot_learned = learned_flat.reshape(-1, num_slots, learned_flat.shape[-1])
-    per_slot_true = true_flat.reshape(-1, num_slots)
-    # Baumgartner App. F.1 treats each trajectory as one sample and compares its
-    # complete learned parameter vector against all five true masses. For the
-    # exact scalar bottleneck this is E x 5 versus E x 5. Flattening only the
-    # coordinate axes (not episode and object) also gives a well-defined
-    # overcomplete diagnostic for legacy d>1 representations.
-    episode_learned = per_slot_learned.flatten(1)
-    episode_true = per_slot_true
-    best_dim, recovery_learned, recovery_true = marginal_recovery(learned_flat, true_flat)
-    pred_loss = torch.stack(pred_losses).mean().item()
-    pred_loss_normalized = torch.stack(pred_losses_normalized).mean().item()
-    logit_penalty = torch.stack(logit_penalties).mean().item()
-    constraint_prediction = (
-        pred_loss if resolved_normalization == "raw" else pred_loss_normalized
-    )
+    episode_learned = torch.cat(learned_coordinates)
+    episode_true = torch.cat(true_parameters)
+    if episode_learned.shape[1] != num_slots or episode_true.shape[1] != num_slots:
+        raise ValueError(
+            "strict graph-aligned mass recovery requires exactly one global latent "
+            f"coordinate per object; got learned {tuple(episode_learned.shape)} and "
+            f"true {tuple(episode_true.shape)} for {num_slots} objects"
+        )
+    recovery = one_to_one_recovery(episode_learned, episode_true)
+
+    # The state rows already follow GT object order. Reorder only the learned
+    # parameter columns so column i denotes true mass i, using the mapping
+    # selected globally from a disjoint recovery alignment fold.
+    learned_param = torch.cat(learned_param_graphs)
+    true_param = torch.cat(true_param_graphs)
+    aligned_param = align_parameter_columns(learned_param, recovery.target_to_learned)
+
+    pred_loss = _weighted_mean(pred_losses, batch_weights)
+    pred_loss_normalized = _weighted_mean(pred_losses_normalized, batch_weights)
+    logit_penalty = _weighted_mean(logit_penalties, batch_weights)
+    constraint_prediction = pred_loss if resolved_normalization == "raw" else pred_loss_normalized
+    weighted_logit = lambda_logit * logit_penalty
+    constraint_loss = constraint_prediction + weighted_logit
     metrics = {
         "pred_loss": pred_loss,
-        "pred_loss_normalized": pred_loss_normalized,
-        "target_var": torch.stack(target_vars).mean().item(),
-        "logit_penalty": logit_penalty,
+        "mean_abs_logit": _weighted_mean(mean_abs_logits, batch_weights),
+        "gate_entropy": _weighted_mean(gate_entropies, batch_weights),
         # The exact tau quantity, on the same configured scale as training.
-        "constraint_loss": constraint_prediction + lambda_logit * logit_penalty,
-        "shd_state": torch.stack(shd_state).mean().item(),
-        "shd_param": torch.stack(shd_param).mean().item(),
-        "mcc": nonlinear_mcc(episode_learned, episode_true).item(),
-        "mcc_linear": mean_max_correlation(episode_learned, episode_true).item(),
-        # Retain the former shared-per-object probe under an explicit name. It
-        # can be useful diagnostically, but it is not the paper's MCC.
-        "mcc_pooled": nonlinear_mcc(learned_flat, true_flat).item(),
-        "mcc_linear_pooled": mean_max_correlation(learned_flat, true_flat).item(),
-        "path_density": torch.stack(path_density).mean().item(),
-        "path_density_full": torch.stack(path_density_full).mean().item(),
-        "num_samples": float(episode_learned.shape[0]),
-        "num_pooled_samples": float(learned_flat.shape[0]),
+        "constraint_loss": constraint_loss,
+        "shd_state": _weighted_mean(shd_state, batch_weights),
+        "shd_param_aligned": structural_hamming_distance(aligned_param, true_param).item(),
+        # The only periodic mass-recovery curve: strict nonlinear one-to-one
+        # recovery under one global permutation.
+        "mass_mcc": recovery.nonlinear_score.item(),
+        "path_density": _weighted_mean(path_density, batch_weights),
+    }
+    diagnostics = {
+        "logit_penalty": logit_penalty,
+        "logit_weighted": weighted_logit,
+        "logit_fraction": weighted_logit / max(constraint_loss, 1e-12),
+        "mean_gate_probability": _weighted_mean(mean_gate_probabilities, batch_weights),
+        "pred_loss_normalized": pred_loss_normalized,
+        "target_var": _weighted_mean(target_vars, batch_weights),
+        "mass_mcc_linear": recovery.linear_score.item(),
+        "path_density_full": _weighted_mean(path_density_full, batch_weights),
+        "num_samples": float(recovery.num_samples),
     }
     return IdentifiabilityReport(
         metrics=metrics,
-        recovery_best_dim=int(best_dim.item()),
-        recovery_learned=recovery_learned,
-        recovery_true=recovery_true,
-        per_slot_learned=per_slot_learned,
-        per_slot_true=per_slot_true,
+        diagnostics=diagnostics,
+        learned_coordinates=episode_learned,
+        true_parameters=episode_true,
+        recovery_matrix=recovery.nonlinear_matrix,
+        recovery_linear_matrix=recovery.linear_matrix,
+        target_to_learned=recovery.target_to_learned,
     )
 
 

@@ -18,6 +18,7 @@ from torch import Tensor, nn
 from scjepa.models.channel_split import (
     AttnPooling,
     CrossSlotAttnPooling,
+    GlobalLatentAttnPooling,
     KinematicHead,
     TrackAwareAttnPooling,
     build_pooling,
@@ -33,7 +34,9 @@ class StateJepa(nn.Module):
         self,
         context_embed: nn.Module,
         target_embed: nn.Module,
-        pooling: AttnPooling | CrossSlotAttnPooling | TrackAwareAttnPooling,
+        pooling: (
+            AttnPooling | CrossSlotAttnPooling | TrackAwareAttnPooling | GlobalLatentAttnPooling
+        ),
         kinematic_head: KinematicHead | None,
         predictor: Spartan,
         gt_states: bool = False,
@@ -98,9 +101,15 @@ class StateJepa(nn.Module):
             assert self.kinematic_head is not None
             anchors = self.kinematic_head.project(self.context_embed(states[:, anchor_steps]))
             target_slots = self.target_embed(states[:, th:])  # (B, K, N, d)
-        prediction, path_matrix, sparsity, logit_penalty = rollout_predictions(
-            self.predictor, anchors, causal_params, aux, chain_len
-        )
+        (
+            prediction,
+            path_matrix,
+            sparsity,
+            logit_penalty,
+            mean_abs_logit,
+            mean_gate_probability,
+            gate_entropy,
+        ) = rollout_predictions(self.predictor, anchors, causal_params, aux, chain_len)
         return JepaOutput(
             prediction=prediction,
             target_slots=target_slots.flatten(0, 1),
@@ -110,11 +119,15 @@ class StateJepa(nn.Module):
             path_matrix=path_matrix,
             sparsity=sparsity,
             logit_penalty=logit_penalty,
+            mean_abs_logit=mean_abs_logit,
+            mean_gate_probability=mean_gate_probability,
+            gate_entropy=gate_entropy,
         )
 
 
 def build_state_jepa(
     state_dim: int = 4,
+    num_slots: int | None = None,
     slot_size: int = 32,
     pooling_heads: int = 4,
     pooling_type: str = "cross_slot",  # D14 default; "per_slot" = D4 ablation
@@ -125,7 +138,7 @@ def build_state_jepa(
     spartan_mlp_hidden: int = 512,
     spartan_mlp_layers: int = 3,
     spartan_temperature: float = 1.0,
-    spartan_paired_object_attention: bool = False,
+    spartan_node_embeddings: bool = False,
     aux_dim: int | None = None,
     spartan_dense: bool = False,
     spartan_identity: bool = False,
@@ -141,8 +154,9 @@ def build_state_jepa(
     next states), and the target/kinematic modules are dropped (nothing on the
     state path trains, so the constraint's ruler is fixed). ``param_dim`` is
     the per-object causal bottleneck width; ``None`` preserves the historical
-    ``slot_size``-dimensional output. A scalar bottleneck is obtained with
-    ``pooling_type="track_aware", param_dim=1``.
+    ``slot_size``-dimensional output. ``pooling_type="global_latent"`` uses
+    ``num_slots`` persistent global coordinates; ``param_dim=1`` makes each
+    coordinate scalar.
     """
     resolved_param_dim = slot_size if param_dim is None else param_dim
     predictor_state_dim = state_dim if gt_states else slot_size
@@ -155,6 +169,7 @@ def build_state_jepa(
             pooling_heads,
             max_history,
             param_dim=param_dim,
+            num_slots=num_slots,
         ),
         kinematic_head=None if gt_states else KinematicHead(slot_size=slot_size),
         predictor=Spartan(
@@ -164,11 +179,10 @@ def build_state_jepa(
             mlp_hidden_size=spartan_mlp_hidden,
             mlp_num_layers=spartan_mlp_layers,
             temperature=spartan_temperature,
-            paired_object_attention=spartan_paired_object_attention,
+            node_embeddings=spartan_node_embeddings,
+            num_slots=num_slots if spartan_node_embeddings else None,
             aux_dim=aux_dim,
-            param_size=(
-                resolved_param_dim if resolved_param_dim != predictor_state_dim else None
-            ),
+            param_size=(resolved_param_dim if resolved_param_dim != predictor_state_dim else None),
             dense=spartan_dense,
             identity=spartan_identity,
         ),

@@ -7,6 +7,7 @@ import torch
 
 from scjepa.data import BounceDataset
 from scjepa.eval import evaluate_identifiability
+from scjepa.models import GlobalLatentAttnPooling
 from scjepa.models.state_jepa import StateJepa, build_state_jepa
 from scjepa.training import TrainConfig, Trainer
 
@@ -95,9 +96,7 @@ def test_state_jepa_trains_on_bounce(tmp_path: Path) -> None:
     assert all(torch.isfinite(torch.tensor(v)) for v in metrics.values())
 
 
-def tiny_gt_model(
-    *, spartan_dense: bool = False, spartan_identity: bool = False
-) -> StateJepa:
+def tiny_gt_model(*, spartan_dense: bool = False, spartan_identity: bool = False) -> StateJepa:
     torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
     return build_state_jepa(
         state_dim=4,
@@ -113,20 +112,21 @@ def tiny_gt_model(
     )
 
 
-def tiny_gt_scalar_model() -> StateJepa:
-    """Small version of the corrected Baumgartner true-state architecture."""
+def tiny_gt_global_latent_model() -> StateJepa:
+    """Small version of the no-pairing Baumgartner true-state architecture."""
     torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
     return build_state_jepa(
         state_dim=4,
+        num_slots=N,
         slot_size=16,
         pooling_heads=2,
-        pooling_type="track_aware",
+        pooling_type="global_latent",
         param_dim=1,
         spartan_layers=1,
         spartan_embed_dim=None,
         spartan_mlp_hidden=32,
         spartan_mlp_layers=2,
-        spartan_paired_object_attention=True,
+        spartan_node_embeddings=True,
         gt_states=True,
     )
 
@@ -145,13 +145,15 @@ def test_gt_states_forward_contract() -> None:
     assert out.path_matrix.shape == (2, 2 * N, 2 * N)
 
 
-def test_gt_states_track_aware_scalar_parameter_contract() -> None:
-    """Baumgartner baseline emits exactly one causal scalar for each object."""
-    model = tiny_gt_scalar_model()
+def test_gt_states_global_latent_parameter_contract() -> None:
+    """Five persistent global coordinates feed five independently addressed nodes."""
+    model = tiny_gt_global_latent_model()
     states = torch.randn(2, 5, N, 4)
     out = model(states)
     assert out.causal_params.shape == (2, N, 1)
+    assert isinstance(model.pooling, GlobalLatentAttnPooling)
     assert model.predictor.param_size == 1
+    assert model.predictor.node_embeddings
     assert out.prediction.shape == (2, N, 4)
     assert out.path_matrix.shape == (2, 2 * N, 2 * N)
 
@@ -243,7 +245,7 @@ def test_prediction_matching_auto_resolves_from_tracked_state_contract(tmp_path:
 def test_gt_states_harness_reports_fixed_ruler() -> None:
     """target_var must be the GT data constant, not a trainable quantity."""
     dataset = BounceDataset(num_episodes=12, clip_len=4, num_balls=N, resolution=16, seed=3)
-    model = tiny_gt_scalar_model()
+    model = tiny_gt_global_latent_model()
     rng_before = torch.get_rng_state().clone()
     report = evaluate_identifiability(
         model, dataset, input_key="states", batch_size=6, max_batches=2
@@ -251,45 +253,38 @@ def test_gt_states_harness_reports_fixed_ruler() -> None:
     assert torch.equal(torch.get_rng_state(), rng_before)
     states = torch.stack([dataset[i]["states"][-1] for i in range(6)])  # first eval batch targets
     gt_var = states.reshape(-1, 4).var(dim=0).mean()
-    assert abs(report.metrics["target_var"] - gt_var.item()) < 0.05
-    assert report.metrics["constraint_loss"] == pytest.approx(report.metrics["pred_loss"])
-    assert report.per_slot_learned.shape == (12, N, 1)
+    assert abs(report.diagnostics["target_var"] - gt_var.item()) < 0.05
+    assert abs(report.metrics["constraint_loss"] - report.metrics["pred_loss"]) < 1e-9
+    assert report.learned_coordinates.shape == (12, N)
 
 
 def test_identifiability_harness_end_to_end() -> None:
     """Untrained StateJepa on bounce: harness returns bounded, finite metrics."""
     dataset = BounceDataset(num_episodes=12, clip_len=4, num_balls=N, resolution=16, seed=3)
     report = evaluate_identifiability(
-        tiny_gt_scalar_model(), dataset, input_key="states", batch_size=6, max_batches=2
+        tiny_gt_global_latent_model(), dataset, input_key="states", batch_size=6, max_batches=2
     )
     for key in (
         "pred_loss",
-        "pred_loss_normalized",
-        "target_var",
         "constraint_loss",
         "shd_state",
-        "shd_param",
-        "mcc",
-            "mcc_pooled",
-            "path_density",
-            "path_density_full",
-            "num_samples",
-        "num_pooled_samples",
+        "shd_param_aligned",
+        "mass_mcc",
+        "path_density",
     ):
         assert key in report.metrics
         assert torch.isfinite(torch.tensor(report.metrics[key])), key
     # Literal GT states use Baumgartner's raw observation-space MSE as the
     # constraint (lambda_logit=0 here). The normalized value remains diagnostic.
     assert report.metrics["constraint_loss"] == report.metrics["pred_loss"]
-    approx = report.metrics["pred_loss"] / report.metrics["target_var"]
-    assert 0.5 * approx < report.metrics["pred_loss_normalized"] < 2.0 * approx
-    assert 0 <= report.metrics["mcc"] <= 1 + 1e-6
-    assert report.metrics["num_samples"] == 12
-    assert report.metrics["num_pooled_samples"] == 12 * N
-    assert report.recovery_learned.shape == report.recovery_true.shape
-    assert report.recovery_best_dim == 0
-    assert report.per_slot_learned.shape == (12, N, 1)  # (episodes, N, d)
-    assert report.per_slot_true.shape == (12, N)
+    approx = report.metrics["pred_loss"] / report.diagnostics["target_var"]
+    assert 0.5 * approx < report.diagnostics["pred_loss_normalized"] < 2.0 * approx
+    assert 0 <= report.metrics["mass_mcc"] <= 1 + 1e-6
+    assert report.diagnostics["num_samples"] == 12
+    assert report.learned_coordinates.shape == (12, N)
+    assert report.true_parameters.shape == (12, N)
+    assert report.recovery_matrix.shape == (N, N)
+    assert report.target_to_learned.shape == (N,)
 
 
 def test_lambda_max_config_reaches_the_dual(tmp_path: Path) -> None:

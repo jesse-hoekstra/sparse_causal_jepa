@@ -17,7 +17,7 @@ model:
   enc_channels: [3, 64, 64, 64, 64]
   enc_out_channels: 128
   pooling_heads: 4
-  pooling_type: cross_slot # cross_slot (D14) | per_slot (D4) | track_aware
+  pooling_type: cross_slot # cross_slot | per_slot | track_aware | global_latent
   param_dim: null # StateJepa causal width; null preserves slot_size
   max_history: 64
   spartan_layers: 3 # SPARTAN App. A.1
@@ -25,9 +25,9 @@ model:
   spartan_mlp_hidden: 512
   spartan_mlp_layers: 3
   spartan_temperature: 1.0
-  # Relative parameter_i -> state_i relation. Joint object permutations remain
-  # equivariant, while an independent parameter reassignment becomes observable.
-  spartan_paired_object_attention: false
+  # Independent learned addresses for state nodes and parameter-coordinate
+  # nodes. This preserves coordinate identity without specifying any pairing.
+  spartan_node_embeddings: false
   spartan_dense: false # true: A≡1 (SPARTAN's "fully connected model") — τ calibration ONLY
   spartan_identity: false # true: A≡0 (mass-blind reference, path matrix = I) — D16 go/no-go ONLY
   aux_dim: null # Push-T: action dim; CLEVRER/synthetic: null
@@ -95,3 +95,4 @@ wandb:
   enabled: false # keep CI/dev offline by default; enable per-run
   project: sparse-causal-jepa
   mode: online
+  run_tag: null # optional display-name suffix supplied by launch scripts

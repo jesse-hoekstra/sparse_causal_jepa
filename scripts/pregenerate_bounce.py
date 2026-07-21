@@ -7,9 +7,10 @@ once per stage while the GPU idles. Episodes are deterministic per
 
     python scripts/pregenerate_bounce.py experiment=bounce_baumgartner
 
-writes ``data/bounce_train_v<simulator>_<num_clips>.pt`` (~630MB at 100k; data/ is
+writes ``data/bounce_train_v<simulator>_<num_clips>.pt`` for seed 0, or a
+``_seed<N>`` suffixed file for other seeds (~630MB at 100k; data/ is
 gitignored) unless it already exists. Point the runs at it with
-``data.preload=data/bounce_train_v<simulator>_<num_clips>.pt`` — the SAME hydra overrides
+``data.preload=data/bounce_train_v<simulator>_<num_clips>[_seed<N>].pt`` — the SAME hydra overrides
 must go to every reference and main run (D12); the file embeds its generation
 settings and BounceDataset refuses a mismatch. Eval splits (seed offset)
 always generate on the fly — the factory never applies ``preload`` to them.
@@ -66,10 +67,12 @@ def main(cfg: DictConfig) -> None:
     num = int(kwargs["num_episodes"])  # pyright: ignore[reportArgumentType]
     meta = BounceDataset(**kwargs).generation_meta()  # pyright: ignore[reportArgumentType]
     simulator_version = int(meta["simulator_version"])  # pyright: ignore[reportArgumentType]
+    seed = int(kwargs["seed"])  # pyright: ignore[reportArgumentType]
+    seed_suffix = "" if seed == 0 else f"_seed{seed}"
     out = (
         Path(hydra.utils.get_original_cwd())
         / "data"
-        / f"bounce_train_v{simulator_version}_{num}.pt"
+        / f"bounce_train_v{simulator_version}_{num}{seed_suffix}.pt"
     )
     if out.exists():
         try:

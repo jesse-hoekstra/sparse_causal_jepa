@@ -6,6 +6,7 @@ import torch
 from scjepa.models import (
     AttnPooling,
     CrossSlotAttnPooling,
+    GlobalLatentAttnPooling,
     KinematicHead,
     TrackAwareAttnPooling,
 )
@@ -174,6 +175,9 @@ def test_build_pooling_dispatch() -> None:
     track_aware = build_pooling("track_aware", D, 2, 8, param_dim=1)
     assert isinstance(track_aware, TrackAwareAttnPooling)
     assert track_aware.param_dim == 1
+    global_latent = build_pooling("global_latent", D, 2, 8, param_dim=1, num_slots=N)
+    assert isinstance(global_latent, GlobalLatentAttnPooling)
+    assert global_latent.num_latents == N
     with pytest.raises(ValueError, match="pooling_type"):
         build_pooling("nope", D, 2, 8)
 
@@ -268,3 +272,55 @@ def test_track_aware_validates_param_dim() -> None:
         TrackAwareAttnPooling(slot_size=D, num_heads=2, param_dim=0)
     with pytest.raises(ValueError, match="track_aware"):
         build_pooling("cross_slot", D, 2, 8, param_dim=1)
+
+
+@pytest.fixture
+def global_latent_pooling() -> GlobalLatentAttnPooling:
+    torch.manual_seed(11)  # pyright: ignore[reportUnknownMemberType]
+    return GlobalLatentAttnPooling(
+        slot_size=D,
+        num_latents=N,
+        num_input_slots=N,
+        num_heads=2,
+        max_history=8,
+        param_dim=1,
+    )
+
+
+def test_global_latent_coordinates_see_whole_trajectory(
+    global_latent_pooling: GlobalLatentAttnPooling, history: torch.Tensor
+) -> None:
+    """Every persistent coordinate may use evidence from every input track."""
+    global_latent_pooling.eval()
+    changed_track = history.clone()
+    changed_track[:, :, 1] += 5.0
+    with torch.no_grad():
+        original = global_latent_pooling(history)
+        changed = global_latent_pooling(changed_track)
+    assert original.shape == (B, N, 1)
+    assert torch.isfinite(original).all()
+    assert ((changed - original).abs().sum(dim=(0, 2)) > 0).all()
+
+
+def test_global_latent_outputs_are_queries_not_track_anchored(
+    global_latent_pooling: GlobalLatentAttnPooling, history: torch.Tensor
+) -> None:
+    """Permuting tracks does not permute the persistent latent coordinates."""
+    global_latent_pooling.eval()
+    permutation = torch.tensor([2, 0, 3, 1])
+    with torch.no_grad():
+        original = global_latent_pooling(history)
+        permuted_history = global_latent_pooling(history[:, :, permutation])
+    assert not torch.allclose(permuted_history, original[:, permutation])
+
+
+def test_global_latent_gradients_and_guards(
+    global_latent_pooling: GlobalLatentAttnPooling, history: torch.Tensor
+) -> None:
+    global_latent_pooling(history).square().mean().backward()
+    for name, parameter in global_latent_pooling.named_parameters():
+        assert parameter.grad is not None, f"no gradient for {name}"
+    with pytest.raises(ValueError, match="object slots"):
+        global_latent_pooling(history[:, :, :-1])
+    with pytest.raises(ValueError, match="requires num_slots"):
+        build_pooling("global_latent", D, 2, 8, param_dim=1)
