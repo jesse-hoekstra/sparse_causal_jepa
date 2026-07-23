@@ -27,9 +27,9 @@ from torch import Tensor, nn
 from scjepa.models.channel_split import (
     AttnPooling,
     CrossSlotAttnPooling,
-    GlobalLatentAttnPooling,
     KinematicHead,
     TrackAwareAttnPooling,
+    TrackedSlotAttentionPooling,
     build_pooling,
 )
 from scjepa.models.savi import SAViEncoder
@@ -152,7 +152,7 @@ class SCJepa(nn.Module):
         context_encoder: SAViEncoder,
         target_encoder: SAViEncoder,
         pooling: (
-            AttnPooling | CrossSlotAttnPooling | TrackAwareAttnPooling | GlobalLatentAttnPooling
+            AttnPooling | CrossSlotAttnPooling | TrackAwareAttnPooling | TrackedSlotAttentionPooling
         ),
         kinematic_head: KinematicHead,
         predictor: Spartan,
@@ -241,6 +241,7 @@ def build_scjepa(
     enc_out_channels: int = 128,
     pooling_heads: int = 4,
     pooling_type: str = "cross_slot",  # D14 default; "per_slot" = D4 ablation
+    parameter_slot_iterations: int = 3,
     param_dim: int | None = None,
     max_history: int = 64,
     spartan_layers: int = 3,
@@ -288,6 +289,7 @@ def build_scjepa(
             max_history,
             param_dim=param_dim,
             num_slots=num_slots,
+            num_iterations=parameter_slot_iterations,
         ),
         kinematic_head=KinematicHead(slot_size=slot_size),  # state_size = d (D9)
         predictor=Spartan(

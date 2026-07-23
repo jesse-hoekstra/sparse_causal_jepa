@@ -117,16 +117,16 @@ def main() -> None:
     alignment_path.write_text(json.dumps(alignment_record, indent=2))
     print(f"  recovery alignment saved to {alignment_path}")
 
-    # Full global-coordinate recovery grid. Rows are physical masses, columns
-    # are anonymous learned coordinates. The green outline shows the ONE
-    # dataset-level Hungarian assignment; no diagonal correspondence is
-    # assumed or rewarded.
+    # Full tracked-parameter recovery grid. Rows are physical masses, columns
+    # are learned parameter slots. The green outline shows the ONE frozen
+    # dataset-level Hungarian assignment (kept as a conservative guard against
+    # stable implementation-level permutations).
     num_slots = report.true_parameters.shape[1]
     grid_fig, grid_axes = plt.subplots(
         num_slots, num_slots, figsize=(1.75 * num_slots, 1.75 * num_slots), squeeze=False
     )
     for i in range(num_slots):  # row: true mass of ball i
-        for j in range(num_slots):  # column: learned global coordinate j
+        for j in range(num_slots):  # column: learned tracked parameter slot j
             cell = grid_axes[i][j]
             cell.scatter(
                 report.learned_coordinates[:, j].numpy(),
@@ -154,7 +154,7 @@ def main() -> None:
             if i == num_slots - 1:
                 cell.set_xlabel(f"$\\hat\\theta_{{{j + 1}}}$")
     grid_fig.suptitle(
-        "global one-to-one mass recovery "
+        "tracked one-to-one mass recovery "
         f"(green = frozen assignment, MCC={report.metrics['mass_mcc']:.3f})"
     )
     grid_fig.tight_layout()

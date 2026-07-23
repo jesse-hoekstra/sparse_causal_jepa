@@ -820,3 +820,32 @@ without mass labels: within 5% of zero-control prediction, choose the smallest P
 that achieves 90% of the best admissible reduction of \(L_{logit}-2\). Final pipeline evaluation
 uses a different test offset. This is only a dense feasibility screen; the decisive evidence remains
 whether the gated run reaches τ and prunes while retaining prediction and `mass_mcc`.
+
+## D26 — Tracked iterative parameter slots for Example 1 (decided 2026-07-23, Jesse+Codex)
+
+**Supersedes D25's parameter encoder.** Five independent global queries were distinguishable but
+did not compete or inherit the simulator's tracked-object identity. The dense D25 sweep collapsed
+to common episode-level mass information: mass MCC stayed at floor for every logit coefficient,
+and a frozen-checkpoint audit found nearly uniform query-to-track attention with no linearly
+recoverable centered individual masses. `GlobalLatentAttnPooling` and its configuration branch are
+removed rather than retained as an Example-1 ablation. Old D25 checkpoints remain reproducible
+from their recorded git revision, not from current HEAD.
+
+**Architecture.** Example 1 uses `TrackedSlotAttentionPooling`. A shared temporal attention block
+first summarizes each true-state track. Permutation-equivariant self-attention then contextualizes
+those summaries with collision-partner evidence. Parameter slot $i$ is initialized from track
+$i$'s temporal summary and refined for three Slot Attention iterations. In every iteration, each
+input track distributes unit responsibility across the five parameter slots; a persistent anchor
+term in the slot query retains tracked identity. A shared unconstrained scalar head emits one
+physical-parameter coordinate per tracked object.
+
+This supplies object tracking, already present in the true-state observations and provided by SAVi
+in the future pixel experiment. It does not supervise mass values or expose an assignment matrix,
+shared state/parameter address, same-index attention bias, or causal edge to SPARTAN. State and
+parameter node-address tables remain separate and independently initialized, and all 25
+parameter-to-state edges remain available for the graph to discover.
+
+**Protocol.** The first full dense/identity/sparse pipeline uses the previously employed
+`lambda_logit=1e-3` as a diagnostic bridge, not a newly selected coefficient. If tracked Slot
+Attention restores individual mass recovery, rerun the label-free dense logit sweep under this
+new architecture before multi-seed confirmatory experiments.

@@ -13,9 +13,9 @@ paper-to-code-translator).
 from scjepa.models.channel_split import (
     AttnPooling,
     CrossSlotAttnPooling,
-    GlobalLatentAttnPooling,
     KinematicHead,
     TrackAwareAttnPooling,
+    TrackedSlotAttentionPooling,
 )
 from scjepa.models.jepa import JepaOutput, SCJepa
 from scjepa.models.savi import SAViEncoder
@@ -25,7 +25,6 @@ from scjepa.models.state_jepa import StateJepa
 __all__ = [
     "AttnPooling",
     "CrossSlotAttnPooling",
-    "GlobalLatentAttnPooling",
     "JepaOutput",
     "KinematicHead",
     "SAViEncoder",
@@ -34,4 +33,5 @@ __all__ = [
     "SpartanOutput",
     "StateJepa",
     "TrackAwareAttnPooling",
+    "TrackedSlotAttentionPooling",
 ]

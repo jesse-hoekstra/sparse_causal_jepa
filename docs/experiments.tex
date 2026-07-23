@@ -1,0 +1,656 @@
+% Experiments-section fragment for the SCJEPA manuscript.
+% Intended to be included from the main paper with \input{docs/experiments}.
+% Required packages: amsmath, amssymb, bm, booktabs.
+% Status: Experiment 1 is implemented and running; Experiments 2 and 3 are
+% prospective protocols. Replace the explicit status statements with measured
+% results once each continuation gate has been passed.
+
+\section{Experiments}
+\label{sec:experiments}
+
+We evaluate whether sparse predictive structure can identify time-invariant physical
+parameters while progressively removing access to the ground-truth state.  We use a
+three-experiment ladder.  Experiment~1 gives both branches the true physical state;
+Experiment~2 replaces the predictor-side state by a causal visual encoding while retaining a
+true-state target; and Experiment~3 jointly learns the context and single-frame target
+representations from pixels.  The physical system, parameter distribution, SPARTAN predictor,
+and evaluation logic are held fixed as far as the change in observation contract permits.
+Each experiment is run only after its predecessor passes a predeclared continuation gate.  This
+staging separates failures of causal parameter identification from failures of perception,
+tracking, or jointly learned target geometry.
+
+At the time of writing, Experiment~1 is implemented and its attention-logit sweep is running.
+The later experiments below specify the intended confirmatory protocols and must not be read as
+completed empirical results.
+
+\subsection{Bounce}
+\label{sec:experiments:bounce}
+
+\subsubsection{Data}
+\label{sec:experiments:bounce:data}
+
+An episode contains $N=5$ elastic balls in the unit square.  We use $X_t$ for a rendered
+frame, $Z_t=(z_t^1,\ldots,z_t^N)$ for the true kinematic state, and
+$\boldsymbol{m}=(m_1,\ldots,m_N)$ for the time-invariant physical parameters, where
+\begin{equation}
+    X_t\in[0,1]^{3\times64\times64},
+    \qquad
+    z_t^i=(p_{x,t}^i,p_{y,t}^i,v_{x,t}^i,v_{y,t}^i)\in\mathbb{R}^{4},
+    \qquad
+    m_i>0.
+    \label{eq:bounce-observations}
+\end{equation}
+For every episode and object, the implemented Baumgartner-aligned configuration samples
+\begin{equation}
+    \epsilon_i\sim\mathcal{N}(0,1),
+    \qquad
+    m_i=\operatorname{clip}_{[0.5,3.0]}(1.5+0.5\epsilon_i),
+    \qquad
+    r_i=r_0\frac{m_i}{m_{\mathrm{ref}}},
+    \label{eq:bounce-mass-radius}
+\end{equation}
+with $r_0=0.08$ and the episode-independent reference $m_{\mathrm{ref}}=1.5$.
+Equation~\eqref{eq:bounce-mass-radius} is a clipped Gaussian, rather than a truncated
+Gaussian, and therefore places atoms at the clipping boundaries.  The numerical mass
+distribution is our declared choice because its exact parameters are not specified by the
+source Bounce experiment.
+
+The initial velocity has fixed norm $0.7$ and uniformly random direction,
+\begin{equation}
+    \varphi_i\sim\mathcal{U}[0,2\pi),
+    \qquad
+    v_0^i=0.7(\cos\varphi_i,\sin\varphi_i).
+\end{equation}
+The current generator sequentially samples an initial centre uniformly from
+$[1.05r_i,1-1.05r_i]^2$ and accepts it only if
+$\lVert p_0^i-p_0^j\rVert_2>1.1(r_i+r_j)$ for all previously placed objects $j$.
+Consequently, the support of the initial positions is itself mass-dependent.  We report this
+fact rather than describing the initial state as independent of mass.  To isolate evidence from
+the subsequent dynamics, the final study also includes a mass-independent-initialization
+control: all wall margins and pair-separation constraints are computed using the common
+worst-case radius $r_{\max}=r_0(3.0/1.5)$, irrespective of the sampled masses.  This control is
+required before attributing recovery specifically to transition dynamics rather than to the
+initial-state support.
+
+The simulator records $T=60$ states at intervals $\Delta t=0.1$, with eight physics
+substeps per recorded transition.  Free motion is followed by exact reflection of wall
+overshoot about $r_i$ or $1-r_i$.  For a colliding pair, let
+\begin{equation}
+    n_{ij}=\frac{p_i-p_j}{\lVert p_i-p_j\rVert_2},
+    \qquad
+    u_{ij}=(v_i-v_j)^\top n_{ij}<0.
+\end{equation}
+The restitution-one velocity update is
+\begin{align}
+    v_i' &= v_i-\frac{2m_j}{m_i+m_j}u_{ij}n_{ij},
+    &
+    v_j' &= v_j+\frac{2m_i}{m_i+m_j}u_{ij}n_{ij}.
+    \label{eq:elastic-collision}
+\end{align}
+Before applying this impulse, any penetration is projected back to the contact surface
+$\lVert p_i-p_j\rVert_2=r_i+r_j$ using inverse-mass weights.  The corrected simulator is
+versioned so that pre-generated trajectories from older collision rules cannot be mixed with
+the current data.
+
+Each episode supplies
+\begin{equation}
+    (X_{0:T-1},Z_{0:T-1},\boldsymbol{m},C_{0:T-2}),
+    \qquad
+    C_t\in\{0,1\}^{N\times N},
+\end{equation}
+where $C_{t,ij}=1$ records a pair contact during transition $t\rightarrow t+1$.
+Off-diagonal entries are symmetric.  In the mass-dependent-radius environment,
+$C_{t,ii}=1$ records a wall contact because its location depends on $m_i$ through $r_i$.
+We use the first $T_{\mathrm{par}}=30$ observations to infer one parameter representation and
+evaluate $K=T-T_{\mathrm{par}}=30$ transitions,
+\begin{equation}
+    \mathcal{I}=\{T_{\mathrm{par}}-1,\ldots,T-2\}=\{29,\ldots,58\}.
+    \label{eq:transition-index-set}
+\end{equation}
+Thus, the parameter encoder sees observations $0,\ldots,29$, while the supervised pairs in
+Experiment~1 are $(Z_{29},Z_{30}),\ldots,(Z_{58},Z_{59})$.  These are 30
+teacher-forced one-step predictions, not one 30-step open-loop rollout.
+
+\paragraph{Why absolute masses are observable.}
+If all physical radii were equal, multiplying every mass by a common positive constant would
+leave Equation~\eqref{eq:elastic-collision} unchanged; elastic impulses would then identify
+mass ratios but not absolute scale.  The implemented relation
+$r_i=r_0m_i/m_{\mathrm{ref}}$ removes that symmetry because a common mass rescaling also
+changes pair-contact distances, wall-contact locations, penetration correction, and the support
+of initial positions.  The current state experiment sets rendering off and never supplies a
+literal radius coordinate, but its observed positions and velocities are nevertheless generated
+by this mass-dependent geometry.  We therefore claim identification in the
+mass-proportional-physical-radius environment, not in the harder equal-radius environment.
+
+For Experiments~2 and~3, physical and rendered radii must be separated.  The simulator retains
+Equation~\eqref{eq:bounce-mass-radius}, while every object is drawn with the same
+mass-independent glyph and rendered radius.  The primary visual data must also contain no
+dataset-global visual signature tied to simulator row index.  Hence a single frame cannot reveal
+mass from the object's glyph, although a sequence can reveal mass through centre motion and
+hidden contact geometry.  A visible-radius version and an equal-physical-radius version are
+reported only as labelled controls.  The current data implementation uses a single radius switch
+for physics and rendering; splitting those two settings and versioning the resulting data are
+prerequisites for the visual experiments.
+
+\subsubsection{Ground-truth local graphs}
+\label{sec:experiments:bounce:graphs}
+
+The destination row is indexed first in every graph.  From $C_t$, we define the true
+state-to-state and mass-to-state local graphs as
+\begin{align}
+    G^{Z\rightarrow Z}_{t,ij}
+        &= \mathbf{1}\{i=j\ \lor\ C_{t,ij}=1\},
+        \\
+    G^{m\rightarrow Z}_{t,ij}
+        &= \mathbf{1}\!\left\{C_{t,ij}=1\ \lor\
+             \left(i=j\ \land\ \bigvee_k C_{t,ik}=1\right)\right\}.
+    \label{eq:bounce-ground-truth-graphs}
+\end{align}
+A pair collision therefore gives each affected state an own-mass and partner-mass parent; a
+mass-dependent wall collision gives the affected state an own-mass parent.  Self-state edges are
+always present because free motion depends on the object's previous state.
+
+\subsubsection{Shared model comparisons and metrics}
+\label{sec:experiments:shared-protocol}
+
+Every scientific comparison uses the same three predictor modes under matched initialization
+rules, training budgets, and data splits:
+\begin{enumerate}
+    \item \emph{Dense}: $A^{(\ell)}\equiv\boldsymbol{1}$ in every SPARTAN layer and no
+          path penalty.
+    \item \emph{Token-local}: $A^{(\ell)}\equiv\boldsymbol{0}$, so only each token's
+          residual--MLP path remains.  This reference has no access to other state or parameter
+          tokens, but its own state may contain statistical traces of earlier mass-dependent
+          geometry; it is therefore more precise than calling the reference fully mass-blind.
+    \item \emph{Sparse}: learned hard Bernoulli gates with the SPARTAN path objective and a
+          GECO-style constraint controller.
+\end{enumerate}
+
+There are $N$ state tokens and $N$ parameter tokens.  For $L_{\mathrm{sp}}=3$ SPARTAN
+layers, the multilayer reachability matrix is
+\begin{equation}
+    \overline A
+    =\bigl(A^{(L_{\mathrm{sp}})}+I\bigr)\cdots
+     \bigl(A^{(1)}+I\bigr),
+    \label{eq:spartan-path-matrix}
+\end{equation}
+where $\overline A_{ij}>0$ means that at least one permitted computational path connects source
+token $j$ to decoded output $i$.  The optimized path count includes only the $N$ decoded state
+rows,
+\begin{equation}
+    \mathcal{L}_{\mathrm{path}}
+    =\mathbb{E}\!\left[
+       \sum_{i=1}^{N}\sum_{j=1}^{2N}\overline A_{ij}
+     \right],
+    \qquad
+    \rho_{\mathrm{path}}
+    =\frac{1}{2N^2}\sum_{i=1}^{N}\sum_{j=1}^{2N}
+       \mathbf{1}\{\overline A_{ij}>0\}.
+    \label{eq:path-objective-density}
+\end{equation}
+The second quantity discards path multiplicity and is the primary pruning metric.  With ten
+tokens, the token-local reference has $\overline A=I_{10}$ and
+$\rho_{\mathrm{path}}=5/50=0.1$, while the dense model has
+$\rho_{\mathrm{path}}=1$.  The corresponding unnormalised path objectives are 5 and 6655:
+if $J$ is the $10\times10$ all-ones matrix, then
+$(J+I)^3=I+133J$, each decoded row sums to 1331, and five decoded rows sum to 6655.
+Reachability over all output rows is retained as a diagnostic only, since parameter-token outputs
+are not decoded.
+
+For a fixed target space, training minimizes
+\begin{equation}
+    \mathcal{L}
+    =\mathcal{L}_{\mathrm{pred}}
+     +\lambda_{\mathrm{logit}}\mathcal{L}_{\mathrm{logit}}
+     +\lambda_{\mathrm{reg}}\mathcal{R}
+     +\Lambda^{-1}\mathcal{L}_{\mathrm{path}},
+    \label{eq:shared-training-objective}
+\end{equation}
+when sparsity is enabled.  Here $\mathcal{R}$ is VISReg on learned
+representations.  Fixed raw-state targets are not regularized: applying VISReg to them produces
+no model gradient and only adds a stochastic constant.  The attention-logit penalty averages
+$\exp(a)+\exp(-a)$ over layer logits $a$ and has theoretical minimum 2; the implementation uses
+a linear continuation beyond $|a|=30$ for numerical stability.
+
+The dual constraint excludes both VISReg and the path penalty,
+\begin{equation}
+    c=\mathcal{L}_{\mathrm{pred}}
+      +\lambda_{\mathrm{logit}}\mathcal{L}_{\mathrm{logit}}
+      \leq \tau.
+    \label{eq:raw-geco-constraint}
+\end{equation}
+For every architecture and seed, $\tau$ is recalibrated as the held-out constraint of a
+converged dense reference, and the sparse run is launched only if the dense constraint is below
+the token-local constraint under a predeclared paired uncertainty test.  The dual variable starts
+at $\Lambda=10^6$, making the initial path weight $10^{-6}$, and increases or decreases according
+to a moving average of $c-\tau$.  A Boolean indicator that sparsity is enabled is not evidence
+that pruning occurred.
+
+The coefficient $\lambda_{\mathrm{logit}}$ is selected without mass labels.  The dense sweep
+contains an exact zero control, rejects candidates whose prediction error is more than 5\% worse
+than that control, and selects the smallest Pareto coefficient attaining 90\% of the best
+admissible reduction in $\mathcal{L}_{\mathrm{logit}}-2$.  We repeat or revalidate this screen
+whenever the token geometry, matching rule, or learned target space changes.  Neither masses nor
+graph labels select hyperparameters, checkpoints, or seeds.
+
+\paragraph{Parameter recovery.}
+In Experiment~1, the learned parameter vector consists of five persistent global coordinates
+$\widehat{\boldsymbol\theta}\in\mathbb{R}^{5}$.  On a probe-training fold we fit a scalar
+one-hidden-layer MLP for every pair $(\widehat\theta_j,m_i)$.  A disjoint alignment fold yields
+a nonlinear $R^2$ matrix and one global Hungarian bijection $\sigma$; the frozen bijection is
+scored on a third fold:
+\begin{equation}
+    \operatorname{MCC}_{1:1}
+      =\frac{1}{N}\sum_{i=1}^{N}R^2_{\sigma(i),i}.
+    \label{eq:strict-mcc}
+\end{equation}
+Negative $R^2$ values are clipped to zero.  This is stricter than a mean--maximum score because
+one learned coordinate cannot explain several masses and the permutation cannot change between
+episodes.  The same frozen $\sigma$ aligns parameter columns before computing graph error.  In
+the track-attached visual experiments, the single trajectory assignment instead pairs each
+learned track scalar with its physical object; the nonlinear probe is then scored over held-out
+episode--track pairs.
+
+We report raw prediction error, the exact constraint in
+Equation~\eqref{eq:raw-geco-constraint}, $\rho_{\mathrm{path}}$, state and parameter structural
+Hamming distance (SHD), all five assigned nonlinear $R^2$ values, and
+$\operatorname{MCC}_{1:1}$.  SHD is the mean unnormalised number of mismatched entries in the
+$N\times N$ local graph and therefore lies in $[0,25]$.  Decodability alone does not establish
+causal use.  We consequently evaluate three interventions: permuting learned parameter vectors
+between episodes, replacing them by their training mean, and disabling retained
+parameter-to-state paths.  Effects are reported separately on contact and non-contact
+transitions.
+
+Seed 0 is used for development.  Once a protocol is frozen, eight fresh paired seeds (1--8) are
+reported, including valid optimization failures.  Dense, token-local, and sparse checkpoints are
+evaluated on the same final 5,000-episode split.  Paired differences use a percentile bootstrap
+over seed pairs with 10,000 resamples and a fixed analysis seed.  Interrupted jobs, corrupt
+artifacts, or provenance mismatches are rerun; reproducible optimization failures remain in the
+denominator.
+
+\begin{table}[t]
+    \centering
+    \small
+    \begin{tabular}{p{0.18\linewidth}p{0.22\linewidth}p{0.23\linewidth}p{0.27\linewidth}}
+        \toprule
+        Experiment & Predictor-side observation & Prediction target & Strongest supported claim \\
+        \midrule
+        1: true state & $Z_{0:t}$ & true $Z_{t+1}$ & Identification and sparse use conditional on ordered oracle state tracks. \\
+        2: visual context & $X_{0:t}$ & true $Z_{t+1}$ & Visual state estimation and mass discovery with state-supervised training. \\
+        3: fully visual & $X_{0:t}$ & $E_\phi(X_{t+1})$ & Jointly learned visual mass representation and sparse causal use, up to trajectory permutation. \\
+        \bottomrule
+    \end{tabular}
+    \caption{The three experiments change the observation contract one step at a time.}
+    \label{tab:experiment-ladder}
+\end{table}
+
+\subsection{Experiment 1: true-state context and true-state target}
+\label{sec:experiments:true-state}
+
+\paragraph{Question and source of mass information.}
+This experiment asks whether the parameter encoder and SPARTAN can recover and use the masses
+when perception, state grounding, and slot correspondence are given.  The model receives only
+$[p_x,p_y,v_x,v_y]$ rows, but those trajectories contain mass information through collision
+impulses, mass-dependent contact and wall geometry, and---in the current primary generator---the
+mass-dependent initial-position support.  The mass-independent-initialization control isolates
+the latter contribution.
+
+\paragraph{Model.}
+A shared linear map embeds each context state into 32 dimensions,
+\begin{equation}
+    e_t^i=W_c z_t^i+b_c\in\mathbb{R}^{32}.
+\end{equation}
+Five learned latent queries attend to all $T_{\mathrm{par}}N=150$ context tokens after learned
+temporal and source-track embeddings, and a scalar head produces
+\begin{equation}
+    \widehat{S}^{\mathrm{ph}}
+    \equiv\widehat{\boldsymbol\theta}
+    =P_\eta(e_{0:T_{\mathrm{par}}-1})\in\mathbb{R}^{5\times1}.
+    \label{eq:experiment-one-parameters}
+\end{equation}
+These are persistent global coordinates; coordinate $j$ is not declared to be the mass of input
+row $j$.  Independent learned addresses distinguish the five state nodes and five parameter
+nodes without privileging any of the 25 parameter-to-state relations.  SPARTAN separately
+projects four-dimensional state tokens and scalar parameter tokens into a 512-dimensional
+workspace, applies three sparse-attention layers with three-linear-layer 512-wide MLPs, and
+projects the five decoded state tokens back to $\mathbb{R}^{4}$:
+\begin{equation}
+    \widehat Z_{t+1}
+      =f_\gamma(Z_t,\widehat{\boldsymbol\theta}),
+    \qquad t\in\mathcal I.
+    \label{eq:experiment-one-predictor}
+\end{equation}
+The same $\widehat{\boldsymbol\theta}$ is reused for all 30 transitions in an episode.
+
+Training uses aligned raw-state MSE,
+\begin{equation}
+    \mathcal{L}^{(1)}_{\mathrm{pred}}
+    =\frac{1}{|\mathcal I|N\,4}
+      \sum_{t\in\mathcal I}\sum_{i=1}^{N}
+      \lVert\widehat z_{t+1}^i-z_{t+1}^i\rVert_2^2,
+    \label{eq:experiment-one-loss}
+\end{equation}
+with every prediction anchored at the corresponding true $Z_t$.  The operative run uses 100,000
+training episodes, batch size 16 (480 supervised transitions per update), Adam with learning rate
+$5\times10^{-5}$, and 300,000 updates.  No target encoder is present.  VISReg is applied only to
+learned context-side representations in the confirmatory protocol.
+
+\paragraph{Current status.}
+The state model, global parameter coordinates, dense and token-local references, learned hard
+gates, raw constraint, one-to-one mass recovery, and graph evaluation are implemented.  Before a
+paper claim, all three checkpoints must be evaluated on the same final split; evaluation artifacts
+must be split-specific; paired bootstrap reporting and parameter interventions must be added; and
+the gradient-free target VISReg constant must be removed from this regime.
+
+\paragraph{Continuation gate.}
+We begin implementation of Experiment~2 only after a complete development pilot shows that
+(i) the dense constraint is reliably below the token-local constraint; (ii) the sparse constraint
+crosses its freshly calibrated $\tau$; (iii) $\Lambda$ leaves its ceiling downwards and held-out
+$\rho_{\mathrm{path}}$ falls for at least three consecutive evaluations; (iv) final density is
+strictly between the token-local and dense endpoints; (v) five distinct masses are recovered
+under one frozen global permutation; (vi) aligned parameter SHD improves; and (vii) at least one
+parameter intervention worsens contact-sensitive prediction.  A failed but understood pilot may
+motivate a protocol revision; adding pixels cannot repair an unexplained failure of this oracle
+state experiment.
+
+The confirmatory Experiment~1 claim additionally uses the following preregistered targets:
+\begin{itemize}
+    \item at least six of eight sparse seeds show sustained pruning and finish with the median of
+          their last three density evaluations in $(0.10,0.90]$;
+    \item the ratio of mean sparse to paired-dense test MSE is at most $1.05$, and at least six of
+          eight seeds have a last-three-validation median constraint no larger than $1.05\tau$;
+    \item median sparse $\operatorname{MCC}_{1:1}$ is at least $0.80$, with at least six of eight
+          seeds at or above $0.70$;
+    \item the paired 95\% interval for sparse minus token-local MCC lies above zero, and mean
+          sparse parameter SHD is below both matched references;
+    \item a positive paired sparse-minus-dense MCC interval is the strongest result, but a
+          structural result remains supported when that interval overlaps zero if the ratio of
+          mean sparse to dense MCC is at least $0.95$ and all prediction, pruning, graph, and
+          intervention gates pass.
+\end{itemize}
+The Experiment~1 claim is conditional on ordered oracle kinematic tracks.  It is not yet a visual
+or anonymous-object result, and high MCC without an intervention effect is described as parameter
+information rather than demonstrated causal use.
+
+\subsection{Permutation-safe readiness checks}
+\label{sec:experiments:readiness}
+
+The fixed global coordinates and node addresses in Experiment~1 are appropriate for ordered
+simulator rows but not for anonymous visual slots.  Before introducing pixels, we validate the
+visual coordinate contract on consistently permuted true-state trajectories.  The visual models
+emit one scalar parameter per inferred track.  The state token and parameter token of track $i$
+receive the same ephemeral key $\kappa_i$; $\kappa_i$ carries no state or physical information
+and permutes with the complete track.  This binding is architectural, whereas the parameter value
+and the SPARTAN paths that use it remain learned.
+
+For a trajectory-level raw-state assignment, define the standardized cost
+\begin{equation}
+    D_e(i,j)=\frac{1}{|\mathcal I|\,4}
+      \sum_{t\in\mathcal I}\sum_{a=1}^{4}
+      \left(
+        \frac{\widehat z_{e,t+1,i,a}-z_{e,t+1,j,a}}{\sigma_a}
+      \right)^2,
+    \qquad
+    \pi_e^*=\underset{\pi\in\mathfrak S_N}{\operatorname{argmin}}
+      \sum_{i=1}^{N}D_e(i,\pi(i)).
+    \label{eq:trajectory-hungarian-raw}
+\end{equation}
+The discrete assignment is detached, but gradients pass through the selected predictions.  One
+$\pi_e^*$ is held fixed for the complete trajectory and is reused for state loss, parameter
+recovery, and every graph axis; per-frame rematching is forbidden.  The readiness suite requires
+invariance to a whole-trajectory permutation, a positive penalty for a mid-trajectory switch,
+joint equivariance of state tokens, parameter tokens and keys, and correct graph-axis alignment.
+We retain exactly five slots until an explicit null-slot contract is introduced.  These are
+implementation-validity checks, not a fourth scientific experiment.
+
+\subsection{Experiment 2: visual context and true-state target}
+\label{sec:experiments:visual-state}
+
+\paragraph{Question and source of mass information.}
+Experiment~2 asks whether a visual encoder can replace every predictor-side true state while the
+prediction target remains the fixed physical state.  Because rendered glyphs have equal size and
+carry no persistent simulator-row signature, mass must be inferred from a 30-frame history of
+motion and contact geometry rather than from a single object's appearance.  The unchanged raw
+target makes failures attributable to perception or parameter inference rather than to a moving
+target representation.
+
+\paragraph{Model.}
+A causal recurrent encoder $Q_\psi$ maps frames to five 32-dimensional tracks,
+\begin{equation}
+    \widetilde S_{0:t}=Q_\psi(X_{0:t}),
+    \qquad
+    \widetilde S_t\in\mathbb{R}^{N\times32}.
+\end{equation}
+A shared grounded head gives the current physical-state estimate, while track-aware temporal and
+cross-object pooling gives one scalar parameter per track:
+\begin{align}
+    Z_t^{\mathrm{ctx}} &=g_\omega(\widetilde S_t)\in\mathbb{R}^{N\times4},
+    \\
+    \widehat{S}^{\mathrm{ph}}
+       &=P_\eta(\widetilde S_{0:T_{\mathrm{par}}-1})
+         \in\mathbb{R}^{N\times1}.
+    \label{eq:experiment-two-heads}
+\end{align}
+Only frames $0,\ldots,29$ may affect $\widehat S^{\mathrm{ph}}$.  Later source frames are
+available for teacher-forcing $Z_t^{\mathrm{ctx}}$, but perturbing them must leave the parameter
+estimate unchanged.  With the shared ephemeral track keys from
+Section~\ref{sec:experiments:readiness}, SPARTAN uses a four-dimensional state interface, a scalar
+parameter interface, and a 512-dimensional internal workspace:
+\begin{equation}
+    \widehat Z_{t+1}
+      =f_\gamma(Z_t^{\mathrm{ctx}},\widehat S^{\mathrm{ph}})
+      \in\mathbb{R}^{N\times4}.
+    \label{eq:experiment-two-prediction}
+\end{equation}
+There is no target encoder in this experiment.  The target is the unchanged $Z_{t+1}$, and
+training remains one-step teacher-forced; longer open-loop rollouts are evaluation diagnostics.
+
+The trajectory assignment in Equation~\eqref{eq:trajectory-hungarian-raw} is selected once per
+episode and reused for both current-state grounding and next-state prediction.  With targets
+gathered under the detached assignment, the objective is
+\begin{equation}
+    \mathcal{L}^{(2)}
+      =\mathcal{L}^{(2)}_{\mathrm{pred}}
+       +\lambda_{\mathrm{ground}}\mathcal{L}_{\mathrm{ground}}
+       +\lambda_{\mathrm{logit}}\mathcal{L}_{\mathrm{logit}}
+       +\lambda_{\mathrm{reg}}\mathcal{R}(\widetilde S)
+       +\Lambda^{-1}\mathcal{L}_{\mathrm{path}}.
+    \label{eq:experiment-two-objective}
+\end{equation}
+The GECO constraint contains only raw next-state MSE and the weighted logit penalty, as in
+Equation~\eqref{eq:raw-geco-constraint}; grounding and VISReg remain outside it.  There is no
+target-side VISReg because the target is fixed data.
+
+\paragraph{Continuation gate.}
+Experiment~2 must satisfy all shared dense, token-local, sparse, pruning, graph, and intervention
+checks under a freshly selected $\lambda_{\mathrm{logit}}$ and freshly calibrated $\tau$.  In
+addition, we require: near-complete five-object coverage and a low trajectory switch rate,
+including at contacts; accurate grounded position and velocity without target-frame leakage;
+stronger held-out mass recovery from $\widehat S^{\mathrm{ph}}$ than incremental mass information
+in the four-dimensional state bottleneck; no change in $\widehat S^{\mathrm{ph}}$ when frames after
+$T_{\mathrm{par}}$ are perturbed; and success with mass-dependent physical radii but
+mass-independent uniform rendering.  Tracking thresholds and grounding tolerances are frozen on
+the development split before paired confirmatory seeds.
+
+Only after a complete pilot meets this conjunction do we proceed to the fully visual target.
+The supported claim is that frame inputs suffice at inference for state estimation and sparse mass
+discovery under state-supervised training.  It is not a self-supervised result: true states define
+the grounding loss, prediction target, and training assignment.  Removing the current-state
+grounding is retained as an ablation, not as a separate main experiment.
+
+\subsection{Optional diagnostic: learned target of the true future state}
+\label{sec:experiments:state-target-diagnostic}
+
+If Experiment~3 fails, we insert a small diagnostic between Experiments~2 and~3.  A jointly
+learned shared per-object encoder maps the true $Z_{t+1}\in\mathbb{R}^{N\times4}$ to a
+32-dimensional target, while the source remains visual.  Dense and token-local runs test whether
+a simultaneously moving target can remain non-collapsed and comparable when object rows are
+already given.  If this diagnostic succeeds but the image target fails, slot formation or target
+tracking is implicated; if both fail, the moving target geometry or calibration is implicated.
+Because this diagnostic still trains on true states and does not test single-frame visual slot
+formation, it is not a mandatory experiment and does not automatically receive a full sparse
+multi-seed study.
+
+\subsection{Experiment 3: jointly learned visual context and target}
+\label{sec:experiments:fully-visual}
+
+\paragraph{Question.}
+The final experiment asks whether mass recovery, parameter use, and SPARTAN pruning survive when
+all trainable components are learned jointly from frames.  During training, true states, masses,
+contacts, renderer masks, and simulator identities are unavailable to the model, loss, and
+matching procedure.  They are used only for held-out evaluation.  The long-context encoder, the
+single-frame observation/target encoder, parameter encoder, temporal lift, and SPARTAN are all
+optimized simultaneously; an EMA or frozen target is a labelled control rather than the primary
+model.
+
+\paragraph{Independent single-frame observations and generic target tracks.}
+The observation encoder is called independently on one image at a time,
+\begin{equation}
+    \{(o_t^r,M_t^r)\}_{r=1}^{N}=E_\phi(X_t),
+    \qquad
+    o_t^r\in\mathbb{R}^{32},
+    \label{eq:single-frame-encoder}
+\end{equation}
+where $M_t^r$ is the slot assignment map.  In particular, the target call for transition
+$t\rightarrow t+1$ receives only $X_{t+1}$.  The loss may associate outputs from several such
+independent calls, but the encoder itself never receives a target sequence or context history.
+
+Let $\mu(M)$ denote the spatial centroid of an assignment map.  Since the currently normalized
+map sums to one for every slot, its total mass is not a valid presence score; any future
+confidence statistic must instead be derived from pre-normalization assignment mass, logits, or
+entropy.  Target tracks are assembled sequentially with a detached Hungarian assignment
+\begin{equation}
+    \rho_{e,t}^*
+      =\underset{\rho\in\mathfrak S_N}{\operatorname{argmin}}
+        \sum_{i=1}^{N}\mathcal{C}_{e,t}(i,\rho(i)),
+    \qquad
+    \overline o_{e,t}^{\,i}=o_{e,t}^{\rho_{e,t}^*(i)}.
+    \label{eq:target-track-assignment}
+\end{equation}
+For the primary Bounce experiment, $\mathcal C$ is geometry-only: it combines the distance
+between the candidate centroid and the constant-velocity prediction
+$2\mu(M_{t-1}^i)-\mu(M_{t-2}^i)$ with overlap between the candidate support and a correspondingly
+translated previous support.  The first two frames use the analogous position-only costs.  A
+normalized learned-feature distance is a possible extension for more complex scenes, but it is
+not a fixed renderer-identity key and must generalize under held-out appearance changes.  The
+primary Bounce renderer uses uniform object glyphs, so no hand-specified appearance category can
+solve Equation~\eqref{eq:target-track-assignment}.
+
+\paragraph{A type-closed dynamical state.}
+A single frame supplies position-like evidence but cannot determine velocity.  We therefore use a
+shared two-frame lift,
+\begin{equation}
+    S_t^i=L_\xi\!\left([\nu(\overline o_{t-1}^{\,i}),
+                         \nu(\overline o_t^{\,i})]\right)
+       \in\mathbb{R}^{32},
+    \label{eq:temporal-lift}
+\end{equation}
+where $\nu$ is a predeclared per-slot normalization.  In parallel, a separate causal recurrent
+context encoder and track-aware parameter pooler use only the first 30 frames,
+\begin{equation}
+    \widetilde S_{0:T_{\mathrm{par}}-1}
+       =Q_\psi(X_{0:T_{\mathrm{par}}-1}),
+    \qquad
+    \widehat S^{\mathrm{ph}}
+       =P_\eta(\widetilde S_{0:T_{\mathrm{par}}-1})
+       \in\mathbb{R}^{N\times1}.
+    \label{eq:visual-parameter-context}
+\end{equation}
+The parameter and dynamical-state tokens use the same permutation-carrying track keys described
+in Section~\ref{sec:experiments:readiness}.  SPARTAN works internally at width 512 and predicts
+the next 32-dimensional observation slots,
+\begin{equation}
+    \widehat O_{t+1}=f_\gamma(S_t,\widehat S^{\mathrm{ph}})
+       \in\mathbb{R}^{N\times32}.
+    \label{eq:fully-visual-prediction}
+\end{equation}
+An autoregressive prediction is fed back through the same lift,
+\begin{equation}
+    \widehat S_{t+1}^{\,i}
+       =L_\xi\!\left([\nu(\overline o_t^{\,i}),
+                       \nu(\widehat o_{t+1}^{\,i})]\right),
+    \qquad
+    \widehat O_{t+2}=f_\gamma(\widehat S_{t+1},\widehat S^{\mathrm{ph}}).
+    \label{eq:type-closed-rollout}
+\end{equation}
+This avoids feeding a target-space prediction directly into a context-head state whose equal
+width does not guarantee equal meaning.
+
+After independently encoded targets have been assembled into tracks, a second detached
+trajectory-level Hungarian assignment $\pi_e^*$ matches predicted tracks to target tracks by
+their mean normalized latent distance across all prediction times.  This one assignment is held
+fixed for the complete loss and graph alignment.  The within-target assignments $\rho_{e,t}^*$
+and the predictor-to-target assignment $\pi_e^*$ are distinct; replacing either with independent
+per-frame prediction matching could hide track switches.
+
+\paragraph{Objective and common-start comparison.}
+Let $\mathcal{L}_{\mathrm{TF}}$ denote trajectory-matched one-step latent MSE and let
+$\mathcal{L}^{(2)}_{\mathrm{AR}}$ denote the two-step loss obtained from
+Equation~\eqref{eq:type-closed-rollout}.  The predictive objective is
+\begin{equation}
+    \mathcal{L}^{(3)}_{\mathrm{pred}}
+      =\mathcal{L}_{\mathrm{TF}}
+       +\beta\mathcal{L}^{(2)}_{\mathrm{AR}},
+    \label{eq:fully-visual-predictive-loss}
+\end{equation}
+where $\beta$ is fixed before the reference runs.  Longer open-loop horizons through multiple
+contacts are evaluated but are not initially backpropagated end to end.  VISReg is computed per
+aligned track across episodes and time for both learned branches; flattening all slot addresses
+together would not exclude a static slot-codebook collapse.
+
+For the learned target, the dual uses a detached within-track variance scale,
+\begin{align}
+    V_{\mathrm{within}}
+      &=\frac{1}{N\,32}\sum_{i=1}^{N}\sum_{a=1}^{32}
+        \operatorname{Var}_{e,t}(\overline o_{e,t,i,a}),
+        \\
+    c_3
+      &=\frac{\mathcal{L}^{(3)}_{\mathrm{pred}}}
+              {\operatorname{sg}(V_{\mathrm{within}})}
+        +\lambda_{\mathrm{logit}}\mathcal{L}_{\mathrm{logit}}
+      \leq\tau_3.
+    \label{eq:fully-visual-constraint}
+\end{align}
+This scale normalization does not by itself make two independently learned target geometries
+comparable.  We therefore first train all representation modules with a dense SPARTAN from
+scratch, then clone one common checkpoint into continued dense, token-local, and sparse legs.
+The target and context encoders remain trainable in the primary sparse leg, and $\tau_3$ is
+measured in the shared checkpoint geometry.  A frozen-target pruning leg is reported as a
+fixed-ruler audit, not as a replacement for the fully joint result.  Throughout training we
+measure target drift, within-track variance, effective rank, and fixed held-out probes so that a
+smaller loss cannot be misread as equal prediction quality after target collapse or semantic
+drift.
+
+\paragraph{Final acceptance gate.}
+The fully visual result is accepted only if all of the following hold:
+\begin{itemize}
+    \item every trainable branch receives gradients, and aligned context and target slots retain
+          non-trivial within-track variance, effective rank, and object-position information;
+    \item the target encoder is called on one frame at a time, later frames cannot affect
+          $\widehat S^{\mathrm{ph}}$, and no true state, mass, contact, mask, or simulator identity
+          enters the training assignment or loss;
+    \item all five objects are covered and the target and predictor trajectory switch rates are
+          negligible outside explicitly flagged observational ambiguities, including at contacts;
+    \item position is decodable from one-frame slots, while velocity is substantially more
+          decodable from the two-frame state in Equation~\eqref{eq:temporal-lift} than from one
+          frame alone;
+    \item the dense constraint is reliably below the token-local constraint in the common target
+          geometry, and the sparse model reaches its fresh $\tau_3$, prunes materially, and
+          remains strictly above the token-local density endpoint;
+    \item masses are recoverable from $\widehat S^{\mathrm{ph}}$ but not from a fixed
+          single-frame glyph signature, and parameter permutation, mean replacement, and retained
+          path ablations worsen contact-sensitive prediction;
+    \item open-loop latent error and norm are reported by horizon through multiple contacts, and
+          dense, token-local, and sparse target representations remain sufficiently comparable for
+          the constrained-loss comparison to be meaningful;
+    \item the result reproduces over paired confirmatory seeds and under uniform and held-out
+          heterogeneous-rendering controls.
+\end{itemize}
+
+For visually indistinguishable objects at a genuinely ambiguous crossing or contact, recovery of
+an arbitrary simulator label is not identifiable from the observations.  In such cases we report
+set-level mass recovery and ambiguity-aware tracking metrics rather than using a renderer-specific
+identity shortcut.  Subject to this qualification, Experiment~3 supports the intended final
+claim: jointly learned frame representations contain a track-attached, time-invariant mass
+representation that SPARTAN uses through a pruned causal predictor, with true simulator variables
+used only to evaluate that claim.

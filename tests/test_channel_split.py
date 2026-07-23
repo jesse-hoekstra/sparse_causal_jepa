@@ -6,9 +6,9 @@ import torch
 from scjepa.models import (
     AttnPooling,
     CrossSlotAttnPooling,
-    GlobalLatentAttnPooling,
     KinematicHead,
     TrackAwareAttnPooling,
+    TrackedSlotAttentionPooling,
 )
 from scjepa.models.channel_split import build_pooling
 
@@ -175,9 +175,18 @@ def test_build_pooling_dispatch() -> None:
     track_aware = build_pooling("track_aware", D, 2, 8, param_dim=1)
     assert isinstance(track_aware, TrackAwareAttnPooling)
     assert track_aware.param_dim == 1
-    global_latent = build_pooling("global_latent", D, 2, 8, param_dim=1, num_slots=N)
-    assert isinstance(global_latent, GlobalLatentAttnPooling)
-    assert global_latent.num_latents == N
+    tracked_slots = build_pooling(
+        "tracked_slot_attention",
+        D,
+        2,
+        8,
+        param_dim=1,
+        num_slots=N,
+        num_iterations=2,
+    )
+    assert isinstance(tracked_slots, TrackedSlotAttentionPooling)
+    assert tracked_slots.num_slots == N
+    assert tracked_slots.num_iterations == 2
     with pytest.raises(ValueError, match="pooling_type"):
         build_pooling("nope", D, 2, 8)
 
@@ -275,52 +284,86 @@ def test_track_aware_validates_param_dim() -> None:
 
 
 @pytest.fixture
-def global_latent_pooling() -> GlobalLatentAttnPooling:
+def tracked_slot_pooling() -> TrackedSlotAttentionPooling:
     torch.manual_seed(11)  # pyright: ignore[reportUnknownMemberType]
-    return GlobalLatentAttnPooling(
+    return TrackedSlotAttentionPooling(
         slot_size=D,
-        num_latents=N,
-        num_input_slots=N,
+        num_slots=N,
         num_heads=2,
         max_history=8,
         param_dim=1,
+        num_iterations=3,
     )
 
 
-def test_global_latent_coordinates_see_whole_trajectory(
-    global_latent_pooling: GlobalLatentAttnPooling, history: torch.Tensor
+def test_tracked_slot_attention_shape_gradients_and_relational_evidence(
+    tracked_slot_pooling: TrackedSlotAttentionPooling, history: torch.Tensor
 ) -> None:
-    """Every persistent coordinate may use evidence from every input track."""
-    global_latent_pooling.eval()
+    """Every tracked scalar can use contextualized collision-partner evidence."""
+    tracked_slot_pooling.eval()
     changed_track = history.clone()
     changed_track[:, :, 1] += 5.0
+    original = tracked_slot_pooling(history)
     with torch.no_grad():
-        original = global_latent_pooling(history)
-        changed = global_latent_pooling(changed_track)
+        changed = tracked_slot_pooling(changed_track)
     assert original.shape == (B, N, 1)
     assert torch.isfinite(original).all()
-    assert ((changed - original).abs().sum(dim=(0, 2)) > 0).all()
+    other_slots = torch.tensor([0, 2, 3])
+    assert not torch.allclose(original[:, other_slots], changed[:, other_slots])
+
+    original.square().mean().backward()  # pyright: ignore[reportUnknownMemberType]
+    for name, parameter in tracked_slot_pooling.named_parameters():
+        assert parameter.grad is not None, f"no gradient for {name}"
 
 
-def test_global_latent_outputs_are_queries_not_track_anchored(
-    global_latent_pooling: GlobalLatentAttnPooling, history: torch.Tensor
+def test_tracked_slot_attention_is_jointly_permutation_equivariant(
+    tracked_slot_pooling: TrackedSlotAttentionPooling, history: torch.Tensor
 ) -> None:
-    """Permuting tracks does not permute the persistent latent coordinates."""
-    global_latent_pooling.eval()
+    """Track identities and their parameter slots must permute together."""
+    tracked_slot_pooling.eval()
     permutation = torch.tensor([2, 0, 3, 1])
     with torch.no_grad():
-        original = global_latent_pooling(history)
-        permuted_history = global_latent_pooling(history[:, :, permutation])
-    assert not torch.allclose(permuted_history, original[:, permutation])
+        expected = tracked_slot_pooling(history)[:, permutation]
+        actual = tracked_slot_pooling(history[:, :, permutation])
+    torch.testing.assert_close(actual, expected)
 
 
-def test_global_latent_gradients_and_guards(
-    global_latent_pooling: GlobalLatentAttnPooling, history: torch.Tensor
+def test_tracked_slot_attention_competes_over_parameter_slots(
+    tracked_slot_pooling: TrackedSlotAttentionPooling, history: torch.Tensor
 ) -> None:
-    global_latent_pooling(history).square().mean().backward()
-    for name, parameter in global_latent_pooling.named_parameters():
-        assert parameter.grad is not None, f"no gradient for {name}"
+    responsibilities = tracked_slot_pooling.assignment_matrix(history)
+    assert responsibilities.shape == (B, N, N)
+    assert (responsibilities >= 0).all()
+    torch.testing.assert_close(responsibilities.sum(dim=-1), torch.ones(B, N))
+
+
+def test_tracked_slot_attention_respects_time_and_track_continuation(
+    tracked_slot_pooling: TrackedSlotAttentionPooling, history: torch.Tensor
+) -> None:
+    """Reversing time or swapping tracks transiently must change the inferred parameters."""
+    tracked_slot_pooling.eval()
+    transient_swap = history.clone()
+    transient_swap[:, 1] = transient_swap[:, 1, torch.tensor([1, 0, 3, 2])]
+    with torch.no_grad():
+        original = tracked_slot_pooling(history)
+        reversed_time = tracked_slot_pooling(history.flip(dims=[1]))
+        broken_tracks = tracked_slot_pooling(transient_swap)
+    assert not torch.allclose(original, reversed_time)
+    assert not torch.allclose(original, broken_tracks)
+
+
+def test_tracked_slot_attention_guards_and_removed_global_option(
+    tracked_slot_pooling: TrackedSlotAttentionPooling, history: torch.Tensor
+) -> None:
     with pytest.raises(ValueError, match="object slots"):
-        global_latent_pooling(history[:, :, :-1])
+        tracked_slot_pooling(history[:, :, :-1])
     with pytest.raises(ValueError, match="requires num_slots"):
-        build_pooling("global_latent", D, 2, 8, param_dim=1)
+        build_pooling("tracked_slot_attention", D, 2, 8, param_dim=1)
+    with pytest.raises(ValueError, match="pooling_type"):
+        build_pooling("global_latent", D, 2, 8, param_dim=1, num_slots=N)
+    with pytest.raises(ValueError, match="num_iterations"):
+        TrackedSlotAttentionPooling(slot_size=D, num_slots=N, num_iterations=0)
+    with pytest.raises(ValueError, match="param_dim"):
+        TrackedSlotAttentionPooling(slot_size=D, num_slots=N, param_dim=0)
+    with pytest.raises(ValueError, match="max_history"):
+        tracked_slot_pooling(torch.randn(B, 9, N, D))
