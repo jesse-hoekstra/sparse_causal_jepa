@@ -71,6 +71,7 @@ def _load_record(run_dir: Path) -> dict[str, Any]:
         "spartan_layers": int(cfg.model.spartan_layers),
         "spartan_embed_dim": int(cfg.model.spartan_embed_dim),
         "pooling_type": str(cfg.model.pooling_type),
+        "parameter_slot_iterations": int(cfg.model.get("parameter_slot_iterations", 3)),
         "node_embeddings": bool(cfg.model.spartan_node_embeddings),
         "dense": bool(cfg.model.spartan_dense),
         "sparsity_enabled": bool(cfg.train.sparsity_enabled),
@@ -161,6 +162,7 @@ def main() -> None:
         "num_samples",
         "eval_seed_offset",
         "pooling_type",
+        "parameter_slot_iterations",
         "node_embeddings",
     )
     for key in provenance_keys:

@@ -7,7 +7,7 @@ import torch
 
 from scjepa.data import BounceDataset
 from scjepa.eval import evaluate_identifiability
-from scjepa.models import GlobalLatentAttnPooling
+from scjepa.models import TrackedSlotAttentionPooling
 from scjepa.models.state_jepa import StateJepa, build_state_jepa
 from scjepa.training import TrainConfig, Trainer
 
@@ -112,15 +112,16 @@ def tiny_gt_model(*, spartan_dense: bool = False, spartan_identity: bool = False
     )
 
 
-def tiny_gt_global_latent_model() -> StateJepa:
-    """Small version of the no-pairing Baumgartner true-state architecture."""
+def tiny_gt_tracked_slot_model() -> StateJepa:
+    """Small version of Example 1's tracked iterative parameter encoder."""
     torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
     return build_state_jepa(
         state_dim=4,
         num_slots=N,
         slot_size=16,
         pooling_heads=2,
-        pooling_type="global_latent",
+        pooling_type="tracked_slot_attention",
+        parameter_slot_iterations=2,
         param_dim=1,
         spartan_layers=1,
         spartan_embed_dim=None,
@@ -145,13 +146,13 @@ def test_gt_states_forward_contract() -> None:
     assert out.path_matrix.shape == (2, 2 * N, 2 * N)
 
 
-def test_gt_states_global_latent_parameter_contract() -> None:
-    """Five persistent global coordinates feed five independently addressed nodes."""
-    model = tiny_gt_global_latent_model()
+def test_gt_states_tracked_slot_parameter_contract() -> None:
+    """One competitively refined scalar per track feeds independent graph addresses."""
+    model = tiny_gt_tracked_slot_model()
     states = torch.randn(2, 5, N, 4)
     out = model(states)
     assert out.causal_params.shape == (2, N, 1)
-    assert isinstance(model.pooling, GlobalLatentAttnPooling)
+    assert isinstance(model.pooling, TrackedSlotAttentionPooling)
     assert model.predictor.param_size == 1
     assert model.predictor.node_embeddings
     assert out.prediction.shape == (2, N, 4)
@@ -245,7 +246,7 @@ def test_prediction_matching_auto_resolves_from_tracked_state_contract(tmp_path:
 def test_gt_states_harness_reports_fixed_ruler() -> None:
     """target_var must be the GT data constant, not a trainable quantity."""
     dataset = BounceDataset(num_episodes=12, clip_len=4, num_balls=N, resolution=16, seed=3)
-    model = tiny_gt_global_latent_model()
+    model = tiny_gt_tracked_slot_model()
     rng_before = torch.get_rng_state().clone()
     report = evaluate_identifiability(
         model, dataset, input_key="states", batch_size=6, max_batches=2
@@ -262,7 +263,7 @@ def test_identifiability_harness_end_to_end() -> None:
     """Untrained StateJepa on bounce: harness returns bounded, finite metrics."""
     dataset = BounceDataset(num_episodes=12, clip_len=4, num_balls=N, resolution=16, seed=3)
     report = evaluate_identifiability(
-        tiny_gt_global_latent_model(), dataset, input_key="states", batch_size=6, max_batches=2
+        tiny_gt_tracked_slot_model(), dataset, input_key="states", batch_size=6, max_batches=2
     )
     for key in (
         "pred_loss",

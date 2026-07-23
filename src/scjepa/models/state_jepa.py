@@ -18,9 +18,9 @@ from torch import Tensor, nn
 from scjepa.models.channel_split import (
     AttnPooling,
     CrossSlotAttnPooling,
-    GlobalLatentAttnPooling,
     KinematicHead,
     TrackAwareAttnPooling,
+    TrackedSlotAttentionPooling,
     build_pooling,
 )
 from scjepa.models.jepa import JepaOutput, resolve_chains, rollout_predictions
@@ -35,7 +35,7 @@ class StateJepa(nn.Module):
         context_embed: nn.Module,
         target_embed: nn.Module,
         pooling: (
-            AttnPooling | CrossSlotAttnPooling | TrackAwareAttnPooling | GlobalLatentAttnPooling
+            AttnPooling | CrossSlotAttnPooling | TrackAwareAttnPooling | TrackedSlotAttentionPooling
         ),
         kinematic_head: KinematicHead | None,
         predictor: Spartan,
@@ -131,6 +131,7 @@ def build_state_jepa(
     slot_size: int = 32,
     pooling_heads: int = 4,
     pooling_type: str = "cross_slot",  # D14 default; "per_slot" = D4 ablation
+    parameter_slot_iterations: int = 3,
     param_dim: int | None = None,
     max_history: int = 64,
     spartan_layers: int = 3,
@@ -154,9 +155,9 @@ def build_state_jepa(
     next states), and the target/kinematic modules are dropped (nothing on the
     state path trains, so the constraint's ruler is fixed). ``param_dim`` is
     the per-object causal bottleneck width; ``None`` preserves the historical
-    ``slot_size``-dimensional output. ``pooling_type="global_latent"`` uses
-    ``num_slots`` persistent global coordinates; ``param_dim=1`` makes each
-    coordinate scalar.
+    ``slot_size``-dimensional output. ``pooling_type="tracked_slot_attention"``
+    initializes one iterative parameter slot from each tracked object;
+    ``param_dim=1`` makes every identified coordinate scalar.
     """
     resolved_param_dim = slot_size if param_dim is None else param_dim
     predictor_state_dim = state_dim if gt_states else slot_size
@@ -170,6 +171,7 @@ def build_state_jepa(
             max_history,
             param_dim=param_dim,
             num_slots=num_slots,
+            num_iterations=parameter_slot_iterations,
         ),
         kinematic_head=None if gt_states else KinematicHead(slot_size=slot_size),
         predictor=Spartan(

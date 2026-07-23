@@ -1,14 +1,15 @@
-"""Identifiability evaluation for globally indexed latent coordinates.
+"""Identifiability evaluation for scalar physical-parameter slots.
 
 Consumes any JEPA variant with the ``JepaOutput`` contract plus a dataset whose
 items carry the bounce-style ground truth (``params``, ``contacts``). Returns
 the compact scalar metrics used during training and the full held-out recovery
 matrix used for final analysis.
 
-State rows are object-aligned in the GT-state regime. Parameter coordinates are
-*not* assumed to have the same order as masses: one global Hungarian mapping is
-learned on a held-out alignment split, frozen on the final score split, and
-also used to align parameter-graph columns before SHD is computed.
+State rows and tracked parameter slots are object-aligned in the GT-state
+regime. The evaluator nevertheless fits one global Hungarian mapping on a
+held-out alignment split, freezes it on the final score split, and uses it to
+align parameter-graph columns before SHD. This catches any stable learned
+permutation without permitting episode-wise reassignment.
 """
 
 from typing import NamedTuple
@@ -180,8 +181,9 @@ def evaluate_identifiability(
         mean_abs_logits.append(output.mean_abs_logit.cpu())
         mean_gate_probabilities.append(output.mean_gate_probability.cpu())
         gate_entropies.append(output.gate_entropy.cpu())
-        # One row per episode. Coordinate order is persistent but deliberately
-        # not assumed to match the physical mass order.
+        # One row per episode. Coordinates are track-anchored; the conservative
+        # global recovery assignment still catches any stable implementation-
+        # level permutation without allowing per-episode matching.
         learned_coordinates.append(output.causal_params.flatten(1).cpu())
         true_parameters.append(batch["params"].flatten(1).cpu())
 
@@ -191,8 +193,8 @@ def evaluate_identifiability(
     episode_true = torch.cat(true_parameters)
     if episode_learned.shape[1] != num_slots or episode_true.shape[1] != num_slots:
         raise ValueError(
-            "strict graph-aligned mass recovery requires exactly one global latent "
-            f"coordinate per object; got learned {tuple(episode_learned.shape)} and "
+            "strict graph-aligned mass recovery requires exactly one scalar parameter "
+            f"slot per object; got learned {tuple(episode_learned.shape)} and "
             f"true {tuple(episode_true.shape)} for {num_slots} objects"
         )
     recovery = one_to_one_recovery(episode_learned, episode_true)

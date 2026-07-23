@@ -33,13 +33,16 @@ model:
   # parameter path (context embed + pooling) and the predictor train.
   gt_states: true
   num_slots: 5
-  # Five persistent learned coordinate queries encode the complete trajectory
-  # into Baumgartner's known q=5 latent vector. Unlike track_aware pooling,
-  # output coordinate j is not defined as the parameter of input track j.
-  pooling_type: global_latent
+  # Example 1: true-state tracks already provide the temporal object identity
+  # that SAVi supplies in pixels. One parameter slot is anchored to each track,
+  # competes for relationally contextualized trajectory evidence, and is
+  # iteratively refined without supplying any state<-parameter edge to SPARTAN.
+  pooling_type: tracked_slot_attention
+  parameter_slot_iterations: 3
   param_dim: 1
   # Give graph nodes distinct addresses, but do not privilege any of the 25
-  # parameter-to-state relations. A global latent permutation remains valid.
+  # parameter-to-state relations. State and parameter address tables remain
+  # separate and independently initialized.
   spartan_node_embeddings: true
 
 data:
@@ -84,11 +87,11 @@ train:
   # no_grad + shuffle=false and consumes no training RNG: enabling it does not
   # perturb the training trajectory (D12-safe).
   eval_every: 5000
-  # Their lambda_logit is unspecified ("small"). Zero is a neutral placeholder
-  # for bare train.py calls, not the reported setting: first run
-  # isambard_logit_sweep.sbatch, then pass its selected value explicitly to
-  # isambard_pipeline.sbatch. Their F.4 shows that leaving it at zero can make
-  # the path objective plateau in the actual gated model.
+  # Their lambda_logit is unspecified ("small"). Zero remains a neutral
+  # placeholder for bare train.py calls. D26's first architecture check passes
+  # the previously used 1e-3 explicitly to isambard_pipeline.sbatch; only after
+  # mass recovery is restored do we rerun isambard_logit_sweep.sbatch for this
+  # architecture. Their F.4 shows that zero can make the gated path plateau.
   lambda_logit: 0.0
   # SPARTAN A.2 / Baumgartner Eq. 10 leave this numerical step unspecified.
   # Keep D23's 2e-2 as a conservative first pilot value, but do NOT treat its

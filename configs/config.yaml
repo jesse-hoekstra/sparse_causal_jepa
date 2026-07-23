@@ -10,14 +10,18 @@ model:
   type: vision # vision (SCJepa, pixels) | states (StateJepa, GT-embedding regime)
   state_dim: 4 # states regime only: dimension of GT object states
   resolution: 64
-  num_slots: 7
-  slot_size: 128
+  # Bounce visual contract: one learned slot per object, each represented in
+  # the 32-D latent space predicted by SPARTAN. The predictor still uses the
+  # separate 512-D internal workspace configured below.
+  num_slots: 5
+  slot_size: 32
   slot_mlp_size: 256
   num_iterations: 2
   enc_channels: [3, 64, 64, 64, 64]
   enc_out_channels: 128
   pooling_heads: 4
-  pooling_type: cross_slot # cross_slot | per_slot | track_aware | global_latent
+  pooling_type: cross_slot # cross_slot | per_slot | track_aware | tracked_slot_attention
+  parameter_slot_iterations: 3 # iterative parameter refinement, not SAVi frame iterations
   param_dim: null # StateJepa causal width; null preserves slot_size
   max_history: 64
   spartan_layers: 3 # SPARTAN App. A.1
