@@ -21,7 +21,7 @@ Track keys κᵢ (Eq. 27, §6.4): one key is SHARED by the state token and the
 parameter token descended from track i — it records their common trajectory
 origin without forcing any same-track edge open. Keys are drawn once from a
 fixed non-trainable codebook (registered as a buffer: excluded from gradient
-updates, independent of states and parameters). Experiment 1's tracks are the
+updates, independent of states and parameters). The state-to-state regime's tracks are the
 ordered simulator rows, so codebook row i serves track i in every episode; the
 visual experiments will add the episode-level codebook permutation of §6.4.
 Key SCALE is unspecified upstream — matched to the role-embedding init (0.02).
@@ -182,11 +182,14 @@ class Spartan(nn.Module):
         temperature: float = 1.0,
         dense: bool = False,
         identity: bool = False,
+        output_dim: int | None = None,
     ) -> None:
-        """Build the predictor (defaults are the Experiment-1 configuration).
+        """Build the predictor (defaults are the state-to-state configuration).
 
         Args:
-            state_dim: k = 4, raw state width (also the decoded output width).
+            state_dim: Width of the state interface. The state-to-state regime feeds the raw
+                k = 4 state (Eq. 27); the visual experiments feed the learned
+                latent state, d_s = 32 (Eqs. 93/117).
             param_dim: Scalar parameter coordinates (Eq. 25): 1.
             num_slots: N tracked objects; the token count is M = 2N.
             num_layers: L_sp = 3.
@@ -196,6 +199,10 @@ class Spartan(nn.Module):
             temperature: τ_g = 1 Gumbel-softmax temperature (Eq. 33).
             dense: A ≡ 1 — the fully connected τ-calibration reference.
             identity: A ≡ 0 — the token-local reference. Mutually exclusive.
+            output_dim: Width of the decoded head. ``None`` = ``state_dim``,
+                which covers state-to-state (Eq. 37, R^4 -> R^4) and visual-to-visual
+                (Eq. 118, R^d_s -> R^d_s). The visual-to-state regime is the asymmetric case:
+                a latent d_s input decoded into the raw R^4 target (Eq. 95).
         """
         super().__init__()
         if dense and identity:
@@ -205,12 +212,14 @@ class Spartan(nn.Module):
         self.state_dim = state_dim
         self.param_dim = param_dim
         self.num_slots = num_slots
+        self.embed_dim = embed_dim
+        self.output_dim = state_dim if output_dim is None else output_dim
         self.dense = dense
         self.identity = identity
         # Eq. 27/28: separate input projections into the shared workspace.
         self.state_project = nn.Linear(state_dim, embed_dim)
         self.param_project = nn.Linear(param_dim, embed_dim)
-        self.out_project = nn.Linear(embed_dim, state_dim)  # Eq. 37
+        self.out_project = nn.Linear(embed_dim, self.output_dim)  # Eq. 37 / 95 / 118
         # Learned role embeddings rho^Z, rho^θ (Eq. 27).
         self.state_role = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.param_role = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -237,12 +246,42 @@ class Spartan(nn.Module):
             ]
         )
 
+    def sample_track_keys(
+        self, batch: int, generator: torch.Generator | None = None
+    ) -> Float[Tensor, "b n d"]:
+        """Episode-level permuted track keys for the visual experiments (§6.4).
+
+        The state-to-state regime's tracks ARE the ordered simulator rows, so codebook row i
+        serves track i in every episode and the fixed buffer is used directly.
+        Visual tracks are anonymous, so §6.4 draws the keys "from a fixed
+        non-trainable codebook under an independently sampled episode-level
+        permutation": the key still records that a state token and a parameter
+        token share one recurrent origin, but it cannot harden into a persistent
+        simulator-row identity, because which codebook row a track receives is
+        redrawn every episode.
+        """
+        device = self.track_keys.device
+        permutations = torch.stack(
+            [
+                torch.randperm(self.num_slots, generator=generator, device=device)
+                for _ in range(batch)
+            ]
+        )
+        return self.track_keys.expand(batch, -1, -1).gather(
+            1, permutations.unsqueeze(-1).expand(batch, self.num_slots, self.embed_dim)
+        )
+
     def forward(
         self,
         state: Float[Tensor, "b n k"],
         params: Float[Tensor, "b n p"],
+        track_keys: Float[Tensor, "b n d"] | None = None,
     ) -> SpartanOutput:
-        """One transition: predict Ẑ_{t+1} from (Z_t, θ̂) and expose the graph."""
+        """One transition: predict Ẑ_{t+1} from (Z_t, θ̂) and expose the graph.
+
+        ``track_keys`` overrides the fixed codebook rows with per-episode keys
+        (§6.4); ``None`` keeps the state-to-state regime's fixed assignment.
+        """
         if (
             state.ndim != 3
             or params.ndim != 3
@@ -256,9 +295,16 @@ class Spartan(nn.Module):
                 f"(B, {self.num_slots}, {self.param_dim}), got {tuple(state.shape)} "
                 f"vs {tuple(params.shape)}"
             )
-        # Eq. 27: token construction, [state 0..N-1 | params N..2N-1].
-        state_tokens = self.state_project(state) + self.state_role + self.track_keys
-        param_tokens = self.param_project(params) + self.param_role + self.track_keys
+        keys = self.track_keys if track_keys is None else track_keys
+        if keys.shape[-2:] != (self.num_slots, self.embed_dim):
+            raise ValueError(
+                f"track_keys must be (..., {self.num_slots}, {self.embed_dim}), "
+                f"got {tuple(keys.shape)}"
+            )
+        # Eq. 27: token construction, [state 0..N-1 | params N..2N-1]. The SAME
+        # key is added to the state and parameter token of a track.
+        state_tokens = self.state_project(state) + self.state_role + keys
+        param_tokens = self.param_project(params) + self.param_role + keys
         tokens = torch.cat((state_tokens, param_tokens), dim=1)  # (B, 2N, D_sp)
 
         adjacencies: list[Tensor] = []

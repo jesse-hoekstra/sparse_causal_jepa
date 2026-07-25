@@ -31,7 +31,7 @@ Choices the write-up leaves open (flagged per project policy):
 
 Permutation contract (§6.2): no absolute track-index embedding exists anywhere
 in this module, so permuting the tracked-object axis permutes θ̂ identically.
-Experiment 2 reuses this module unchanged apart from the input map (Eq. 91):
+The visual regimes reuse this module unchanged apart from the input map (Eq. 91):
 pass ``state_dim`` = the visual slot width instead of 4.
 """
 
@@ -67,8 +67,8 @@ class ParameterEncoder(nn.Module):
         """Build the encoder.
 
         Args:
-            state_dim: k, per-object input width (Experiment 1: 4 = [x,y,vx,vy];
-                Experiment 2 passes the visual slot width instead, Eq. 91).
+            state_dim: k, per-object input width (state-to-state: 4 = [x,y,vx,vy];
+                the visual regimes pass the slot width instead, Eq. 91).
             dim: d = 32, working width (Eq. 16).
             num_heads: H = 4 attention heads, d_h = d/H = 8 (Eq. 18).
             max_history: Length of the learned temporal-PE table; forward

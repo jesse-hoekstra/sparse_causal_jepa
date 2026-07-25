@@ -193,7 +193,7 @@ Typical current launch:
 ```bash
 SWEEP=outputs/lambda_logit_sweep_logit_seed0/sweep_summary.json
 LAMBDA_LOGIT=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["selected_lambda_logit"])' "$SWEEP")
-sbatch --account=<PROJECT> scripts/isambard_pipeline.sbatch full_seed0 "$LAMBDA_LOGIT" 0
+sbatch --account=<PROJECT> scripts/isambard_exp1_pipeline.sbatch full_seed0 "$LAMBDA_LOGIT" 0
 ```
 
 ### What counts as actual pruning

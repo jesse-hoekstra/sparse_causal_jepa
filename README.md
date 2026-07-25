@@ -10,9 +10,14 @@ VISReg anti-collapse regularizer, so that causal structure can be identified fro
 and parameters (SHD/MCC against ground truth) without any reconstruction objective.
 
 **Decision log:** [`docs/decisions.md`](docs/decisions.md) is the source of truth for settled
-design decisions (D1 PyTorch, D2 SAVi, D3 VISReg, D4 attention pooling, D5 reuse-first,
-D6 single-step loss, D7 from-scratch training, D8 packaging & tooling). Read it before changing
-anything it covers.
+design decisions: a short list of standing rules (framework, vendoring, tooling, SPARTAN
+interpretations, simulator contract, pipeline consistency, grad-skip guard) followed by
+D27–D30, which define the two metrics, the Experiment-1 architecture, and the verified result.
+Read it before changing anything it covers.
+
+> **NOTE (2026-07-25):** the sections below still describe the pre-D29 pipeline and are stale —
+> `--identity-check`, `train.lambda_reg`, `health/target_slot_std_*` and `mass_mcc` no longer
+> exist. See `CLAUDE.md` for current commands and metrics until this file is rewritten.
 
 ## Repo map
 
@@ -107,7 +112,7 @@ steps — so treat the CPU run as the pipeline check and scale steps up (GPU/ove
 paper-grade numbers. Step counts per phase: `--calib-steps` always sets the calibration length;
 `--main-steps` (or a `train.steps=...` hydra override) sets the main run's.
 
-## The experiment ladder (bounce; decisions.md D13)
+## The experiment ladder (bounce) — STALE, superseded by D29
 
 Every rung uses the same one-command runner (τ auto-calibrated per rung; overrides apply to both
 runs); repeat with `train.seed=0..7` for seeded statistics. Periodic W&B evaluation contains only
@@ -169,7 +174,7 @@ sbatch --account=<PROJECT> scripts/isambard_logit_sweep.sbatch logit_seed0 0
 # The job prints selected_lambda_logit and writes it to sweep_summary.json.
 SWEEP=outputs/lambda_logit_sweep_logit_seed0/sweep_summary.json
 LAMBDA_LOGIT=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["selected_lambda_logit"])' "$SWEEP")
-sbatch --account=<PROJECT> scripts/isambard_pipeline.sbatch full_seed0 "$LAMBDA_LOGIT" 0
+sbatch --account=<PROJECT> scripts/isambard_exp1_pipeline.sbatch full_seed0 "$LAMBDA_LOGIT" 0
 ```
 
 The sweep compares prediction against the `lambda_logit=0` control, rejects values degrading it

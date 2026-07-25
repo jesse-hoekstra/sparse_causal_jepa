@@ -44,6 +44,12 @@ def _dataset_kwargs(cfg: DictConfig) -> dict[str, object]:
         "mass_range": tuple(data.mass_range),
         "mass_normal": tuple(data.mass_normal) if data.get("mass_normal") is not None else None,
         "radius_from_mass": bool(data.get("radius_from_mass", False)),
+        # The only visual-experiment knob that changes the STATES, so the only
+        # one that belongs in a preload file's identity. Rendering settings are
+        # deliberately absent: preloads store no frames (``render`` is forced
+        # False below), so the same physics file serves the state and the visual
+        # experiments.
+        "mass_independent_init": bool(data.get("mass_independent_init", False)),
         "speed": data.speed,
         "seed": data.seed,
         "render": False,
@@ -69,10 +75,13 @@ def main(cfg: DictConfig) -> None:
     simulator_version = int(meta["simulator_version"])  # pyright: ignore[reportArgumentType]
     seed = int(kwargs["seed"])  # pyright: ignore[reportArgumentType]
     seed_suffix = "" if seed == 0 else f"_seed{seed}"
+    # The mass-independent-initialization control generates DIFFERENT states, so
+    # it must not land on the primary file's name.
+    control_suffix = "_massindepinit" if kwargs["mass_independent_init"] else ""
     out = (
         Path(hydra.utils.get_original_cwd())
         / "data"
-        / f"bounce_train_v{simulator_version}_{num}{seed_suffix}.pt"
+        / f"bounce_train_v{simulator_version}_{num}{control_suffix}{seed_suffix}.pt"
     )
     if out.exists():
         try:

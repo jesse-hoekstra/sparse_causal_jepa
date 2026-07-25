@@ -1,0 +1,49 @@
+# @package _global_
+# The visual-to-visual regime (experiments.pdf §6.6): visual context, EMA visual target.
+#
+# The controlled change from the visual-to-state regime is the TARGET and nothing else. During
+# training the model never sees true states, masses, contact graphs, renderer
+# masks or simulator identities; those are held-out evaluation only. The
+# objective is Eq. 121 and the dual constraint is Eq. 123 (variance-normalized,
+# unlike Experiments 1 and 2).
+#
+# Data is the visual condition: identical white glyphs at one shared rendered
+# radius over the SAME physics as the state-to-state regime (Eq. 2 mass-proportional physical
+# radii), rendered on the fly from the states preload.
+
+data:
+  num_clips: 100000
+  clip_len: 60 # T (§6.1.1)
+  preload: data/bounce_train_v2_100000.pt
+  render: true
+  resolution: 64
+  render_radius_from_mass: false
+  uniform_appearance: true
+  mass_independent_init: false
+
+model:
+  regime: visual_to_visual
+  num_slots: 5 # N (Eq. 42)
+  slot_size: 32 # d, SAVi slot width (Eq. 42)
+  latent_state_dim: 32 # d_s, SPARTAN's state interface AND output (Eqs. 88/118)
+  resolution: 64
+  ema_decay: 0.996 # tau_EMA (Eq. 111); §6.6 requires faster/slower controls
+  variance_floor: 1.0e-4 # epsilon_var (Eq. 123)
+
+train:
+  steps: 300000
+  # Two SAVi branches over 60 frames dominate memory: the context encoder holds
+  # 64x64 features for T-1 frames with a full backward graph, and the EMA branch
+  # adds a no-grad pass over T. Start at 4 and raise only if it fits.
+  batch_size: 4
+  context_len: 30 # Tpar (Eq. 106); I = {29, ..., 58}
+  sparsity_tau: 1.0 # placeholder; the pipeline recalibrates tau_3 from the dense run
+  # Frames are drawn per batch, so render in worker processes: inline it would
+  # be SERIAL with the optimizer (~1.7 h over 300k steps at batch 8). Episodes
+  # are index-deterministic, so this does not change which data a step sees.
+  num_workers: 8
+  prefetch_factor: 4
+  eval_every: 5000
+  log_every: 100
+  checkpoint_every: 2000
+  checkpoint_keep_every: 25000

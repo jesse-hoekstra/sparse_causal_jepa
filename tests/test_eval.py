@@ -11,7 +11,7 @@ from scjepa.eval import (
     read_learned_graph,
     structural_hamming_distance,
 )
-from scjepa.models import build_experiment1
+from scjepa.models import build_state_to_state
 
 N = 3
 
@@ -100,7 +100,7 @@ def test_diagnostics_run_on_bounce_pipeline() -> None:
     torch.manual_seed(2)  # pyright: ignore[reportUnknownMemberType]
     dataset = BounceDataset(num_episodes=4, clip_len=4, num_balls=N, seed=5, render=False)
     batch = next(iter(DataLoader(dataset, batch_size=4)))
-    model = build_experiment1(
+    model = build_state_to_state(
         num_slots=N, spartan_layers=1, spartan_embed_dim=32, spartan_mlp_hidden=32
     )
     model.eval()

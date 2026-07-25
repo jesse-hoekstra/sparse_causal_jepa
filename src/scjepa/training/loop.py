@@ -1,4 +1,4 @@
-"""Training loop for Experiment 1 (experiments.pdf §6.1.3 / §6.2).
+"""Training loop for the state-to-state regime (experiments.pdf §6.1.3 / §6.2).
 
 Objective per step, exactly Eq. 40:
 
@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from scjepa.eval.harness import evaluate_identifiability
 from scjepa.losses import aligned_mse
-from scjepa.models.experiment1 import Experiment1Model, TransitionOutput
+from scjepa.models.state_to_state import StateToStateModel, TransitionOutput
 from scjepa.training.lagrangian import SparsityLagrangian
 
 
@@ -75,7 +75,7 @@ class TrainConfig:
     lambda_logit: float = 0.0  # selected by the dense sweep (§6.1.3); 0 disables
     seed: int = 0
     device: str = "cpu"
-    context_len: int | None = None  # Tpar (Experiment 1: 30); None -> T-1
+    context_len: int | None = None  # Tpar (the state-to-state regime: 30); None -> T-1
     # Periodic held-out identifiability eval (the analog of Baumgartner
     # Fig. 17's MCC-over-steps). None = off; needs an eval_dataset.
     eval_every: int | None = None
@@ -84,6 +84,15 @@ class TrainConfig:
     # consecutive skips — the weights are then already broken, fail loudly.
     grad_skip_threshold: float = 1e3
     grad_skip_max_consecutive: int = 2000
+    # DataLoader worker processes. 0 (the default) renders/loads inline, which
+    # is right for the state-to-state regime: its episodes are plain tensor slices. The
+    # visual experiments draw frames per batch, so without workers that cost is
+    # SERIAL with the optimizer — measured 1.7 h over 300k steps at batch 8.
+    # Episodes are deterministic per index and the shuffle order comes from the
+    # main-process generator, so raising this does not change which data a step
+    # sees.
+    num_workers: int = 0
+    prefetch_factor: int = 4
     log_every: int = 10
     checkpoint_every: int = 200
     # ALSO keep step-tagged checkpoints every N steps (last.pt is overwritten).
@@ -96,7 +105,7 @@ class Trainer:
 
     def __init__(
         self,
-        model: Experiment1Model,
+        model: StateToStateModel,
         dataset: Dataset[dict[str, Tensor]],
         config: TrainConfig,
         logger: MetricLogger | None = None,
@@ -129,12 +138,16 @@ class Trainer:
         """Deterministic per-epoch shuffling so resume can replay the order."""
         generator = torch.Generator()
         generator.manual_seed(self.config.seed * 100_003 + epoch)
+        workers = self.config.num_workers
         return DataLoader(
             self.dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
             generator=generator,
             drop_last=True,
+            num_workers=workers,
+            persistent_workers=workers > 0,
+            prefetch_factor=self.config.prefetch_factor if workers > 0 else None,
         )
 
     def _batches(self) -> Iterator[dict[str, Tensor]]:
@@ -152,18 +165,41 @@ class Trainer:
             epoch += 1
 
     # ------------------------------------------------------------- steps ----
+    # --------------------------------------------------- experiment seams ----
+    # The visual-to-visual regime keeps this loop's objective, guards, checkpointing and resume
+    # but changes three things: it reads frames, its dual sees a
+    # variance-normalized constraint (Eq. 123), and it must step an EMA target
+    # after each optimizer step. Those are the only overrides.
+    def _forward(self, batch: dict[str, Tensor]) -> TransitionOutput:
+        """Run the model on one batch (the state-to-state regime: true states)."""
+        states = batch["states"].to(self.device)
+        return self.model(states, context_len=self.config.context_len)
+
+    def _constraint(
+        self, pred_loss: Tensor, logit_loss: Tensor, output: TransitionOutput
+    ) -> Tensor:
+        """Eq. 13: the dual constraint excludes the path penalty."""
+        del output
+        return (pred_loss + logit_loss).detach()
+
+    def _after_optimizer_step(self, output: TransitionOutput) -> None:
+        """Hook for post-update work (the visual-to-visual regime's EMA, Eq. 111)."""
+
+    def _extra_metrics(self, output: TransitionOutput) -> dict[str, float]:
+        """Experiment-specific metrics merged into the logged dict."""
+        del output
+        return {}
+
     def _train_step(self, batch: dict[str, Tensor]) -> dict[str, float]:
         """One optimizer step over Eq. 40; returns scalar metrics."""
-        states = batch["states"].to(self.device)
-        output: TransitionOutput = self.model(states, context_len=self.config.context_len)
+        output = self._forward(batch)
 
         pred_loss = aligned_mse(output.prediction, output.target)  # Eq. 39
         logit_loss = self.config.lambda_logit * output.logit_penalty
         total = pred_loss + logit_loss
         if self.config.sparsity_enabled:
             total = total + self.lagrangian.penalty_weight * output.sparsity
-        # Eq. 13: the dual constraint excludes the path penalty.
-        constraint = (pred_loss + logit_loss).detach()
+        constraint = self._constraint(pred_loss, logit_loss, output)
 
         if not torch.isfinite(total):
             raise RuntimeError(
@@ -195,11 +231,12 @@ class Trainer:
         else:
             self.consecutive_skips = 0
             self.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+            self._after_optimizer_step(output)
             if self.config.sparsity_enabled:
                 self.lagrangian.update(constraint)
 
         num_decoded = output.prediction.shape[1]
-        return {
+        return self._extra_metrics(output) | {
             "loss/total": total.item(),
             "loss/pred": pred_loss.item(),
             "loss/logit": logit_loss.item(),

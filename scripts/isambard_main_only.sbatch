@@ -9,7 +9,7 @@
 #   sbatch scripts/isambard_main_only.sbatch RUN_TAG TAU LAMBDA_LOGIT [STEPS] [SEED] [hydra overrides...]
 # Tau and lambda_logit are mandatory. Any argument after SEED is forwarded to
 # scripts/train.py verbatim (e.g. train.sparsity_lambda_init=1e4 for probe
-# runs). Prefer scripts/isambard_pipeline.sbatch for reportable results.
+# runs). Prefer scripts/isambard_exp1_pipeline.sbatch for reportable results.
 #
 # PROVENANCE NOTE: record the sibling calibration run, the factor, and every
 # forwarded override for every tau.
@@ -23,7 +23,7 @@
 set -euo pipefail
 if [ "$#" -lt 3 ]; then
   echo "usage: sbatch $0 RUN_TAG CALIBRATED_TAU LAMBDA_LOGIT [STEPS] [SEED]" >&2
-  echo "prefer scripts/isambard_pipeline.sbatch so tau is recalibrated in-pipeline" >&2
+  echo "prefer scripts/isambard_exp1_pipeline.sbatch so tau is recalibrated in-pipeline" >&2
   exit 2
 fi
 RUN_TAG=$1

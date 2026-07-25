@@ -145,6 +145,45 @@ class SAViEncoder(nn.Module):
             raise AssertionError(f"slot history has shape {tuple(slots.shape)}")
         return slots
 
+    @torch.no_grad()
+    def allocations(self, frames: Float[Tensor, "b t c h w"]) -> Float[Tensor, "b t n p"]:
+        """Final spatially normalized Slot-Attention allocation M (Eq. 70/133).
+
+        ``[b, t, i, p]`` is the responsibility of spatial position ``p`` assigned
+        to slot ``i``, normalized so each slot's map sums to 1 (Eq. 71). This is
+        what the evaluation-only track alignment of Eqs. 134-138 takes centroids
+        of, and it is the only place the model's spatial grounding is visible.
+
+        Captured with a forward hook rather than by editing the vendored module
+        (D5 keeps ``third_party`` at minimal diff): the hook records the features
+        each Slot-Attention call received, and the allocation is then recomputed
+        from those features and the slots the call returned, i.e. the attention
+        of the FINAL slots. Evaluation-only, so the extra projections are cheap.
+        """
+        module = self._impl.slot_attention  # pyright: ignore[reportUnknownMemberType]
+        captured: list[Tensor] = []
+
+        def hook(_module: object, args: tuple[Tensor, ...], output: Tensor) -> None:
+            features, slots = args[0], output
+            normed = module.norm_inputs(features)  # pyright: ignore[reportUnknownMemberType]
+            k = module.project_k(normed)  # pyright: ignore[reportUnknownMemberType]
+            q = module.project_q(slots)  # pyright: ignore[reportUnknownMemberType]
+            logits = module.attn_scale * torch.einsum("bpc,bnc->bpn", k, q)
+            attention = torch.softmax(logits, dim=-1) + module.eps
+            attention = attention / attention.sum(dim=1, keepdim=True)  # Eq. 70
+            captured.append(attention.permute(0, 2, 1))  # (B, N, P)
+
+        handle = module.register_forward_hook(hook)  # pyright: ignore[reportUnknownMemberType]
+        try:
+            self.forward(frames)
+        finally:
+            handle.remove()
+        if len(captured) != frames.shape[1]:
+            raise AssertionError(
+                f"captured {len(captured)} allocations for {frames.shape[1]} frames"
+            )
+        return torch.stack(captured, dim=1)
+
 
 __all__ = ["SAViEncoder"]
 

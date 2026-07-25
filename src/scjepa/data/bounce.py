@@ -194,26 +194,55 @@ def render_bounce(
     resolution: int = 64,
     radius: float = 0.08,
     radii: Float[Tensor, " n"] | None = None,
+    uniform_appearance: bool = False,
 ) -> Float[Tensor, "t 3 h w"]:
-    """Render ball positions as colored discs on a black background, in [0, 1].
+    """Render ball positions as discs on a black background, in [0, 1].
 
-    Default: equal radii for all balls (D11: mass is invisible); identity via
-    _PALETTE colors, later balls drawn on top. ``radii`` renders per-ball sizes
-    (Baumgartner variant — mass becomes visible in a single frame).
+    Two appearance contracts, chosen by ``uniform_appearance``:
+
+    * ``False`` (the state-to-state regime visualisation, simulator v2): each ball gets its
+      own _PALETTE colour and, if ``radii`` is given, its own size. Both are
+      dataset-global signatures tied to the simulator ROW INDEX, so a single
+      frame reveals identity and (with ``radii``) mass.
+    * ``True`` (Experiments 2/3 primary condition, experiments.pdf p.14): every
+      object is drawn with "the same mass-independent glyph and rendered
+      radius". All discs are white and share ``radius``; ``radii`` is ignored
+      for drawing. The frames then carry "no dataset-global visual signature
+      tied to simulator row index", so mass is only reachable through centre
+      motion and hidden contact geometry.
+
+    ``radii`` still describes the PHYSICAL collision radii and is what the
+    simulator used; passing it here only affects how large the discs are drawn.
     """
-    num_frames, num_balls = states.shape[0], states.shape[1]
-    if num_balls > _PALETTE.shape[0]:
+    num_balls = states.shape[1]
+    if not uniform_appearance and num_balls > _PALETTE.shape[0]:
         raise ValueError(f"palette supports up to {_PALETTE.shape[0]} balls, got {num_balls}")
     axis = (torch.arange(resolution) + 0.5) / resolution
     grid_y, grid_x = torch.meshgrid(axis, axis, indexing="ij")  # image row = y
-    frames = torch.zeros(num_frames, 3, resolution, resolution)
-    for t in range(num_frames):
-        for ball in range(num_balls):
-            cx, cy = states[t, ball, 0], states[t, ball, 1]
-            ball_radius = float(radii[ball]) if radii is not None else radius
-            inside = (grid_x - cx) ** 2 + (grid_y - cy) ** 2 < ball_radius**2
-            frames[t, :, inside] = _PALETTE[ball].unsqueeze(-1)
-    return frames
+
+    if uniform_appearance:
+        ball_radii = torch.full((num_balls,), radius)
+        palette = torch.ones(num_balls, 3)
+    else:
+        ball_radii = radii.clone() if radii is not None else torch.full((num_balls,), radius)
+        palette = _PALETTE[:num_balls]
+
+    # Rasterize every (frame, ball) disc at once rather than looping T*N times:
+    # for 60 frames and 5 balls that is 300 full-resolution passes per episode,
+    # which the visual experiments pay on every batch.
+    centre_x = states[:, :, 0].unsqueeze(-1).unsqueeze(-1)  # (T, N, 1, 1)
+    centre_y = states[:, :, 1].unsqueeze(-1).unsqueeze(-1)
+    squared = (grid_x - centre_x) ** 2 + (grid_y - centre_y) ** 2  # (T, N, H, W)
+    inside = squared < (ball_radii.view(1, -1, 1, 1) ** 2)
+
+    # Later balls are drawn ON TOP, so each pixel takes the HIGHEST covering
+    # index; -1 marks background. This reproduces the sequential overwrite that
+    # the per-ball loop performed.
+    index = torch.where(
+        inside, torch.arange(num_balls).view(1, -1, 1, 1).expand_as(inside), -1
+    ).amax(dim=1)  # (T, H, W)
+    colours = torch.cat([torch.zeros(1, 3), palette])  # row 0 = background
+    return colours[index + 1].permute(0, 3, 1, 2).contiguous()
 
 
 class BounceDataset(Dataset[dict[str, Tensor]]):
@@ -234,6 +263,9 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
         mass_range: tuple[float, float] = (0.5, 3.0),
         mass_normal: tuple[float, float] | None = None,
         radius_from_mass: bool = False,
+        render_radius_from_mass: bool | None = None,
+        uniform_appearance: bool = False,
+        mass_independent_init: bool = False,
         speed: float = 0.5,
         seed: int = 0,
         render: bool = True,
@@ -253,15 +285,45 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
         must MATCH this constructor's (checked; a mismatch raises — silently
         serving episodes from a different physics config would break the D12
         identical-config rule between calibration and main). ``num_episodes``
-        may be smaller than the file holds (a prefix is used); ``render`` must
-        be False (frames are not stored).
+        may be smaller than the file holds (a prefix is used). Preload files
+        store no frames; with ``render=True`` the frames are rendered ON THE
+        FLY from the preloaded states, which is what makes the visual
+        experiments affordable — 100k x 60 rendered frames would be ~294 GB on
+        disk, while the states they are drawn from are already stored and the
+        physics is identical.
 
         Baumgartner-aligned variant (their App. E bounce): ``mass_normal=(mean,
         std)`` samples masses from a non-zero-mean normal (clamped to
         mass_range) instead of uniform, and ``radius_from_mass=True`` scales
-        each ball's radius ∝ its mass (mean radius = ``radius``): mass then
-        acts through contact geometry too, and IS visible in rendered frames —
-        deliberately departing from D11's invisibility for that comparison.
+        each ball's PHYSICAL radius ∝ its mass (mean radius = ``radius``): mass
+        then acts through contact geometry too, which is what makes ABSOLUTE
+        mass (not just mass ratios) identifiable at all — experiments.pdf p.14
+        "Why absolute masses are observable".
+
+        Visual-experiment knobs (experiments.pdf p.14: "For the visual regimes,
+        physical and rendered radii must be separated"):
+
+        * ``render_radius_from_mass``: how large discs are DRAWN. ``None``
+          (default) follows ``radius_from_mass``, reproducing simulator-v2
+          frames exactly. ``False`` draws every ball at the shared ``radius``
+          while the physics keeps the mass-dependent radii — the visual regimes
+          primary condition. ``True`` is the labelled visible-radius control.
+        * ``uniform_appearance``: draw all balls as identical white discs
+          instead of _PALETTE colours, removing the persistent per-row visual
+          signature. Required alongside ``render_radius_from_mass=False`` for
+          the primary visual condition.
+        * ``mass_independent_init``: compute wall margins and pair separation
+          from the common worst-case radius r_max = radius * mass_range[1] /
+          mass_ref rather than each ball's own radius, so the initial-position
+          SUPPORT no longer depends on mass. This isolates recovery evidence to
+          the transition dynamics and is a required control before attributing
+          recovery to them. It changes the generated states, so it is part of
+          the preload identity.
+
+        Setting ``render_radius_from_mass``/``uniform_appearance`` never changes
+        states, params or contacts, so it is deliberately NOT part of
+        ``generation_meta``: the same preloaded physics serves the state-to-state
+        state runs and the visual runs.
         """
         if not 0 < mass_range[0] < mass_range[1]:
             raise ValueError(f"invalid mass_range {mass_range}")
@@ -273,6 +335,11 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
         self.mass_range = mass_range
         self.mass_normal = mass_normal
         self.radius_from_mass = radius_from_mass
+        self.render_radius_from_mass = (
+            radius_from_mass if render_radius_from_mass is None else render_radius_from_mass
+        )
+        self.uniform_appearance = uniform_appearance
+        self.mass_independent_init = mass_independent_init
         self.speed = speed
         self.seed = seed
         self.render = render
@@ -280,8 +347,6 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
         self._cached: dict[int, dict[str, Tensor]] = {}
         self._preloaded: dict[str, Tensor] | None = None
         if preload is not None:
-            if render:
-                raise ValueError("preload stores no frames; requires render=False")
             payload = torch.load(preload, weights_only=True)
             meta, expected = payload["meta"], self.generation_meta()
             stored_n = int(meta.pop("num_episodes"))
@@ -296,8 +361,17 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
             self._preloaded = payload["tensors"]
 
     def generation_meta(self) -> dict[str, object]:
-        """Every setting that influences generated episodes (preload identity)."""
-        return {
+        """Every setting that influences generated episodes (preload identity).
+
+        Rendering settings are absent by design: preload files store states,
+        params and contacts, none of which depend on how the discs are drawn.
+
+        ``mass_independent_init`` DOES change the states, so it appears here —
+        but only when enabled, so that preload files written before the flag
+        existed still compare equal. D12 must refuse silent drift without also
+        refusing silent sameness.
+        """
+        meta: dict[str, object] = {
             "simulator_version": _SIMULATOR_VERSION,
             "num_episodes": self.num_episodes,
             "clip_len": self.clip_len,
@@ -309,6 +383,27 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
             "speed": self.speed,
             "seed": self.seed,
         }
+        if self.mass_independent_init:
+            meta["mass_independent_init"] = True
+        return meta
+
+    def physical_radii(self, masses: Float[Tensor, "n 1"]) -> Float[Tensor, " n"] | None:
+        """Collision radii r_i = radius * m_i / m_ref (experiments.pdf Eq. 2), or None.
+
+        The reference mass is episode-INDEPENDENT (audit G2): normalising by the
+        episode mean would make geometry reveal only m_i/mean(m), and since
+        elastic impulses are mass-ratio-only, absolute mass would stop being
+        identifiable by any model.
+        """
+        if not self.radius_from_mass:
+            return None
+        return self.radius * masses.squeeze(-1) / self._mass_reference()
+
+    def _mass_reference(self) -> float:
+        """Episode-independent m_ref used by Eq. 2 (1.5 in the configured setup)."""
+        if self.mass_normal is not None:
+            return self.mass_normal[0]
+        return (self.mass_range[0] + self.mass_range[1]) / 2
 
     def __len__(self) -> int:
         """Number of episodes."""
@@ -319,28 +414,65 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
 
         Uses each ball's OWN radius for wall margins and pairwise separation
         (audit G3: mean-radius margins let large balls start overlapping —
-        72/300 baumgartner episodes began in contact).
+        72/300 baumgartner episodes began in contact). The support of the
+        initial positions is therefore itself mass-dependent.
+
+        Under ``mass_independent_init`` every margin instead uses the common
+        worst-case radius r_max = radius * mass_range[1] / m_ref, so the support
+        is identical for every mass draw and recovery evidence must come from
+        the dynamics rather than from where the balls could start.
         """
-        r = radii if radii is not None else torch.full((self.num_balls,), self.radius)
-        placed: list[Tensor] = []
+        if self.mass_independent_init:
+            r_max = self.radius * self.mass_range[1] / self._mass_reference()
+            r = torch.full((self.num_balls,), r_max)
+        else:
+            r = radii if radii is not None else torch.full((self.num_balls,), self.radius)
         for i in range(self.num_balls):
-            margin = float(r[i]) * 1.05
-            while True:
-                candidate = margin + torch.rand(2, generator=generator) * (1 - 2 * margin)
-                if all(
-                    (candidate - p).square().sum().sqrt() > (float(r[i]) + float(r[j])) * 1.1
-                    for j, p in enumerate(placed)
-                ):
-                    placed.append(candidate)
-                    break
-        return torch.stack(placed)
+            if 2 * float(r[i]) * 1.05 >= 1.0:
+                raise ValueError(
+                    f"ball radius {float(r[i]):.3f} leaves no room in the unit box; "
+                    f"reduce radius or mass_range"
+                )
+        # Greedy sequential placement can paint itself into a corner: the first
+        # balls land legally and leave nowhere for the last one. That is rare at
+        # mass-proportional radii but routine at the worst-case radius, where
+        # every ball claims r_max, so a failed ball restarts the WHOLE
+        # configuration rather than resampling into a dead layout.
+        #
+        # Both caps are far above what the mass-proportional path ever uses, so
+        # its draw sequence — and every episode generated before this guard
+        # existed — is unchanged.
+        max_per_ball, max_layouts = 2_000, 20_000
+        for _ in range(max_layouts):
+            placed: list[Tensor] = []
+            for i in range(self.num_balls):
+                margin = float(r[i]) * 1.05
+                for _ in range(max_per_ball):
+                    candidate = margin + torch.rand(2, generator=generator) * (1 - 2 * margin)
+                    if all(
+                        (candidate - p).square().sum().sqrt() > (float(r[i]) + float(r[j])) * 1.1
+                        for j, p in enumerate(placed)
+                    ):
+                        placed.append(candidate)
+                        break
+                else:
+                    break  # dead layout — restart from an empty box
+            if len(placed) == self.num_balls:
+                return torch.stack(placed)
+        raise RuntimeError(
+            f"could not place {self.num_balls} balls of radius <= {float(r.max()):.3f} in "
+            f"{max_layouts} layout attempts; the requested packing is too dense"
+        )
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
         """Generate episode ``index``: sample params/state, simulate, render."""
         if self._preloaded is not None:
             if not 0 <= index < self.num_episodes:
                 raise IndexError(index)
-            return {key: tensor[index] for key, tensor in self._preloaded.items()}
+            item = {key: tensor[index] for key, tensor in self._preloaded.items()}
+            if self.render and "frames" not in item:
+                item["frames"] = self._render(item["states"], item["params"])
+            return item
         if self.cache and index in self._cached:
             return self._cached[index]
         generator = torch.Generator().manual_seed(self.seed * 1_000_003 + index)
@@ -352,20 +484,7 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
             )
         else:
             masses = low + torch.rand(self.num_balls, 1, generator=generator) * (high - low)
-        # Fixed proportionality r_i = radius · m_i / mass_ref with an
-        # episode-INDEPENDENT reference (audit G2): normalizing by the episode
-        # mean made geometry reveal only m_i/mean(m) — and elastic impulses are
-        # mass-ratio-only, so absolute mass became unidentifiable by ANY model
-        # (measured MCC ceiling 0.775 vs Baumgartner's ~0.9).
-        if self.radius_from_mass:
-            mass_ref = (
-                self.mass_normal[0]
-                if self.mass_normal is not None
-                else (self.mass_range[0] + self.mass_range[1]) / 2
-            )
-            radii = self.radius * masses.squeeze(-1) / mass_ref
-        else:
-            radii = None
+        radii = self.physical_radii(masses)
         positions = self._initial_positions(generator, radii)
         angles = torch.rand(self.num_balls, generator=generator) * 2 * math.pi
         velocities = self.speed * torch.stack([angles.cos(), angles.sin()], dim=-1)
@@ -374,12 +493,33 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
         )
         item = {"states": states, "params": masses, "contacts": contacts}
         if self.render:
-            item["frames"] = render_bounce(
-                states, resolution=self.resolution, radius=self.radius, radii=radii
-            )
+            item["frames"] = self._render(states, masses)
         if self.cache:
             self._cached[index] = item
         return item
+
+    def _render(
+        self, states: Float[Tensor, "t n 4"], masses: Float[Tensor, "n 1"]
+    ) -> Float[Tensor, "t 3 h w"]:
+        """Draw an episode under the configured appearance contract.
+
+        The drawn radii come from ``render_radius_from_mass``, which is
+        independent of the ``radius_from_mass`` the physics used — that split
+        is what lets the visual experiments keep mass identifiable through the
+        dynamics while hiding it from any single frame.
+        """
+        drawn_radii = (
+            self.radius * masses.squeeze(-1) / self._mass_reference()
+            if self.render_radius_from_mass
+            else None
+        )
+        return render_bounce(
+            states,
+            resolution=self.resolution,
+            radius=self.radius,
+            radii=drawn_radii,
+            uniform_appearance=self.uniform_appearance,
+        )
 
 
 __all__ = ["BounceDataset", "render_bounce", "simulate_bounce"]

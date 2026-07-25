@@ -1,4 +1,11 @@
-"""Experiment 1 — true-state context, true-state target (experiments.pdf §6.2).
+"""State-to-state regime: true object states in, true next state out.
+
+The oracle rung of the ladder — perception, state grounding and slot
+correspondence are all given, so a failure here is a failure of causal parameter
+identification and nothing else. Row i IS physical object i, so no track
+alignment exists anywhere in training or evaluation.
+
+(experiments.pdf §6.2.)
 
 The context encoder is the identity on states plus the parameter encoder
 (Eq. 15): E⁽¹⁾_ctx[Z_{0:Tpar-1}] = (Z_{Tpar-1}, θ̂) with θ̂ = P_η(Z_{0:Tpar-1}).
@@ -41,7 +48,7 @@ class TransitionOutput(NamedTuple):
     gate_entropy: Float[Tensor, ""]
 
 
-class Experiment1Model(nn.Module):
+class StateToStateModel(nn.Module):
     """Parameter encoder P_η + SPARTAN f_gamma on ground-truth object states."""
 
     def __init__(self, parameter_encoder: ParameterEncoder, predictor: Spartan) -> None:
@@ -61,7 +68,7 @@ class Experiment1Model(nn.Module):
             states: (B, T, N, k) episode batch; the parameter encoder sees
                 observations 0..Tpar-1, and the supervised pairs are
                 (Z_{Tpar-1}, Z_{Tpar}), …, (Z_{T-2}, Z_{T-1})  (Eq. 7).
-            context_len: Tpar (Experiment 1: 30). None -> T-1 (K = 1).
+            context_len: Tpar (the state-to-state regime: 30). None -> T-1 (K = 1).
         """
         if states.ndim != 4 or states.shape[1] < 2:
             raise ValueError(f"expected (B, T>=2, N, k), got {tuple(states.shape)}")
@@ -89,7 +96,7 @@ class Experiment1Model(nn.Module):
         )
 
 
-def build_experiment1(
+def build_state_to_state(
     state_dim: int = 4,
     num_slots: int = 5,
     param_encoder_dim: int = 32,
@@ -102,9 +109,9 @@ def build_experiment1(
     spartan_temperature: float = 1.0,
     spartan_dense: bool = False,
     spartan_identity: bool = False,
-) -> Experiment1Model:
-    """Build the Experiment-1 model from plain config values (Hydra-friendly)."""
-    return Experiment1Model(
+) -> StateToStateModel:
+    """Build the state-to-state model from plain config values (Hydra-friendly)."""
+    return StateToStateModel(
         parameter_encoder=ParameterEncoder(
             state_dim=state_dim,
             dim=param_encoder_dim,
@@ -126,4 +133,4 @@ def build_experiment1(
     )
 
 
-__all__ = ["Experiment1Model", "TransitionOutput", "build_experiment1"]
+__all__ = ["StateToStateModel", "TransitionOutput", "build_state_to_state"]
