@@ -1,37 +1,22 @@
-"""Model modules: SAVi encoders, channel split, SPARTAN predictor.
+"""Model modules for the experiment ladder (experiments.pdf §6).
 
-Will contain: the PyTorch SAVi encoder (D2 — SAVi, not SAVi++; validated against
-the official JAX repo), the channel split (per-slot temporal attention pooling for
-causal parameters per D4, plus the linear kinematic head on last-step slots), the
-SPARTAN transition model (implemented from arXiv:2411.06890 — must expose its
-interaction graph for SHD/MCC eval), and optional auxiliary-variable conditioning.
-
-Owner: model-architecture-engineer (method-faithfulness reviewed by
-paper-to-code-translator).
+Experiment 1: ``ParameterEncoder`` (P_η, §6.2 Eqs. 16-26) + ``Spartan``
+(f_gamma, Eqs. 27-37) composed by ``Experiment1Model`` (Eq. 38). ``SAViEncoder``
+is the shared causal visual substrate for Experiments 2 and 3 (§6.3).
 """
 
-from scjepa.models.channel_split import (
-    AttnPooling,
-    CrossSlotAttnPooling,
-    KinematicHead,
-    TrackAwareAttnPooling,
-    TrackedSlotAttentionPooling,
-)
-from scjepa.models.jepa import JepaOutput, SCJepa
+from scjepa.models.experiment1 import Experiment1Model, TransitionOutput, build_experiment1
+from scjepa.models.parameter_encoder import ParameterEncoder
 from scjepa.models.savi import SAViEncoder
-from scjepa.models.spartan import Spartan, SpartanOutput
-from scjepa.models.state_jepa import StateJepa
+from scjepa.models.spartan import Spartan, SpartanLayer, SpartanOutput
 
 __all__ = [
-    "AttnPooling",
-    "CrossSlotAttnPooling",
-    "JepaOutput",
-    "KinematicHead",
+    "Experiment1Model",
+    "ParameterEncoder",
     "SAViEncoder",
-    "SCJepa",
     "Spartan",
+    "SpartanLayer",
     "SpartanOutput",
-    "StateJepa",
-    "TrackAwareAttnPooling",
-    "TrackedSlotAttentionPooling",
+    "TransitionOutput",
+    "build_experiment1",
 ]

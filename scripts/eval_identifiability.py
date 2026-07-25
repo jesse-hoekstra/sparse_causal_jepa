@@ -2,12 +2,10 @@
 
 Loads a training run's ``resolved_config.yaml`` + ``last.pt``, rebuilds the
 model through the same factory the trainer used, evaluates prediction, sparse
-graphs and strict one-to-one mass recovery on a held-out split, and saves the
-full pairwise recovery matrix next to the checkpoint.
+graphs and Baumgartner App. F.1 mass-recovery MCC on a held-out split, and saves
+the full pairwise R² matrix next to the checkpoint.
 
-Only meaningful for the GT-embedding regime (``model.type: states``), where
-slot i ≡ object i by construction; refuses the vision regime until a
-slot↔object alignment step exists (see scjepa/eval/harness.py).
+Experiment 1: slot i ≡ tracked object i by construction (ζ = id).
 """
 
 # pyright: reportUnknownMemberType=false
@@ -22,8 +20,6 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from scjepa.eval import evaluate_identifiability
-from scjepa.models.jepa import SCJepa
-from scjepa.models.state_jepa import StateJepa
 from scjepa.training.factory import build_dataset, build_model
 
 matplotlib.use("Agg")
@@ -57,14 +53,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.run_dir / "resolved_config.yaml")
-    if cfg.model.type != "states":
-        raise SystemExit(
-            "eval_identifiability currently supports model.type=states only: in the "
-            "vision regime learned slots are not aligned to objects, so graph/recovery "
-            "computed naively would be meaningless (see scjepa/eval/harness.py)."
-        )
     model = build_model(cfg.model)
-    assert isinstance(model, SCJepa | StateJepa)
     # Always deserialize through CPU so checkpoints written on a GPU machine
     # remain inspectable elsewhere; the harness moves the model to --device.
     payload = torch.load(args.run_dir / "last.pt", map_location="cpu", weights_only=False)
@@ -76,14 +65,10 @@ def main() -> None:
     report = evaluate_identifiability(
         model,
         dataset,
-        input_key=cfg.train.input_key,
         batch_size=args.batch_size,
         device=args.device,
         context_len=cfg.train.get("context_len", None),
-        rollout_horizon=cfg.train.get("rollout_horizon", None),
         lambda_logit=cfg.train.get("lambda_logit", 0.0),
-        prediction_matching=str(cfg.train.get("prediction_matching", "auto")),
-        constraint_normalization=str(cfg.train.get("constraint_normalization", "auto")),
     )
 
     print(f"identifiability report for {args.run_dir} (step {payload['step']}):")
@@ -106,22 +91,21 @@ def main() -> None:
     metrics_path.write_text(json.dumps(record, indent=2))
     print(f"  metrics saved to {metrics_path}")
 
-    alignment_record: dict[str, object] = {
-        "target_to_learned": [int(value) for value in report.target_to_learned],
+    # Rows are true masses, columns are learned coordinates (App. F.1's I x J).
+    matrix_record: dict[str, object] = {
+        "orientation": "nonlinear_r2[true_mass][learned_coordinate]",
         "nonlinear_r2": [[float(value) for value in row] for row in report.recovery_matrix],
-        "absolute_pearson": [
-            [float(value) for value in row] for row in report.recovery_linear_matrix
-        ],
     }
-    alignment_path = args.run_dir / "recovery_alignment.json"
-    alignment_path.write_text(json.dumps(alignment_record, indent=2))
-    print(f"  recovery alignment saved to {alignment_path}")
+    matrix_path = args.run_dir / "mcc_matrix.json"
+    matrix_path.write_text(json.dumps(matrix_record, indent=2))
+    print(f"  MCC R^2 matrix saved to {matrix_path}")
 
-    # Full tracked-parameter recovery grid. Rows are physical masses, columns
-    # are learned parameter slots. The green outline shows the ONE frozen
-    # dataset-level Hungarian assignment (kept as a conservative guard against
-    # stable implementation-level permutations).
+    # Recovery grid: rows are physical masses, columns are learned parameter
+    # coordinates. The green outline marks each row's argmax — the cell that
+    # actually enters MCC = mean_i max_j R^2_ij. An off-diagonal green cell
+    # means the mass is recoverable, but not from its own track's coordinate.
     num_slots = report.true_parameters.shape[1]
+    best_for_mass = report.recovery_matrix.argmax(dim=1)  # per true mass: argmax_j
     grid_fig, grid_axes = plt.subplots(
         num_slots, num_slots, figsize=(1.75 * num_slots, 1.75 * num_slots), squeeze=False
     )
@@ -139,13 +123,13 @@ def main() -> None:
             cell.text(
                 0.04,
                 0.94,
-                f"$R^2={report.recovery_matrix[j, i]:.2f}$",
+                f"$R^2={report.recovery_matrix[i, j]:.2f}$",
                 transform=cell.transAxes,
                 ha="left",
                 va="top",
                 fontsize=7,
             )
-            if int(report.target_to_learned[i]) == j:
+            if int(best_for_mass[i]) == j:
                 for spine in cell.spines.values():
                     spine.set_color("tab:green")
                     spine.set_linewidth(2.0)
@@ -153,10 +137,7 @@ def main() -> None:
                 cell.set_ylabel(f"$m_{{{i + 1}}}$")
             if i == num_slots - 1:
                 cell.set_xlabel(f"$\\hat\\theta_{{{j + 1}}}$")
-    grid_fig.suptitle(
-        "tracked one-to-one mass recovery "
-        f"(green = frozen assignment, MCC={report.metrics['mass_mcc']:.3f})"
-    )
+    grid_fig.suptitle(f"mass recovery (green = row argmax, F.1 MCC={report.metrics['mcc']:.3f})")
     grid_fig.tight_layout()
     grid_path = args.run_dir / "recovery_grid.png"
     grid_fig.savefig(grid_path, dpi=150)

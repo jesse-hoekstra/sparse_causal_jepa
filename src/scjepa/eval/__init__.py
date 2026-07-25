@@ -10,34 +10,19 @@ Owner: experiment-infra-engineer.
 """
 
 from scjepa.eval.graph import (
-    align_parameter_columns,
-    gt_graphs_from_contacts,
-    read_learned_graphs,
+    gt_causal_graph_from_contacts,
+    read_learned_graph,
     structural_hamming_distance,
 )
 from scjepa.eval.harness import IdentifiabilityReport, evaluate_identifiability
-from scjepa.eval.parameters import (
-    OneToOneRecovery,
-    correlation_matrix,
-    marginal_recovery,
-    mean_max_correlation,
-    nonlinear_mcc,
-    one_to_one_recovery,
-    optimal_one_to_one_assignment,
-)
+from scjepa.eval.parameters import MccReport, nonlinear_mcc
 
 __all__ = [
     "IdentifiabilityReport",
-    "OneToOneRecovery",
-    "align_parameter_columns",
-    "correlation_matrix",
+    "MccReport",
     "evaluate_identifiability",
-    "gt_graphs_from_contacts",
-    "marginal_recovery",
-    "mean_max_correlation",
+    "gt_causal_graph_from_contacts",
     "nonlinear_mcc",
-    "one_to_one_recovery",
-    "optimal_one_to_one_assignment",
-    "read_learned_graphs",
+    "read_learned_graph",
     "structural_hamming_distance",
 ]

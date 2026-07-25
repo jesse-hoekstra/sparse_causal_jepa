@@ -1,106 +1,24 @@
 # @package _global_
-# STAGE-1 JEPA config aligned to Baumgartner et al. (dynamical_system.pdf)
-# bounce, matching their App. E environment as closely as specified:
-#   - 5 balls, elastic collisions, object-level (state) observations
-#   - masses ~ non-zero-mean normal (exact params UNSPECIFIED upstream; ours
-#     below, clamped to mass_range — flag in any writeup)
-#   - radius proportional to mass ("for ease of observation" + variability;
-#     deliberately departs from D11 invisibility for this comparison)
-#   - attention-logit loss (their Eq. 11; F.4: required against path plateau)
-#   - mass recovery = nonlinear MLP-R² under one global one-to-one coordinate
-#     permutation, with the assignment selected and scored on disjoint folds
-# Their scale: ~300k steps, 8 seeds (Fig. 17) -> GPU/overnight, not laptop.
-# Their Fig. 3 SPARTAN MCC (~0.9+) is context, not a like-for-like target: the
-# model is ours (JEPA, D6-D9), and our one-to-one held-out score is stricter
-# than their mean-max metric even though it uses the same nonlinear R² probes.
-# D24/D25 change the simulator, parameter encoder, loss, and path objective,
-# so every reported run must recalibrate tau under this exact config. Use the
-# full same-pipeline lineage in scripts/isambard_pipeline.sbatch.
-
-defaults:
-  - bounce_states
-
-model:
-  # SPARTAN App. A.1 Table 3, Interventional Pong column: 3 transformer layers,
-  # embedding dim 512, MLP hidden 512, 3 MLP layers (bounce_states shrinks these
-  # for CPU smokes — this paper-aligned run must not inherit that). Our latent
-  # mass itself is scalar (`param_dim: 1` below); it and the raw 4-D GT state
-  # tokens are separately projected into the 512-D transformer workspace.
-  spartan_layers: 3
-  spartan_embed_dim: 512
-  spartan_mlp_hidden: 512
-  # D21: rollout state space = raw GT states (fixed ruler, D20) — only the
-  # parameter path (context embed + pooling) and the predictor train.
-  gt_states: true
-  num_slots: 5
-  # Example 1: true-state tracks already provide the temporal object identity
-  # that SAVi supplies in pixels. One parameter slot is anchored to each track,
-  # competes for relationally contextualized trajectory evidence, and is
-  # iteratively refined without supplying any state<-parameter edge to SPARTAN.
-  pooling_type: tracked_slot_attention
-  parameter_slot_iterations: 3
-  param_dim: 1
-  # Give graph nodes distinct addresses, but do not privilege any of the 25
-  # parameter-to-state relations. State and parameter address tables remain
-  # separate and independently initialized.
-  spartan_node_embeddings: true
+# Experiment 1 at paper scale (experiments.pdf §6.1–6.2): true-state context,
+# true-state target, 5-ball Bounce v2 with mass-proportional physical radii.
+# tau and lambda_logit are NOT set here: lambda_logit comes from the label-free
+# dense sweep (§6.1.3; scripts/isambard_logit_sweep.sbatch + summarize), tau is
+# recalibrated by the pipeline as 1.0x the held-out constraint of the converged
+# dense reference (scripts/run_bounce_example.sh / isambard_pipeline.sbatch).
 
 data:
-  mass_normal: [1.5, 0.5] # UNSPECIFIED upstream — our choice
-  radius_from_mass: true
-  # 2026-07-19: 4000 was the initial-commit CPU-era default (20k-step runs,
-  # 2x128 model) and was never rescaled. At 300k steps x batch 16 it means
-  # ~1200 views per episode; run jkslgj4o showed the Pong-scale model
-  # memorizing them (train pred 0.0011 vs held-out 0.0216, eval flat from
-  # step 5k) — which poisons tau (held-out-calibrated tau vs a dual driven by
-  # memorized train loss). 100k episodes = 3M unique transitions (~48 views
-  # each), ~0.7GB cached states-only, one-off generation absorbed into the
-  # first epoch. MUST be identical for calibration and main (D12) — pinned
-  # here, not on the CLI, so it cannot be forgotten.
-  num_clips: 100000
+  num_clips: 100000 # 3M unique transitions; rescale if capacity/steps change
+  clip_len: 60 # T (§6.1.1)
+  preload: data/bounce_train_v2_100000.pt
 
 train:
-  # Raw states retain simulator object identity. Do not let a per-transition
-  # assignment erase that known correspondence in the diagnostic baseline.
-  prediction_matching: aligned
-  # Raw-state observations already provide the fixed ruler used in
-  # Baumgartner/SPARTAN's reconstruction constraint; use their raw MSE.
-  constraint_normalization: raw
-  sparsity_lambda_init: 1.0e6
-  # Inherited only as a bare-train.py smoke placeholder, now in raw-MSE units.
-  # The reporting pipeline always replaces it with the fresh dense reference.
+  steps: 300000 # Baumgartner Fig. 17 scale
+  batch_size: 16 # x30 teacher-forced transitions per episode
+  context_len: 30 # Tpar (Eq. 17); I = {29, ..., 58}
+  # Inherited only as a bare-train.py placeholder, in raw-MSE units. The
+  # reporting pipeline always replaces it with the fresh dense reference.
   sparsity_tau: 0.75
-  steps: 300000
-  lr: 5.0e-5 # SPARTAN App. A.1 Table 3 (Adam) — overrides bounce_states' CPU value
-  # D21: teacher-forced one-step objective (SPARTAN Eq. 7; Baumgartner's Markov
-  # MLE factorization — decoder "performs one-step prediction", their Fig. 1).
-  # Every transition is anchored at the TRUE state. D24 now uses raw MSE and a
-  # corrected collision surface, so pre-D24 numeric floors are invalid. The
-  # reporting runner trains a matched A≡0 reference (--identity-check) and
-  # requires tau below that measured floor before the sparse run begins.
-  rollout_horizon: 1
-  # Periodic held-out identifiability eval. The base default is null and earlier
-  # launches passed it on the CLI — run 8xjg7ra5 (2026-07-19) silently ran
-  # without eval curves because of that. A 300k main run without eval/shd/mcc
-  # curves violates the "a metric that CAN leave its failure value MUST be
-  # watched" rule, so it is pinned in the experiment config now. Eval is
-  # no_grad + shuffle=false and consumes no training RNG: enabling it does not
-  # perturb the training trajectory (D12-safe).
-  eval_every: 5000
-  # Their lambda_logit is unspecified ("small"). Zero remains a neutral
-  # placeholder for bare train.py calls. D26's first architecture check passes
-  # the previously used 1e-3 explicitly to isambard_pipeline.sbatch; only after
-  # mass recovery is restored do we rerun isambard_logit_sweep.sbatch for this
-  # architecture. Their F.4 shows that zero can make the gated path plateau.
-  lambda_logit: 0.0
-  # SPARTAN A.2 / Baumgartner Eq. 10 leave this numerical step unspecified.
-  # Keep D23's 2e-2 as a conservative first pilot value, but do NOT treat its
-  # old timing evidence as transferable: D24 changed normalized loss to raw
-  # MSE and changed the path objective's scale. Watch how quickly lambda leaves
-  # 1e6 after the raw constraint crosses tau, then tune before the seed sweep.
-  sparsity_step_size: 2.0e-2
-  # The papers specify no clamp. We retain the base 1e6 only as a numerical
-  # recovery guard; unlike D22's 3e4 cap its initial path weight is just 1e-6.
-  # There is no explicit warm-up: the large initial lambda supplies the
-  # dynamics-first phase described in the papers.
-  sparsity_lambda_max: 1.0e6
+  eval_every: 5000 # a metric that CAN leave its failure value MUST be watched
+  log_every: 100
+  checkpoint_every: 2000
+  checkpoint_keep_every: 25000 # D18 rolling fallbacks

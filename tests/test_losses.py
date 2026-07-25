@@ -1,144 +1,41 @@
-"""Invariant tests for the loss package: Hungarian predictive loss + regularizer."""
+"""Tests for the Experiment-1 prediction loss (experiments.pdf Eq. 39)."""
 
 import pytest
 import torch
 
-from scjepa.losses import (
-    RegularizerKind,
-    SlotRegularizer,
-    aligned_mse,
-    hungarian_mse,
-    match_slots,
-    prediction_constraint,
-    prediction_mse,
-    resolve_constraint_normalization,
-    resolve_prediction_matching,
-)
-
-B, N, D = 4, 5, 16
+from scjepa.losses import aligned_mse
 
 
-@pytest.fixture
-def pred() -> torch.Tensor:
+def test_zero_at_identity() -> None:
+    pred = torch.randn(4, 5, 4)
+    assert aligned_mse(pred, pred).item() == 0
+
+
+def test_matches_eq39_elementwise_mean() -> None:
+    """L_pred = (1/(|I| N k)) sum of squared errors == element-wise MSE."""
     torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
-    return torch.randn(B, N, D, requires_grad=True)
+    pred, target = torch.randn(6, 5, 4), torch.randn(6, 5, 4)
+    manual = (pred - target).square().sum() / pred.numel()
+    torch.testing.assert_close(aligned_mse(pred, target), manual)
 
 
-@pytest.fixture
-def target() -> torch.Tensor:
+def test_keeps_known_object_correspondence() -> None:
+    """Row identity is tracked: swapping rows changes the loss (no matching)."""
     torch.manual_seed(1)  # pyright: ignore[reportUnknownMemberType]
-    return torch.randn(B, N, D, requires_grad=True)
+    target = torch.randn(2, 3, 4)
+    pred = target[:, [1, 0, 2]]
+    assert aligned_mse(pred, target).item() > 0
 
 
-def test_zero_at_identity(pred: torch.Tensor) -> None:
-    loss = hungarian_mse(pred, pred.detach().clone())
-    torch.testing.assert_close(loss, torch.tensor(0.0))
-
-
-def test_permutation_invariance(pred: torch.Tensor, target: torch.Tensor) -> None:
-    """D6: permuting target slots must not change the matched loss."""
-    baseline = hungarian_mse(pred, target)
-    for _ in range(3):
-        perm = torch.randperm(N)
-        torch.testing.assert_close(hungarian_mse(pred, target[:, perm]), baseline)
-
-
-def test_aligned_loss_keeps_known_object_correspondence() -> None:
-    """Tracked GT rows must not be silently relabelled to lower the error."""
-    pred = torch.tensor([[[0.0], [2.0]]])
-    permuted_target = torch.tensor([[[2.0], [0.0]]])
-    torch.testing.assert_close(hungarian_mse(pred, permuted_target), torch.tensor(0.0))
-    torch.testing.assert_close(aligned_mse(pred, permuted_target), torch.tensor(4.0))
-    torch.testing.assert_close(
-        prediction_mse(pred, permuted_target, "aligned"), torch.tensor(4.0)
-    )
-
-
-def test_prediction_matching_auto_policy() -> None:
-    assert resolve_prediction_matching("auto", object_aligned=True) == "aligned"
-    assert resolve_prediction_matching("auto", object_aligned=False) == "hungarian"
-    assert resolve_prediction_matching("hungarian", object_aligned=True) == "hungarian"
-    with pytest.raises(ValueError, match="unknown prediction matching"):
-        resolve_prediction_matching("nearest", object_aligned=True)
-
-
-def test_constraint_normalization_auto_policy() -> None:
-    assert resolve_constraint_normalization("auto", gt_states=True) == "raw"
-    assert resolve_constraint_normalization("auto", gt_states=False) == "target_variance"
-    loss, variance = torch.tensor(0.3), torch.tensor(0.1)
-    torch.testing.assert_close(prediction_constraint(loss, variance, "raw"), loss)
-    torch.testing.assert_close(
-        prediction_constraint(loss, variance, "target_variance"), torch.tensor(3.0)
-    )
-    with pytest.raises(ValueError, match="unknown constraint normalization"):
-        resolve_constraint_normalization("batch_mean", gt_states=True)
-
-
-def test_matches_aligned_mse_when_slots_correspond(pred: torch.Tensor) -> None:
-    """With slots already aligned (small noise), matching must pick the identity."""
-    target = pred.detach() + 0.01 * torch.randn_like(pred)
-    expected = torch.nn.functional.mse_loss(pred, target)
-    torch.testing.assert_close(hungarian_mse(pred, target), expected)
-    assignment = match_slots(pred, target)
-    identity = torch.arange(N).expand(B, N)
-    assert torch.equal(assignment, identity)
-
-
-def test_recovers_planted_permutation(pred: torch.Tensor) -> None:
-    """match_slots must invert a planted slot shuffle."""
-    perm = torch.randperm(N)
-    shuffled = pred.detach()[:, perm]
-    assignment = match_slots(pred, shuffled)
-    # target slot assignment[i] equals pred slot i ⇒ assignment must be argsort-free
-    # inverse: shuffled[:, assignment[b]] == pred[b]
-    for b in range(B):
-        torch.testing.assert_close(shuffled[b, assignment[b]], pred.detach()[b])
-
-
-def test_gradients_flow_to_both_sides(pred: torch.Tensor, target: torch.Tensor) -> None:
-    """Joint training (D7): the loss must send gradients into pred AND target."""
-    loss = hungarian_mse(pred, target)
-    loss.backward()  # pyright: ignore[reportUnknownMemberType]
+def test_gradients_flow() -> None:
+    pred = torch.randn(2, 3, 4, requires_grad=True)
+    aligned_mse(pred, torch.randn(2, 3, 4)).backward()  # pyright: ignore[reportUnknownMemberType]
     assert pred.grad is not None
-    assert pred.grad.abs().sum() > 0
-    assert target.grad is not None
-    assert target.grad.abs().sum() > 0
+    assert torch.isfinite(pred.grad).all()
 
 
-def test_rejects_shape_mismatch(pred: torch.Tensor) -> None:
-    with pytest.raises(ValueError, match="expected matching"):
-        hungarian_mse(pred, torch.randn(B, N + 1, D))
-
-
-@pytest.mark.parametrize("kind", ["visreg", "sigreg"])
-def test_regularizer_detects_collapse(kind: RegularizerKind) -> None:
-    """D3: a collapsed batch must be penalized far more than a well-spread one."""
-    torch.manual_seed(2)  # pyright: ignore[reportUnknownMemberType]
-    reg = SlotRegularizer(kind=kind)
-    collapsed = torch.ones(B, N, D)  # every slot identical
-    spread = torch.randn(64, N, D)  # ~ the loss's Gaussian reference
-    collapsed_penalty = reg(collapsed)
-    spread_penalty = reg(spread)
-    assert torch.isfinite(collapsed_penalty)
-    assert torch.isfinite(spread_penalty)
-    assert collapsed_penalty > 10 * spread_penalty
-
-
-@pytest.mark.parametrize("kind", ["visreg", "sigreg"])
-def test_regularizer_grads_and_leading_axes(kind: RegularizerKind) -> None:
-    torch.manual_seed(3)  # pyright: ignore[reportUnknownMemberType]
-    reg = SlotRegularizer(kind=kind)
-    slots = torch.randn(B, 3, N, D, requires_grad=True)  # (B, T, N, d) also allowed
-    penalty = reg(slots)
-    assert penalty.shape == ()
-    penalty.backward()
-    assert slots.grad is not None
-    assert slots.grad.abs().sum() > 0
-
-
-def test_regularizer_input_guards() -> None:
-    reg = SlotRegularizer()
-    with pytest.raises(ValueError, match="at least 2"):
-        reg(torch.randn(1, D))
-    with pytest.raises(ValueError, match="expected"):
-        reg(torch.randn(D))
+def test_rejects_shape_mismatch() -> None:
+    with pytest.raises(ValueError, match="matching"):
+        aligned_mse(torch.randn(2, 3, 4), torch.randn(2, 4, 4))
+    with pytest.raises(ValueError, match="matching"):
+        aligned_mse(torch.randn(2, 3, 4, 1), torch.randn(2, 3, 4, 1))
