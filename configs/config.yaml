@@ -1,102 +1,68 @@
-# Base config for scripts/train.py (Hydra). Experiment presets override this:
-#   python scripts/train.py experiment=smoke
-# Every hyperparameter of the objective and the model lives here (D8).
+# Base config for scripts/train.py (Hydra) — Experiment 1 (experiments.pdf §6.2).
+# These defaults are a tiny CPU sanity scale; the paper-scale settings live in
+# experiment/bounce_baumgartner.yaml:
+#   python scripts/train.py experiment=bounce_baumgartner ...
 
 defaults:
   - _self_
   - experiment: null
 
 model:
-  type: vision # vision (SCJepa, pixels) | states (StateJepa, GT-embedding regime)
-  state_dim: 4 # states regime only: dimension of GT object states
-  resolution: 64
-  # Bounce visual contract: one learned slot per object, each represented in
-  # the 32-D latent space predicted by SPARTAN. The predictor still uses the
-  # separate 512-D internal workspace configured below.
-  num_slots: 5
-  slot_size: 32
-  slot_mlp_size: 256
-  num_iterations: 2
-  enc_channels: [3, 64, 64, 64, 64]
-  enc_out_channels: 128
-  pooling_heads: 4
-  pooling_type: cross_slot # cross_slot | per_slot | track_aware | tracked_slot_attention
-  parameter_slot_iterations: 3 # iterative parameter refinement, not SAVi frame iterations
-  param_dim: null # StateJepa causal width; null preserves slot_size
-  max_history: 64
-  spartan_layers: 3 # SPARTAN App. A.1
-  spartan_embed_dim: 512 # SPARTAN App. A.1
-  spartan_mlp_hidden: 512
+  state_dim: 4 # k = [x, y, vx, vy] (Eq. 1)
+  num_slots: 5 # N balls = N state tokens = N parameter tokens (Eq. 29)
+  param_encoder_dim: 32 # d (Eq. 16)
+  param_encoder_heads: 4 # H (Eq. 18)
+  max_history: 64 # learned temporal-PE table length (>= Tpar)
+  spartan_layers: 3 # L_sp (§6.2)
+  spartan_embed_dim: 512 # D_sp (Eq. 27)
+  spartan_mlp_hidden: 512 # Eq. 36: three 512-wide linears
   spartan_mlp_layers: 3
-  spartan_temperature: 1.0
-  # Independent learned addresses for state nodes and parameter-coordinate
-  # nodes. This preserves coordinate identity without specifying any pairing.
-  spartan_node_embeddings: false
-  spartan_dense: false # true: A≡1 (SPARTAN's "fully connected model") — τ calibration ONLY
-  spartan_identity: false # true: A≡0 (mass-blind reference, path matrix = I) — D16 go/no-go ONLY
-  aux_dim: null # Push-T: action dim; CLEVRER/synthetic: null
+  spartan_temperature: 1.0 # tau_g (Eq. 33)
+  spartan_dense: false # A≡1: the fully connected tau-calibration reference
+  spartan_identity: false # A≡0: the token-local reference
 
 data:
-  name: bounce # bounce | synthetic_smoke (CLEVRER/Push-T pending)
-  num_clips: 1000 # episodes (bounce) or clips (smoke)
-  clip_len: 4 # Th + 1
+  name: bounce
+  num_clips: 64 # paper scale: 100000 (set in the experiment preset)
+  clip_len: 8 # paper scale: T = 60
   seed: 0
-  # bounce-specific (ignored by synthetic_smoke):
   num_balls: 5
-  resolution: ${model.resolution}
-  radius: 0.08
-  mass_range: [0.5, 3.0]
-  speed: 0.5
-  render: true # false skips frames (GT-embedding regime)
+  resolution: 64
+  radius: 0.08 # r0 (Eq. 2)
+  mass_range: [0.5, 3.0] # clip bounds (Eq. 2)
+  mass_normal: [1.5, 0.5] # m = clip(1.5 + 0.5*eps) (Eq. 2)
+  radius_from_mass: true # r_i = r0 * m_i / m_ref (Eq. 2)
+  speed: 0.7 # |v0| (Eq. 3)
+  render: false # Experiment 1 sets rendering off (§6.1.1)
+  cache: true
+  preload: null # scripts/pregenerate_bounce.py file for the train split
 
 train:
-  steps: 100
+  steps: 200
   batch_size: 4
   lr: 5.0e-5 # SPARTAN App. A.1 (Adam)
   grad_clip: 1.0
-  lambda_reg: 1.0 # weight of the VISReg/SIGReg term (both branches)
-  sparsity_enabled: true # the ±sparsity ablation toggle
-  # During warm-up gates still train through prediction/logit gradients, but the
-  # path penalty and dual update are disabled so dynamics can be learned first.
-  sparsity_warmup_steps: 0
-  sparsity_tau: 0.1 # target pred loss (paper: fully-connected model's loss)
-  sparsity_step_size: 1.0e-3
-  sparsity_lambda_init: 1.0e3
-  sparsity_lambda_max: 1.0e6 # upper dual clamp (D22: cap overshoot; descent is undershoot-rate-limited)
-  sparsity_momentum: 0.99
-  regularizer: visreg # D3: visreg | sigreg
-  num_projections: 256
+  sparsity_enabled: true # false: dense / token-local references
+  sparsity_tau: 0.1 # PLACEHOLDER — pipelines recalibrate per §6.1.3
+  sparsity_step_size: 2.0e-2 # alpha, the one numerical knob the papers leave open
+  sparsity_lambda_init: 1.0e6 # §6.1.3: lambda starts at 1e6 (path weight 1e-6)
+  sparsity_momentum: 0.99 # moving average of c - tau
+  lambda_logit: 0.0 # selected by the label-free dense sweep (§6.1.3)
   seed: 0
   device: cpu
-  input_key: frames # frames (vision) | states (GT-embedding regime)
-  # auto = aligned MSE for StateJepa's persistent object rows; visual learned
-  # slots use Hungarian only as a temporary set-prediction fallback.
-  prediction_matching: auto # auto | aligned | hungarian
-  # auto = raw MSE on literal GT states (paper's fixed ruler), detached
-  # target-variance normalization when the learned target space can rescale.
-  constraint_normalization: auto # auto | raw | target_variance
-  context_len: null # context window Th: null -> single transition (K=1)
-  # D16 autoregressive rollout: K = clip_len - context_len transitions are covered
-  # by chains of this length (must divide K); null -> one chain over all K
-  # (paper-literal S_Tp, my_paper p7/p16). Chains feed predictions back in.
-  rollout_horizon: null
-  eval_every: null # periodic held-out identifiability eval (states regime only)
-  eval_episodes: 128 # episodes per periodic eval (seed-offset 17 split)
-  # D18 grad-spike guards: skip the update (optimizer + dual) when the pre-clip
-  # grad norm is non-finite or above the threshold; raise after this many
-  # consecutive skips (run 7wupt6pw froze silently for 230k steps without them).
+  context_len: 4 # Tpar; paper scale: 30 (Eq. 17)
+  eval_every: null # periodic held-out identifiability eval
+  eval_episodes: 128
+  # D18 grad-spike guards (run health, not objective): skip the update when
+  # the pre-clip grad norm is non-finite or absurd; raise when persistent.
   grad_skip_threshold: 1.0e3
-  # Skipped steps freeze the weights, so patience is free and each retry is a
-  # fresh draw; the counter resets on any calm batch, so 2000 consecutive
-  # (~8 bounce epochs, ~10 min) means calm batches are <1/2000 = dead run.
-  # (50 killed run 0ta5ymcw mid-episode; its prior episode passed at ~50%.)
   grad_skip_max_consecutive: 2000
   log_every: 10
   checkpoint_every: 200
-  checkpoint_keep_every: null # ALSO keep step_<N>.pt every N steps (last.pt is overwritten)
+  checkpoint_keep_every: null
 
 wandb:
-  enabled: false # keep CI/dev offline by default; enable per-run
+  enabled: false
   project: sparse-causal-jepa
   mode: online
-  run_tag: null # optional display-name suffix supplied by launch scripts
+  run_tag: null

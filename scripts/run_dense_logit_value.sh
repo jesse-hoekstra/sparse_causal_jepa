@@ -26,7 +26,6 @@ echo "dense logit run: lambda_logit=${LAMBDA_LOGIT} steps=${STEPS} -> ${OUT_DIR}
   model.spartan_dense=true \
   model.spartan_identity=false \
   train.sparsity_enabled=false \
-  train.sparsity_warmup_steps=0 \
   "train.lambda_logit=${LAMBDA_LOGIT}" \
   "train.steps=${STEPS}" \
   "train.seed=${SEED}" \

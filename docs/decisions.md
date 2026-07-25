@@ -849,3 +849,136 @@ parameter-to-state edges remain available for the graph to discover.
 `lambda_logit=1e-3` as a diagnostic bridge, not a newly selected coefficient. If tracked Slot
 Attention restores individual mass recovery, rerun the label-free dense logit sweep under this
 new architecture before multi-seed confirmatory experiments.
+
+## D27 — One mass-recovery metric: Baumgartner App. F.1 MCC (decided 2026-07-25, Jesse)
+
+**Supersedes the recovery metrics of D24 and D25.** Three similar recovery numbers were in
+flight at once — a strict Hungarian one-to-one score (reported as `mass_mcc`), a Pearson
+mean-max proxy (`mean_max_correlation`), and the F.1 nonlinear mean-max score
+(`nonlinear_mcc`) — plus a linear variant in the diagnostics (`mass_mcc_linear`). Comparing
+runs across them was ambiguous. Only the reference paper's metric is retained.
+
+**The metric.** `sources/dynamical_system.pdf` App. F.1 p.39, verbatim: R² ∈ R^{I x J} is
+built by fitting θ_i ≈ MLP_ij(θ̂_j) for every pair, and "The MCC metric is calculated as
+MCC = 1/I Σ_i max_j(R²_ij)" — a MEAN OF MAXIMA over ground-truth rows, with NO bijection
+constraint. Their probe protocol (p.40) is reproduced exactly: one-hidden-layer MLP, hidden
+dim 32, 5,000 sampled points, 90/10 cross-validation split. Unspecified upstream and
+therefore ours (interpretation): tanh, Adam lr 1e-2, 300 full-batch steps, negative R²
+clamped to 0. One sample per episode (bounce: E x 5 learned vs E x 5 masses).
+
+**Consequences.** (a) The score is permutation-INSENSITIVE and indifferent to which learned
+coordinate carries a mass: one coordinate may be the argmax for several true masses, and the
+argmax need not be the track-matched coordinate. It measures whether mass information exists
+in θ̂, not where. Any binding claim needs a separate, explicitly named diagnostic — do not
+smuggle one back into this metric. (b) It has no assignment output, so `align_parameter_columns`
+is deleted and parameter-graph columns are compared in their natural tracked-object order
+(the ζ = id contract for the true-state experiment); `shd_param_aligned` is renamed
+`shd_param` and its values are NOT comparable to pre-D27 runs (this rename is itself
+SUPERSEDED by D28, which replaces the per-block scores with a single `shd`). (c) The recovery grid's green
+outline now marks each row's argmax — the cell that actually enters the sum — instead of a
+frozen assignment; `recovery_alignment.json` is replaced by `mcc_matrix.json`, whose matrix
+is stored in the paper's [true_mass][learned_coordinate] orientation (the old file used the
+transpose). (d) W&B/metrics key is `eval/mcc`; `mass_mcc`, `mass_mcc_linear` and
+`absolute_pearson` are gone.
+
+## D28 — One graph metric: SPARTAN's SHD against the full ground-truth causal graph (decided 2026-07-25, Jesse)
+
+**Provenance.** SHD is not a Baumgartner et al. metric (0 occurrences in dynamical_system.pdf).
+It is SPARTAN's: Table 1 and §4.1 "Graph Learning" — "we evaluate the Structural Hamming
+Distance, a commonly used metric in graph structure learning, between the learned graphs and
+the ground-truth" — and App. D p.19 repeats the phrasing. Lower is better (their Table 1 and
+Table 7 captions state it). my_paper.pdf p.13 and the write-up §6.7 both require a graph-error
+number, so it is kept.
+
+**The metric.** ONE number, `eval/shd`, matching that sentence literally: the learned graph
+against the ground-truth causal graph, not a sub-block. Rows are the N decoded next-states,
+columns are all 2N source tokens [state | params], so the range is [0, 2N²] = [0, 50] for five
+balls. This is the same index set as the path objective and ρ_path (write-up Eq. 11), so the
+pruning curve and the graph score describe the same object. Parameter-token ROWS stay excluded
+because they are never decoded and carry no "parent of a prediction" meaning. Readout is
+SPARTAN Eq. 5 exactly: Ā_ij counts paths j → i and an edge exists iff Ā_ij >= 1 (applied as
+>= 0.5 on integer counts). Ground truth is the concatenation of write-up Eq. 8 (state) and
+Eq. 9 (mass), in token order.
+
+**Superseded.** The previous split into `shd_state` / `shd_param` (and the D24/D25
+Hungarian-aligned `shd_param_aligned`) is gone; none of those keys are logged any more, and
+their values are not comparable to `shd`. `gt_graphs_from_contacts` / `read_learned_graphs`
+became `gt_causal_graph_from_contacts` / `read_learned_graph`, each returning the single
+(N, 2N) graph.
+
+**CAUTION — SHD alone rewards learning nothing.** Measured directly from the simulator (200
+episodes x 30 transitions): the true graph has 7.86 edges out of 50, and 33% of transitions
+have no parameter edge at all. Reference points, verified:
+
+  * perfect model            SHD = 0
+  * EMPTY graph (A=0)        SHD = 2.86   <- the token-local reference, MCC = 0
+  * SATURATED graph (A=1)    SHD = 42.14  <- the dense reference, MCC = 0.948
+
+Since lower is better, the mass-blind model beats the mass-recovering one ~15x. This is the
+standard SHD failure on sparse ground truth (false positives dominate), not an implementation
+bug. `shd` is therefore NOT a standalone quality signal: read it against both references and
+JOINTLY with `mcc`. Success is `shd` falling toward ~0 WHILE `mcc` stays high and `pred_loss`
+stays near the dense reference; failure mode #2 (empty-graph collapse) produces `shd` ~= 2.9
+with `mcc` = 0, i.e. the second-best possible SHD. Also note `shd` is a deterministic function
+of the ground-truth edge count whenever the learned graph is saturated or empty, so a frozen
+value is not a model property at all — it only becomes evidence once density leaves its rails.
+
+**Naming.** What is compared is REACHABILITY agreement on the thresholded path matrix, not
+verified causal use. The write-up §6.7 must be updated: it currently says "state and parameter
+structural Hamming distance (SHD)" with range [0, 25]; it is now one SHD with range [0, 50].
+
+## D29 — Experiment-1 exact replication refactor (decided 2026-07-25, Jesse)
+
+**The instruction.** The write-up (experiments.pdf §6.1–6.2, formerly docs/experiments.tex) is
+now the SPEC for Experiment 1; the code was rebuilt to match it 1:1, and everything Experiment 1
+does not use — and Experiments 2/3 as specified will not use — was deleted rather than kept as
+ablation surface. Supersedes, for this codebase: D4/D13/D14 (pooling variants), D15/D16 (rollout
+objective — the write-up prescribes 30 teacher-forced ONE-STEP predictions, Eq. 7/§6.2), D19
+(per-chain gate noise — moot without chains; Eq. 33's fresh per-transition noise is exact), D22
+(λ clamp — the write-up's dual is unclamped in both directions), D25's separate trainable node
+tables and D26's tracked-slot-attention encoder (replaced by the write-up's own parameter
+encoder). D3's VISReg is not part of any of the three experiment objectives (Eqs. 40/102/121;
+fixed or stopped-gradient targets) and was removed with the Hungarian matching (per-step
+rematching is explicitly forbidden in §6.4). D17/D20/D21/D24's surviving content (raw-MSE ruler,
+gt states, one-step objective, simulator v2) is what the write-up codifies.
+
+**What the code now is.** One model per §6.2: `ParameterEncoder` (Eqs. 16–26: shared linear
+embed + learned temporal PE → per-timestep relational self-attention across tracks → single
+shared temporal query pooling per track → unconstrained scalar head) + `Spartan` (Eqs. 27–37:
+separate W_Z/W_θ projections, role embeddings, SHARED fixed non-trainable track key κ_i added to
+the state and parameter token of track i, single-head hard-gated layers, MLP(x+h), path matrix,
+decoded-rows path objective) composed by `Experiment1Model` (Eq. 38: same θ̂ for all 30
+transitions, every prediction anchored at the true Z_t). Trainer objective is exactly Eq. 40;
+dual constraint exactly Eq. 13; dual update log λ += α·MA[c−τ] with λ₀=1e6, no clamp. Deleted:
+SCJepa, rollout machinery, all four pooling variants, kinematic head, Hungarian matching,
+VISReg/SlotRegularizer, target-variance constraint normalization (returns with Exp 3's Eq. 123),
+aux-token pathway, gate-noise chaining, sparsity warm-up, λ clamps, the synthetic smoke dataset.
+Verified fidelity anchor: the dense model's path objective is EXACTLY 6655 and token-local 5
+(§6.1.3's stated endpoints; regression-tested).
+
+**Unspecified-upstream choices (flagged in code):** learned temporal PE; FFN_time hidden width
+2d; track-key scale 0.02 (matched to role-embed init) from a fixed seed-0 codebook shared by all
+three predictor modes; Adam; the dual step α.
+
+**Pipeline (why the token-local training stage was dropped).** §6.1.3 gates the sparse run on
+the dense constraint sitting below the token-local constraint. The token-local model (A≡0)
+disconnects parameter tokens from every decoded row, so its constraint is INVARIANT to the
+parameter-encoder architecture; the measured raw floor pred=0.043645 (run ku244l5e, 300k steps,
+offset-17 split) therefore remains valid, and the launchers enforce the gate arithmetically
+(τ ≤ 0.043645 + λ_logit·2.0) instead of retraining a third stage per pipeline. The confirmatory
+8-seed protocol still trains token-local references — they are one of the three compared
+checkpoints, not just a gate.
+
+**λ_logit and τ protocol (per §6.1.3, one full dense run for τ).**
+1. λ_logit: label-free DENSE sweep (grid now 0:1e-6:3e-6:1e-5:3e-5:1e-4:3e-4:1e-3 — recentered
+   low because the raw-scale feasibility arithmetic of 2026-07-25 bounds usable values at
+   ≈ 3e-5: gate commitment costs λ_logit·(2cosh|l|−2) INSIDE the constraint, and τ has no slack
+   for it). Selection rule unchanged: zero control, ≤5% pred tolerance, smallest Pareto
+   coefficient reaching 90% of the best admissible reduction of L_logit−2. Sweep runs may be
+   shortened (SWEEP_STEPS) — the sweep compares dense runs to each other, it does not set τ.
+2. τ: exactly ONE full-length dense run per architecture/seed inside the pipeline;
+   τ = 1.0 × its held-out constraint_loss (Eq. 13 units). No factor, no identity stage.
+   CAVEAT (from the 2026-07-25 feasibility analysis): τ=1.0× leaves the gated model zero slack
+   — it must shed essentially all Bernoulli gate noise AND pay its commitment cost. If
+   eval/constraint_loss plateaus above τ with λ falling never engaging pruning, the fallback
+   order is unchanged: smaller λ_logit, then Gumbel temperature, then a LABELLED slack ablation.

@@ -314,9 +314,7 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
         """Number of episodes."""
         return self.num_episodes
 
-    def _initial_positions(
-        self, generator: torch.Generator, radii: Tensor | None = None
-    ) -> Tensor:
+    def _initial_positions(self, generator: torch.Generator, radii: Tensor | None = None) -> Tensor:
         """Rejection-sample non-overlapping centers inside the box.
 
         Uses each ball's OWN radius for wall margins and pairwise separation

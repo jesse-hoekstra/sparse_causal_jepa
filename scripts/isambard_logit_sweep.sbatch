@@ -4,7 +4,7 @@
 # grid or the usual 300k-step/full-eval defaults:
 #
 #   sbatch --account=<PROJECT> scripts/isambard_logit_sweep.sbatch logit_seed0 0
-#   LAMBDA_LOGIT_GRID='0:3e-5:1e-4:3e-4:1e-3:3e-3:1e-2:3e-2' \
+#   LAMBDA_LOGIT_GRID='0:1e-6:3e-6:1e-5:3e-5:1e-4:3e-4:1e-3' \
 #     sbatch --account=<PROJECT> scripts/isambard_logit_sweep.sbatch logit_seed0 0
 #
 # Eight one-GPU srun steps execute concurrently across two complete Isambard-AI
@@ -26,7 +26,7 @@ SEED=${2:-0}
 case "${SEED}" in
   ''|*[!0-9]*) echo "SEED must be a non-negative integer, got: ${SEED}" >&2; exit 2 ;;
 esac
-GRID=${LAMBDA_LOGIT_GRID:-0:3e-5:1e-4:3e-4:1e-3:3e-3:1e-2:3e-2}
+GRID=${LAMBDA_LOGIT_GRID:-0:1e-6:3e-6:1e-5:3e-5:1e-4:3e-4:1e-3}
 STEPS=${SWEEP_STEPS:-300000}
 EVAL_EPISODES=${EVAL_EPISODES:-5000}
 VALIDATION_SEED_OFFSET=${VALIDATION_SEED_OFFSET:-23}

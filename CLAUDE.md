@@ -65,46 +65,55 @@ Failure catalog (all observed, all diagnosed — don't re-derive):
    signatures are consecutive-run skip growth or every-batch skipping (then: Gumbel temperature
    is the next lever, not the skip limit).
 
-## Key mechanics (verified against papers 2026-07-11/12)
-- The training objective is an AUTOREGRESSIVE ROLLOUT (D16, 2026-07-12): chains feed their own
-  predictions back with one shared Ŝ^ph (my_paper p7/p16; Baumgartner §3.1/B.4).
-  `train.rollout_horizon` = chain length (must divide K; None = one chain; 1 = the old
-  teacher-forced D15 behavior, kept as ablation). Pre-D16 runs/metrics are NOT comparable.
-- τ reference = `model.spartan_dense=true` (A≡1, SPARTAN's "fully connected model") trained to
-  the SAME length as the main run; factor ~1.1. Never calibrate on the gated model with
-  sparsity off (F-8) or on a short run (v2 failure).
-- v3 go/no-go: the converged dense reference must beat a mass-blind model's loss — if it
-  doesn't, no τ can force param edges (see D16 "Open" note; watch eval/shd_param early).
-  RESOLVED 2026-07-14 in NORMALIZED units (D17): identity floor 0.90 flat vs dense 0.63–0.66
-  at Tp=30/ctx=30 — the raw floors differ by only 0.008 because the two models equilibrate at
-  different embedding scales (raw comparisons across models are scale-confounded; never use them).
-- Constraint the dual compares to τ is SCALE-FREE since D17:
-  `pred / Var(target batch, detached) + lambda_logit·logit_penalty` (Baumgartner Eq. 9 + the
-  one deliberate deviation, variance normalization — rationale in decisions.md D17). The eval
-  harness reports it as `constraint_loss` — calibrate τ on THAT, never bare pred_loss; 1.0 ≈
-  predicting the batch mean; pre-D17 constraint values are NOT comparable. Watch the logit
-  share: at equilibrium it consumes constraint budget (~0.022 for gated models; fine inside
-  the ~0.26 normalized window, fatal inside the 0.008 raw one).
-- Gate/penalty logits are the SCALED q·k/√d (interpretation — papers write unscaled q·k, which
-  is untrainable at init; flagged in `src/scjepa/models/spartan.py`).
-- Rollout gate noise is drawn ONCE per chain and reused across its steps (D19): per-step
-  Bernoulli marginals exactly Eq. 3, common-threshold coupling within a chain, independent
-  across chains. The papers are silent (their gradients never cross one sampling round —
-  SPARTAN Eq. 6 is single-transition, Baumgartner's decoder is one-step per Fig. 1); i.i.d.
-  per-step redraws detonate under Tp=30 BPTT (failure #5).
+## Key mechanics (Experiment 1 == experiments.pdf §6.1–6.2 exactly, D29 2026-07-25)
+- The training objective is 30 TEACHER-FORCED ONE-STEP predictions per episode (Eq. 7/§6.2):
+  θ̂ pooled once from observations 0..29, every prediction anchored at the TRUE Z_t. There is
+  no rollout, no rollout_horizon knob, no gate-noise chaining. Objective = Eq. 40
+  (pred + λ_logit·logit + λ⁻¹·path); dual constraint = Eq. 13 (pred + λ_logit·logit, RAW
+  units) — no VISReg, no Hungarian matching, no variance normalization in Experiment 1.
+- Model: `ParameterEncoder` (Eqs. 16–26: relational attention per timestep FIRST, then
+  per-track temporal pooling, then a bare scalar head) + `Spartan` (Eqs. 27–37) with one
+  FIXED non-trainable track key κ_i shared by state and parameter token i (buffer,
+  seed-0 codebook, scale 0.02 = our choice). Dense A≡1 / token-local A≡0 references share
+  the same modules and codebook. Verified endpoints: dense L_path = 6655, token-local = 5.
+- Dual: log λ += α·MA[c − τ], λ₀ = 1e6, UNCLAMPED both directions (§6.1.3). α = 2e-2 is the
+  one free numerical knob. Pre-D29 runs/metrics are NOT comparable to new ones.
+- τ = 1.0 × the held-out `constraint_loss` of ONE converged full-length dense run per
+  architecture/seed (never a short reference — v2 failure; never the gated model with
+  sparsity off — F-8). Launch gate: τ must sit below the token-local floor
+  0.043645 + λ_logit·2.0 (reused measurement ku244l5e — the A≡0 constraint is
+  parameter-encoder-invariant; the 8-seed confirmatory protocol retrains it).
+- λ_logit comes from the label-free dense sweep (§6.1.3 rule, grid recentered to
+  0…1e-3 low end): feasibility arithmetic (2026-07-25) says values above ~3e-5 make the
+  gated constraint set EMPTY at raw scale — gate commitment costs λ_logit·(2cosh|l|−2)
+  inside a τ that has zero slack. Watch the gated run's |logit| leaving ~0.3 early.
+- Gate/penalty logits are the SCALED q·k/√D_sp — now codified in the write-up (Eq. 31).
 - Path matrix entries are path COUNTS (∏(A_l+I)); `path_density` = fraction of entries ≥ 0.5;
   identity-only matrix ⇒ density = 1/T (T=10 for 5-ball states regime ⇒ 0.100 exactly).
-- `shd_param` = 1.4595 constant ⇔ zero learned param edges (both failed runs); any real
-  param-edge learning moves it.
-- MCC here = Baumgartner F.1 nonlinear MLP-R² (`eval/parameters.py`), reference SPARTAN bounce
-  MCC ~0.9 (their Fig. 3), MCC ramps late in training (their Fig. 17) — flat-low before ~100k
-  steps is normal ONLY if density/shd are still moving.
+- **There is exactly ONE graph metric (D28, 2026-07-25): `eval/shd`** — SPARTAN's SHD (their
+  Table 1; Baumgartner never use it), lower is better, between the LEARNED graph and the
+  GROUND-TRUTH causal graph: decoded state rows x all 2N source tokens [state | params],
+  range [0, 50] for 5 balls, same index set as `path_density`/the path objective.
+  **NEVER read it alone** — the true graph has only 7.86 of 50 edges, so (verified) the EMPTY
+  graph scores 2.86 and the SATURATED one 42.14: lower-is-better favours the model that learned
+  nothing by ~15x. Reference points: perfect 0 · empty/token-local 2.86 (mcc 0) · dense 42.14
+  (mcc 0.948). Success = `shd` falling toward 0 WITH `mcc` high; `shd`≈2.9 with `mcc`≈0 is
+  empty-graph collapse (failure #2), i.e. the second-best SHD is a total failure. A frozen
+  `shd` is not a model property while the graph is saturated or empty (it is then just the GT
+  edge count). Superseded keys, NOT comparable: `shd_state`, `shd_param`, `shd_param_aligned`.
+- **There is exactly ONE mass-recovery metric (D27, 2026-07-25): `eval/mcc`** = Baumgartner
+  App. F.1 `mean_i max_j R²_ij` (`eval/parameters.py:nonlinear_mcc`), so it is directly
+  comparable to their bounce reference ~0.9 (Fig. 3). It ramps late in training (their
+  Fig. 17) — flat-low before ~100k steps is normal ONLY if density/shd are still moving.
+  Do NOT add a second recovery score. Runs before 2026-07-25 logged `eval/mass_mcc`
+  (a stricter Hungarian one-to-one score) and `eval/shd_param_aligned` — different
+  quantities, do not plot them on the same axis as the current keys.
 
 ## Commands
-- Full pipeline: `bash scripts/run_bounce_example.sh --run-tag=X --main-steps=M
-  experiment=bounce_baumgartner ...` (calibration = dense A≡1, same length as main, τ = 1.1×
-  its constraint_loss by default; `--calib-steps` only for smokes; other hydra overrides go to
-  BOTH runs, D12).
+- Full pipeline: `bash scripts/run_bounce_example.sh --run-tag=X ...` (dense A≡1 same
+  length as main → τ = 1.0× its held-out constraint_loss → sparse run → 5000-episode eval;
+  NO identity stage since D29 — pass `--tau-max` = the token-local floor instead;
+  `--calib-steps` only for smokes; other hydra overrides go to BOTH runs, D12).
 - Cheap stability smoke (~3 min, CPU): 1500–3000 steps via `Trainer` directly with
   `data.num_clips=200` — see Claude memory for the pattern; healthy = grad_norm < 1 throughout.
 - Pull W&B history: `wandb.Api().run('jesse-hoekstra-university-of-oxford/sparse-causal-jepa/<id>').scan_history(...)`

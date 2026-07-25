@@ -1,4 +1,4 @@
-"""Training entrypoint: ``python scripts/train.py [experiment=smoke] [key=value ...]``.
+"""Training entrypoint: ``python scripts/train.py [experiment=bounce_baumgartner] [key=value ...]``.
 
 Hydra manages the config and the run directory; the resolved config is saved
 next to the run outputs. W&B is opt-in (``wandb.enabled=true``) so offline
@@ -13,8 +13,6 @@ import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
-from scjepa.models.jepa import SCJepa
-from scjepa.models.state_jepa import StateJepa
 from scjepa.training import MetricLogger, NoopLogger, TrainConfig, Trainer, seed_everything
 from scjepa.training.factory import build_dataset, build_model
 
@@ -68,30 +66,20 @@ def main(cfg: DictConfig) -> None:
         )
         eval_dataset = build_dataset(eval_cfg, seed_offset=17)  # pyright: ignore[reportArgumentType]
     model = build_model(cfg.model)
-    assert isinstance(model, SCJepa | StateJepa)
     train_config = TrainConfig(
         steps=cfg.train.steps,
         batch_size=cfg.train.batch_size,
         lr=cfg.train.lr,
         grad_clip=cfg.train.grad_clip,
-        lambda_reg=cfg.train.lambda_reg,
         sparsity_enabled=cfg.train.sparsity_enabled,
-        sparsity_warmup_steps=int(cfg.train.get("sparsity_warmup_steps", 0)),
         sparsity_tau=cfg.train.sparsity_tau,
         sparsity_step_size=cfg.train.sparsity_step_size,
         sparsity_lambda_init=cfg.train.sparsity_lambda_init,
-        sparsity_lambda_max=cfg.train.get("sparsity_lambda_max", 1e6),
         sparsity_momentum=cfg.train.sparsity_momentum,
         lambda_logit=cfg.train.get("lambda_logit", 0.0),
-        regularizer=cfg.train.regularizer,
-        num_projections=cfg.train.num_projections,
         seed=cfg.train.seed,
         device=cfg.train.device,
-        input_key=cfg.train.input_key,
-        prediction_matching=str(cfg.train.get("prediction_matching", "auto")),
-        constraint_normalization=str(cfg.train.get("constraint_normalization", "auto")),
         context_len=cfg.train.get("context_len", None),
-        rollout_horizon=cfg.train.get("rollout_horizon", None),
         eval_every=cfg.train.get("eval_every", None),
         grad_skip_threshold=cfg.train.get("grad_skip_threshold", 1e3),
         grad_skip_max_consecutive=cfg.train.get("grad_skip_max_consecutive", 2000),
@@ -102,19 +90,15 @@ def main(cfg: DictConfig) -> None:
     )
     experiment = HydraConfig.get().runtime.choices.get("experiment") or cfg.data.name
     if cfg.model.get("spartan_identity", False):
-        phase = "identity-reference"
+        phase = "token-local"
+    elif cfg.model.get("spartan_dense", False):
+        phase = "dense"
     elif cfg.train.sparsity_enabled:
         phase = "sparse"
     else:
-        phase = "fc-calibration"
-    context_len = cfg.train.get("context_len", None)
-    num_transitions = cfg.data.clip_len - context_len if context_len else 1  # K (legacy: 1)
-    chain_len = cfg.train.get("rollout_horizon", None) or num_transitions  # Tp (null = one chain)
+        phase = "gated-no-sparsity"  # ablation only; NOT the dense reference
     lambda_logit = float(cfg.train.get("lambda_logit", 0.0))
-    run_name = (
-        f"{experiment}-{phase}-ll{lambda_logit:g}-"
-        f"Tp{chain_len}-K{num_transitions}-seed{cfg.train.seed}"
-    )
+    run_name = f"{experiment}-{phase}-ll{lambda_logit:g}-seed{cfg.train.seed}"
     if cfg.wandb.get("run_tag") is not None:
         run_name = f"{run_name}-{cfg.wandb.run_tag}"
     logger: MetricLogger = (

@@ -1,32 +1,11 @@
-"""Loss terms: predictive loss, anti-collapse regularizer, sparsity penalty.
+"""Loss terms (experiments.pdf §6.1.3 / §6.2).
 
-Prediction matching is aligned for tracked object rows and Hungarian-matched for
-unordered learned slots. The package also contains the config-selectable
-anti-collapse regularizer and the SPARTAN sparsity penalty.
-
-Owner: paper-to-code-translator (definitions traceable to equations);
-experiment-infra-engineer assembles the terms into the training objective.
+Experiment 1 optimizes Eq. 40: aligned raw-state MSE (Eq. 39) plus the
+attention-logit penalty and the dual-weighted path objective — the latter two
+are computed inside the SPARTAN module; only the prediction term lives here.
+Object rows are tracked, so the loss is plain aligned MSE: no matching.
 """
 
-from scjepa.losses.predictive import (
-    aligned_mse,
-    hungarian_mse,
-    match_slots,
-    prediction_constraint,
-    prediction_mse,
-    resolve_constraint_normalization,
-    resolve_prediction_matching,
-)
-from scjepa.losses.regularizer import RegularizerKind, SlotRegularizer
+from scjepa.losses.predictive import aligned_mse
 
-__all__ = [
-    "RegularizerKind",
-    "SlotRegularizer",
-    "aligned_mse",
-    "hungarian_mse",
-    "match_slots",
-    "prediction_constraint",
-    "prediction_mse",
-    "resolve_constraint_normalization",
-    "resolve_prediction_matching",
-]
+__all__ = ["aligned_mse"]

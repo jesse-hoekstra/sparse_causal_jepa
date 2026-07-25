@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 
 from scjepa.data import BounceDataset
 from scjepa.data.bounce import render_bounce, simulate_bounce
-from scjepa.models.jepa import build_scjepa
+from scjepa.models import build_experiment1
 
 RADIUS = 0.08
 
@@ -177,26 +177,15 @@ def test_render_and_cache_flags() -> None:
 
 
 def test_bounce_feeds_the_full_pipeline() -> None:
-    """A DataLoader batch of bounce clips runs through SCJepa unchanged."""
+    """A DataLoader batch of bounce clips runs through the Experiment-1 model."""
     torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
-    dataset = BounceDataset(num_episodes=2, clip_len=3, num_balls=3, resolution=64, seed=1)
+    dataset = BounceDataset(num_episodes=2, clip_len=3, num_balls=3, seed=1, render=False)
     batch = next(iter(DataLoader(dataset, batch_size=2)))
-    model = build_scjepa(
-        resolution=64,
-        num_slots=3,
-        slot_size=16,
-        slot_mlp_size=32,
-        num_iterations=1,
-        enc_channels=(3, 8, 8),
-        enc_out_channels=16,
-        pooling_heads=2,
-        spartan_layers=1,
-        spartan_embed_dim=None,
-        spartan_mlp_hidden=32,
-        spartan_mlp_layers=2,
+    model = build_experiment1(
+        num_slots=3, spartan_layers=1, spartan_embed_dim=32, spartan_mlp_hidden=32
     )
-    out = model(batch["frames"])
-    assert out.prediction.shape == (2, 3, 16)
+    out = model(batch["states"], context_len=2)  # K = 1 transition
+    assert out.prediction.shape == (2, 3, 4)
     assert batch["contacts"].shape == (2, 2, 3, 3)  # ground truth rides along
 
 
@@ -238,7 +227,8 @@ def test_baumgartner_variant_radius_from_mass() -> None:
 
 def test_radius_from_mass_uses_fixed_reference() -> None:
     """G2: r_i ∝ m_i with an episode-independent constant, so absolute mass
-    is geometrically identifiable (episode-mean normalization capped MCC at ~0.77)."""
+    is geometrically identifiable (episode-mean normalization capped MCC at ~0.77).
+    """
     dataset = BounceDataset(
         num_episodes=2,
         clip_len=3,
@@ -261,7 +251,8 @@ def test_radius_from_mass_uses_fixed_reference() -> None:
 
 def test_wall_bounce_recorded_on_diagonal_only_with_radii() -> None:
     """G1: wall bounces are mass-relevant iff radius ∝ mass; the contacts
-    diagonal records them only then."""
+    diagonal records them only then.
+    """
     masses = torch.tensor([[2.0]])
     positions = torch.tensor([[0.15, 0.5]])
     velocities = torch.tensor([[-0.6, 0.0]])  # heading at the left wall
@@ -315,9 +306,7 @@ def test_recorded_states_respect_all_contact_surfaces() -> None:
         positions = item["states"][..., :2]
         assert (positions >= radii.view(1, -1, 1) - 1e-6).all()
         assert (positions <= 1 - radii.view(1, -1, 1) + 1e-6).all()
-        distances = (
-            positions.unsqueeze(2) - positions.unsqueeze(1)
-        ).square().sum(dim=-1).sqrt()
+        distances = (positions.unsqueeze(2) - positions.unsqueeze(1)).square().sum(dim=-1).sqrt()
         minimum = radii.unsqueeze(0) + radii.unsqueeze(1)
         off_diagonal = ~torch.eye(dataset.num_balls, dtype=torch.bool)
         assert (distances[:, off_diagonal] >= minimum[off_diagonal] - 1e-6).all()
@@ -339,8 +328,7 @@ def _write_preload(path: str) -> None:
     source = BounceDataset(**_tiny_kwargs())  # pyright: ignore[reportArgumentType]
     items = [source[i] for i in range(len(source))]
     tensors = {
-        key: torch.stack([item[key] for item in items])
-        for key in ("states", "params", "contacts")
+        key: torch.stack([item[key] for item in items]) for key in ("states", "params", "contacts")
     }
     torch.save({"meta": source.generation_meta(), "tensors": tensors}, path)
 

@@ -49,7 +49,7 @@ def _load_record(run_dir: Path) -> dict[str, Any]:
         "constraint_loss": constraint,
         # Ground-truth mass recovery is a diagnostic only.  It must not be the
         # hyperparameter-selection objective for an unsupervised claim.
-        "mass_mcc": float(metrics.get("mass_mcc", metrics.get("mcc", float("nan")))),
+        "mcc": float(metrics["mcc"]),
         "mean_abs_logit": float(metrics["mean_abs_logit"]),
         "gate_entropy": float(metrics["gate_entropy"]),
         "mean_gate_probability": float(metrics["mean_gate_probability"]),
@@ -65,17 +65,12 @@ def _load_record(run_dir: Path) -> dict[str, Any]:
         "num_clips": int(cfg.data.num_clips),
         "clip_len": int(cfg.data.clip_len),
         "context_len": int(cfg.train.context_len),
-        "rollout_horizon": int(cfg.train.rollout_horizon),
         "num_slots": int(cfg.model.num_slots),
-        "param_dim": int(cfg.model.param_dim),
+        "param_encoder_dim": int(cfg.model.param_encoder_dim),
         "spartan_layers": int(cfg.model.spartan_layers),
         "spartan_embed_dim": int(cfg.model.spartan_embed_dim),
-        "pooling_type": str(cfg.model.pooling_type),
-        "parameter_slot_iterations": int(cfg.model.get("parameter_slot_iterations", 3)),
-        "node_embeddings": bool(cfg.model.spartan_node_embeddings),
         "dense": bool(cfg.model.spartan_dense),
         "sparsity_enabled": bool(cfg.train.sparsity_enabled),
-        "sparsity_warmup_steps": int(cfg.train.sparsity_warmup_steps),
     }
     numeric = [value for value in record.values() if isinstance(value, int | float)]
     if not all(math.isfinite(float(value)) for value in numeric):
@@ -86,8 +81,6 @@ def _load_record(run_dir: Path) -> dict[str, Any]:
         )
     if not record["dense"] or record["sparsity_enabled"]:
         raise ValueError(f"{run_dir}: expected a dense run with sparsity disabled")
-    if record["sparsity_warmup_steps"] != 0:
-        raise ValueError(f"{run_dir}: sweep must use zero warm-up steps")
     return record
 
 
@@ -154,16 +147,12 @@ def main() -> None:
         "num_clips",
         "clip_len",
         "context_len",
-        "rollout_horizon",
         "num_slots",
-        "param_dim",
+        "param_encoder_dim",
         "spartan_layers",
         "spartan_embed_dim",
         "num_samples",
         "eval_seed_offset",
-        "pooling_type",
-        "parameter_slot_iterations",
-        "node_embeddings",
     )
     for key in provenance_keys:
         values = {record[key] for record in records}
@@ -181,7 +170,7 @@ def main() -> None:
 
     print(
         "lambda_logit | pred_loss  rel_zero | logit excess mean|z| entropy | "
-        "mass_mcc | admissible pareto"
+        "     mcc | admissible pareto"
     )
     print("-" * 112)
     for record in records:
@@ -190,7 +179,7 @@ def main() -> None:
             f"{record['pred_loss']:9.6f} {record['prediction_relative_to_baseline']:8.2%} | "
             f"{record['logit_penalty']:5.2f} {record['logit_excess']:6.3f} "
             f"{record['mean_abs_logit']:7.3f} {record['gate_entropy']:7.3f} | "
-            f"{record['mass_mcc']:8.4f} | "
+            f"{record['mcc']:8.4f} | "
             f"{record['prediction_admissible']!s:>10} {record['pareto']!s:>6}"
         )
 
@@ -227,7 +216,7 @@ def main() -> None:
             "description": (
                 "Among Pareto coefficients within the prediction tolerance, choose the smallest "
                 "one achieving the requested fraction of the best logit-excess reduction. "
-                "mass_mcc is shown only as a validation diagnostic."
+                "mcc is shown only as a validation diagnostic."
             ),
         },
         "pareto_candidates": [record["lambda_logit"] for record in candidates],

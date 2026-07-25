@@ -1,355 +1,184 @@
-"""Invariant tests for the SPARTAN predictor (hard attention, path matrix, sparsity)."""
-
-from typing import cast
+"""Tests for the SPARTAN sparse transition predictor (experiments.pdf Eqs. 27-37)."""
 
 import pytest
 import torch
 
 from scjepa.models import Spartan
-from scjepa.models.spartan import SpartanLayer
 
-B, N, D = 2, 3, 8
-T = 2 * N  # state + parameter tokens
+N, K, DIM = 3, 4, 32
 
 
-@pytest.fixture
-def model() -> Spartan:
+def tiny(dense: bool = False, identity: bool = False, layers: int = 2) -> Spartan:
     torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
-    return Spartan(slot_size=D, num_layers=2, embed_dim=None, mlp_hidden_size=16)
+    return Spartan(
+        state_dim=K,
+        param_dim=1,
+        num_slots=N,
+        num_layers=layers,
+        embed_dim=DIM,
+        mlp_hidden_size=DIM,
+        mlp_num_layers=2,
+        dense=dense,
+        identity=identity,
+    )
 
 
 @pytest.fixture
 def inputs() -> tuple[torch.Tensor, torch.Tensor]:
     torch.manual_seed(1)  # pyright: ignore[reportUnknownMemberType]
-    return torch.randn(B, N, D), torch.randn(B, N, D)
+    return torch.randn(2, N, K), torch.randn(2, N, 1)
 
 
-def test_output_shapes(model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
-    out = model(*inputs)
-    assert out.prediction.shape == (B, N, D)
-    assert out.path_matrix.shape == (B, T, T)
-    assert out.sparsity.shape == ()
-    assert torch.isfinite(out.prediction).all()
+def test_output_shapes(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+    out = tiny()(*inputs)
+    assert out.prediction.shape == (2, N, K)  # Eq. 37: decoded into R^4
+    assert out.path_matrix.shape == (2, 2 * N, 2 * N)  # M = 2N tokens
+    assert out.sparsity.ndim == 0
 
 
-def test_path_matrix_is_integer_valued(
-    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
-) -> None:
-    """Hard {0,1} adjacencies (Eq. 3) ⇒ Ā counts paths ⇒ integer entries."""
-    for train in (True, False):
-        model.train(train)
-        path = model(*inputs).path_matrix
-        torch.testing.assert_close(path, path.round(), atol=1e-4, rtol=0)
-        assert (path >= 0).all()
-        # Residual identity (Eq. 5): every token has at least the self path.
-        diagonal = path.diagonal(dim1=1, dim2=2)
-        assert (diagonal >= 1 - 1e-4).all()
+def test_path_matrix_is_integer_valued(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+    """Eq. 10: entries of (A^L+I)...(A^1+I) are path COUNTS."""
+    out = tiny()(*inputs)
+    torch.testing.assert_close(out.path_matrix, out.path_matrix.round())
+    assert (out.path_matrix.diagonal(dim1=-2, dim2=-1) >= 1).all()  # residual self-paths
 
 
-def test_sparsity_equals_decoded_state_row_path_sum(
-    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
-) -> None:
-    """Only paths ending at decoded state rows belong in the objective."""
-    out = model(*inputs)
-    torch.testing.assert_close(out.sparsity, out.path_matrix[:, :N].sum(dim=(1, 2)).mean())
-
-
-def test_identity_sparsity_counts_only_state_residuals(
+def test_sparsity_covers_only_decoded_state_rows(
     inputs: tuple[torch.Tensor, torch.Tensor],
 ) -> None:
-    """Undecoded parameter residuals must not add a constant sparsity charge."""
-    model = Spartan(slot_size=D, num_layers=2, embed_dim=None, mlp_hidden_size=16, identity=True)
+    """Eq. 11: the path objective sums the N decoded rows only."""
+    out = tiny()(*inputs)
+    expected = out.path_matrix[:, :N].sum(dim=(1, 2)).mean()
+    torch.testing.assert_close(out.sparsity, expected)
+
+
+def test_identity_mode_is_token_local(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+    """A≡0: path matrix exactly I — only each token's residual-MLP path remains."""
+    model = tiny(identity=True).eval()
     out = model(*inputs)
-    torch.testing.assert_close(out.sparsity, torch.tensor(float(N)))
-
-
-def test_sparsity_penalty_has_gradients(
-    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
-) -> None:
-    """Straight-through sampling must let |Ā| gradients reach the q/k projections."""
-    model.train()
-    model(*inputs).sparsity.backward()  # pyright: ignore[reportUnknownMemberType]
-    for layer_index, module in enumerate(model.layers):
-        layer = cast(SpartanLayer, module)
-        for projection in (layer.project_q, layer.project_k):
-            assert projection.weight.grad is not None, f"layer {layer_index}: no grad"
-            assert projection.weight.grad.abs().sum() > 0, f"layer {layer_index}: zero grad"
-
-
-def test_mask_blocks_information_flow(model: Spartan) -> None:
-    """THE causal claim: Ā_ij = 0 ⇒ ∂ prediction_i / ∂ token_j = 0 (eval mode)."""
-    model.eval()
-    torch.manual_seed(2)  # pyright: ignore[reportUnknownMemberType]
-    state = torch.randn(1, N, D, requires_grad=True)
-    params = torch.randn(1, N, D, requires_grad=True)
-    out = model(state, params)
-    path = out.path_matrix[0]  # (T, T)
-
-    checked_zero = checked_nonzero = 0
-    for i in range(N):  # prediction rows = state-token positions
-        grads = torch.autograd.grad(out.prediction[0, i].sum(), (state, params), retain_graph=True)
-        token_grads = torch.cat([grads[0][0], grads[1][0]], dim=0)  # (T, d)
-        for j in range(T):
-            if path[i, j] < 0.5:
-                assert token_grads[j].abs().max() < 1e-6, f"leak {j} → prediction {i}"
-                checked_zero += 1
-            elif token_grads[j].abs().max() > 0:
-                checked_nonzero += 1
-    assert checked_nonzero > 0  # dependence actually flows where paths exist
-    if checked_zero == 0:
-        pytest.skip("random init produced a fully connected graph; nothing to check")
-
-
-def test_slot_permutation_equivariance(
-    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
-) -> None:
-    """Permuting slots (same permutation for S_t and Ŝ^ph) permutes predictions."""
-    model.eval()
+    eye = torch.eye(2 * N).expand(2, -1, -1)
+    torch.testing.assert_close(out.path_matrix, eye)
+    # Parameter values cannot influence predictions.
     state, params = inputs
-    perm = torch.randperm(N)
-    with torch.no_grad():
-        base = model(state, params).prediction
-        permuted = model(state[:, perm], params[:, perm]).prediction
-    torch.testing.assert_close(permuted, base[:, perm])
-
-
-def test_independent_node_embeddings_expose_coordinates(
-    inputs: tuple[torch.Tensor, torch.Tensor],
-) -> None:
-    """Node addresses make reassignment visible without specifying i ← i."""
-    state, params = inputs
-    reassignment = torch.tensor([1, 2, 0])
-
-    torch.manual_seed(14)  # pyright: ignore[reportUnknownMemberType]
-    anonymous = Spartan(
-        slot_size=D,
-        num_layers=1,
-        embed_dim=None,
-        mlp_hidden_size=16,
-        dense=True,
-    ).eval()
-    torch.manual_seed(14)  # pyright: ignore[reportUnknownMemberType]
-    addressed = Spartan(
-        slot_size=D,
-        num_layers=1,
-        embed_dim=None,
-        mlp_hidden_size=16,
-        dense=True,
-        node_embeddings=True,
-        num_slots=N,
-    ).eval()
-
-    with torch.no_grad():
-        anonymous_base = anonymous(state, params).prediction
-        anonymous_reassigned = anonymous(state, params[:, reassignment]).prediction
-        addressed_base = addressed(state, params).prediction
-        addressed_reassigned = addressed(state, params[:, reassignment]).prediction
-    torch.testing.assert_close(anonymous_reassigned, anonymous_base)
-    assert not torch.allclose(addressed_reassigned, addressed_base)
-    assert addressed.state_node_embed is not None
-    assert addressed.param_node_embed is not None
-    assert not torch.equal(addressed.state_node_embed, addressed.param_node_embed)
-
-
-def test_node_embeddings_validate_fixed_slot_count(
-    inputs: tuple[torch.Tensor, torch.Tensor],
-) -> None:
-    with pytest.raises(ValueError, match="positive num_slots"):
-        Spartan(
-            slot_size=D,
-            embed_dim=None,
-            mlp_hidden_size=16,
-            node_embeddings=True,
-        )
-    addressed = Spartan(
-        slot_size=D,
-        embed_dim=None,
-        mlp_hidden_size=16,
-        node_embeddings=True,
-        num_slots=N + 1,
-    )
-    with pytest.raises(ValueError, match="configured num_slots"):
-        addressed(*inputs)
-
-
-def test_auxiliary_tokens() -> None:
-    torch.manual_seed(3)  # pyright: ignore[reportUnknownMemberType]
-    aux_model = Spartan(slot_size=D, num_layers=1, embed_dim=None, mlp_hidden_size=16, aux_dim=4)
-    state, params = torch.randn(B, N, D), torch.randn(B, N, D)
-    aux = torch.randn(B, 2, 4)
-    out = aux_model(state, params, aux)
-    assert out.prediction.shape == (B, N, D)
-    assert out.path_matrix.shape == (B, T + 2, T + 2)
-    # Aux is optional even when the pathway exists (CLEVRER-style usage).
-    assert aux_model(state, params).path_matrix.shape == (B, T, T)
-
-
-def test_embed_dim_projection() -> None:
-    """App. A.1 separates token dim from embedding dim: d -> e -> d round trip."""
-    torch.manual_seed(4)  # pyright: ignore[reportUnknownMemberType]
-    model = Spartan(slot_size=D, num_layers=1, embed_dim=32, mlp_hidden_size=16)
-    out = model(torch.randn(B, N, D), torch.randn(B, N, D))
-    assert out.prediction.shape == (B, N, D)  # back in slot space
-    assert out.path_matrix.shape == (B, T, T)
-    out.prediction.square().mean().backward()  # pyright: ignore[reportUnknownMemberType]
-    assert not isinstance(model.in_project, torch.nn.Identity)
-    assert not isinstance(model.out_project, torch.nn.Identity)
-
-
-def test_input_guards(model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
-    state, params = inputs
-    with pytest.raises(ValueError, match="params"):
-        model(state, torch.randn(B, N + 1, D))
-    with pytest.raises(ValueError, match="aux_dim=None"):
-        model(state, params, aux=torch.randn(B, 2, 4))
-
-
-def test_param_size_split_token_dims() -> None:
-    """D20: state tokens k-dim, param tokens d-dim, predictions back in k-dim."""
-    torch.manual_seed(5)  # pyright: ignore[reportUnknownMemberType]
-    model = Spartan(slot_size=4, num_layers=1, embed_dim=32, mlp_hidden_size=16, param_size=D)
-    state, params = torch.randn(B, N, 4), torch.randn(B, N, D)
-    out = model(state, params)
-    assert out.prediction.shape == (B, N, 4)
-    assert out.path_matrix.shape == (B, T, T)
-    out.prediction.square().mean().backward()  # pyright: ignore[reportUnknownMemberType]
-    assert model.param_project is not None
-    with pytest.raises(ValueError, match="params"):
-        model(state, torch.randn(B, N, 4))  # params must be param_size-dim
-    # param_size=None keeps the shared projection (pre-D20 state_dict intact).
-    shared = Spartan(slot_size=D, num_layers=1, embed_dim=None, mlp_hidden_size=16)
-    assert shared.param_project is None
-    assert not any("param_project" in k for k in shared.state_dict())
-
-
-def test_logit_penalty_finite_and_grows_with_logits(
-    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
-) -> None:
-    """Eq. 11 (Baumgartner): larger attention logits ⇒ larger penalty.
-
-    The penalty must be finite, at least 2 (exp(x) + exp(-x) >= 2), and grow
-    when logits are inflated — it exists to keep the softmax gradient alive.
-    """
-    model.eval()
-    out = model(*inputs)
-    assert torch.isfinite(out.logit_penalty)
-    assert out.logit_penalty >= 2.0 - 1e-4  # exp(x) + exp(-x) >= 2
-    layer = cast(SpartanLayer, model.layers[0])
-    with torch.no_grad():
-        layer.project_q.weight.mul_(3.0)
-    inflated = model(*inputs)
-    assert inflated.logit_penalty > out.logit_penalty
-
-
-def test_logit_diagnostics_are_finite_and_bounded(
-    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
-) -> None:
-    out = model(*inputs)
-    assert torch.isfinite(out.mean_abs_logit)
-    assert torch.isfinite(out.mean_gate_probability)
-    assert torch.isfinite(out.gate_entropy)
-    assert out.mean_abs_logit >= 0
-    assert 0 <= out.mean_gate_probability <= 1
-    assert 0 <= out.gate_entropy <= torch.log(torch.tensor(2.0)) + 1e-6
+    out_other = model(state, params + 5.0)
+    torch.testing.assert_close(out.prediction, out_other.prediction)
 
 
 def test_dense_mode_is_fully_connected_and_deterministic(
     inputs: tuple[torch.Tensor, torch.Tensor],
 ) -> None:
-    """A≡1 (audit F-8): the tau-calibration reference must be a TRUE dense
-    transformer — every path open, no Bernoulli sampling noise in train mode."""
-    torch.manual_seed(0)
-    dense = Spartan(slot_size=D, num_layers=2, embed_dim=None, mlp_hidden_size=16, dense=True)
-    dense.train()
-    first = dense(*inputs)
-    second = dense(*inputs)
-    torch.testing.assert_close(first.prediction, second.prediction)  # no sampling
-    assert (first.path_matrix >= 1).all()  # every token reaches every prediction
-    torch.manual_seed(0)
-    gated = Spartan(slot_size=D, num_layers=2, embed_dim=None, mlp_hidden_size=16)
-    gated.train()
-    a = gated(*inputs)
-    b = gated(*inputs)
-    assert not torch.allclose(a.prediction, b.prediction)  # gated model DOES sample
+    """A≡1 with no gate sampling: rho_path = 1, repeat calls agree in train mode."""
+    model = tiny(dense=True)
+    out1, out2 = model(*inputs), model(*inputs)
+    torch.testing.assert_close(out1.prediction, out2.prediction)
+    assert bool((out1.path_matrix >= 1).all())
 
 
-def test_identity_mode_is_mass_blind_and_deterministic(
-    inputs: tuple[torch.Tensor, torch.Tensor],
-) -> None:
-    """A≡0 (D16 go/no-go): the mass-blind reference must have NO cross-token
-    flow — path matrix exactly I, predictions insensitive to param tokens and
-    to every other slot — and no Bernoulli sampling noise in train mode."""
-    torch.manual_seed(0)
-    model = Spartan(slot_size=D, num_layers=2, embed_dim=None, mlp_hidden_size=16, identity=True)
-    model.train()
+def test_paper_stated_path_objective_endpoints() -> None:
+    """§6.1.3: with ten tokens, dense L_path = 6655 and token-local = 5."""
+    state, params = torch.randn(1, 5, K), torch.randn(1, 5, 1)
+    dense = Spartan(num_slots=5, num_layers=3, embed_dim=DIM, mlp_hidden_size=DIM, dense=True)
+    assert dense(state, params).sparsity.item() == 6655.0
+    local = Spartan(num_slots=5, num_layers=3, embed_dim=DIM, mlp_hidden_size=DIM, identity=True)
+    assert local(state, params).sparsity.item() == 5.0
+
+
+def test_eval_gates_are_deterministic(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+    """Eq. 34: eval-mode adjacency is the noiseless threshold 1{g > 0}."""
+    model = tiny().eval()
+    out1, out2 = model(*inputs), model(*inputs)
+    torch.testing.assert_close(out1.prediction, out2.prediction)
+    torch.testing.assert_close(out1.path_matrix, out2.path_matrix)
+
+
+def test_train_gates_resample_fresh_noise(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+    """Eq. 33: every training forward draws fresh Gumbel noise."""
+    model = tiny()
+    torch.manual_seed(2)  # pyright: ignore[reportUnknownMemberType]
+    out1 = model(*inputs)
+    out2 = model(*inputs)
+    assert not torch.equal(out1.path_matrix, out2.path_matrix)
+
+
+def test_track_keys_fixed_shared_and_distinct() -> None:
+    """Eq. 27: one fixed non-trainable codebook shared by all three modes."""
+    sparse, dense, identity = tiny(), tiny(dense=True), tiny(identity=True)
+    keys = sparse.track_keys
+    assert keys.shape == (1, N, DIM)
+    assert not keys.requires_grad
+    assert all("track_keys" not in name for name, _ in sparse.named_parameters())
+    dists = torch.cdist(keys[0], keys[0]) + torch.eye(N)
+    assert bool((dists > 0).all())  # rows pairwise distinct
+    torch.testing.assert_close(dense.track_keys, keys)
+    torch.testing.assert_close(identity.track_keys, keys)
+
+
+def test_track_keys_give_tokens_addresses(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+    """Identical-content rows get different outputs: kappa_i is an address."""
+    model = tiny(dense=True).eval()
     state, params = inputs
-    first = model(state, params)
-    second = model(state, params)
-    torch.testing.assert_close(first.prediction, second.prediction)  # no sampling
-    eye = torch.eye(2 * N).expand(B, -1, -1)
-    torch.testing.assert_close(first.path_matrix, eye)  # residual paths only
-    # Mass-blind: perturbing the param tokens must not move any prediction.
-    blind = model(state, torch.randn_like(params))
-    torch.testing.assert_close(first.prediction, blind.prediction)
-    # Slot-local: perturbing slot j must leave every other slot's prediction unchanged.
-    poked_state = state.clone()
-    poked_state[:, 0] += 1.0
-    poked = model(poked_state, params)
-    torch.testing.assert_close(first.prediction[:, 1:], poked.prediction[:, 1:])
-    assert not torch.allclose(first.prediction[:, 0], poked.prediction[:, 0])
+    state = state.clone()
+    state[:, 1] = state[:, 0]  # rows 0 and 1 identical in content
+    params = params.clone()
+    params[:, 1] = params[:, 0]
+    out = model(state, params)
+    # If keys carried no information the two rows would be exchangeable and
+    # their predictions identical; the distinct kappa breaks the tie.
+    assert not torch.allclose(out.prediction[:, 0], out.prediction[:, 1])
 
 
-def test_dense_identity_mutually_exclusive() -> None:
+def test_gates_block_information_flow() -> None:
+    """A masked edge admits no information (Eq. 35 masks BEFORE normalizing)."""
+    model = tiny(identity=True).eval()  # extreme case: everything masked
+    state = torch.randn(1, N, K)
+    params = torch.randn(1, N, 1)
+    out1 = model(state, params)
+    state2 = state.clone()
+    state2[:, 2] += 10.0  # perturb another token
+    out2 = model(state2, params)
+    torch.testing.assert_close(out1.prediction[:, 0], out2.prediction[:, 0])
+
+
+def test_logit_penalty_minimum_and_growth(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+    """exp(a)+exp(-a): minimum 2 at a=0, grows with |a|, finite at extremes."""
+    out = tiny()(*inputs)
+    assert out.logit_penalty.item() >= 2.0
+    assert torch.isfinite(out.logit_penalty)
+    # The linear continuation keeps huge logits finite.
+    model = tiny(dense=True)
+    with torch.no_grad():
+        model.state_project.weight.mul_(1e4)
+    big = model(*inputs)
+    assert torch.isfinite(big.logit_penalty)
+    assert big.logit_penalty > out.logit_penalty
+
+
+def test_diagnostics_bounded(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+    out = tiny()(*inputs)
+    assert 0 <= out.mean_gate_probability.item() <= 1
+    assert 0 <= out.gate_entropy.item() <= 0.6932
+    assert out.mean_abs_logit.item() >= 0
+
+
+def test_gradients_reach_gates_and_params(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+    """Straight-through (Eq. 33): prediction + path losses reach q/k and theta."""
+    model = tiny()
+    state, params = inputs
+    params = params.clone().requires_grad_(True)
+    out = model(state, params)
+    (out.prediction.square().mean() + 1e-6 * out.sparsity).backward()  # pyright: ignore[reportUnknownMemberType]
+    assert params.grad is not None
+    q_grad = model.layers[0].project_q.weight.grad
+    assert q_grad is not None
+    assert q_grad.abs().sum() > 0
+
+
+def test_input_guards(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
+    model = tiny()
+    state, params = inputs
+    with pytest.raises(ValueError, match="expected state"):
+        model(state[:, :2], params)
+    with pytest.raises(ValueError, match="expected state"):
+        model(state, params.squeeze(-1))
     with pytest.raises(ValueError, match="mutually exclusive"):
-        Spartan(slot_size=D, embed_dim=None, mlp_hidden_size=16, dense=True, identity=True)
-
-
-def test_gate_noise_reuse_is_deterministic(
-    model: Spartan, inputs: tuple[torch.Tensor, torch.Tensor]
-) -> None:
-    """D19: with a fixed noise draw the gated forward is deterministic — a
-    chain reusing one draw cannot flicker at unchanged state — while the
-    default (no noise passed) still samples freshly per call."""
-    model.train()
-    noise = model.sample_gate_noise(*inputs)
-    assert noise is not None and len(noise) == 2
-    assert noise[0].shape == (B, T, T)
-    first = model(*inputs, gate_noise=noise)
-    second = model(*inputs, gate_noise=noise)
-    torch.testing.assert_close(first.prediction, second.prediction)
-    torch.testing.assert_close(first.path_matrix, second.path_matrix)
-    fresh_a = model(*inputs)
-    fresh_b = model(*inputs)
-    assert not torch.allclose(fresh_a.prediction, fresh_b.prediction)
-    with pytest.raises(ValueError, match="gate_noise"):
-        model(*inputs, gate_noise=noise[:1])
-
-
-def test_gate_noise_none_for_dense_and_identity(
-    inputs: tuple[torch.Tensor, torch.Tensor],
-) -> None:
-    """Dense (A≡1) and identity (A≡0) modes sample nothing — no noise to draw."""
-    for kwargs in ({"dense": True}, {"identity": True}):
-        ref = Spartan(slot_size=D, num_layers=2, embed_dim=None, mlp_hidden_size=16, **kwargs)
-        assert ref.sample_gate_noise(*inputs) is None
-
-
-def test_rollout_draws_gate_noise_once_per_chain(
-    inputs: tuple[torch.Tensor, torch.Tensor],
-) -> None:
-    """D19: a Tp=4 chain consumes exactly as much RNG as a Tp=1 chain — the
-    thresholds are drawn once per chain, never per step."""
-    from scjepa.models.jepa import rollout_predictions
-
-    state, params = inputs
-    anchors = state.unsqueeze(1)  # (B, 1 chain, N, D)
-    torch.manual_seed(7)
-    predictor = Spartan(slot_size=D, num_layers=2, embed_dim=None, mlp_hidden_size=16)
-    predictor.train()
-    torch.manual_seed(123)
-    rollout_predictions(predictor, anchors, params, None, 1)
-    rng_after_short = torch.get_rng_state()
-    torch.manual_seed(123)
-    rollout_predictions(predictor, anchors, params, None, 4)
-    rng_after_long = torch.get_rng_state()
-    assert torch.equal(rng_after_short, rng_after_long)
+        Spartan(num_slots=N, dense=True, identity=True)

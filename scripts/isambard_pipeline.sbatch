@@ -9,9 +9,8 @@
 # NOTE: unlike the omi box there is NO nohup here — sbatch detaches the job;
 # follow it with `tail -f slurm-scjepa-bounce-<jobid>.out` or `squeue --me`.
 #
-# Walltime: one job runs dense and identity references, then main (D12). If the
-# GPU smoke shows the three stages cannot fit the partition's MaxTime, split
-# them at the reference/main boundaries instead of raising --time blindly.
+# Walltime: one job runs the dense reference then main (D12/D29 — the
+# token-local reference is a reused measured constant, not a third stage).
 #SBATCH --job-name=scjepa-bounce
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
@@ -69,18 +68,27 @@ python scripts/pregenerate_bounce.py \
   "data.num_clips=${NUM_CLIPS}" \
   "data.seed=${SEED}"
 
+# Launch gate (§6.1.3): the sparse run starts only if tau is below the
+# token-local constraint. The token-local model (A≡0) disconnects parameter
+# tokens from every decoded row, so its constraint is invariant to the
+# parameter-encoder architecture; we reuse the measured raw floor
+# pred=0.043645 (run ku244l5e, 300k steps, offset-17 split) plus this run's
+# logit term at its minimum (penalty=2.0 exactly at zero logits) instead of
+# retraining the reference every pipeline (D29). The confirmatory 8-seed
+# protocol retrains token-local references for the paired uncertainty test.
+TOKEN_LOCAL_FLOOR=$(python -c "print(0.043645 + float('${LAMBDA_LOGIT}') * 2.0)")
+
 bash scripts/run_bounce_example.sh \
   "--run-tag=${RUN_TAG}" \
   --main-steps=300000 \
   --eval-episodes=5000 \
   --final-seed-offset=29 \
   --eval-device=cuda \
-  --identity-check \
   --tau-factor=1.0 \
+  "--tau-max=${TOKEN_LOCAL_FLOOR}" \
   experiment=bounce_baumgartner \
   wandb.enabled=true \
   train.device=cuda \
-  train.sparsity_warmup_steps=0 \
   "train.lambda_logit=${LAMBDA_LOGIT}" \
   "train.seed=${SEED}" \
   "data.seed=${SEED}" \

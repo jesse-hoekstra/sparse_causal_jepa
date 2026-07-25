@@ -1,4 +1,4 @@
-"""Tests for the identifiability diagnostics (graphs/SHD, correlations/MCC)."""
+"""Tests for the identifiability diagnostics (graphs/SHD and the F.1 MCC)."""
 
 import pytest
 import torch
@@ -6,212 +6,129 @@ from torch.utils.data import DataLoader
 
 from scjepa.data import BounceDataset
 from scjepa.eval import (
-    align_parameter_columns,
-    correlation_matrix,
-    evaluate_identifiability,
-    gt_graphs_from_contacts,
-    marginal_recovery,
-    mean_max_correlation,
-    one_to_one_recovery,
-    optimal_one_to_one_assignment,
-    read_learned_graphs,
+    gt_causal_graph_from_contacts,
+    nonlinear_mcc,
+    read_learned_graph,
     structural_hamming_distance,
 )
-from scjepa.models.jepa import build_scjepa
+from scjepa.models import build_experiment1
 
 N = 3
 
 
-def test_visual_identifiability_refuses_framewise_unaligned_slots() -> None:
-    """MCC/SHD are undefined until visual slots have persistent track alignment."""
-    model = build_scjepa(
-        resolution=64,
-        num_slots=N,
-        slot_size=16,
-        slot_mlp_size=32,
-        num_iterations=1,
-        enc_channels=(3, 8, 8),
-        enc_out_channels=16,
-        pooling_heads=2,
-        spartan_layers=1,
-        spartan_embed_dim=None,
-        spartan_mlp_hidden=32,
-        spartan_mlp_layers=2,
-    )
-    dataset = BounceDataset(num_episodes=1, clip_len=3, num_balls=N, resolution=64)
-    with pytest.raises(ValueError, match="trajectory-level"):
-        evaluate_identifiability(model, dataset, input_key="frames")
-
-
-def test_gt_graph_derivation() -> None:
-    """State graph = last contacts + self; param diag = involved-in-contact."""
+def test_gt_causal_graph_derivation() -> None:
+    """Columns are [state | params]: state edge on contact or self; mass edge on contact."""
     contacts = torch.zeros(1, 2, N, N, dtype=torch.bool)
     contacts[0, 0, 0, 1] = contacts[0, 0, 1, 0] = True  # earlier transition: ignored
     contacts[0, 1, 1, 2] = contacts[0, 1, 2, 1] = True  # last transition: pair (1, 2)
-    state_graph, param_graph = gt_graphs_from_contacts(contacts)
+    graph = gt_causal_graph_from_contacts(contacts)
+    assert graph.shape == (1, N, 2 * N)
     expected_state = torch.eye(N, dtype=torch.bool)
     expected_state[1, 2] = expected_state[2, 1] = True
-    assert torch.equal(state_graph[0], expected_state)
+    assert torch.equal(graph[0, :, :N], expected_state)
     expected_param = torch.zeros(N, N, dtype=torch.bool)
     expected_param[1, 2] = expected_param[2, 1] = True
     expected_param[1, 1] = expected_param[2, 2] = True  # own mass matters in contact
-    assert torch.equal(param_graph[0], expected_param)  # ball 0: no mass edges at all
+    assert torch.equal(graph[0, :, N:], expected_param)  # ball 0: no mass edges at all
 
 
 def test_learned_graph_readout_and_shd() -> None:
     path = torch.zeros(1, 2 * N, 2 * N)
-    path[0, :, :] = 0.0
     path[0, 0, 0] = 1.0  # self path
     path[0, 0, 1] = 2.0  # two paths state 1 -> state 0
     path[0, 1, N + 2] = 1.0  # param 2 -> state 1
-    state_graph, param_graph = read_learned_graphs(path, num_slots=N)
-    assert state_graph[0, 0, 1]
-    assert state_graph[0, 0, 0]
-    assert param_graph[0, 1, 2]
-    assert param_graph.sum() == 1
+    graph = read_learned_graph(path, num_slots=N)
+    assert graph.shape == (1, N, 2 * N)
+    assert graph[0, 0, 0]  # state self-path retained
+    assert graph[0, 0, 1]  # state source retained
+    assert graph[0, 1, N + 2]  # parameter source retained
+    assert graph.sum() == 3
+    # Undecoded parameter ROWS are excluded even when they carry paths.
+    assert read_learned_graph(torch.ones(1, 2 * N, 2 * N), num_slots=N).shape == (1, N, 2 * N)
     # SHD: identical -> 0; one flip -> 1.
-    assert structural_hamming_distance(state_graph, state_graph).item() == 0
-    flipped = state_graph.clone()
+    assert structural_hamming_distance(graph, graph).item() == 0
+    flipped = graph.clone()
     flipped[0, 2, 2] = ~flipped[0, 2, 2]
-    assert structural_hamming_distance(state_graph, flipped).item() == 1
+    assert structural_hamming_distance(graph, flipped).item() == 1
 
 
-def test_parameter_graph_columns_follow_global_recovery_assignment() -> None:
-    learned = torch.zeros(1, N, N, dtype=torch.bool)
-    learned[0, 0, 2] = True
-    learned[0, 1, 0] = True
-    learned[0, 2, 1] = True
-    # true mass 0 <- learned coordinate 2; mass 1 <- 0; mass 2 <- 1.
-    aligned = align_parameter_columns(learned, torch.tensor([2, 0, 1]))
-    assert torch.equal(aligned, torch.eye(N, dtype=torch.bool).unsqueeze(0))
-    with pytest.raises(ValueError, match="bijection"):
-        align_parameter_columns(learned, torch.tensor([0, 0, 1]))
-
-
-def test_correlation_recovers_planted_diffeomorphism() -> None:
-    """ŝ = tanh(θ) in one dim + noise elsewhere ⇒ that dim wins, MCC high."""
-    torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
-    theta = torch.rand(500, 1) * 2.5 + 0.5  # masses
-    learned = torch.randn(500, 6)
-    learned[:, 3] = torch.tanh(theta.squeeze(-1)) + 0.01 * torch.randn(500)
-    best_dim, best_values, true_values = marginal_recovery(learned, theta)
-    assert best_dim.item() == 3
-    # tanh saturates over this mass range, so Pearson |corr| sits well below 1
-    # even for a perfect diffeomorphism (the docstring caveat); the monotone
-    # scatter below is the decisive check.
-    assert mean_max_correlation(learned, theta) > 0.8
-    # The scatter pairs are monotone (diffeomorphism shape), up to noise.
-    order = true_values.argsort()
-    diffs = best_values[order].diff()
-    assert (diffs > -0.05).float().mean() > 0.95
-
-
-def test_correlation_low_for_independent_noise() -> None:
-    torch.manual_seed(1)  # pyright: ignore[reportUnknownMemberType]
-    theta = torch.rand(500, 1)
-    learned = torch.randn(500, 6)
-    assert mean_max_correlation(learned, theta) < 0.2
-
-
-def test_episode_level_mcc_allows_one_global_parameter_permutation() -> None:
-    """Paper-shaped E x N MCC accepts a fixed learned-coordinate permutation."""
-    torch.manual_seed(7)  # pyright: ignore[reportUnknownMemberType]
-    theta = torch.randn(500, 5)
-    learned = theta[:, [2, 4, 1, 0, 3]]
-    assert mean_max_correlation(learned, theta) > 0.999
-    # Pooling episode and object destroys the coordinate relation and is not
-    # invariant to this legitimate learned-factor permutation.
-    pooled = mean_max_correlation(learned.reshape(-1, 1), theta.reshape(-1, 1))
-    assert pooled < 0.2
-
-
-def test_strict_assignment_is_one_to_one() -> None:
-    """The same attractive learned coordinate cannot be reused for two masses."""
-    scores = torch.tensor(
-        [
-            [0.99, 0.98, 0.00],
-            [0.10, 0.20, 0.30],
-            [0.00, 0.10, 0.97],
-        ]
-    )
-    target_to_learned = optimal_one_to_one_assignment(scores)
-    assignment = [int(value) for value in target_to_learned]
-    assert assignment == [0, 1, 2]
-    assert len(set(assignment)) == 3
-
-
-def test_one_to_one_recovery_finds_one_global_permutation() -> None:
+def test_mcc_matrix_is_true_by_learned() -> None:
+    """R² rows are TRUE parameters, columns learned coordinates (App. F.1's I x J)."""
     torch.manual_seed(8)  # pyright: ignore[reportUnknownMemberType]
     target = torch.randn(600, 3)
-    learned = target[:, [2, 0, 1]]
-    recovery = one_to_one_recovery(learned, target, epochs=100)
-    assert [int(value) for value in recovery.target_to_learned] == [1, 2, 0]
-    assert recovery.nonlinear_score > 0.98
-    assert recovery.linear_score > 0.999
-    assert recovery.nonlinear_matrix.shape == (3, 3)
+    learned = target[:, [2, 0, 1]]  # learned j carries true parameter [2, 0, 1][j]
+    report = nonlinear_mcc(learned, target, epochs=100)
+    assert report.matrix.shape == (3, 3)
+    # true 0 lives in learned 1, true 1 in learned 2, true 2 in learned 0.
+    assert [int(value) for value in report.matrix.argmax(dim=1)] == [1, 2, 0]
+    assert report.score > 0.98
+    assert report.num_samples == 600
 
 
-def test_correlation_matrix_guards() -> None:
+def test_mcc_is_permutation_insensitive() -> None:
+    """The kept metric credits a mass to ANY learned coordinate (no bijection)."""
+    torch.manual_seed(7)  # pyright: ignore[reportUnknownMemberType]
+    theta = torch.randn(400, 3)
+    permuted = nonlinear_mcc(theta[:, [2, 0, 1]], theta, epochs=100).score
+    identity = nonlinear_mcc(theta, theta, epochs=100).score
+    assert abs(float(permuted) - float(identity)) < 0.02
+
+
+def test_mcc_credits_one_learned_coordinate_for_several_true_parameters() -> None:
+    """No bijection is enforced: the same column may win several rows."""
+    torch.manual_seed(11)  # pyright: ignore[reportUnknownMemberType]
+    shared = torch.randn(400, 1)
+    # True rows 0 and 1 are both determined by `shared`; only one learned
+    # coordinate carries it, yet both rows score highly.
+    target = torch.cat((shared, 2.0 * shared + 1.0, torch.randn(400, 1)), dim=1)
+    learned = torch.cat((shared, torch.randn(400, 2)), dim=1)
+    report = nonlinear_mcc(learned, target, epochs=200)
+    assert [int(value) for value in report.matrix.argmax(dim=1)[:2]] == [0, 0]
+    assert float(report.matrix[0, 0]) > 0.95
+    assert float(report.matrix[1, 0]) > 0.95
+
+
+def test_mcc_guards() -> None:
     with pytest.raises(ValueError, match="equal S"):
-        correlation_matrix(torch.randn(4, 2), torch.randn(5, 1))
+        nonlinear_mcc(torch.randn(4, 2), torch.randn(5, 1), epochs=2)
     with pytest.raises(ValueError, match="at least 2"):
-        correlation_matrix(torch.randn(1, 2), torch.randn(1, 1))
+        nonlinear_mcc(torch.randn(1, 2), torch.randn(1, 1), epochs=2)
 
 
 def test_diagnostics_run_on_bounce_pipeline() -> None:
-    """Untrained model on real bounce data: everything wires, values bounded."""
+    """Untrained Experiment-1 model on real bounce data: everything wires."""
     torch.manual_seed(2)  # pyright: ignore[reportUnknownMemberType]
-    dataset = BounceDataset(num_episodes=4, clip_len=4, num_balls=N, resolution=64, seed=5)
+    dataset = BounceDataset(num_episodes=4, clip_len=4, num_balls=N, seed=5, render=False)
     batch = next(iter(DataLoader(dataset, batch_size=4)))
-    model = build_scjepa(
-        resolution=64,
-        num_slots=N,
-        slot_size=16,
-        slot_mlp_size=32,
-        num_iterations=1,
-        enc_channels=(3, 8, 8),
-        enc_out_channels=16,
-        pooling_heads=2,
-        spartan_layers=1,
-        spartan_embed_dim=None,
-        spartan_mlp_hidden=32,
-        spartan_mlp_layers=2,
+    model = build_experiment1(
+        num_slots=N, spartan_layers=1, spartan_embed_dim=32, spartan_mlp_hidden=32
     )
     model.eval()
     with torch.no_grad():
-        out = model(batch["frames"])
-    state_gt, param_gt = gt_graphs_from_contacts(batch["contacts"])
-    state_learned, param_learned = read_learned_graphs(out.path_matrix, num_slots=N)
-    for learned_graph, gt_graph in ((state_learned, state_gt), (param_learned, param_gt)):
-        shd = structural_hamming_distance(learned_graph, gt_graph)
-        assert 0 <= shd.item() <= N * N
-    # (episode, ball) samples: flatten for the parameter metrics.
-    learned_flat = out.causal_params.reshape(-1, out.causal_params.shape[-1])
-    target_flat = batch["params"].reshape(-1, 1)
-    mcc = mean_max_correlation(learned_flat, target_flat)
+        out = model(batch["states"], context_len=3)  # K = 1
+    graph_gt = gt_causal_graph_from_contacts(batch["contacts"])
+    graph_learned = read_learned_graph(out.path_matrix, num_slots=N)
+    assert 0 <= structural_hamming_distance(graph_learned, graph_gt).item() <= 2 * N * N
+    # One row per episode for the parameter metric.
+    mcc = nonlinear_mcc(out.causal_params.flatten(1), batch["params"].flatten(1), epochs=20).score
     assert 0 <= mcc.item() <= 1 + 1e-6
 
 
-def test_nonlinear_mcc_beats_pearson_on_diffeomorphism() -> None:
-    """F.1 metric: near-1 on a planted diffeomorphism where Pearson saturates."""
-    from scjepa.eval import nonlinear_mcc
-
+def test_nonlinear_mcc_recovers_planted_diffeomorphism() -> None:
+    """F.1 metric: near-1 on a planted tanh diffeomorphism, near-0 on noise."""
     torch.manual_seed(4)  # pyright: ignore[reportUnknownMemberType]
     theta = torch.rand(800, 1) * 2.5 + 0.5
     learned = torch.randn(800, 4)
     learned[:, 2] = torch.tanh(theta.squeeze(-1)) + 0.01 * torch.randn(800)
-    score = nonlinear_mcc(learned, theta, epochs=200)
-    assert score > 0.9
-    assert score > mean_max_correlation(learned, theta)
+    report = nonlinear_mcc(learned, theta, epochs=200)
+    assert report.score > 0.9
+    assert int(report.matrix.argmax(dim=1)[0]) == 2
     # And near-zero relationship stays near zero (no overfitting inflation).
-    noise_score = nonlinear_mcc(torch.randn(800, 4), theta, epochs=200)
-    assert noise_score < 0.3
+    assert nonlinear_mcc(torch.randn(800, 4), theta, epochs=200).score < 0.3
 
 
 def test_nonlinear_mcc_preserves_global_torch_rng() -> None:
     """Periodic evaluation must not change subsequent stochastic training draws."""
-    from scjepa.eval import nonlinear_mcc
-
     torch.manual_seed(17)  # pyright: ignore[reportUnknownMemberType]
     target = torch.randn(40, 1)
     learned = torch.cat((target.square(), torch.randn(40, 1)), dim=1)
