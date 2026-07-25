@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 
 from scjepa.data import BounceDataset
 from scjepa.data.bounce import render_bounce, simulate_bounce
-from scjepa.models import build_experiment1
+from scjepa.models import build_state_to_state
 
 RADIUS = 0.08
 
@@ -177,11 +177,11 @@ def test_render_and_cache_flags() -> None:
 
 
 def test_bounce_feeds_the_full_pipeline() -> None:
-    """A DataLoader batch of bounce clips runs through the Experiment-1 model."""
+    """A DataLoader batch of bounce clips runs through the state-to-state model."""
     torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
     dataset = BounceDataset(num_episodes=2, clip_len=3, num_balls=3, seed=1, render=False)
     batch = next(iter(DataLoader(dataset, batch_size=2)))
-    model = build_experiment1(
+    model = build_state_to_state(
         num_slots=3, spartan_layers=1, spartan_embed_dim=32, spartan_mlp_hidden=32
     )
     out = model(batch["states"], context_len=2)  # K = 1 transition
@@ -371,12 +371,20 @@ def test_preload_refuses_legacy_simulator_version(tmp_path: Path) -> None:
         BounceDataset(**_tiny_kwargs(), preload=path)  # pyright: ignore[reportArgumentType]
 
 
-def test_preload_requires_states_regime(tmp_path) -> None:  # noqa: ANN001
+def test_preload_renders_frames_on_the_fly(tmp_path) -> None:  # noqa: ANN001
+    """Preload files store no frames, so ``render=True`` draws them from the states.
+
+    This is what lets the visual experiments reuse the state-to-state physics: the
+    frames for 100k x 60 steps would be ~294 GB on disk, while the states they
+    are drawn from already exist.
+    """
     path = str(tmp_path / "pre.pt")
     _write_preload(path)
     rendered = {**_tiny_kwargs(), "render": True}
-    with pytest.raises(ValueError, match="render"):
-        BounceDataset(**rendered, preload=path)  # pyright: ignore[reportArgumentType]
+    dataset = BounceDataset(**rendered, preload=path)  # pyright: ignore[reportArgumentType]
+    item = dataset[0]
+    assert "frames" in item
+    assert item["frames"].shape[0] == item["states"].shape[0]
 
 
 def test_factory_never_preloads_eval_splits(tmp_path) -> None:  # noqa: ANN001

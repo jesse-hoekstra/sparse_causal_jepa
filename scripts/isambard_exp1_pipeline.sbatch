@@ -2,7 +2,7 @@
 # Isambard-AI (GH200, aarch64, Slurm) launch for the D26 bounce_baumgartner
 # pipeline. Submit FROM THE REPO ROOT:
 #
-#   sbatch --account=<PROJECT> scripts/isambard_pipeline.sbatch RUN_TAG LAMBDA_LOGIT [SEED]
+#   sbatch --account=<PROJECT> scripts/isambard_exp1_pipeline.sbatch RUN_TAG LAMBDA_LOGIT [SEED]
 #
 # Fill in --account (from `sacctmgr show assoc user=$USER format=account%20`)
 # and adjust --partition if `sinfo -s` names one explicitly for GPU work.

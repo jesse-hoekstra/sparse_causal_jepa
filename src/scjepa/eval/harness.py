@@ -1,6 +1,6 @@
-"""Identifiability evaluation for Experiment 1 (experiments.pdf §6.1.3 / §6.7).
+"""Identifiability evaluation for the state-to-state regime (experiments.pdf §6.1.3 / §6.7).
 
-Consumes an ``Experiment1Model`` plus a bounce dataset whose items carry the
+Consumes an ``StateToStateModel`` plus a bounce dataset whose items carry the
 ground truth (``params``, ``contacts``). Two headline numbers, one from each
 source paper: ``mcc`` is Baumgartner App. F.1's recovery score (D27, see
 ``scjepa.eval.parameters``) and ``shd`` is SPARTAN's Structural Hamming
@@ -29,7 +29,7 @@ from scjepa.eval.graph import (
 )
 from scjepa.eval.parameters import nonlinear_mcc
 from scjepa.losses import aligned_mse
-from scjepa.models.experiment1 import Experiment1Model, TransitionOutput
+from scjepa.models.state_to_state import StateToStateModel, TransitionOutput
 
 
 class IdentifiabilityReport(NamedTuple):
@@ -59,7 +59,7 @@ def _weighted_mean(values: list[Tensor], weights: list[int]) -> float:
 @torch.random.fork_rng(devices=[])  # pyright: ignore[reportUnknownMemberType]
 @torch.no_grad()
 def evaluate_identifiability(
-    model: Experiment1Model,
+    model: StateToStateModel,
     dataset: Dataset[dict[str, Tensor]],
     batch_size: int = 32,
     max_batches: int | None = None,
@@ -70,7 +70,7 @@ def evaluate_identifiability(
     """Evaluate prediction / constraint / SHD / MCC over the dataset.
 
     Args:
-        model: The Experiment-1 model (eval mode is set here).
+        model: The state-to-state model (eval mode is set here).
         dataset: Items with ``states``, ``params`` and ``contacts``.
         batch_size: Eval batch size.
         max_batches: Optional cap for quick runs.

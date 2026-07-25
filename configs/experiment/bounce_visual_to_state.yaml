@@ -1,0 +1,51 @@
+# @package _global_
+# The visual-to-state regime (experiments.pdf §6.5): visual context, TRUE-STATE target.
+#
+# The middle rung. The predictor-side observation is the causal frame history;
+# the target stays the fixed physical state Z_{t+1} (Eq. 85). Because the target
+# is fixed data there is no target encoder, no EMA teacher and no
+# representation-collapse regularizer (§6.5) — a constant context state cannot
+# predict episode-varying future states, so collapse is not a trivial optimum.
+#
+# Objective Eq. 102, constraint Eq. 103 (RAW, like the state-to-state regime — only
+# The visual-to-visual regime normalizes by a target variance). Predictions come out in
+# visual-track order and targets in simulator-row order, so a detached
+# trajectory-level assignment (Eqs. 98-100) is applied before the loss.
+#
+# Data: identical physics to the state-to-state regime (Eq. 2 mass-proportional PHYSICAL
+# radii), rendered on the fly as identical white glyphs at one shared radius.
+
+data:
+  num_clips: 100000
+  clip_len: 60 # T (§6.1.1)
+  preload: data/bounce_train_v2_100000.pt
+  render: true
+  resolution: 64
+  render_radius_from_mass: false
+  uniform_appearance: true
+  mass_independent_init: false
+
+model:
+  regime: visual_to_state
+  state_dim: 4 # raw target width (Eq. 95 decodes into this)
+  num_slots: 5 # N (Eq. 42)
+  slot_size: 32 # d, SAVi slot width; also the Eq. 91 parameter-encoder input
+  latent_state_dim: 32 # d_s, SPARTAN's state interface (Eqs. 88/94)
+  resolution: 64
+
+train:
+  steps: 300000
+  # One SAVi branch over 60 frames with a full backward graph. Cheaper than
+  # The visual-to-visual regime (no second branch) but far heavier than the state-to-state regime's 16.
+  batch_size: 8
+  context_len: 30 # Tpar (Eq. 90); I = {29, ..., 58}
+  sparsity_tau: 0.75 # placeholder; the pipeline recalibrates tau_2 from the dense run
+  # Frames are drawn per batch, so render in worker processes: inline it would
+  # be SERIAL with the optimizer (~1.7 h over 300k steps at batch 8). Episodes
+  # are index-deterministic, so this does not change which data a step sees.
+  num_workers: 8
+  prefetch_factor: 4
+  eval_every: 5000
+  log_every: 100
+  checkpoint_every: 2000
+  checkpoint_keep_every: 25000

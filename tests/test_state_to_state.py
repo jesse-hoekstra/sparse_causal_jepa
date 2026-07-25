@@ -1,4 +1,4 @@
-"""Tests for the Experiment-1 model (experiments.pdf §6.2, Eqs. 15/38-40)."""
+"""Tests for the state-to-state model (experiments.pdf §6.2, Eqs. 15/38-40)."""
 
 import pytest
 import torch
@@ -6,14 +6,14 @@ from torch.utils.data import DataLoader
 
 from scjepa.data import BounceDataset
 from scjepa.eval import evaluate_identifiability
-from scjepa.models import Experiment1Model, build_experiment1
+from scjepa.models import StateToStateModel, build_state_to_state
 
 N = 3
 
 
-def tiny_model(dense: bool = False, identity: bool = False) -> Experiment1Model:
+def tiny_model(dense: bool = False, identity: bool = False) -> StateToStateModel:
     torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
-    return build_experiment1(
+    return build_state_to_state(
         num_slots=N,
         param_encoder_dim=16,
         param_encoder_heads=2,

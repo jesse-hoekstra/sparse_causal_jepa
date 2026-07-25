@@ -123,4 +123,4 @@ python scripts/summarize_logit_sweep.py "${BASE}"
 SELECTED=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["selected_lambda_logit"])' "${BASE}/sweep_summary.json")
 echo "dense lambda_logit sweep complete: ${BASE}/sweep_summary.json"
 echo "selected lambda_logit=${SELECTED}"
-echo "next: sbatch --account=<PROJECT> scripts/isambard_pipeline.sbatch <run_tag> ${SELECTED} ${SEED}"
+echo "next: sbatch --account=<PROJECT> scripts/isambard_exp1_pipeline.sbatch <run_tag> ${SELECTED} ${SEED}"

@@ -15,6 +15,8 @@ from omegaconf import DictConfig, OmegaConf
 
 from scjepa.training import MetricLogger, NoopLogger, TrainConfig, Trainer, seed_everything
 from scjepa.training.factory import build_dataset, build_model
+from scjepa.training.visual_to_state import VisualToStateTrainer
+from scjepa.training.visual_to_visual import VisualToVisualTrainer
 
 
 class WandbLogger:
@@ -83,6 +85,8 @@ def main(cfg: DictConfig) -> None:
         eval_every=cfg.train.get("eval_every", None),
         grad_skip_threshold=cfg.train.get("grad_skip_threshold", 1e3),
         grad_skip_max_consecutive=cfg.train.get("grad_skip_max_consecutive", 2000),
+        num_workers=int(cfg.train.get("num_workers", 0)),
+        prefetch_factor=int(cfg.train.get("prefetch_factor", 4)),
         log_every=cfg.train.log_every,
         checkpoint_every=cfg.train.checkpoint_every,
         checkpoint_keep_every=cfg.train.get("checkpoint_keep_every", None),
@@ -106,7 +110,16 @@ def main(cfg: DictConfig) -> None:
         if cfg.wandb.enabled
         else NoopLogger()
     )
-    final = Trainer(model, dataset, train_config, logger, eval_dataset=eval_dataset).train()
+    # Each regime keeps every guard, checkpoint and resume path of the shared
+    # Trainer and overrides only what its observation contract implies. The
+    # state-to-state path is untouched by this dispatch.
+    trainers = {
+        "state_to_state": Trainer,
+        "visual_to_state": VisualToStateTrainer,
+        "visual_to_visual": VisualToVisualTrainer,
+    }
+    trainer_class = trainers[str(cfg.model.get("regime", "state_to_state"))]
+    final = trainer_class(model, dataset, train_config, logger, eval_dataset=eval_dataset).train()
     print(
         f"done at step {train_config.steps}: " + ", ".join(f"{k}={v:.4g}" for k, v in final.items())
     )
