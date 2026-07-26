@@ -23,7 +23,7 @@ ball-ball collisions always, and at wall bounces iff radius ∝ mass (audit G1).
 
 Deliberate design (D11): mass is NOT rendered — all balls share one radius and
 are identified by color. A single frame therefore reveals positions but never
-S^ph; parameters are only observable from multi-frame behaviour (D4 rationale).
+θ; parameters are only observable from multi-frame behaviour (D4 rationale).
 
 Physics: elastic impulse exchange (restitution 1), wall reflections (velocity
 rule mass-independent; timing/geometry mass-dependent iff radius ∝ mass),
