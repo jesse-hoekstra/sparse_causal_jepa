@@ -20,7 +20,7 @@ A batch is a dict of tensors:
   range and normalization.
 - `actions`/auxiliaries `U_t` where the dataset has them (Push-T yes, CLEVRER no) — the pipeline
   must work with and without them (config flag, matching the model's optional conditioning).
-- Optional ground-truth annotations for eval only: object states, physical parameters, causal
+- Optional ground-truth annotations for eval only: object states, system parameters, causal
   graphs (synthetic data), never fed to the model during training.
 
 ## Non-negotiables
@@ -39,7 +39,7 @@ A batch is a dict of tensors:
    windows and the eval protocol.
 2. **Push-T**: frames + actions for action-conditioned prediction and MPC eval.
 3. **Synthetic dynamical systems** (identifiability experiments): generators with known ground-truth
-   parameters S^ph, known (local) causal graphs, and optional interventions — so SHD/MCC and
+   parameters θ, known (local) causal graphs, and optional interventions — so SHD/MCC and
    marginal-recovery plots (learned parameter vs. ground truth) are computable. Keep generators
    seeded and pure; store the ground truth alongside the rendered observations.
 4. Possibly MOVi for SAVi pretraining sanity checks — only if the model agent needs it.

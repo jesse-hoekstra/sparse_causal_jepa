@@ -6,7 +6,7 @@
 
 The central objective in `research-roadmap.md` is still correct:
 
-> Learn time-invariant physical parameters from trajectories, show that SPARTAN uses them through
+> Learn time-invariant system parameters from trajectories, show that SPARTAN uses them through
 > a sparse causal graph, and progressively replace true states with frames until the context
 > encoder, target encoder, parameter encoder, and SPARTAN are trained jointly from visual data.
 
@@ -466,6 +466,6 @@ Do not add these until the three gates work:
 - a full confirmatory study of the optional learned-true-state-target diagnostic.
 
 The scientifically minimal result is already substantial: jointly learn frame representations,
-infer hidden physical parameters from a longer visual context, predict single-frame target slots
+infer hidden system parameters from a longer visual context, predict single-frame target slots
 through a sparse SPARTAN, and verify from held-out simulator data that the learned parameters are
 the true causal masses and are actually used at collisions.

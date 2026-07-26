@@ -31,8 +31,8 @@ Framework is **PyTorch** (D1); reuse-first via vendored `third_party/` code (D5)
 - Context & target SAVi encoders **jointly trained** — **no EMA target, no frozen encoder, no
   stop-gradient asymmetry**. Collapse prevention = VISReg/SIGReg loss term only.
 - Channel split (D4): per-slot temporal attention pooling collapses the time axis
-  `(B, Th, N, d) → (B, N, d)` = Ŝ^ph; linear head on last-step slots = S_t.
-- SPARTAN predicts Ŝ_{t+1} from (S_t, Ŝ^ph, optional U_t) and must **expose its interaction
+  `(B, Th, N, d) → (B, N, d)` = θ̂; linear head on last-step slots = S_t.
+- SPARTAN predicts Ŝ_{t+1} from (S_t, θ̂, optional U_t) and must **expose its interaction
   graph** for SHD/MCC eval.
 - Loss: Hungarian-matched predictive loss + regularizer (both branches) + SPARTAN sparsity penalty.
 - Auxiliary variables (actions) strictly optional — Push-T uses them, CLEVRER doesn't.

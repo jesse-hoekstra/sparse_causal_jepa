@@ -48,7 +48,7 @@ fail loudly rather than silently. Read `docs/decisions.md` first; it binds you.
 
 ## Eval harness (standalone on a checkpoint, each its own script/config)
 - **Identifiability diagnostics** (synthetic data): SHD and MCC between SPARTAN's read-out
-  interaction graph and ground truth; marginal plots of learned Ŝ^ph dims vs. ground-truth
+  interaction graph and ground truth; marginal plots of learned θ̂ dims vs. ground-truth
   parameters (Baumgartner-style); with/without-sparsity ablation as a config toggle.
 - **CLEVRER**: 128→160-frame imagined rollouts; export trajectories for ALOE downstream QA; compare
   vs. SlotFormer/C-JEPA numbers.

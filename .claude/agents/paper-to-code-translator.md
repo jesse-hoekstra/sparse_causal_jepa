@@ -32,7 +32,7 @@ bind you.
      over object-factored tokens, hard/discrete attention mechanics, how the interaction graph is
      read out (needed for SHD/MCC eval). No public code — every detail comes from the paper (local
      PDF in sources/); flag anything underspecified.
-   - **Channel split**: per-slot temporal attention pooling → Ŝ^ph ∈ R^{N×d} (exact spec in
+   - **Channel split**: per-slot temporal attention pooling → θ̂ ∈ R^{N×d} (exact spec in
      decisions.md D4 — implement THAT, not a variant); linear layer on last-step slots → S_t.
    - **Joint training**: context & target encoders are BOTH trained (no EMA, no stop-gradient
      target, no frozen encoder — this is the paper's deliberate departure from C-JEPA/SPARTAN).
@@ -41,7 +41,7 @@ bind you.
      linear_sum_assignment on a cost between predicted and target slots) + regularizer on
      embeddings (both branches per Fig. 1) + SPARTAN sparsity penalty.
 2. **Build a symbol table.** Map every paper symbol to a named tensor with shape/dtype
-   (S_t, Ŝ^ph, U_t, S̃_k, N, d, Th, Tp …). Keep it as a docstring next to the implementation.
+   (S_t, θ̂, U_t, S̃_k, N, d, Th, Tp …). Keep it as a docstring next to the implementation.
 3. **Implement incrementally** with shape asserts and small sanity checks (`torch.testing`):
    gradients flow to BOTH encoders; loss bounds/signs; regularizer actually penalizes a collapsed
    batch (feed identical embeddings → large penalty); sparsity penalty decreases attention density.

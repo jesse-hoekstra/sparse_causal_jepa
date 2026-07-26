@@ -55,7 +55,7 @@ class _PostNormBlock(nn.Module):
 
 
 class ParameterEncoder(nn.Module):
-    """Track-attached scalar physical-parameter coordinates from state history."""
+    """Track-attached scalar system-parameter coordinates from state history."""
 
     def __init__(
         self,

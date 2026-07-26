@@ -10,7 +10,7 @@ slots, same-index attention bias, and explicit 10k-step sparsity warm-up.
 
 ## Central research question
 
-Can a JEPA recover time-invariant physical parameters such as object masses while SPARTAN prunes
+Can a JEPA recover time-invariant system parameters such as object masses while SPARTAN prunes
 its predictor to a compact, meaningful causal dependency graph, and does that result survive when
 we progressively remove access to ground-truth state representations?
 
@@ -660,7 +660,7 @@ states. The ultimate experiment removes that oracle. For every transition `t -> 
 encoder receives only the image `x[t+1]`. No true state is fed to either model branch or used in the
 training loss. States, masses, and contact graphs are retained only for held-out evaluation.
 
-This is the strongest intended result: sparse, interpretable physical-parameter use learned from
+This is the strongest intended result: sparse, interpretable system-parameter use learned from
 video while the JEPA predicts a separately learned visual target representation.
 
 ### Exact branch contract

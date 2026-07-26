@@ -160,7 +160,7 @@ python scripts/train.py data.name=bounce data.clip_len=10 train.steps=...   # vi
 #   until then only training health (pred loss, collapse metrics) is reportable.
 
 # Negative control — pixels + VISIBLE mass (radius rendered): expect prediction to
-# stay good while param->state edges prune away and MCC on S^ph collapses — the
+# stay good while param->state edges prune away and MCC on θ̂ collapses — the
 # parameter migrates into the state channel (D13 scope condition), motivating the
 # observability assumption in the manuscript.
 python scripts/train.py data.name=bounce data.radius_from_mass=true ...

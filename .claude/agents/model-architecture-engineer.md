@@ -26,11 +26,11 @@ JEPA Using a SPARTAN"**. You write composable, shape-safe, configurable `nn.Modu
   2. **Channel split** (D4 — implement exactly):
      - `AttnPooling`: per-slot temporal PMA block, shared weights across slots, single learned
        query + temporal positional encodings, collapses the time axis: `(B, Th, N, d) → (B, N, d)`
-       = Ŝ^ph. No cross-slot mixing — relational effects are SPARTAN's job.
+       = θ̂. No cross-slot mixing — relational effects are SPARTAN's job.
      - `KinematicHead`: linear layer on last-step slots `(B, N, d) → (B, N, d)` = S_t,
-       disassociating it from Ŝ^ph.
+       disassociating it from θ̂.
   3. **SPARTAN predictor** (from paper, spec via paper-to-code-translator): sparse transformer over
-     object-factored tokens taking (S_t, Ŝ^ph, optional U_t) → Ŝ_{t+1}. Must expose its attention
+     object-factored tokens taking (S_t, θ̂, optional U_t) → Ŝ_{t+1}. Must expose its attention
      pattern / learned interaction graph as a first-class output — the SHD/MCC eval and the
      identifiability claims depend on reading it out.
   4. **Auxiliary conditioning**: actions/proprioception U_t concatenated into the state tokens,
