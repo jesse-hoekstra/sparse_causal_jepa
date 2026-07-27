@@ -7,10 +7,13 @@ source paper: ``mcc`` is Baumgartner App. F.1's recovery score (D27, see
 Distance between the learned graph and the ground-truth causal graph (D28, see
 ``scjepa.eval.graph``). NEITHER is meaningful alone — see D28.
 
-The constraint is reported exactly as the dual sees it (Eq. 13, raw units):
-``constraint_loss = pred_loss + lambda_logit * logit_penalty``. Calibrate τ on
-THAT quantity. Evaluation runs in eval mode, so gates are the deterministic
-Eq. 34 thresholds.
+The constraint is reported exactly as the dual sees it (raw units):
+``constraint_loss = pred_loss + lambda_roll * rollout_loss + lambda_logit *
+logit_penalty``, the scalarised hybrid §4.3 bound. Calibrate τ on THAT
+quantity, and pass the SAME ``rollout_len``/``lambda_roll`` used in training —
+a mismatch on either side silently invalidates τ. Evaluation runs in eval mode,
+so gates are the deterministic Eq. 34 thresholds; the rollout is anchored at
+the fixed t = Tpar-1 in both modes, so the reported constraint is reproducible.
 
 Everything is in tracked-object order by construction (ζ = id, Eq. 132): no
 permutation of parameter coordinates or graph axes is fitted anywhere.
@@ -28,7 +31,7 @@ from scjepa.eval.graph import (
     structural_hamming_distance,
 )
 from scjepa.eval.parameters import nonlinear_mcc
-from scjepa.losses import aligned_mse
+from scjepa.losses import aligned_mse, rollout_weights, weighted_rollout_mse
 from scjepa.models.state_to_state import StateToStateModel, TransitionOutput
 
 
@@ -66,6 +69,8 @@ def evaluate_identifiability(
     device: str = "cpu",
     context_len: int | None = None,
     lambda_logit: float = 0.0,
+    rollout_len: int | None = None,
+    lambda_roll: float = 0.0,
 ) -> IdentifiabilityReport:
     """Evaluate prediction / constraint / SHD / MCC over the dataset.
 
@@ -77,7 +82,11 @@ def evaluate_identifiability(
         device: Device string.
         context_len: Tpar — must match training.
         lambda_logit: Training's attention-logit weight, included in the
-            reported constraint exactly as in the training dual (Eq. 13).
+            reported constraint exactly as in the training dual.
+        rollout_len: K for the hybrid rollout branch — must match training,
+            since τ is calibrated on the constraint this function reports.
+            None disables the branch (pure teacher-forced constraint).
+        lambda_roll: Training's rollout weight inside the scalarised bound.
     """
     model = model.to(device).eval()
     # DataLoader draws a worker/base seed even with shuffle=False. Give it a
@@ -90,6 +99,7 @@ def evaluate_identifiability(
     )
     num_slots: int | None = None
     pred_losses: list[Tensor] = []
+    rollout_losses: list[Tensor] = []
     logit_penalties: list[Tensor] = []
     learned_graphs: list[Tensor] = []
     true_graphs: list[Tensor] = []
@@ -106,10 +116,19 @@ def evaluate_identifiability(
         if max_batches is not None and index >= max_batches:
             break
         states = batch["states"].to(device)
-        output: TransitionOutput = model(states, context_len=context_len)
+        output: TransitionOutput = model(states, context_len=context_len, rollout_len=rollout_len)
         batch_weights.append(states.shape[0])
         num_slots = output.prediction.shape[1]
         pred_losses.append(aligned_mse(output.prediction, output.target).cpu())
+        if output.rollout_prediction is not None and output.rollout_target is not None:
+            weights = rollout_weights(
+                output.rollout_prediction.shape[1], device=output.rollout_prediction.device
+            )
+            rollout_losses.append(
+                weighted_rollout_mse(
+                    output.rollout_prediction, output.rollout_target, weights
+                ).cpu()
+            )
         logit_penalties.append(output.logit_penalty.cpu())
         # One ground-truth local graph per predicted transition (Eqs. 8/9),
         # flattened to match the model's (B·K, ...) transition rows.
@@ -151,9 +170,14 @@ def evaluate_identifiability(
     pred_loss = _weighted_mean(pred_losses, batch_weights)
     logit_penalty = _weighted_mean(logit_penalties, batch_weights)
     weighted_logit = lambda_logit * logit_penalty
-    constraint_loss = pred_loss + weighted_logit  # Eq. 13, raw units
+    # Hybrid §4.3 dual form, scalarised: the bound covers the teacher-forced
+    # AND rollout errors. τ is calibrated on exactly this number.
+    raw_rollout = _weighted_mean(rollout_losses, batch_weights) if rollout_losses else 0.0
+    rollout_loss = lambda_roll * raw_rollout  # the term as it enters the bound
+    constraint_loss = pred_loss + rollout_loss + weighted_logit  # raw units
     metrics = {
         "pred_loss": pred_loss,
+        "rollout_loss": rollout_loss,
         "mean_abs_logit": _weighted_mean(mean_abs_logits, batch_weights),
         "gate_entropy": _weighted_mean(gate_entropies, batch_weights),
         "constraint_loss": constraint_loss,

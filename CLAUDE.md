@@ -3,14 +3,20 @@
 PyTorch research codebase for Jesse's paper (`sources/my_paper.pdf`). SPARTAN predictor
 (`sources/SPARTAN.pdf`, no public code) inside a JEPA, with the bounce identifiability
 experiment replicated from Baumgartner et al. (`sources/dynamical_system.pdf`).
-Settled design decisions live in `docs/decisions.md` (D1–D30) and BIND all work.
+Settled design decisions live in `docs/decisions.md` (D1–D34) and BIND all work.
 Subagent roster and shared conventions: `.claude/agents/README.md`.
 
-**STATUS: Experiment 1 works — the mechanisms are confirmed (D30, 2026-07-25, run 7cq3h2ur).**
-Sparsification prunes the graph AND recovers the masses: `mcc` 0.948, `shd` 4.81,
-`path_density` 0.223, L_path 12.3, zero skipped steps in 300k. τ=0.02 was a TEST value, not the
-§6.1.3 τ=1.0×dense — fine here, because Experiment 1 is a mechanism check, not the main
-experiment. D30 has the reference trajectory. Current work moves to Experiment 2.
+**STATUS: Experiment 1's mechanisms are confirmed, but the OBJECTIVE CHANGED on 2026-07-27.**
+Under the pure teacher-forced objective, sparsification pruned the graph AND recovered the
+masses (D30, run 7cq3h2ur): `mcc` 0.948, `shd` 4.81, `path_density` 0.223, L_path 12.3, zero
+skipped steps in 300k, at τ=0.02 (a TEST value, ~1.5–2× dense, not the §6.1.3 τ=1.0×dense).
+
+**D34 replaced that objective with the HYBRID one: teacher forcing PLUS a full-window K=30
+autoregressive rollout, with the rollout inside the dual constraint.** Consequences that bite
+immediately: τ is on a NEW SCALE and every pre-D34 τ (0.02 included) is void; D30's four-phase
+trajectory was measured pre-hybrid so its NUMBERS are not comparable (its structure should be);
+and no full 300k hybrid run exists yet — only 1500-step CPU smokes. Treat the first hybrid run
+as unexplored territory with a known-good shape, not as a repeat of 7cq3h2ur.
 
 ## Non-negotiable working rules
 - **Verify against the paper, not the name.** Never state a name-based or memory-based guess
@@ -24,13 +30,18 @@ experiment. D30 has the reference trajectory. Current work moves to Experiment 2
   run finish before checking the first two eval points.
 
 ## Run-health signatures (states regime, bounce)
-**The reference is now MEASURED, not inferred: run `7cq3h2ur` (D30).** Compare any new sparse
-run against its four phases rather than against a static checklist — the metrics are supposed to
-move a long way, and most "failures" reported before D30 were phase 1 mistaken for death.
+**Reference run `7cq3h2ur` (D30) — measured under the PRE-D34 pure-TF objective.** Its four
+phases are a property of the GECO dual and should survive the hybrid change; its NUMBERS should
+not be expected to (c now carries λ_roll·L_roll, so τ, `sparsity/constraint` and the λ
+trajectory are all on a new scale). Compare a new run against the SHAPE below, not the values —
+the metrics are supposed to move a long way, and most "failures" reported before D30 were
+phase 1 mistaken for death. Step ranges assume 300k steps and will shift with the extra term.
 1. **Saturation (~0–75k):** c > τ, so `sparsity/lambda` CLIMBS (1e4 → 4.5e7), `path_density`
    → 1.0, `loss/sparsity` rises to ~2400, `shd` parks at ~42, `mcc` loiters 0.25–0.30.
    This is correct and looks exactly like the D26 never-prunes failure. Do not kill a run here.
-2. **Reversal (~75–90k):** `loss/pred` drops under τ; λ peaks and rolls over.
+2. **Reversal (~75–90k):** `sparsity/constraint` drops under τ; λ peaks and rolls over. Watch
+   the CONSTRAINT, not `loss/pred` — under D34 the bound is the scalarised sum, so `loss/pred`
+   can sit well below τ while c is still above it.
 3. **Pruning cascade (~90–155k):** λ falls ~3.5 orders, `path_density` 1.0 → 0.27,
    `loss/sparsity` 2400 → 25, `shd` 42 → 5, and **`mcc` climbs 0.46 → 0.935 inside this same
    window** — identification is concurrent with pruning, which is the experiment's whole claim.
@@ -39,45 +50,64 @@ move a long way, and most "failures" reported before D30 were phase 1 mistaken f
    and `attention/gate_entropy` FALLING (0.25 → 0.19) = gates committing, not sitting in the
    p≈0.5 limbo that killed D26.
 
-Point checks that still apply: `health/grad_norm` mostly < 1 (7cq3h2ur: max 1.42, mean 0.47) ·
-`health/skipped_steps` should now be **0** — post-D29 there is no BPTT, and the mid-density
-transit was crossed without a single skip, so ANY sustained skipping is a new bug, not the
-expected residual it was pre-D29 · `eval/path_density` strictly between 1/T and 1 · train
-`loss/pred` vs `eval/pred_loss` gap < ~3x, and at 100k clips eval should be BETTER than train
-(0.0142 vs 0.019); a large gap the other way = memorization (run jkslgj4o 2026-07-19: 14x gap
-at num_clips=4000 — rescale `data.num_clips` whenever capacity or steps change).
+Point checks that still apply: `health/grad_norm` — 7cq3h2ur (pure TF) ran max 1.42 / mean 0.47;
+the hybrid's 1500-step smokes ran max 4.02 (K=10) and 4.43 (K=30), so **a few units is normal
+now, not a warning** · `health/skipped_steps` should be **0**: the D34 smokes crossed 1500 steps
+with zero skips at both K, so sustained skipping is a real signal, though unlike pre-D34 there
+IS a BPTT chain (30 steps deep) that could in principle produce one · `eval/path_density`
+strictly between 1/T and 1 · `loss/rollout` vs `loss/pred`: started at ~1.5× in the smoke; if
+the rollout share runs away, τ has become a rollout-only bound with all the slack in L_TF —
+that is a λ_roll question, not a K question · train `loss/pred` vs `eval/pred_loss` gap < ~3x,
+and at 100k clips eval should be BETTER than train (0.0142 vs 0.019); a large gap the other way
+= memorization (run jkslgj4o 2026-07-19: 14x gap at num_clips=4000 — rescale `data.num_clips`
+whenever capacity or steps change).
 
-Failure catalog. **#1 and #2 are LIVE. #3–#5 are structurally unreachable in Experiment 1**
-(no regularizer, no rollout, no gate-noise chaining post-D29) — kept as history, and re-check
-them if a later experiment reintroduces a regularizer or a moving target:
-1. **Logit-penalty explosion** (LIVE; run n5zq9nct, 2026-07-11): loss/logit ≫ loss/pred, grad
+Failure catalog — BOTH LIVE (the retired rollout/regularizer entries were pruned 2026-07-27;
+they were pure-rollout or VISReg-era runs that predate the current numerics and objective, see
+D34 and git history if ever needed):
+1. **Logit-penalty explosion** (run n5zq9nct, 2026-07-11): loss/logit ≫ loss/pred, grad
    spikes 1e5–1e15, lambda railed at 1e6 → fixed by 1/√d on gate logits + masked-softmax
    numerics + constraint_loss calibration (commit 55b5282; Claude memory
    `project-spartan-logit-stability`).
-2. **Empty-graph collapse** (LIVE; run qqye6ug1, 2026-07-12): graph pruned to identity
+2. **Empty-graph collapse** (run qqye6ug1, 2026-07-12): graph pruned to identity
    (density = 1/T exactly), param→state edges dead, `mcc` at the noise floor, `shd` ≈ 2.7 —
    i.e. the SECOND-BEST SHD is total failure. Full diagnosis in `docs/audits/2026-07-12-*.md`.
    Verified drivers: τ slack converted into gate-closure depth by the logit term INSIDE the
    constraint (F-9), τ calibrated on the gated model rather than a true dense one (F-8), and a
-   dual step crossing its range in ~2k steps (F-10). D30 shows the cure in practice: a τ the
-   dense model actually beats, λ_logit small enough to leave commitment budget, and patience
-   through phase 1.
-3. *(retired for Exp 1)* **Scale collapse via weak lambda_reg** — target embeddings shrink to
-   satisfy the constraint; VISReg at lambda_reg=1.0 was the anchor.
-4. *(retired for Exp 1)* **Zombie freeze via finite blow-up** (run 7wupt6pw, 2026-07-17):
-   Tp=30 rollout amplified a grad spike to a FINITE ~1e30 MSE that passed the isfinite guard,
-   BPTT overflowed, grad_norm = inf, clip multiplied all grads by max_norm/inf = 0 → weights
-   frozen while the run "finished". Signature: byte-identical eval rows.
-5. *(retired for Exp 1)* **Mid-density gradient detonation** (runs 0ta5ymcw/u94wqvcb,
-   2026-07-17): 60 i.i.d. hard-mask resamplings in one backward graph made the step-Jacobian
-   product heavy-tailed at density 0.55–0.7. Fixed by D19, then deleted with the rollout.
+   dual step crossing its range in ~2k steps (F-10). D30 showed the cure: a τ the dense model
+   actually beats, λ_logit small enough to leave commitment budget, and patience through
+   phase 1. Note the logit term stays inside the constraint by design — that is Baumgartner
+   Eq. 9, not an oversight (D34).
 
-## Key mechanics (Experiment 1 == experiments.pdf §6.1–6.2 exactly, D29 2026-07-25)
-- The training objective is 30 TEACHER-FORCED ONE-STEP predictions per episode (Eq. 7/§6.2):
-  θ̂ pooled once from observations 0..29, every prediction anchored at the TRUE Z_t. There is
-  no rollout, no rollout_horizon knob, no gate-noise chaining. Objective = Eq. 40
-  (pred + λ_logit·logit + λ⁻¹·path); dual constraint = Eq. 13 (pred + λ_logit·logit, RAW
-  units) — no VISReg, no Hungarian matching, no variance normalization in Experiment 1.
+The D18 grad-spike guard stays in the loop regardless: a non-finite or absurd pre-clip grad norm
+rejects the whole update (optimizer AND dual), and persistent skipping raises. Its origin was a
+finite ~1e30 loss that passed `isfinite`, overflowed the backward pass to grad_norm = inf, and
+let clipping multiply every gradient by zero — a run that "finished" 230k frozen steps with
+byte-identical eval rows. That signature is worth recognising now that BPTT exists again.
+
+## Key mechanics (Experiment 1, hybrid objective — D34 2026-07-27)
+- **The objective has TWO prediction branches sharing one θ̂** (pooled once from observations
+  0..29). Hybrid write-up Eq. 36, dual form:
+
+      L = L_TF + λ_roll·L_roll + λ_logit·L_logit + λ⁻¹·L_path
+      c = L_TF + λ_roll·L_roll + λ_logit·L_logit  ≤  τ      (path penalty excluded)
+
+  `L_TF` (Eq. 32/39) = 30 teacher-forced one-step predictions, each anchored at the TRUE Z_t,
+  t ∈ I_TF = {29,…,58}. `L_roll` (Eq. 35) = ONE autoregressive chain anchored at the true Z_29
+  and rolled to Z_59 (K=30, fixed anchor, no sampling), every prefix supervised. w_1 = 0 always
+  — at k=1 the chain recomputes the TF term at t=29 — and the remaining w_k are uniform,
+  normalised so K⁻¹Σw_k = 1, making L_roll a MEAN per-step error so λ_roll survives a change of
+  K. λ_roll = 1. K=30 fits the existing 60-step clips exactly: **no preload change.**
+  No VISReg, no Hungarian matching, no variance normalization in Experiment 1.
+- **Both prediction terms AND the logit term sit inside the bound, and that is Baumgartner, not
+  a liberty.** Their Eq. 9 (p7) is `min L_path s.t. L_rec + L_KL + L_logit ≤ L*` (L_KL absent
+  for us: no cVAE), and their `L_rec` reconstructs Eq. 2's autoregressive trajectory, so a
+  rollout under the bound moves TOWARD their formulation. §4.3's "bounds" (plural) are
+  scalarised into one, keeping a single dual variable and a single τ.
+- **The eval harness must mirror the training constraint exactly.** τ is calibrated on
+  `evaluate_identifiability`'s `constraint_loss`; it reads `rollout_len`/`lambda_roll` from the
+  same config keys the trainer uses. Changing either on one side alone silently invalidates τ.
+  This is the most breakable thing in the design.
 - Model: `ParameterEncoder` (Eqs. 16–26: relational attention per timestep FIRST, then
   per-track temporal pooling, then a bare scalar head) + `Spartan` (Eqs. 27–37) with one
   FIXED non-trainable track key κ_i shared by state and parameter token i (buffer,
@@ -87,19 +117,22 @@ them if a later experiment reintroduces a regularizer or a moving target:
   numerical knob. λ₀ = 1e6 is the write-up's value and the code default; D30 used 1e4, which is
   safe precisely BECAUSE the dual is unclamped — λ₀ only sets how far phase 1 has to climb
   before the constraint binds (it rose to 4.5e7 anyway). Pre-D29 runs are NOT comparable.
-- **Working configuration (D30, verified): τ = 0.02, λ_logit = 1e-5, λ₀ = 1e4, α = 2e-2.**
-  Start here. τ=0.02 is a test value (~1.5–2× the dense constraint, so the run had slack), not
-  a protocol number — any reportable τ must carry its provenance.
-- Protocol τ (for the confirmatory table) = 1.0 × the held-out `constraint_loss` of ONE
-  converged full-length dense run per architecture/seed (never a short reference — v2 failure;
-  never the gated model with sparsity off — F-8). Launch gate: τ must sit below the token-local
-  floor 0.043645 + λ_logit·2.0 (reused measurement ku244l5e — the A≡0 constraint is
-  parameter-encoder-invariant; the 8-seed confirmatory protocol retrains it).
+- **Working configuration: λ_logit = 1e-5, λ_roll = 1.0, K = 30, λ₀ = 1e4, α = 2e-2.** τ is NOT
+  a number you carry over — **D30's τ=0.02 is void under the hybrid constraint** (c now includes
+  λ_roll·L_roll, which ran ~1.5× L_TF in the smoke). Let the pipeline calibrate it.
+- Protocol τ = 1.0 × the held-out `constraint_loss` of ONE converged full-length dense run per
+  architecture/seed, computed with the IDENTICAL rollout settings (never a short reference — v2
+  failure; never the gated model with sparsity off — F-8). The `--tau-max` token-local launch
+  gate was DELETED in D34: its floor (0.043645 + λ_logit·2.0, run ku244l5e) was measured under
+  the pure-TF constraint and is a different quantity now.
 - λ_logit comes from the label-free dense sweep (§6.1.3 rule, grid recentered to
   0…1e-3 low end): feasibility arithmetic (2026-07-25) says values above ~3e-5 make the
   gated constraint set EMPTY at raw scale — gate commitment costs λ_logit·(2cosh|l|−2)
   inside a τ that has zero slack. 1e-5 is confirmed to work; |logit| should GROW past ~3
   (7cq3h2ur ended at 3.87), and gates that stay near 0.3 mean the run never committed.
+  That arithmetic was done against the PURE-TF constraint. The hybrid τ is a larger absolute
+  number (it absorbs λ_roll·L_roll), so the ~3e-5 ceiling is if anything conservative now —
+  but it has not been recomputed, so treat it as an untested bound rather than a measured one.
 - Gate/penalty logits are the SCALED q·k/√D_sp — now codified in the write-up (Eq. 31).
 - Path matrix entries are path COUNTS (∏(A_l+I)); `path_density` = fraction of entries ≥ 0.5;
   identity-only matrix ⇒ density = 1/T (T=10 for 5-ball states regime ⇒ 0.100 exactly).
@@ -134,20 +167,30 @@ them if a later experiment reintroduces a regularizer or a moving target:
   - Exp 3 (visual ctx, EMA target): `sbatch --account=<P> scripts/isambard_exp3_pipeline.sbatch TAG LAMBDA_LOGIT [SEED] [STEPS]`
   Configs: `bounce_baumgartner` / `bounce_visual_to_state` / `bounce_visual_to_visual`. All three share
   the SAME physics preload; the visual ones render frames from it on the fly.
-- **Reproduce the D30 result** (~1.6 h on one GPU, 300k steps):
-  `bash scripts/isambard_main_only.sbatch <tag> 0.02 1e-5 300000 <seed> train.sparsity_lambda_init=1e4`
-  (`bash`, not `sbatch`, when already inside an `srun --pty` allocation).
+- **Reproduce the PRE-D34 D30 result** (~1.6 h on one GPU, 300k steps) — needs the rollout
+  branch switched off, since the objective changed underneath it:
+  `bash scripts/isambard_main_only.sbatch <tag> 0.02 1e-5 300000 <seed> train.sparsity_lambda_init=1e4 train.rollout_len=null`
+  (`bash`, not `sbatch`, when already inside an `srun --pty` allocation). WITHOUT
+  `rollout_len=null` this trains the hybrid objective at a τ calibrated for the old one.
 - Full pipeline: `bash scripts/run_bounce_example.sh --run-tag=X ...` (dense A≡1 same
   length as main → τ = 1.0× its held-out constraint_loss → sparse run → 5000-episode eval;
-  NO identity stage since D29 — pass `--tau-max` = the token-local floor instead;
-  `--calib-steps` only for smokes; other hydra overrides go to BOTH runs, D12).
-- Cheap stability smoke (~3 min, CPU): 1500–3000 steps via `Trainer` directly with
-  `data.num_clips=200` — see Claude memory for the pattern; healthy = grad_norm < 1 throughout.
+  NO identity stage since D29, NO `--tau-max` gate since D34; `--calib-steps` only for smokes;
+  other hydra overrides go to BOTH runs, D12).
+- Cheap stability smoke (~3–5 min, CPU): 1500–3000 steps via `Trainer` directly with
+  `data.num_clips=200` at paper geometry (clip_len 60, context_len 30) — see Claude memory for
+  the pattern. Healthy under the hybrid objective = **zero skipped steps and grad_norm of order
+  a few** (measured max 4.02 at K=10, 4.43 at K=30); the pre-D34 "< 1 throughout" rule was for
+  the pure-TF objective and is too strict now.
 - **NEVER regenerate `data/bounce_train_v2_100000.pt`.** The simulator is deterministic on a
   given machine but NOT across machines: regenerating the identical config on the Mac vs the
   server diverges chaotically (measured n=200: 194/200 episodes differ, max |delta| 3.4, and
   **26% get a different contact graph** — i.e. a different ground-truth causal graph). The file
   is the physics of record for D30 and for Experiment 2. Visual runs render frames FROM it.
+  Nuance if T ever has to grow (D34 does NOT need it — K=30 fits 60-step clips exactly):
+  LENGTHENING `clip_len` is a pure prefix EXTENSION, not a regeneration — measured n=40, first
+  60 states and 59 contacts bit-identical, max |delta| 0.0. It is still only safe as a NEW file
+  generated on the SAME machine as the existing one; `clip_len` is part of the preload identity,
+  so a mismatched run raises rather than silently truncating.
 - Plot an episode: `python scripts/plot_bounce_episode.py --condition states|visual [--show-collision-radii]`
   (`visual` shows the real 64x64 encoder input). Note the renderer puts y DOWN (`grid_y` indexes
   image rows); the committed `data/bounce_v2_episode_00000.png` was drawn y-up, so it is
@@ -155,4 +198,7 @@ them if a later experiment reintroduces a regularizer or a moving target:
 - Pull W&B history: `wandb.Api().run('jesse-hoekstra-university-of-oxford/sparse-causal-jepa/<id>').scan_history(...)`
   (credentials in ~/.netrc). Runs execute on the NFS server — make sure it has the current
   commit; `git_sha` is recorded in each run's config.
-- Tests: `.venv/bin/python -m pytest tests/ -q` (82 tests, ~1 min, must stay green).
+- Tests: `.venv/bin/python -m pytest tests/ -q` (135 tests, ~15 s, must stay green).
+  `tests/test_rollout.py` pins the hybrid branch: that it is genuinely autoregressive (a
+  degenerate rollout that quietly became K teacher-forced steps would still train and still
+  look healthy), Eq. 35's normalisation, w_1 = 0, and train/eval computing the same targets.

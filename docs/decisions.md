@@ -380,3 +380,68 @@ but not calibrated); §6.7's parameter interventions; the frozen held-out state 
 and the "incremental information beyond the state branch" check; and the §6.4 readiness suite.
 The ladder's gating still applies — Experiment 2 must pass its continuation gate before
 Experiment 3 is interpreted.
+
+## D34 — Experiment 1 objective is HYBRID: teacher forcing + a full-window autoregressive rollout, both inside the constraint (decided 2026-07-27, Jesse)
+
+D29 made Experiment 1 a pure teacher-forced one-step objective and deleted the rollout. D34
+puts a rollout back, on a different footing: it is now a SECOND branch alongside teacher
+forcing, not a replacement for it, and it is inside the dual constraint.
+
+**Objective (hybrid write-up Eq. 36, dual form).**
+
+    sparse:  L = L_TF + lambda_roll*L_roll + lambda_logit*L_logit + lambda^-1 * L_path
+    bound:   c = L_TF + lambda_roll*L_roll + lambda_logit*L_logit  <=  tau
+
+`L_TF` is unchanged: 30 teacher-forced one-step predictions, every one anchored at the true
+Z_t (Eq. 32/39). `L_roll` is Eq. 35 — ONE autoregressive chain per episode anchored at the
+true Z_29 and rolled out over the whole prediction window to Z_59, with every prefix
+k = 1..K supervised (Remark 4's difference from V-JEPA 2-AC, which supervises only the
+terminal state). Both branches share the single theta-hat pooled from observations 0..29;
+that sharing is the point, not an optimisation (§4.4(ii)).
+
+**K = 30, one fixed anchor at t = Tpar-1.** The write-up samples the start; we do not. A fixed
+anchor makes train and eval compute the same quantity, which matters because tau is calibrated
+on the eval constraint, and K=30 covers the entire window from one chain, so no sampling is
+needed for coverage. Tpar-1+K = 29+30 = 59 = T-1 fits the EXISTING 60-step clips exactly:
+**no preload regeneration** (measured: lengthening clip_len is a pure prefix extension, first
+60 states/59 contacts bit-identical, but that is not needed here).
+
+**w_1 = 0 always, remaining weights uniform and normalised so K^-1 sum_k w_k = 1.** At k=1 the
+rollout recomputes f_gamma(Z_29, theta-hat) against Z_30 — bit-for-bit the teacher-forced term
+at t=29, differing only by the gate draw. The anchor is structurally inside
+I_TF = {Tpar-1,...,T-2}, so the write-up's coverage condition holds via L_TF without it.
+Normalising keeps L_roll a MEAN per-step error, so lambda_roll does not silently rescale the
+constraint when K changes. Eq. 35 leaves w_k free; uniform is our choice, because §4.4(ii)
+requires only that every prefix be constrained and any other profile would be an unmotivated
+hyperparameter. lambda_roll = 1.
+
+**The rollout belongs INSIDE the constraint, and so does the logit term — this is Baumgartner,
+verified.** Their Eq. 9 (p7) is `min L_path s.t. L_rec + L_KL + L_logit <= L*`: the logit loss
+is inside the bound, and L_KL is absent for us only because Experiment 1 has no cVAE. Their
+`L_rec` reconstructs p_psi(tau | theta-hat, x_0) where Eq. 2 defines tau as the AUTOREGRESSIVE
+trajectory [x_0, f(x_0), f o f(x_0), ...]. Their reconstruction target is itself a
+full-trajectory rollout, so bounding L_roll moves toward their formulation; pure teacher
+forcing was the deviation. §4.3 specifies "upper bounds on the teacher-forced and rollout
+errors" (plural); we scalarise into ONE bound with the same lambda_roll that weights the
+objective, keeping one dual variable and one tau.
+
+**tau MUST be recalibrated.** c now carries L_roll, so every pre-D34 tau (including D30's 0.02)
+is on a different scale and is NOT transferable. The pipeline recalibrates automatically because
+`scjepa.eval.harness` computes the identical scalarised constraint from the same config keys —
+that mirroring is the single most breakable thing in this design. Changing `rollout_len` or
+`lambda_roll` on one side alone silently invalidates tau.
+
+**The token-local launch gate (`--tau-max`) is DELETED.** It compared tau against a floor
+(0.043645 + lambda_logit*2.0, run ku244l5e) measured under the pure-TF constraint, which is a
+different quantity now.
+
+**Stability: measured, not argued.** 1500-step CPU smokes at paper geometry (T=60, Tpar=30,
+3 SPARTAN layers): K=10 gave grad_norm max 4.02, K=30 gave max 4.43, **zero skipped steps in
+both**. The per-k drift curve at K=30 SATURATES rather than compounding — error rises to ~0.11
+at k~19 and falls back to 0.092 by k=30 (ratio k=30/k=1 = 1.35), because five balls in a box is
+a compact bounded state space. Catalog failures #4/#5 were pure-rollout runs with NO teacher
+forcing and predate the masked-softmax/denominator numerics fixes, so they do not transfer.
+
+**Still unmeasured:** no full 300k hybrid run exists. D30's four-phase trajectory was recorded
+under the pure-TF objective; the phase STRUCTURE should survive (it is a property of the GECO
+dual) but none of its numbers are comparable.

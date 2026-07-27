@@ -48,6 +48,9 @@ def tiny_config(out_dir: Path, steps: int = 3, **overrides: object) -> TrainConf
         sparsity_tau=0.5,
         context_len=2,
         lambda_logit=1e-3,
+        # T=4, Tpar=2: the chain starts at t=1 and its last target is S̄_3,
+        # so K=2 keeps the hybrid branch live in every training test.
+        rollout_len=2,
         log_every=1,
         checkpoint_every=1000,
         out_dir=str(out_dir),
@@ -78,6 +81,7 @@ def test_training_smoke(tmp_path: Path) -> None:
     for key in (
         "loss/total",
         "loss/pred",
+        "loss/rollout",
         "loss/logit",
         "loss/sparsity",
         "sparsity/constraint",
@@ -87,9 +91,10 @@ def test_training_smoke(tmp_path: Path) -> None:
     ):
         assert key in metrics
         assert torch.isfinite(torch.tensor(metrics[key])), key
-    # Eq. 13: the constraint excludes the path penalty.
+    # Hybrid §4.3 dual form: the bound covers the teacher-forced AND rollout
+    # errors, scalarised, and still excludes the path penalty.
     assert metrics["sparsity/constraint"] == pytest.approx(
-        metrics["loss/pred"] + metrics["loss/logit"], rel=1e-6
+        metrics["loss/pred"] + metrics["loss/rollout"] + metrics["loss/logit"], rel=1e-6
     )
     assert (tmp_path / "last.pt").exists()
 
@@ -100,7 +105,8 @@ def test_references_train_without_path_penalty(tmp_path: Path) -> None:
         trainer = Trainer(model, tiny_dataset(), tiny_config(tmp_path, sparsity_enabled=False))
         metrics = trainer.train()
         assert metrics["loss/total"] == pytest.approx(
-            metrics["loss/pred"] + metrics["loss/logit"], rel=1e-6
+            metrics["loss/pred"] + metrics["loss/rollout"] + metrics["loss/logit"],
+            rel=1e-6,
         )
         assert metrics["sparsity/lambda"] == pytest.approx(1e6)
 
@@ -146,7 +152,7 @@ def test_sparsity_ablation_toggle(tmp_path: Path) -> None:
     metrics = trainer.train()
     assert metrics["sparsity/lambda"] == pytest.approx(1e6)
     assert metrics["loss/total"] == pytest.approx(
-        metrics["loss/pred"] + metrics["loss/logit"], rel=1e-6
+        metrics["loss/pred"] + metrics["loss/rollout"] + metrics["loss/logit"], rel=1e-6
     )
 
 
@@ -170,6 +176,7 @@ def test_periodic_eval_logs_metrics(tmp_path: Path) -> None:
     assert eval_records
     expected_eval_keys = {
         "eval/pred_loss",
+        "eval/rollout_loss",
         "eval/mean_abs_logit",
         "eval/gate_entropy",
         "eval/constraint_loss",
@@ -198,3 +205,14 @@ def test_periodic_eval_logs_metrics(tmp_path: Path) -> None:
 def test_eval_requires_dataset(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="eval_every"):
         Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path, eval_every=1))
+
+
+def test_dataset_smaller_than_one_batch_raises(tmp_path: Path) -> None:
+    """drop_last=True on a too-small dataset yields ZERO batches.
+
+    Before the guard this spun through empty epochs forever — regenerating
+    data, never stepping, never erroring — so a misconfigured run looked like
+    a slow one. It must fail at construction instead.
+    """
+    with pytest.raises(ValueError, match="yields no batches"):
+        Trainer(tiny_model(), tiny_dataset(4), tiny_config(tmp_path, batch_size=8))

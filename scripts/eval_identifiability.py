@@ -19,7 +19,7 @@ import matplotlib
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from scjepa.eval import evaluate_identifiability
+from scjepa.eval import IdentifiabilityReport, evaluate_identifiability
 from scjepa.training.factory import build_dataset, build_model
 
 matplotlib.use("Agg")
@@ -62,6 +62,9 @@ def main() -> None:
     eval_cfg = OmegaConf.merge(cfg.data, {"num_clips": args.episodes})
     assert isinstance(eval_cfg, DictConfig)
     dataset = build_dataset(eval_cfg, seed_offset=args.seed_offset)
+    # The rollout settings MUST come from the run's own config: tau is
+    # calibrated on the constraint this reports, so a mismatch between the
+    # dense reference and the sparse run would silently rescale the bound.
     report = evaluate_identifiability(
         model,
         dataset,
@@ -69,6 +72,8 @@ def main() -> None:
         device=args.device,
         context_len=cfg.train.get("context_len", None),
         lambda_logit=cfg.train.get("lambda_logit", 0.0),
+        rollout_len=cfg.train.get("rollout_len", None),
+        lambda_roll=float(cfg.train.get("lambda_roll", 0.0)),
     )
 
     print(f"identifiability report for {args.run_dir} (step {payload['step']}):")
@@ -142,6 +147,54 @@ def main() -> None:
     grid_path = args.run_dir / "recovery_grid.png"
     grid_fig.savefig(grid_path, dpi=150)
     print(f"  recovery grid saved to {grid_path}")
+
+    _log_to_wandb(args.run_dir, cfg, report, grid_path, int(payload["step"]), args.seed_offset)
+
+
+def _log_to_wandb(
+    run_dir: Path,
+    cfg: DictConfig,
+    report: object,
+    grid_path: Path,
+    step: int,
+    seed_offset: int,
+) -> None:
+    """Attach the final eval + recovery grid to the TRAINING run's W&B page.
+
+    ``scripts/train.py`` writes ``wandb_run_id.txt`` next to the checkpoint, so
+    this resumes that run rather than creating a detached second entry. Silently
+    does nothing when the run was not tracked (``wandb.enabled=false``, CI, or
+    an older run dir without the id file) — evaluation must never fail because
+    of logging.
+    """
+    id_file = run_dir / "wandb_run_id.txt"
+    if not cfg.get("wandb", {}).get("enabled", False) or not id_file.exists():
+        return
+    try:
+        import wandb
+    except ImportError:
+        print("  wandb not installed — skipping upload")
+        return
+    assert isinstance(report, IdentifiabilityReport)
+    try:
+        run = wandb.init(
+            project=cfg.wandb.project,
+            id=id_file.read_text().strip(),
+            resume="allow",
+            mode=cfg.wandb.get("mode", "online"),
+        )
+        # Prefix distinguishes the 5000-episode final numbers from the periodic
+        # eval/* curves logged during training on a much smaller sample.
+        payload: dict[str, object] = {
+            f"final/{key}": value for key, value in {**report.metrics, **report.diagnostics}.items()
+        }
+        payload["final/recovery_grid"] = wandb.Image(str(grid_path))
+        payload["final/eval_seed_offset"] = seed_offset
+        run.log(payload, step=step)
+        run.finish()
+        print(f"  recovery grid + final metrics logged to W&B run {run.id}")
+    except Exception as error:  # logging must never fail the evaluation
+        print(f"  W&B upload skipped ({type(error).__name__}: {error})")
 
 
 if __name__ == "__main__":

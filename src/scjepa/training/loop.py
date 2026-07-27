@@ -1,18 +1,29 @@
 """Training loop for the state-to-state regime (experiments.pdf §6.1.3 / §6.2).
 
-Objective per step, exactly Eq. 40:
+Hybrid objective per step (hybrid write-up Eq. 36, dual form):
 
-    sparse:          L = L_pred + λ_logit·L_logit + λ⁻¹·L_path
-    dense/identity:  L = L_pred + λ_logit·L_logit          (no path penalty)
+    sparse:          L = L_TF + λ_roll·L_roll + λ_logit·L_logit + λ⁻¹·L_path
+    dense/identity:  L = L_TF + λ_roll·L_roll + λ_logit·L_logit  (no path penalty)
 
-with L_pred the aligned raw-state MSE (Eq. 39) over the K teacher-forced
-transitions and the dual constraint (Eq. 13)
+with L_TF the aligned raw-state MSE (Eq. 32/39) over the K teacher-forced
+transitions, L_roll the dense K-step autoregressive rollout term (Eq. 35), and
+the dual constraint
 
-    c = L_pred + λ_logit·L_logit ≤ τ
+    c = L_TF + λ_roll·L_roll + λ_logit·L_logit ≤ τ
 
-driving the GECO controller — c excludes the path penalty, and no
-representation regularizer exists in this experiment. Optimizer: Adam at the
-SPARTAN default learning rate over all trainable parameters jointly.
+driving the GECO controller. §4.3 specifies the dual form as minimising
+sparsity subject to upper bounds on the teacher-forced AND rollout errors; that
+is scalarised here into ONE bound with the same λ_roll that weights the
+objective, so a single dual variable and a single τ remain. c still excludes
+the path penalty, and no representation regularizer exists in this experiment.
+
+CRITICAL: τ is calibrated as 1.0x the held-out c of a dense reference, so
+``scjepa.eval.harness`` must compute c with the identical rollout settings —
+changing ``rollout_len``/``lambda_roll`` on one side alone silently
+invalidates τ. Both are read from the same config keys and passed through.
+
+Optimizer: Adam at the SPARTAN default learning rate over all trainable
+parameters jointly.
 
 Run infrastructure retained from the audited loop (health, not objective):
 D18 gradient-spike skip guard (a finite ~1e30 loss once froze a run silently
@@ -32,7 +43,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
 from scjepa.eval.harness import evaluate_identifiability
-from scjepa.losses import aligned_mse
+from scjepa.losses import aligned_mse, rollout_weights, weighted_rollout_mse
 from scjepa.models.state_to_state import StateToStateModel, TransitionOutput
 from scjepa.training.lagrangian import SparsityLagrangian
 
@@ -73,6 +84,17 @@ class TrainConfig:
     sparsity_lambda_init: float = 1e6  # §6.1.3: initial path weight 10⁻⁶
     sparsity_momentum: float = 0.99
     lambda_logit: float = 0.0  # selected by the dense sweep (§6.1.3); 0 disables
+    # Hybrid rollout branch (write-up §4.2). rollout_len = K in Eqs. 33-35;
+    # None disables the branch and recovers the pure teacher-forced objective.
+    # lambda_roll weights L_roll in BOTH the objective and the constraint
+    # (Eq. 36 dual form), so it must be identical in the dense τ-calibration
+    # run and the sparse run.
+    # 30 matches configs/experiment/bounce_baumgartner.yaml: a direct-Trainer
+    # smoke must exercise the SAME objective the real run trains, so this
+    # default tracks the experiment config rather than sitting below it.
+    # Episodes shorter than Tpar-1+K raise — set it explicitly for tiny configs.
+    rollout_len: int | None = 30
+    lambda_roll: float = 1.0
     seed: int = 0
     device: str = "cpu"
     context_len: int | None = None  # Tpar (the state-to-state regime: 30); None -> T-1
@@ -129,6 +151,23 @@ class Trainer:
         ).to(self.device)
         # ONE optimizer over everything trainable (P_η and f_gamma jointly).
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr)
+        # Eq. 35 weights w_k, built once (K is fixed for the run).
+        self.rollout_weights = (
+            rollout_weights(config.rollout_len, device=self.device)
+            if config.rollout_len is not None
+            else None
+        )
+        # The loader uses drop_last=True, so a dataset smaller than one batch
+        # yields ZERO batches. `_batches` would then spin through empty epochs
+        # forever — regenerating data, never stepping, never erroring. Fail here
+        # instead: the run is misconfigured, not slow.
+        batches_per_epoch = len(self._epoch_loader(0))
+        if batches_per_epoch == 0:
+            raise ValueError(
+                f"dataset yields no batches: {len(self._epoch_loader(0).dataset)} episodes "  # pyright: ignore[reportArgumentType]
+                f"with batch_size={config.batch_size} and drop_last=True. Raise "
+                "data.num_clips to at least the batch size, or lower train.batch_size."
+            )
         self.step = 0
         self.total_skips = 0  # D18: batches whose update was rejected
         self.consecutive_skips = 0
@@ -153,7 +192,10 @@ class Trainer:
     def _batches(self) -> Iterator[dict[str, Tensor]]:
         """Endless batch stream; fast-forwards within the epoch on resume."""
         first_loader = self._epoch_loader(0)
-        steps_per_epoch = max(len(first_loader), 1)
+        # steps_per_epoch >= 1 is guaranteed by __init__'s guard, so this is a
+        # plain length — NOT max(len, 1), which is what used to turn an empty
+        # loader into a silent infinite loop instead of an error.
+        steps_per_epoch = len(first_loader)
         epoch = self.step // steps_per_epoch
         skip = self.step % steps_per_epoch
         while True:
@@ -173,12 +215,34 @@ class Trainer:
     def _forward(self, batch: dict[str, Tensor]) -> TransitionOutput:
         """Run the model on one batch (the state-to-state regime: true states)."""
         states = batch["states"].to(self.device)
-        return self.model(states, context_len=self.config.context_len)
+        return self.model(
+            states,
+            context_len=self.config.context_len,
+            rollout_len=self.config.rollout_len,
+        )
+
+    def _rollout_loss(self, output: TransitionOutput) -> Tensor:
+        """Eq. 35; zero when the branch is off.
+
+        The visual regimes reach this through the shared step but their outputs
+        carry no rollout fields, so they return the disabled path unchanged.
+        """
+        prediction = getattr(output, "rollout_prediction", None)
+        if prediction is None or self.rollout_weights is None:
+            return torch.zeros((), device=self.device)
+        target = output.rollout_target
+        assert target is not None
+        return weighted_rollout_mse(prediction, target, self.rollout_weights)
 
     def _constraint(
         self, pred_loss: Tensor, logit_loss: Tensor, output: TransitionOutput
     ) -> Tensor:
-        """Eq. 13: the dual constraint excludes the path penalty."""
+        """The dual constraint excludes the path penalty (Eq. 13).
+
+        ``pred_loss`` is the full prediction-side term the bound applies to,
+        i.e. L_TF + λ_roll·L_roll under the hybrid §4.3 dual form — the caller
+        scalarises the two bounds into one before calling this.
+        """
         del output
         return (pred_loss + logit_loss).detach()
 
@@ -191,19 +255,24 @@ class Trainer:
         return {}
 
     def _train_step(self, batch: dict[str, Tensor]) -> dict[str, float]:
-        """One optimizer step over Eq. 40; returns scalar metrics."""
+        """One optimizer step over the hybrid Eq. 36; returns scalar metrics."""
         output = self._forward(batch)
 
-        pred_loss = aligned_mse(output.prediction, output.target)  # Eq. 39
+        pred_loss = aligned_mse(output.prediction, output.target)  # L_TF, Eq. 32
+        # Eq. 36: both prediction branches enter the objective, and (dual form,
+        # §4.3) the same scalarised sum is what the bound applies to. Only the
+        # WEIGHTED term is ever reported — it is the quantity in the objective.
+        rollout_loss = self.config.lambda_roll * self._rollout_loss(output)  # Eq. 35
         logit_loss = self.config.lambda_logit * output.logit_penalty
-        total = pred_loss + logit_loss
+        total = pred_loss + rollout_loss + logit_loss
         if self.config.sparsity_enabled:
             total = total + self.lagrangian.penalty_weight * output.sparsity
-        constraint = self._constraint(pred_loss, logit_loss, output)
+        constraint = self._constraint(pred_loss + rollout_loss, logit_loss, output)
 
         if not torch.isfinite(total):
             raise RuntimeError(
                 f"non-finite loss at step {self.step}: pred={pred_loss.item():.4g} "
+                f"rollout={rollout_loss.item():.4g} "
                 f"sparsity={output.sparsity.item():.4g}"
             )
 
@@ -236,26 +305,38 @@ class Trainer:
                 self.lagrangian.update(constraint)
 
         num_decoded = output.prediction.shape[1]
-        return self._extra_metrics(output) | {
-            "loss/total": total.item(),
-            "loss/pred": pred_loss.item(),
-            "loss/logit": logit_loss.item(),
-            "loss/sparsity": output.sparsity.item(),
-            "attention/logit_penalty": output.logit_penalty.item(),
-            "attention/mean_abs_logit": output.mean_abs_logit.item(),
-            "attention/gate_entropy": output.gate_entropy.item(),
-            "sparsity/constraint": constraint.item(),
-            "sparsity/lambda": float(torch.exp(self.lagrangian.log_lambda).item()),
-            # rho_path over the decoded state rows (Eq. 11); full-token density
-            # stays a diagnostic (parameter rows are not decoded).
-            "sparsity/path_density": (output.path_matrix[:, :num_decoded] >= 0.5)
-            .float()
-            .mean()
-            .item(),
-            "sparsity/path_density_full": (output.path_matrix >= 0.5).float().mean().item(),
-            "health/grad_norm": float(grad_norm.item()),
-            "health/skipped_steps": float(self.total_skips),
-        }
+        # λ_roll·L_roll, as it enters the objective. Emitted ONLY when the branch
+        # is live: the visual regimes share this step but carry no rollout, and a
+        # constant-zero curve is noise on their W&B pages.
+        rollout_metric = (
+            {"loss/rollout": rollout_loss.item()}
+            if getattr(output, "rollout_prediction", None) is not None
+            else {}
+        )
+        return (
+            self._extra_metrics(output)
+            | rollout_metric
+            | {
+                "loss/total": total.item(),
+                "loss/pred": pred_loss.item(),
+                "loss/logit": logit_loss.item(),
+                "loss/sparsity": output.sparsity.item(),
+                "attention/logit_penalty": output.logit_penalty.item(),
+                "attention/mean_abs_logit": output.mean_abs_logit.item(),
+                "attention/gate_entropy": output.gate_entropy.item(),
+                "sparsity/constraint": constraint.item(),
+                "sparsity/lambda": float(torch.exp(self.lagrangian.log_lambda).item()),
+                # rho_path over the decoded state rows (Eq. 11); full-token density
+                # stays a diagnostic (parameter rows are not decoded).
+                "sparsity/path_density": (output.path_matrix[:, :num_decoded] >= 0.5)
+                .float()
+                .mean()
+                .item(),
+                "sparsity/path_density_full": (output.path_matrix >= 0.5).float().mean().item(),
+                "health/grad_norm": float(grad_norm.item()),
+                "health/skipped_steps": float(self.total_skips),
+            }
+        )
 
     def train(self) -> dict[str, float]:
         """Run until ``config.steps``; returns the final step's metrics."""
@@ -295,6 +376,9 @@ class Trainer:
             device=self.config.device,
             context_len=self.config.context_len,
             lambda_logit=self.config.lambda_logit,
+            # Must mirror training exactly — this is the quantity τ bounds.
+            rollout_len=self.config.rollout_len,
+            lambda_roll=self.config.lambda_roll,
         )
         self.model.train()  # the harness switches to eval mode
         # Every run mode logs the FULL eval key set (2026-07-25, Jesse): in the
