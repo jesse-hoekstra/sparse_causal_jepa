@@ -39,6 +39,7 @@ train:
   # The visual-to-visual regime (no second branch) but far heavier than the state-to-state regime's 16.
   batch_size: 8
   context_len: 30 # Tpar (Eq. 90); I = {29, ..., 58}
+  rollout_len: null # hybrid rollout branch is Experiment 1 only for now
   sparsity_tau: 0.75 # placeholder; the pipeline recalibrates tau_2 from the dense run
   # Frames are drawn per batch, so render in worker processes: inline it would
   # be SERIAL with the optimizer (~1.7 h over 300k steps at batch 8). Episodes

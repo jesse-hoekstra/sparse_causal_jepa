@@ -1,7 +1,30 @@
-# Base config for scripts/train.py (Hydra) — Experiment 1 (experiments.pdf §6.2).
-# These defaults are a tiny CPU sanity scale; the paper-scale settings live in
-# experiment/bounce_baumgartner.yaml:
+# ROOT config for scripts/train.py — Hydra loads this by name, then overlays an
+# experiment preset on top (`defaults: [_self_, experiment: null]`, _self_ FIRST):
 #   python scripts/train.py experiment=bounce_baumgartner ...
+#
+# Read this carefully before assuming a value lives in the experiment preset.
+# Only the RUN SIZE below is a tiny CPU sanity scale (steps, batch_size,
+# num_clips, clip_len, context_len, rollout_len). Everything else here is the
+# REAL setting and is inherited unchanged by the paper-scale runs:
+#   * the entire `model:` section — bounce_baumgartner overrides NONE of it, so
+#     spartan_embed_dim/layers/num_slots here ARE the paper architecture;
+#   * the physics in `data:` — num_balls, radius, mass_normal, speed, ...;
+#   * the optimizer and dual in `train:` — lr, grad_clip, sparsity_step_size,
+#     sparsity_momentum, sparsity_lambda_init.
+#
+# TWO KEYS ARE MANDATORY (`???`) AND HAVE NO DEFAULT ON PURPOSE. Both are
+# per-run decisions whose wrong value is silent rather than loud, so Hydra is
+# made to refuse the run instead of picking for you:
+#   * `train.lambda_logit` — a default of 0 would disable the attention-logit
+#     penalty in BOTH the objective and the dual constraint. Choose it from the
+#     label-free dense sweep (scripts/isambard_logit_sweep.sbatch); pass 0.0
+#     explicitly to run the no-penalty ablation deliberately.
+#   * `train.sparsity_tau` — must be 1.0x the held-out constraint of a converged
+#     dense reference (§6.1.3), which only a pipeline can compute. It is read
+#     ONLY when `sparsity_enabled=true`, so dense/token-local reference stages
+#     run without supplying it.
+# Every run prints a RUN CONFIGURATION banner naming the source of each
+# decision-critical key, and `resolved_config.yaml` in the run dir is the record.
 
 defaults:
   - _self_
@@ -43,11 +66,19 @@ train:
   lr: 5.0e-5 # SPARTAN App. A.1 (Adam)
   grad_clip: 1.0
   sparsity_enabled: true # false: dense / token-local references
-  sparsity_tau: 0.1 # PLACEHOLDER — pipelines recalibrate per §6.1.3
+  sparsity_tau: ??? # MANDATORY: 1.0x a converged dense reference (§6.1.3).
+  # Read only when sparsity_enabled=true, so reference stages omit it.
   sparsity_step_size: 2.0e-2 # alpha, the one numerical knob the papers leave open
   sparsity_lambda_init: 1.0e6 # §6.1.3: lambda starts at 1e6 (path weight 1e-6)
   sparsity_momentum: 0.99 # moving average of c - tau
-  lambda_logit: 0.0 # selected by the label-free dense sweep (§6.1.3)
+  lambda_logit: ??? # MANDATORY: from the label-free dense sweep (§6.1.3).
+  # No default: 0.0 would silently disable the penalty in objective AND bound.
+  # Hybrid rollout branch (write-up §4.2). K in Eqs. 33-35; null disables it.
+  # lambda_roll weights L_roll in BOTH the objective and the dual constraint
+  # (Eq. 36 dual form) — the dense tau-calibration run and the sparse run must
+  # use identical values or tau means nothing.
+  rollout_len: 3 # tiny CPU scale (clip_len 8 / context_len 4); paper scale: 30
+  lambda_roll: 1.0
   seed: 0
   device: cpu
   context_len: 4 # Tpar; paper scale: 30 (Eq. 17)

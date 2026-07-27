@@ -93,6 +93,11 @@ known-first-party = ["scjepa"]
 [tool.ruff.lint.per-file-ignores]
 # Tests: docstrings on every test function add noise, not information.
 "tests/**" = ["D100", "D103", "D104"]
+# Same jaxtyping cause as the F722 ignore above, but for SINGLE-axis shape
+# strings (Float[Tensor, "j"]), which parse as a bare name and trip F821
+# instead. Scoped to this file so undefined names stay caught everywhere else;
+# pyright strict covers src/ regardless.
+"src/scjepa/losses/predictive.py" = ["F821"]
 
 # -------------------------------------------------------------- pyright -----
 [tool.pyright]

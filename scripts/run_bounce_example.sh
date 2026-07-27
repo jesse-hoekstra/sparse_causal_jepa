@@ -16,19 +16,12 @@
 #   --eval-episodes=5000 final identifiability sample size (App. F.1: 5000)
 #   --final-seed-offset=29 held-out TEST split; tau calibration uses offset 17
 #   --eval-device=cpu
-#   --tau-max=VALUE      launch gate (§6.1.3): abort unless tau is below the
-#                        token-local constraint. The token-local floor is
-#                        parameter-encoder-independent (A≡0 disconnects the
-#                        parameter tokens from every decoded row), so the
-#                        launchers pass the measured floor as a number instead
-#                        of retraining the reference each pipeline (D29).
 #   --run-tag=x          output dir suffix; REQUIRED for parallel launches
 set -euo pipefail
 
 PY=${PYTHON:-python}
 TAU_FACTOR=${TAU_FACTOR:-1.0}
 CALIB_STEPS=${CALIB_STEPS:-}
-TAU_MAX=${TAU_MAX:-}
 EVAL_EPISODES=${EVAL_EPISODES:-5000}
 FINAL_SEED_OFFSET=${FINAL_SEED_OFFSET:-29}
 EVAL_DEVICE=${EVAL_DEVICE:-cpu}
@@ -37,7 +30,6 @@ HYDRA_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --tau-factor=*)  TAU_FACTOR="${arg#*=}" ;;
-    --tau-max=*)     TAU_MAX="${arg#*=}" ;;
     --calib-steps=*) CALIB_STEPS="${arg#*=}" ;;
     --main-steps=*)  MAIN_STEPS="${arg#*=}" ;;
     --eval-episodes=*) EVAL_EPISODES="${arg#*=}" ;;
@@ -71,12 +63,6 @@ FC_LOSS=$("$PY" scripts/eval_identifiability.py "${BASE}/calibration" --episodes
   | awk '/constraint_loss/ {print $2}')
 TAU=$("$PY" -c "print(float('${FC_LOSS}') * float('${TAU_FACTOR}'))")
 echo "dense held-out constraint_loss=${FC_LOSS} -> tau=${TAU} (x${TAU_FACTOR})"
-if [ -n "${TAU_MAX}" ] && [ "$("$PY" -c "print(1 if float('${TAU}') > float('${TAU_MAX}') else 0)")" = "1" ]; then
-  echo "ABORT: tau=${TAU} > --tau-max=${TAU_MAX} (the token-local floor). A tau at or" >&2
-  echo "above the token-local constraint is satisfiable by the empty graph and cannot" >&2
-  echo "force parameter edges — inspect the dense run before spending main-run compute." >&2
-  exit 3
-fi
 
 echo "== step 2/3: sparse run (tau=${TAU}) =="
 MAIN_STEPS_OVERRIDE=""

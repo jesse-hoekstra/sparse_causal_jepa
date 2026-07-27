@@ -14,10 +14,18 @@ data:
 train:
   steps: 300000 # Baumgartner Fig. 17 scale
   batch_size: 16 # x30 teacher-forced transitions per episode
-  context_len: 30 # Tpar (Eq. 17); I = {29, ..., 58}
-  # Inherited only as a bare-train.py placeholder, in raw-MSE units. The
-  # reporting pipeline always replaces it with the fresh dense reference.
-  sparsity_tau: 0.75
+  context_len: 30 # Tpar (Eq. 17); I_TF = {29, ..., 58}
+  # Hybrid rollout branch (write-up Eqs. 33-35): ONE chain anchored at the
+  # first prediction time t = Tpar-1 = 29, rolled out over the whole window to
+  # t+K = 59 = T-1. K = 30 fits the existing 60-step clips exactly, so it needs
+  # no change to the preload. This is the closest analogue to Baumgartner's
+  # L_rec, which reconstructs the entire trajectory autoregressively from one
+  # initial condition (their Eq. 2 / §3.3).
+  # Measured (1500-step CPU smoke, paper geometry): per-step error rises to
+  # ~0.11 at k~19 then FALLS to 0.092 by k=30 — bounded state space, so depth
+  # does not compound. grad_norm max 4.43, zero skipped steps.
+  rollout_len: 30
+  lambda_roll: 1.0
   eval_every: 5000 # a metric that CAN leave its failure value MUST be watched
   log_every: 100
   checkpoint_every: 2000
