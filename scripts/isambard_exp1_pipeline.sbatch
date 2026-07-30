@@ -19,7 +19,7 @@
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=64
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=slurm-%x-%j.out
 # workq_qos caps MaxWall at 1-00:00:00 (48h was rejected, 2026-07-19); ask
 # for the full 24h. Expected runtime is ~8-12h (2 training stages + ~60
