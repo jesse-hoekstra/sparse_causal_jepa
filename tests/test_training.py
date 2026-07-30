@@ -81,6 +81,7 @@ def test_training_smoke(tmp_path: Path) -> None:
     for key in (
         "loss/total",
         "loss/pred",
+        "loss/rollout_raw",
         "loss/rollout",
         "loss/logit",
         "loss/sparsity",
@@ -88,6 +89,10 @@ def test_training_smoke(tmp_path: Path) -> None:
         "sparsity/lambda",
         "sparsity/path_density",
         "health/grad_norm",
+        "health/grad_norm_tf",
+        "health/grad_norm_rollout_raw",
+        "health/grad_norm_rollout",
+        "schedule/lambda_roll",
     ):
         assert key in metrics
         assert torch.isfinite(torch.tensor(metrics[key])), key
@@ -97,6 +102,40 @@ def test_training_smoke(tmp_path: Path) -> None:
         metrics["loss/pred"] + metrics["loss/rollout"] + metrics["loss/logit"], rel=1e-6
     )
     assert (tmp_path / "last.pt").exists()
+
+
+def test_rollout_weight_warms_up_linearly(tmp_path: Path) -> None:
+    """Continuation reaches the configured coefficient on the declared update."""
+    trainer = Trainer(
+        tiny_model(),
+        tiny_dataset(),
+        tiny_config(tmp_path, steps=4, lambda_roll=2.0, lambda_roll_warmup_steps=4),
+    )
+    batches = trainer._batches()
+    expected = (0.5, 1.0, 1.5, 2.0)
+    for step, coefficient in enumerate(expected, start=1):
+        metrics = trainer._train_step(next(batches))
+        assert metrics["schedule/lambda_roll"] == pytest.approx(coefficient)
+        assert metrics["loss/rollout"] == pytest.approx(
+            coefficient * metrics["loss/rollout_raw"], rel=1e-6
+        )
+        trainer.step = step
+
+
+def test_branch_gradient_metrics_are_raw_and_weighted(tmp_path: Path) -> None:
+    """The applied rollout norm is exactly the raw chain norm times its schedule weight."""
+    trainer = Trainer(
+        tiny_model(),
+        tiny_dataset(),
+        tiny_config(tmp_path, steps=1, lambda_roll=2.0, lambda_roll_warmup_steps=4),
+    )
+    metrics = trainer._train_step(next(trainer._batches()))
+    assert metrics["health/grad_norm_tf"] > 0.0
+    assert metrics["health/grad_norm_rollout_raw"] > 0.0
+    assert metrics["health/grad_norm_rollout"] == pytest.approx(
+        metrics["schedule/lambda_roll"] * metrics["health/grad_norm_rollout_raw"],
+        rel=1e-6,
+    )
 
 
 def test_references_train_without_path_penalty(tmp_path: Path) -> None:

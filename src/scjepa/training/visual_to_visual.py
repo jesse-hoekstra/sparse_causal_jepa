@@ -35,8 +35,20 @@ def collapse_metrics(states: Tensor, prefix: str) -> dict[str, float]:
     across (episode, time) averaged over tracks and coordinates — the quantity
     Eq. 122 feeds to the constraint. ``effective_rank``: the exponential of the
     entropy of the normalized covariance eigenvalues, so a representation using
-    one direction scores ~1 and an isotropic one scores d_s. All three go to
-    their floor together under collapse.
+    one direction scores ~1 and an isotropic one scores d_s. Those three go to
+    their floor together under SCALE collapse.
+
+    ``temporal_var`` covers a mode the other three are jointly blind to: the
+    variance across TIME WITHIN an episode, averaged over episodes. The other
+    three pool episode and time, so a representation that is frozen in time but
+    still varies across episodes keeps all of them healthy — while making both
+    prediction branches trivially satisfiable by the identity map, which is also
+    the sparsest possible graph. That degenerate optimum exists under teacher
+    forcing alone; the K-step rollout raises its payoff (an honest model pays
+    L_TF + lambda_roll*L_roll, a frozen one pays about zero for both), so this
+    number is the one that separates "learned the dynamics" from "stopped
+    moving". Healthy: same order as ``content_var``. Degenerate: heads for zero
+    while ``content_var`` and ``effective_rank`` sit still.
     """
     with torch.no_grad():
         flat = states.detach().flatten(0, 2).float()  # (episodes * time * tracks, d_s)
@@ -50,10 +62,14 @@ def collapse_metrics(states: Tensor, prefix: str) -> dict[str, float]:
             weights = eigenvalues / total
             entropy = -(weights * (weights + 1e-12).log()).sum()
             effective_rank = float(entropy.exp())
+        # Time is axis 1 of (B, T, N, d_s): reduce over it FIRST, so episode
+        # variation cannot mask a temporally frozen representation.
+        temporal_var = float(states.detach().float().var(dim=1, unbiased=False).mean())
         return {
             f"{prefix}/std": float(flat.std(dim=0).mean()),
             f"{prefix}/content_var": float(centred.square().mean()),
             f"{prefix}/effective_rank": effective_rank,
+            f"{prefix}/temporal_var": temporal_var,
         }
 
 
@@ -65,7 +81,11 @@ class VisualToVisualTrainer(Trainer):
     def _forward(self, batch: dict[str, Tensor]) -> VisualToVisualOutput:  # type: ignore[override]
         """Read frames; the true states in the batch are for evaluation only."""
         frames = batch["frames"].to(self.device)
-        return self.model(frames, context_len=self.config.context_len)
+        return self.model(
+            frames,
+            context_len=self.config.context_len,
+            rollout_len=self.config.rollout_len,
+        )
 
     def _constraint(
         self,
@@ -79,6 +99,13 @@ class VisualToVisualTrainer(Trainer):
         by a moving denominator would change what is optimized. The floor
         epsilon_var stops a collapsing target from making the constraint look
         satisfiable by shrinking itself.
+
+        Under the hybrid objective ``pred_loss`` arrives as L_TF +
+        lambda_roll*L_roll (the caller scalarises §4.3's two bounds into one).
+        Both are squared errors in the same target space, so both scale with the
+        representation exactly as ``target_variance`` does: the ratio stays
+        scale-free with the rollout term in it. What the normalization does NOT
+        see is a target frozen in time — watch ``collapse/*/temporal_var``.
         """
         denominator = torch.clamp(output.target_variance, min=self.model.variance_floor)
         return (pred_loss.detach() / denominator + logit_loss.detach()).detach()
@@ -106,6 +133,9 @@ class VisualToVisualTrainer(Trainer):
             device=self.config.device,
             context_len=self.config.context_len,
             lambda_logit=self.config.lambda_logit,
+            # Must mirror training exactly — this is the quantity tau_3 bounds.
+            rollout_len=self.config.rollout_len,
+            lambda_roll=self.config.lambda_roll,
         )
         self.model.train()
         return {f"eval/{key}": value for key, value in report.metrics.items()}

@@ -17,6 +17,11 @@ is scalarised here into ONE bound with the same λ_roll that weights the
 objective, so a single dual variable and a single τ remain. c still excludes
 the path penalty, and no representation regularizer exists in this experiment.
 
+For the K=30 experiment, λ_roll is linearly continued from zero to its declared
+target during the first configured warm-up steps. The same instantaneous value
+is used in the optimized objective and the training constraint. Final dense τ
+calibration occurs after the ramp and therefore uses the target λ_roll.
+
 CRITICAL: τ is calibrated as 1.0x the held-out c of a dense reference, so
 ``scjepa.eval.harness`` must compute c with the identical rollout settings —
 changing ``rollout_len``/``lambda_roll`` on one side alone silently
@@ -95,6 +100,10 @@ class TrainConfig:
     # Episodes shorter than Tpar-1+K raise — set it explicitly for tiny configs.
     rollout_len: int | None = 30
     lambda_roll: float = 1.0
+    # Linear continuation for the recurrent branch. At optimizer update s
+    # (one-indexed), lambda_roll(s) = lambda_roll * min(s / warmup_steps, 1).
+    # Zero preserves the pre-continuation behaviour (full weight immediately).
+    lambda_roll_warmup_steps: int = 0
     seed: int = 0
     device: str = "cpu"
     context_len: int | None = None  # Tpar (the state-to-state regime: 30); None -> T-1
@@ -137,6 +146,8 @@ class Trainer:
         seed_everything(config.seed)
         if config.eval_every is not None and eval_dataset is None:
             raise ValueError("eval_every set but no eval_dataset provided")
+        if config.lambda_roll_warmup_steps < 0:
+            raise ValueError("lambda_roll_warmup_steps must be non-negative")
         self.config = config
         self.eval_dataset = eval_dataset
         self.device = torch.device(config.device)
@@ -234,6 +245,30 @@ class Trainer:
         assert target is not None
         return weighted_rollout_mse(prediction, target, self.rollout_weights)
 
+    def _effective_lambda_roll(self) -> float:
+        """Rollout coefficient for the next (one-indexed) optimizer update."""
+        warmup = self.config.lambda_roll_warmup_steps
+        if warmup == 0:
+            return self.config.lambda_roll
+        progress = min((self.step + 1) / warmup, 1.0)
+        return self.config.lambda_roll * progress
+
+    def _branch_gradient_norm(self, loss: Tensor) -> float:
+        """Global pre-clip norm of one loss branch without touching ``.grad``."""
+        trainable_parameters = tuple(
+            parameter for parameter in self.model.parameters() if parameter.requires_grad
+        )
+        gradients = torch.autograd.grad(
+            loss,
+            trainable_parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        norms = [gradient.detach().norm(2) for gradient in gradients if gradient is not None]
+        if not norms:
+            return 0.0
+        return float(torch.stack(norms).norm(2))
+
     def _constraint(
         self, pred_loss: Tensor, logit_loss: Tensor, output: TransitionOutput
     ) -> Tensor:
@@ -261,8 +296,11 @@ class Trainer:
         pred_loss = aligned_mse(output.prediction, output.target)  # L_TF, Eq. 32
         # Eq. 36: both prediction branches enter the objective, and (dual form,
         # §4.3) the same scalarised sum is what the bound applies to. Only the
-        # WEIGHTED term is ever reported — it is the quantity in the objective.
-        rollout_loss = self.config.lambda_roll * self._rollout_loss(output)  # Eq. 35
+        # weighted term is the quantity in the objective; the raw term is also
+        # reported so continuation cannot disguise an intrinsically unstable chain.
+        raw_rollout_loss = self._rollout_loss(output)  # Eq. 35
+        effective_lambda_roll = self._effective_lambda_roll()
+        rollout_loss = effective_lambda_roll * raw_rollout_loss
         logit_loss = self.config.lambda_logit * output.logit_penalty
         total = pred_loss + rollout_loss + logit_loss
         if self.config.sparsity_enabled:
@@ -275,6 +313,22 @@ class Trainer:
                 f"rollout={rollout_loss.item():.4g} "
                 f"sparsity={output.sparsity.item():.4g}"
             )
+
+        # Branch-specific pre-clip norms are diagnostic autograd traversals;
+        # compute them only on steps that W&B will retain. The raw rollout norm
+        # exposes an unstable K-step chain even while continuation keeps its
+        # applied contribution small.
+        branch_grad_metrics: dict[str, float] = {}
+        diagnostic_step = self.step + 1
+        if diagnostic_step % self.config.log_every == 0 or diagnostic_step == self.config.steps:
+            tf_grad_norm = self._branch_gradient_norm(pred_loss)
+            branch_grad_metrics["health/grad_norm_tf"] = tf_grad_norm
+            if getattr(output, "rollout_prediction", None) is not None:
+                raw_rollout_grad_norm = self._branch_gradient_norm(raw_rollout_loss)
+                branch_grad_metrics |= {
+                    "health/grad_norm_rollout_raw": raw_rollout_grad_norm,
+                    "health/grad_norm_rollout": effective_lambda_roll * raw_rollout_grad_norm,
+                }
 
         self.optimizer.zero_grad(set_to_none=True)
         total.backward()  # pyright: ignore[reportUnknownMemberType]
@@ -309,13 +363,17 @@ class Trainer:
         # is live: the visual regimes share this step but carry no rollout, and a
         # constant-zero curve is noise on their W&B pages.
         rollout_metric = (
-            {"loss/rollout": rollout_loss.item()}
+            {
+                "loss/rollout_raw": raw_rollout_loss.item(),
+                "loss/rollout": rollout_loss.item(),
+            }
             if getattr(output, "rollout_prediction", None) is not None
             else {}
         )
         return (
             self._extra_metrics(output)
             | rollout_metric
+            | branch_grad_metrics
             | {
                 "loss/total": total.item(),
                 "loss/pred": pred_loss.item(),
@@ -335,6 +393,7 @@ class Trainer:
                 "sparsity/path_density_full": (output.path_matrix >= 0.5).float().mean().item(),
                 "health/grad_norm": float(grad_norm.item()),
                 "health/skipped_steps": float(self.total_skips),
+                "schedule/lambda_roll": effective_lambda_roll,
             }
         )
 
@@ -378,7 +437,10 @@ class Trainer:
             lambda_logit=self.config.lambda_logit,
             # Must mirror training exactly — this is the quantity τ bounds.
             rollout_len=self.config.rollout_len,
-            lambda_roll=self.config.lambda_roll,
+            # Periodic evaluation reports the constraint coefficient currently
+            # seen by the dual. Final/post-hoc evaluation occurs after warm-up
+            # and therefore uses the configured target coefficient.
+            lambda_roll=self._effective_lambda_roll(),
         )
         self.model.train()  # the harness switches to eval mode
         # Every run mode logs the FULL eval key set (2026-07-25, Jesse): in the
