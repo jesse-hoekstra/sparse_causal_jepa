@@ -445,3 +445,48 @@ forcing and predate the masked-softmax/denominator numerics fixes, so they do no
 **Still unmeasured:** no full 300k hybrid run exists. D30's four-phase trajectory was recorded
 under the pure-TF objective; the phase STRUCTURE should survive (it is a property of the GECO
 dual) but none of its numbers are comparable.
+
+### D34b — The rollout extends to Experiment 3 but NOT Experiment 2 (2026-07-27, Jesse)
+
+Which regimes can carry the rollout branch is decided by a type, not by preference:
+Eq. 34's recursion needs `F_gamma` to map the representation space to ITSELF.
+
+* **Experiment 1** — raw true states in, raw true states out. Composable.
+* **Experiment 3** — Eq. 118 gives the predictor `output_dim = state_dim`, so it maps the
+  learned latent width to itself. Composable. `rollout_len: 30`, `lambda_roll: 1.0`, same
+  geometry as Experiment 1 (anchor t = Tpar-1 = 29 on the ONLINE path per Eq. 33, rolled to
+  t+K = 59 = T-1, supervised against the EMA target which is already computed over every
+  frame). The same theta-hat AND the same per-episode track keys (§6.4) enter at every step;
+  resampling keys mid-chain would give each step a different episode-level permutation.
+* **Experiment 2 — structurally excluded.** Its predictor takes a 32-dim latent state
+  (Eq. 94) and decodes to a RAW 4-dim state (Eq. 95), so `f` cannot be composed with itself
+  and Assumption 4's closure `F_gamma(S, theta-hat) in S` fails BY TYPE, not by approximation
+  error. Making it composable would mean predicting the next latent and decoding only for the
+  loss — a rewrite of Eqs. 94/95 that invalidates tau_2. Not done.
+
+**Consequence for the write-up:** §4.4(ii)'s trajectory argument, and the path-connectedness
+object of §5, are available to Experiments 1 and 3 and NOT to Experiment 2. The
+visual-to-state regime's identification argument rests on teacher forcing alone. §4 should say
+which regimes instantiate the rollout term rather than let Eq. 36 read as uniform.
+
+**Eq. 123 needs no change.** L_TF and L_roll are both squared errors in the same target space,
+so both scale with the representation exactly as `target_variance` does: the variance-normalized
+constraint stays scale-free with the rollout term in it. The earlier worry that the rollout
+made scale collapse more profitable was wrong.
+
+**What the rollout DOES sharpen, and the new diagnostic.** `content_var` (Eq. 122) pools
+episode and time, and `effective_rank` is a spectrum statistic over the same pooled axis, so
+BOTH stay healthy for a representation that is frozen in time but varies across episodes.
+That representation makes every prediction satisfiable by the identity map — which is also the
+sparsest possible graph, i.e. empty-graph collapse (catalog failure #2) reached from a new
+direction. The optimum already exists under teacher forcing; the rollout raises its payoff,
+since an honest model pays L_TF + lambda_roll*L_roll (L_roll > L_TF, error compounds) while a
+frozen one pays about zero for both. `collapse/*/temporal_var` — variance across TIME within an
+episode, reduced over the time axis FIRST — is the one statistic that separates "learned the
+dynamics" from "stopped moving". Added for both branches; a test pins that the pooled metrics
+cannot distinguish the two cases and that this one can.
+
+**tau_3 must be recalibrated**, exactly as for Experiment 1: `evaluate_visual_to_visual` now
+computes the same scalarised numerator, reading `rollout_len`/`lambda_roll` from the run's own
+config. **Still unmeasured:** Experiment 3 has never been run at length (D32 records it as
+"written and runs end-to-end", no run IDs), so none of these diagnostics has faced a real run.

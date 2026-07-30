@@ -91,6 +91,11 @@ def _print_run_banner(cfg: DictConfig, experiment: str, phase: str, git_sha: str
             _source_of("train.lambda_roll", overrides, preset),
         ),
         (
+            "train.lambda_roll_warmup_steps",
+            str(cfg.train.get("lambda_roll_warmup_steps", 0)),
+            _source_of("train.lambda_roll_warmup_steps", overrides, preset),
+        ),
+        (
             "train.rollout_len",
             str(cfg.train.get("rollout_len", None)),
             _source_of("train.rollout_len", overrides, preset),
@@ -194,6 +199,7 @@ def main(cfg: DictConfig) -> None:
         lambda_logit=float(cfg.train.lambda_logit),  # mandatory: .get() would mask MISSING
         rollout_len=cfg.train.get("rollout_len", None),
         lambda_roll=float(cfg.train.get("lambda_roll", 0.0)),
+        lambda_roll_warmup_steps=int(cfg.train.get("lambda_roll_warmup_steps", 0)),
         seed=cfg.train.seed,
         device=cfg.train.device,
         context_len=cfg.train.get("context_len", None),

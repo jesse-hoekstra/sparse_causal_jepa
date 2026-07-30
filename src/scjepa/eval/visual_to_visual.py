@@ -27,6 +27,7 @@ from scjepa.eval.graph import (
 from scjepa.eval.parameters import nonlinear_mcc
 from scjepa.eval.visual_alignment import physical_assignment, slot_centroids
 from scjepa.losses.alignment import align_to_assignment, invert_assignment
+from scjepa.losses.predictive import rollout_weights, weighted_rollout_mse
 from scjepa.models.visual_to_visual import VisualToVisualModel
 
 __all__ = ["VisualToVisualReport", "evaluate_visual_to_visual"]
@@ -50,6 +51,8 @@ def evaluate_visual_to_visual(
     device: str = "cpu",
     context_len: int | None = None,
     lambda_logit: float = 0.0,
+    rollout_len: int | None = None,
+    lambda_roll: float = 0.0,
     resolution: int = 64,
 ) -> VisualToVisualReport:
     """Run the held-out evaluation; returns metrics in the shared key namespace."""
@@ -59,6 +62,7 @@ def evaluate_visual_to_visual(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
     pred_losses: list[Tensor] = []
+    rollout_losses: list[Tensor] = []
     logit_penalties: list[Tensor] = []
     abs_logits: list[Tensor] = []
     entropies: list[Tensor] = []
@@ -73,11 +77,22 @@ def evaluate_visual_to_visual(
             break
         frames = batch["frames"].to(torch_device)
         states = batch["states"].to(torch_device)
-        output = model(frames, context_len=context_len)
+        output = model(frames, context_len=context_len, rollout_len=rollout_len)
         tpar = context_len if context_len is not None else frames.shape[1] - 1
         num_slots = output.causal_params.shape[1]
 
         pred_losses.append((output.prediction - output.target).square().mean())
+        if output.rollout_prediction is not None and output.rollout_target is not None:
+            rollout_losses.append(
+                weighted_rollout_mse(
+                    output.rollout_prediction,
+                    output.rollout_target,
+                    rollout_weights(
+                        output.rollout_prediction.shape[1],
+                        device=output.rollout_prediction.device,
+                    ),
+                )
+            )
         logit_penalties.append(output.logit_penalty)
         abs_logits.append(output.mean_abs_logit)
         entropies.append(output.gate_entropy)
@@ -121,11 +136,20 @@ def evaluate_visual_to_visual(
     report = nonlinear_mcc(learned_params, true_masses)
     pred_loss = torch.stack(pred_losses).mean()
     variance = torch.stack(variances).mean().clamp(min=model.variance_floor)
+    # Hybrid §4.3 dual form, scalarised: the SAME numerator the trainer builds.
+    rollout_loss = (
+        lambda_roll * torch.stack(rollout_losses).mean()
+        if rollout_losses
+        else torch.zeros((), device=pred_loss.device)
+    )
     metrics = {
         "pred_loss": float(pred_loss),
-        # Eq. 123: exactly the scalar the dual is held to.
+        "rollout_loss": float(rollout_loss),
+        # Eq. 123: exactly the scalar the dual is held to. tau_3 is calibrated
+        # on this, so rollout_len/lambda_roll MUST match training.
         "constraint_loss": float(
-            pred_loss / variance + lambda_logit * torch.stack(logit_penalties).mean()
+            (pred_loss + rollout_loss) / variance
+            + lambda_logit * torch.stack(logit_penalties).mean()
         ),
         "target_variance": float(variance),
         "mean_abs_logit": float(torch.stack(abs_logits).mean()),

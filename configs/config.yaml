@@ -79,6 +79,7 @@ train:
   # use identical values or tau means nothing.
   rollout_len: 3 # tiny CPU scale (clip_len 8 / context_len 4); paper scale: 30
   lambda_roll: 1.0
+  lambda_roll_warmup_steps: 0 # 0 = full weight immediately; Experiment 1 overrides
   seed: 0
   device: cpu
   context_len: 4 # Tpar; paper scale: 30 (Eq. 17)

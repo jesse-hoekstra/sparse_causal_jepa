@@ -47,9 +47,7 @@ def _dataset(episodes: int = 4, clip_len: int = 6) -> BounceDataset:
 def test_target_is_initialized_from_the_online_path() -> None:
     """Eq. 110: shared row ancestry is what makes matching unnecessary."""
     model = _model()
-    for online, target in zip(
-        model.online.parameters(), model.target.parameters(), strict=True
-    ):
+    for online, target in zip(model.online.parameters(), model.target.parameters(), strict=True):
         assert torch.equal(online, target)
 
 
@@ -130,7 +128,7 @@ def test_track_keys_are_permuted_per_episode() -> None:
 def test_constraint_is_variance_normalized() -> None:
     """Eq. 123 divides by the target variance; Eq. 121's gradient objective does not."""
     model = _model()
-    config = TrainConfig(steps=1, batch_size=2, context_len=3, lambda_logit=0.0)
+    config = TrainConfig(steps=1, batch_size=2, context_len=3, rollout_len=3, lambda_logit=0.0)
     trainer = VisualToVisualTrainer(model, _dataset(), config, eval_dataset=None)
     output = model(torch.rand(2, 5, 3, 64, 64), context_len=3)
     pred = torch.tensor(0.5)
@@ -142,7 +140,7 @@ def test_constraint_is_variance_normalized() -> None:
 def test_variance_floor_bounds_the_constraint() -> None:
     """A collapsing target must not make the constraint look satisfiable."""
     model = _model(variance_floor=1e-2)
-    config = TrainConfig(steps=1, batch_size=2, context_len=3)
+    config = TrainConfig(steps=1, batch_size=2, context_len=3, rollout_len=3)
     trainer = VisualToVisualTrainer(model, _dataset(), config, eval_dataset=None)
     output = model(torch.rand(2, 5, 3, 64, 64), context_len=3)._replace(
         target_variance=torch.tensor(0.0)
@@ -154,7 +152,9 @@ def test_variance_floor_bounds_the_constraint() -> None:
 def test_training_step_runs_and_steps_the_ema() -> None:
     """One end-to-end step: frames in, EMA advanced, collapse metrics logged."""
     model = _model()
-    config = TrainConfig(steps=1, batch_size=2, context_len=3, device="cpu", out_dir="/tmp/e3")
+    config = TrainConfig(
+        steps=1, batch_size=2, context_len=3, rollout_len=3, device="cpu", out_dir="/tmp/e3"
+    )
     trainer = VisualToVisualTrainer(model, _dataset(), config, eval_dataset=None)
     before = copy.deepcopy([t.clone() for t in model.target.parameters()])
     metrics = trainer._train_step(next(iter(trainer._epoch_loader(0))))
@@ -208,3 +208,64 @@ def test_slot_centroids_match_the_renderer_axis_convention() -> None:
     centroid = slot_centroids(allocation, 64)[0, 0, 0]
     assert float(centroid[0]) == pytest.approx((20 + 0.5) / 64)
     assert float(centroid[1]) == pytest.approx((10 + 0.5) / 64)
+
+
+def test_rollout_is_autoregressive_and_anchored_on_the_online_path() -> None:
+    """Eqs. 33-34 in the learned latent space.
+
+    The anchor must be the ONLINE state at Tpar-1 and each later step must
+    consume the previous PREDICTION. A rollout that silently re-read the online
+    path every step would be K teacher-forced predictions wearing a chain's
+    clothing, and would train and log identically.
+    """
+    torch.manual_seed(0)
+    model = _model()
+    model.eval()
+    frames = _dataset()[0]["frames"].unsqueeze(0).repeat(2, 1, 1, 1, 1)
+    tpar, horizon = 3, 3
+    with torch.no_grad():
+        out = model(frames, context_len=tpar, rollout_len=horizon)
+        anchor = out.context_states[:, tpar - 1]
+        assert out.rollout_prediction is not None
+        torch.testing.assert_close(out.rollout_prediction[:, 0].shape, anchor.shape)
+        # k=2 must differ from what a fresh online encoding would have produced.
+        teacher_forced_k2 = out.context_states[:, tpar]
+        assert not torch.allclose(out.rollout_prediction[:, 1], teacher_forced_k2)
+
+
+def test_rollout_targets_come_from_the_ema_branch() -> None:
+    """Eq. 114: targets are the EMA path's states, detached, at t+1..t+K."""
+    torch.manual_seed(0)
+    model = _model()
+    model.eval()
+    frames = _dataset()[0]["frames"].unsqueeze(0).repeat(2, 1, 1, 1, 1)
+    tpar, horizon = 3, 3
+    with torch.no_grad():
+        out = model(frames, context_len=tpar, rollout_len=horizon)
+    assert out.rollout_target is not None
+    assert not out.rollout_target.requires_grad
+    for k in range(1, horizon + 1):
+        torch.testing.assert_close(out.rollout_target[:, k - 1], out.target_states[:, tpar - 1 + k])
+
+
+def test_temporal_var_catches_a_time_frozen_representation() -> None:
+    """The mode content_var and effective_rank are jointly blind to.
+
+    A representation constant in time but varying across episodes keeps the
+    pooled statistics healthy while making every prediction trivially
+    satisfiable by the identity map.
+    """
+    torch.manual_seed(0)
+    episodes, time, tracks, dim = 8, 6, 3, 4
+    varied = torch.randn(episodes, time, tracks, dim)
+    frozen = torch.randn(episodes, 1, tracks, dim).expand(-1, time, -1, -1).contiguous()
+
+    healthy = collapse_metrics(varied, "x")
+    degenerate = collapse_metrics(frozen, "x")
+
+    # The pooled statistics cannot tell these apart...
+    assert degenerate["x/content_var"] > 0.5 * healthy["x/content_var"]
+    assert degenerate["x/effective_rank"] > 0.5 * healthy["x/effective_rank"]
+    # ...but the temporal one does, unambiguously.
+    assert degenerate["x/temporal_var"] == pytest.approx(0.0, abs=1e-9)
+    assert healthy["x/temporal_var"] > 0.1

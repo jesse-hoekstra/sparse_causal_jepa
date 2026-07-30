@@ -26,6 +26,13 @@ train:
   # does not compound. grad_norm max 4.43, zero skipped steps.
   rollout_len: 30
   lambda_roll: 1.0
+  # The successful pure-TF run reached its early one-step plateau (~0.04 MSE)
+  # around step 1k and continued settling through 10k. The first full-weight
+  # K=30 run instead entered an irreversible BPTT explosion around step 630.
+  # Ramp linearly from 0 to lambda_roll over 10k updates: the dangerous early
+  # point sees only ~6% rollout weight, while the full objective is restored
+  # long before the sparsification phases.
+  lambda_roll_warmup_steps: 10000
   eval_every: 5000 # a metric that CAN leave its failure value MUST be watched
   log_every: 100
   checkpoint_every: 2000

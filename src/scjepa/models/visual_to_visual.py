@@ -66,6 +66,10 @@ class VisualToVisualOutput(NamedTuple):
     """Online latent states, kept for the Eq. 124 collapse diagnostics."""
     target_states: Float[Tensor, "b t n s"]
     """EMA latent states, kept for the Eq. 124 collapse diagnostics."""
+    rollout_prediction: Float[Tensor, "b j n s"] | None = None
+    """Hybrid Eqs. 33-34: the K autoregressive prefixes. None when disabled."""
+    rollout_target: Float[Tensor, "b j n s"] | None = None
+    """EMA targets S^tgt_{t+1..t+K} for those prefixes (stop-gradient)."""
 
 
 def _content_variance(states: Tensor) -> Tensor:
@@ -122,9 +126,7 @@ class VisualToVisualModel(nn.Module):
         content here, and averaging them would desynchronize the two branches'
         architectures instead of their weights.
         """
-        for target, online in zip(
-            self.target.parameters(), self.online.parameters(), strict=True
-        ):
+        for target, online in zip(self.target.parameters(), self.online.parameters(), strict=True):
             target.mul_(self.ema_decay).add_(online.detach(), alpha=1.0 - self.ema_decay)
         for target_buffer, online_buffer in zip(
             self.target.buffers(), self.online.buffers(), strict=True
@@ -135,12 +137,17 @@ class VisualToVisualModel(nn.Module):
         self,
         frames: Float[Tensor, "b t c h w"],
         context_len: int | None = None,
+        rollout_len: int | None = None,
     ) -> VisualToVisualOutput:
         """Run both branches once, then make the |I| one-step latent predictions.
 
         Args:
             frames: (B, T, 3, H, W) episode batch.
             context_len: Tpar (the visual-to-visual regime: 30). None -> T-1, giving K = 1.
+            rollout_len: K for the hybrid autoregressive branch (Eqs. 33-35).
+                None disables it. Unlike the visual-to-state regime this is
+                well-typed: the predictor maps the learned state width to
+                itself (Eq. 118), so f can be composed with itself.
         """
         if frames.ndim != 5 or frames.shape[1] < 2:
             raise ValueError(f"expected (B, T>=2, C, H, W), got {tuple(frames.shape)}")
@@ -165,9 +172,18 @@ class VisualToVisualModel(nn.Module):
         sources = context.states[:, tpar - 1 :].flatten(0, 1)
         targets = target.states[:, tpar:].flatten(0, 1).detach()  # Eq. 114 stop-gradient
         params = causal_params.repeat_interleave(transitions, dim=0)
-        # §6.4: one key per episode, reused for every transition of that episode.
-        keys = self.predictor.sample_track_keys(batch).repeat_interleave(transitions, dim=0)
+        # §6.4: one key per episode, reused for every transition of that episode
+        # — and, below, for every step of that episode's rollout. Resampling
+        # mid-chain would give each step a different episode-level permutation.
+        episode_keys = self.predictor.sample_track_keys(batch)
+        keys = episode_keys.repeat_interleave(transitions, dim=0)
         out = self.predictor(sources, params, track_keys=keys)
+
+        rollout_prediction = rollout_target = None
+        if rollout_len is not None:
+            rollout_prediction, rollout_target = self._rollout(
+                context.states, target.states, tpar, rollout_len, causal_params, episode_keys
+            )
 
         return VisualToVisualOutput(
             prediction=out.prediction,
@@ -182,7 +198,52 @@ class VisualToVisualModel(nn.Module):
             target_variance=_content_variance(target.states[:, tpar:]).detach(),
             context_states=context.states,
             target_states=target.states,
+            rollout_prediction=rollout_prediction,
+            rollout_target=rollout_target,
         )
+
+    def _rollout(
+        self,
+        context_states: Float[Tensor, "b t n s"],
+        target_states: Float[Tensor, "b t n s"],
+        tpar: int,
+        horizon: int,
+        causal_params: Float[Tensor, "b n 1"],
+        episode_keys: Float[Tensor, "b n d"],
+    ) -> tuple[Float[Tensor, "b j n s"], Float[Tensor, "b j n s"]]:
+        """Hybrid Eqs. 33-34 in the learned latent space.
+
+            Ŝ^[0]_t := S^on_t,   Ŝ^[k]_{t+k} := f_gamma(Ŝ^[k-1]_{t+k-1}, θ̂)
+
+        The chain is anchored at t = Tpar-1 on the ONLINE path — Eq. 33's
+        S^on_t — and supervised against the EMA target path, which has already
+        been run over every frame, so no extra encoder pass is needed. The same
+        θ̂ AND the same episode track keys enter at every step.
+
+        Well-typed only because Eq. 118 gives the predictor ``output_dim =
+        state_dim``: f maps the learned state width to itself. The
+        visual-to-state regime decodes to the raw 4-dim state instead
+        (Eq. 95), so it has no composable f and no rollout branch.
+        """
+        length = context_states.shape[1]
+        # The online path never sees the final frame, so its states run to T-2;
+        # the anchor and every fed-back state come from that branch.
+        if tpar + horizon > target_states.shape[1]:
+            raise ValueError(
+                f"rollout_len={horizon} runs past the episode: need Tpar-1+K <= T-1, "
+                f"got {tpar - 1}+{horizon} > {target_states.shape[1] - 1} (Tpar={tpar})"
+            )
+        if tpar - 1 >= length:
+            raise ValueError(f"context_len={tpar} leaves no online anchor (T-1={length})")
+
+        state = context_states[:, tpar - 1]  # Ŝ^[0] := S^on_t (Eq. 33)
+        predictions: list[Tensor] = []
+        for _ in range(horizon):
+            state = self.predictor(state, causal_params, track_keys=episode_keys).prediction
+            predictions.append(state)
+        # Eq. 114 stop-gradient, exactly as the teacher-forced targets carry it.
+        target = target_states[:, tpar : tpar + horizon].detach()
+        return torch.stack(predictions, dim=1), target
 
 
 def build_visual_to_visual(
