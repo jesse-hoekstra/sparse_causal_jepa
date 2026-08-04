@@ -15,9 +15,46 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from omegaconf import DictConfig, OmegaConf
+
+EXPECTED_ROLLOUT_CURRICULUM: tuple[tuple[int, int | None], ...] = (
+    (0, None),
+    (10_000, 2),
+    (15_000, 5),
+    (25_000, 10),
+    (40_000, 20),
+    (60_000, 30),
+)
+
+
+def _curriculum(value: object) -> tuple[tuple[int, int | None], ...]:
+    """Normalize a JSON/OmegaConf curriculum for validation and comparison."""
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    if not isinstance(value, list):
+        raise ValueError("rollout_curriculum must be a list")
+    stages_value = cast(list[object], value)
+    stages: list[tuple[int, int | None]] = []
+    for index, stage in enumerate(stages_value):
+        if not isinstance(stage, dict):
+            raise ValueError(f"rollout curriculum stage {index} must be a mapping")
+        stage_mapping = cast(dict[str, object], stage)
+        if set(stage_mapping) != {"start_update", "rollout_len"}:
+            raise ValueError(
+                f"rollout curriculum stage {index} must contain start_update and rollout_len"
+            )
+        start_update = stage_mapping["start_update"]
+        raw_horizon = stage_mapping["rollout_len"]
+        if not isinstance(start_update, int) or isinstance(start_update, bool):
+            raise ValueError(f"rollout curriculum start_update {index} must be an integer")
+        if raw_horizon is not None and (
+            not isinstance(raw_horizon, int) or isinstance(raw_horizon, bool)
+        ):
+            raise ValueError(f"rollout curriculum rollout_len {index} must be an integer or null")
+        stages.append((start_update, raw_horizon))
+    return tuple(stages)
 
 
 def _load_record(run_dir: Path) -> dict[str, Any]:
@@ -35,6 +72,8 @@ def _load_record(run_dir: Path) -> dict[str, Any]:
     raw_logit = float(metrics["logit_penalty"])
     constraint = float(metrics["constraint_loss"])
     weighted_logit = float(metrics.get("logit_weighted", coefficient * raw_logit))
+    metric_curriculum = _curriculum(metrics["rollout_curriculum"])
+    config_curriculum = _curriculum(cfg.train.rollout_curriculum)
     record: dict[str, Any] = {
         "run_dir": str(run_dir),
         "lambda_logit": coefficient,
@@ -54,12 +93,22 @@ def _load_record(run_dir: Path) -> dict[str, Any]:
         "gate_entropy": float(metrics["gate_entropy"]),
         "mean_gate_probability": float(metrics["mean_gate_probability"]),
         "step": int(metrics["step"]),
+        "successful_updates": int(metrics["successful_updates"]),
+        "total_skips": int(metrics["total_skips"]),
+        "terminal_rollout_updates": int(metrics["terminal_rollout_updates"]),
+        "terminal_curriculum_reached": bool(metrics["curriculum_terminal_reached"]),
+        "successful_updates_checkpointed": bool(metrics["successful_updates_checkpointed"]),
+        "rollout_curriculum": metric_curriculum,
+        "terminal_stage_start_update": int(metrics["curriculum_terminal_start_update"]),
+        "evaluation_rollout_len": int(metrics["evaluation_rollout_len"]),
+        "lambda_roll": float(metrics["lambda_roll"]),
         "num_samples": int(metrics["num_samples"]),
         "eval_seed_offset": int(metrics["eval_seed_offset"]),
         "git_sha": str(cfg.get("git_sha", "unknown")),
         "train_seed": int(cfg.train.seed),
         "data_seed": int(cfg.data.seed),
         "train_steps": int(cfg.train.steps),
+        "protocol_300k_steps": int(cfg.train.steps) == 300_000,
         "batch_size": int(cfg.train.batch_size),
         "learning_rate": float(cfg.train.lr),
         "num_clips": int(cfg.data.num_clips),
@@ -81,6 +130,23 @@ def _load_record(run_dir: Path) -> dict[str, Any]:
         )
     if not record["dense"] or record["sparsity_enabled"]:
         raise ValueError(f"{run_dir}: expected a dense run with sparsity disabled")
+    if metric_curriculum != config_curriculum:
+        raise ValueError(f"{run_dir}: metrics/config rollout curricula differ")
+    if metric_curriculum != EXPECTED_ROLLOUT_CURRICULUM:
+        raise ValueError(
+            f"{run_dir}: curriculum is {metric_curriculum!r}, "
+            f"expected {EXPECTED_ROLLOUT_CURRICULUM!r}"
+        )
+    if record["evaluation_rollout_len"] != 30 or record["lambda_roll"] != 1.0:
+        raise ValueError(f"{run_dir}: final evaluation must use K=30 and lambda_roll=1")
+    if not record["successful_updates_checkpointed"]:
+        raise ValueError(f"{run_dir}: checkpoint did not persist successful_updates")
+    if not record["terminal_curriculum_reached"] or record["terminal_rollout_updates"] < 1:
+        raise ValueError(f"{run_dir}: checkpoint completed no update at terminal K=30")
+    if record["successful_updates"] + record["total_skips"] != record["step"]:
+        raise ValueError(
+            f"{run_dir}: successful_updates + total_skips does not equal attempted step"
+        )
     return record
 
 
@@ -136,6 +202,11 @@ def main() -> None:
     baseline = baselines[0]
     if baseline["pred_loss"] <= 0:
         raise SystemExit("lambda_logit=0 prediction loss must be positive")
+    if not baseline["protocol_300k_steps"]:
+        print(
+            "WARNING: non-300k sweep; selection is smoke/ablation provenance, "
+            "not the reportable protocol"
+        )
 
     provenance_keys = (
         "git_sha",
@@ -147,6 +218,10 @@ def main() -> None:
         "num_clips",
         "clip_len",
         "context_len",
+        "rollout_curriculum",
+        "terminal_stage_start_update",
+        "evaluation_rollout_len",
+        "lambda_roll",
         "num_slots",
         "param_encoder_dim",
         "spartan_layers",
@@ -213,6 +288,7 @@ def main() -> None:
             "logit_reduction_fraction": args.logit_reduction_fraction,
             "target_logit_excess": target_excess,
             "uses_mass_labels": False,
+            "protocol_300k_steps": bool(selected["protocol_300k_steps"]),
             "description": (
                 "Among Pareto coefficients within the prediction tolerance, choose the smallest "
                 "one achieving the requested fraction of the best logit-excess reduction. "

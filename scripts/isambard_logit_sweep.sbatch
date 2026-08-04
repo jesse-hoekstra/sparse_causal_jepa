@@ -8,7 +8,9 @@
 #     sbatch --account=<PROJECT> scripts/isambard_logit_sweep.sbatch logit_seed0 0
 #
 # Eight one-GPU srun steps execute concurrently across two complete Isambard-AI
-# nodes; additional grid points wait for a GPU to become free. Override
+# nodes; additional grid points wait for a GPU to become free. Every dense run
+# uses the same accepted-update rollout curriculum as tau calibration, and the
+# summary rejects a checkpoint that has not trained at terminal K=30. Override
 # --nodes/--gres/--ntasks together if using a different allocation shape.
 #SBATCH --job-name=scjepa-logit-sweep
 #SBATCH --partition=workq
@@ -31,6 +33,9 @@ STEPS=${SWEEP_STEPS:-300000}
 EVAL_EPISODES=${EVAL_EPISODES:-5000}
 VALIDATION_SEED_OFFSET=${VALIDATION_SEED_OFFSET:-23}
 NUM_CLIPS=${NUM_CLIPS:-100000}
+if [ "${STEPS}" != 300000 ]; then
+  echo "NOTE: SWEEP_STEPS=${STEPS}; non-300k selection is smoke/ablation provenance" >&2
+fi
 if [ "${SEED}" -eq 0 ]; then
   PRELOAD="data/bounce_train_v2_${NUM_CLIPS}.pt"
 else
@@ -106,7 +111,8 @@ for RUN_DIR in "${RUN_DIRS[@]}"; do
     python scripts/eval_identifiability.py "${RUN_DIR}" \
       --episodes "${EVAL_EPISODES}" \
       --seed-offset "${VALIDATION_SEED_OFFSET}" \
-      --device cuda &
+      --device cuda \
+      --require-terminal-curriculum &
   PIDS+=("$!")
 done
 

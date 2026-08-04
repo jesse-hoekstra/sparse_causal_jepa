@@ -5,8 +5,8 @@ Hybrid objective per step (hybrid write-up Eq. 36, dual form):
     sparse:          L = L_TF + λ_roll·L_roll + λ_logit·L_logit + λ⁻¹·L_path
     dense/identity:  L = L_TF + λ_roll·L_roll + λ_logit·L_logit  (no path penalty)
 
-with L_TF the aligned raw-state MSE (Eq. 32/39) over the K teacher-forced
-transitions, L_roll the dense K-step autoregressive rollout term (Eq. 35), and
+with L_TF the aligned raw-state MSE (Eq. 32/39) over every suffix transition,
+L_roll the dense K-step autoregressive rollout term (Eq. 35), and
 the dual constraint
 
     c = L_TF + λ_roll·L_roll + λ_logit·L_logit ≤ τ
@@ -17,10 +17,13 @@ is scalarised here into ONE bound with the same λ_roll that weights the
 objective, so a single dual variable and a single τ remain. c still excludes
 the path penalty, and no representation regularizer exists in this experiment.
 
-For the K=30 experiment, λ_roll is linearly continued from zero to its declared
-target during the first configured warm-up steps. The same instantaneous value
-is used in the optimized objective and the training constraint. Final dense τ
-calibration occurs after the ramp and therefore uses the target λ_roll.
+For the K=30 experiment, λ_roll stays fixed at its declared value (1.0). The
+autoregressive depth instead follows a curriculum indexed by SUCCESSFUL
+optimizer updates: teacher forcing only, then K=2, 5, 10, 20, and finally 30.
+Rejected gradient-spike batches do not advance this schedule. In sparse runs,
+the path penalty and GECO controller remain frozen until the terminal K=30
+stage, because τ is calibrated on the full K=30 constraint; applying that τ to
+a shorter loss would create artificial slack and premature pruning.
 
 CRITICAL: τ is calibrated as 1.0x the held-out c of a dense reference, so
 ``scjepa.eval.harness`` must compute c with the identical rollout settings —
@@ -51,6 +54,8 @@ from scjepa.eval.harness import evaluate_identifiability
 from scjepa.losses import aligned_mse, rollout_weights, weighted_rollout_mse
 from scjepa.models.state_to_state import StateToStateModel, TransitionOutput
 from scjepa.training.lagrangian import SparsityLagrangian
+
+RolloutCurriculum = tuple[tuple[int, int | None], ...]
 
 
 def seed_everything(seed: int) -> None:
@@ -100,10 +105,10 @@ class TrainConfig:
     # Episodes shorter than Tpar-1+K raise — set it explicitly for tiny configs.
     rollout_len: int | None = 30
     lambda_roll: float = 1.0
-    # Linear continuation for the recurrent branch. At optimizer update s
-    # (one-indexed), lambda_roll(s) = lambda_roll * min(s / warmup_steps, 1).
-    # Zero preserves the pre-continuation behaviour (full weight immediately).
-    lambda_roll_warmup_steps: int = 0
+    # Optional (successful_updates, K) stages. ``None`` K disables only the
+    # autoregressive branch; teacher forcing still covers the whole suffix.
+    # ``rollout_len`` remains the terminal/post-hoc-evaluation horizon.
+    rollout_curriculum: RolloutCurriculum | None = None
     seed: int = 0
     device: str = "cpu"
     context_len: int | None = None  # Tpar (the state-to-state regime: 30); None -> T-1
@@ -146,9 +151,8 @@ class Trainer:
         seed_everything(config.seed)
         if config.eval_every is not None and eval_dataset is None:
             raise ValueError("eval_every set but no eval_dataset provided")
-        if config.lambda_roll_warmup_steps < 0:
-            raise ValueError("lambda_roll_warmup_steps must be non-negative")
         self.config = config
+        self._validate_rollout_curriculum()
         self.eval_dataset = eval_dataset
         self.device = torch.device(config.device)
         self.model = model.to(self.device)
@@ -162,12 +166,9 @@ class Trainer:
         ).to(self.device)
         # ONE optimizer over everything trainable (P_η and f_gamma jointly).
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr)
-        # Eq. 35 weights w_k, built once (K is fixed for the run).
-        self.rollout_weights = (
-            rollout_weights(config.rollout_len, device=self.device)
-            if config.rollout_len is not None
-            else None
-        )
+        # Eq. 35 weights depend on the live curriculum horizon. Cache the tiny
+        # vectors by K rather than pinning one tensor for the whole run.
+        self._rollout_weight_cache: dict[int, Tensor] = {}
         # The loader uses drop_last=True, so a dataset smaller than one batch
         # yields ZERO batches. `_batches` would then spin through empty epochs
         # forever — regenerating data, never stepping, never erroring. Fail here
@@ -180,8 +181,44 @@ class Trainer:
                 "data.num_clips to at least the batch size, or lower train.batch_size."
             )
         self.step = 0
+        self.successful_updates = 0
         self.total_skips = 0  # D18: batches whose update was rejected
         self.consecutive_skips = 0
+
+    def _validate_rollout_curriculum(self) -> None:
+        """Reject schedules that could silently change the terminal objective."""
+        curriculum = self.config.rollout_curriculum
+        if curriculum is None:
+            return
+        if self.config.lambda_roll != 1.0:
+            raise ValueError("rollout curriculum requires lambda_roll=1.0")
+        if self.config.rollout_len is None:
+            raise ValueError("rollout curriculum requires a terminal train.rollout_len")
+        if not curriculum or curriculum[0][0] != 0:
+            raise ValueError("rollout_curriculum must start at successful update 0")
+
+        previous_start = -1
+        previous_horizon = 0
+        for index, (start, horizon) in enumerate(curriculum):
+            if start <= previous_start:
+                raise ValueError("rollout_curriculum starts must be strictly increasing")
+            if horizon is None:
+                if index != 0:
+                    raise ValueError("only the first rollout_curriculum stage may disable rollout")
+            else:
+                if horizon < 2:
+                    raise ValueError("curriculum rollout horizons must be >= 2")
+                if horizon < previous_horizon:
+                    raise ValueError("curriculum rollout horizons must be non-decreasing")
+                if horizon == self.config.rollout_len and index != len(curriculum) - 1:
+                    raise ValueError(
+                        "terminal rollout_len may only appear in the final curriculum stage"
+                    )
+                previous_horizon = horizon
+            previous_start = start
+
+        if curriculum[-1][1] != self.config.rollout_len:
+            raise ValueError("rollout_curriculum terminal horizon must equal train.rollout_len")
 
     # ------------------------------------------------------------- data ----
     def _epoch_loader(self, epoch: int) -> DataLoader[dict[str, Tensor]]:
@@ -223,13 +260,33 @@ class Trainer:
     # but changes three things: it reads frames, its dual sees a
     # variance-normalized constraint (Eq. 123), and it must step an EMA target
     # after each optimizer step. Those are the only overrides.
-    def _forward(self, batch: dict[str, Tensor]) -> TransitionOutput:
+    def _current_rollout_len(self) -> int | None:
+        """Return K for the next batch, indexed by accepted optimizer updates."""
+        curriculum = self.config.rollout_curriculum
+        if curriculum is None:
+            return self.config.rollout_len
+        horizon: int | None = None
+        for start, stage_horizon in curriculum:
+            if self.successful_updates < start:
+                break
+            horizon = stage_horizon
+        return horizon
+
+    def _sparsity_active(self) -> bool:
+        """Enable path/GECO only when their calibrated constraint is live."""
+        if not self.config.sparsity_enabled:
+            return False
+        if self.config.rollout_curriculum is None:
+            return True
+        return self._current_rollout_len() == self.config.rollout_len
+
+    def _forward(self, batch: dict[str, Tensor], rollout_len: int | None) -> TransitionOutput:
         """Run the model on one batch (the state-to-state regime: true states)."""
         states = batch["states"].to(self.device)
         return self.model(
             states,
             context_len=self.config.context_len,
-            rollout_len=self.config.rollout_len,
+            rollout_len=rollout_len,
         )
 
     def _rollout_loss(self, output: TransitionOutput) -> Tensor:
@@ -239,19 +296,16 @@ class Trainer:
         carry no rollout fields, so they return the disabled path unchanged.
         """
         prediction = getattr(output, "rollout_prediction", None)
-        if prediction is None or self.rollout_weights is None:
+        if prediction is None:
             return torch.zeros((), device=self.device)
         target = output.rollout_target
         assert target is not None
-        return weighted_rollout_mse(prediction, target, self.rollout_weights)
-
-    def _effective_lambda_roll(self) -> float:
-        """Rollout coefficient for the next (one-indexed) optimizer update."""
-        warmup = self.config.lambda_roll_warmup_steps
-        if warmup == 0:
-            return self.config.lambda_roll
-        progress = min((self.step + 1) / warmup, 1.0)
-        return self.config.lambda_roll * progress
+        horizon = prediction.shape[1]
+        weights = self._rollout_weight_cache.get(horizon)
+        if weights is None:
+            weights = rollout_weights(horizon, device=self.device)
+            self._rollout_weight_cache[horizon] = weights
+        return weighted_rollout_mse(prediction, target, weights)
 
     def _branch_gradient_norm(self, loss: Tensor) -> float:
         """Global pre-clip norm of one loss branch without touching ``.grad``."""
@@ -291,19 +345,20 @@ class Trainer:
 
     def _train_step(self, batch: dict[str, Tensor]) -> dict[str, float]:
         """One optimizer step over the hybrid Eq. 36; returns scalar metrics."""
-        output = self._forward(batch)
+        current_rollout_len = self._current_rollout_len()
+        sparsity_active = self._sparsity_active()
+        output = self._forward(batch, current_rollout_len)
 
         pred_loss = aligned_mse(output.prediction, output.target)  # L_TF, Eq. 32
         # Eq. 36: both prediction branches enter the objective, and (dual form,
         # §4.3) the same scalarised sum is what the bound applies to. Only the
         # weighted term is the quantity in the objective; the raw term is also
-        # reported so continuation cannot disguise an intrinsically unstable chain.
+        # reported so a changing K cannot disguise an unstable chain.
         raw_rollout_loss = self._rollout_loss(output)  # Eq. 35
-        effective_lambda_roll = self._effective_lambda_roll()
-        rollout_loss = effective_lambda_roll * raw_rollout_loss
+        rollout_loss = self.config.lambda_roll * raw_rollout_loss
         logit_loss = self.config.lambda_logit * output.logit_penalty
         total = pred_loss + rollout_loss + logit_loss
-        if self.config.sparsity_enabled:
+        if sparsity_active:
             total = total + self.lagrangian.penalty_weight * output.sparsity
         constraint = self._constraint(pred_loss + rollout_loss, logit_loss, output)
 
@@ -316,8 +371,7 @@ class Trainer:
 
         # Branch-specific pre-clip norms are diagnostic autograd traversals;
         # compute them only on steps that W&B will retain. The raw rollout norm
-        # exposes an unstable K-step chain even while continuation keeps its
-        # applied contribution small.
+        # exposes an unstable K-step chain independently of lambda_roll.
         branch_grad_metrics: dict[str, float] = {}
         diagnostic_step = self.step + 1
         if diagnostic_step % self.config.log_every == 0 or diagnostic_step == self.config.steps:
@@ -327,7 +381,7 @@ class Trainer:
                 raw_rollout_grad_norm = self._branch_gradient_norm(raw_rollout_loss)
                 branch_grad_metrics |= {
                     "health/grad_norm_rollout_raw": raw_rollout_grad_norm,
-                    "health/grad_norm_rollout": effective_lambda_roll * raw_rollout_grad_norm,
+                    "health/grad_norm_rollout": self.config.lambda_roll * raw_rollout_grad_norm,
                 }
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -355,8 +409,9 @@ class Trainer:
             self.consecutive_skips = 0
             self.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
             self._after_optimizer_step(output)
-            if self.config.sparsity_enabled:
+            if sparsity_active:
                 self.lagrangian.update(constraint)
+            self.successful_updates += 1
 
         num_decoded = output.prediction.shape[1]
         # λ_roll·L_roll, as it enters the objective. Emitted ONLY when the branch
@@ -391,9 +446,12 @@ class Trainer:
                 .mean()
                 .item(),
                 "sparsity/path_density_full": (output.path_matrix >= 0.5).float().mean().item(),
+                "sparsity/active": float(sparsity_active),
                 "health/grad_norm": float(grad_norm.item()),
                 "health/skipped_steps": float(self.total_skips),
-                "schedule/lambda_roll": effective_lambda_roll,
+                "schedule/successful_updates": float(self.successful_updates),
+                "schedule/rollout_len": float(current_rollout_len or 0),
+                "schedule/lambda_roll": self.config.lambda_roll,
             }
         )
 
@@ -405,8 +463,15 @@ class Trainer:
         metrics: dict[str, float] = {}
         batches = self._batches()
         while self.step < self.config.steps:
+            rollout_len_before = self._current_rollout_len()
             metrics = self._train_step(next(batches))
             self.step += 1
+            rollout_len_after = self._current_rollout_len()
+            if rollout_len_after != rollout_len_before:
+                next_stage = "tf" if rollout_len_after is None else f"k{rollout_len_after}"
+                self.save_checkpoint(
+                    out_dir / f"curriculum_success_{self.successful_updates}_before_{next_stage}.pt"
+                )
             if self.step % self.config.log_every == 0 or self.step == self.config.steps:
                 self.logger.log(self.step, metrics)
             if (
@@ -435,12 +500,10 @@ class Trainer:
             device=self.config.device,
             context_len=self.config.context_len,
             lambda_logit=self.config.lambda_logit,
-            # Must mirror training exactly — this is the quantity τ bounds.
-            rollout_len=self.config.rollout_len,
-            # Periodic evaluation reports the constraint coefficient currently
-            # seen by the dual. Final/post-hoc evaluation occurs after warm-up
-            # and therefore uses the configured target coefficient.
-            lambda_roll=self._effective_lambda_roll(),
+            # Periodic eval follows the live curriculum stage. Final/post-hoc
+            # calibration deliberately uses config.rollout_len (terminal K).
+            rollout_len=self._current_rollout_len(),
+            lambda_roll=self.config.lambda_roll,
         )
         self.model.train()  # the harness switches to eval mode
         # Every run mode logs the FULL eval key set (2026-07-25, Jesse): in the
@@ -458,6 +521,7 @@ class Trainer:
                 "optimizer": self.optimizer.state_dict(),
                 "lagrangian": self.lagrangian.state_dict(),
                 "step": self.step,
+                "successful_updates": self.successful_updates,
                 "total_skips": self.total_skips,
                 "consecutive_skips": self.consecutive_skips,
                 "rng_python": random.getstate(),
@@ -475,10 +539,20 @@ class Trainer:
         self.lagrangian.load_state_dict(payload["lagrangian"])
         self.step = int(payload["step"])
         self.total_skips = int(payload.get("total_skips", 0))
+        self.successful_updates = int(
+            payload.get("successful_updates", max(self.step - self.total_skips, 0))
+        )
         self.consecutive_skips = int(payload.get("consecutive_skips", 0))
         random.setstate(payload["rng_python"])
         np.random.set_state(payload["rng_numpy"])  # noqa: NPY002
         torch.set_rng_state(payload["rng_torch"])
 
 
-__all__ = ["MetricLogger", "NoopLogger", "TrainConfig", "Trainer", "seed_everything"]
+__all__ = [
+    "MetricLogger",
+    "NoopLogger",
+    "RolloutCurriculum",
+    "TrainConfig",
+    "Trainer",
+    "seed_everything",
+]
