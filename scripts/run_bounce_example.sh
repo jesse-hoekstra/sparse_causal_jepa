@@ -10,8 +10,10 @@
 #   --tau-factor=1.0     tau = factor x dense held-out constraint_loss.
 #                        §6.1.3 prescribes exactly 1.0; any other value is a
 #                        labelled slack ablation.
-#   --calib-steps=N      dense reference length (default: same as main run —
-#                        tau needs a CONVERGED reference; short = smoke only)
+#   --calib-steps=N      dense reference length (default: same as main run).
+#                        Reportable tau requires completion plus accepted
+#                        updates beyond the K=30 boundary at 60k; a short
+#                        override remains a smoke/ablation, not convergence.
 #   --main-steps=300000  main run length (default: config value)
 #   --eval-episodes=5000 final identifiability sample size (App. F.1: 5000)
 #   --final-seed-offset=29 held-out TEST split; tau calibration uses offset 17
@@ -46,7 +48,7 @@ BASE=outputs/bounce_example_${RUN_TAG:-$(date +%Y%m%d_%H%M%S)_$$}
 CALIB_STEPS_OVERRIDE=""
 if [ -n "${CALIB_STEPS}" ]; then
   CALIB_STEPS_OVERRIDE="train.steps=${CALIB_STEPS}"
-  echo "WARNING: --calib-steps=${CALIB_STEPS} — tau from a non-converged reference is only for smoke tests" >&2
+  echo "WARNING: --calib-steps=${CALIB_STEPS}; short references are smoke/ablation only, and terminal-curriculum validation still applies" >&2
 elif [ -n "${MAIN_STEPS:-}" ]; then
   CALIB_STEPS_OVERRIDE="train.steps=${MAIN_STEPS}"
 fi
@@ -56,10 +58,12 @@ echo "== step 1/3: dense reference (A≡1, no path penalty) =="
   "hydra.run.dir=${BASE}/calibration" ${HYDRA_ARGS[@]+"${HYDRA_ARGS[@]}"} \
   model.spartan_dense=true train.sparsity_enabled=false \
   ${CALIB_STEPS_OVERRIDE}
-# tau is calibrated on the exact dual quantity (Eq. 13):
-# constraint_loss = pred_loss + lambda_logit * logit_penalty, held out.
+# Tau is calibrated only after the accepted-update curriculum has reached and
+# trained at terminal K=30. The held-out dual quantity is the complete Eq. 13:
+# pred_loss + rollout_loss (already lambda_roll-weighted) +
+# lambda_logit * logit_penalty.
 FC_LOSS=$("$PY" scripts/eval_identifiability.py "${BASE}/calibration" --episodes 256 \
-  --seed-offset 17 --device "${EVAL_DEVICE}" \
+  --seed-offset 17 --device "${EVAL_DEVICE}" --require-terminal-curriculum \
   | awk '/constraint_loss/ {print $2}')
 TAU=$("$PY" -c "print(float('${FC_LOSS}') * float('${TAU_FACTOR}'))")
 echo "dense held-out constraint_loss=${FC_LOSS} -> tau=${TAU} (x${TAU_FACTOR})"
@@ -75,5 +79,6 @@ echo "== step 3/3: identifiability evaluation =="
 "$PY" scripts/eval_identifiability.py "${BASE}/main" \
   --episodes "${EVAL_EPISODES}" \
   --seed-offset "${FINAL_SEED_OFFSET}" \
-  --device "${EVAL_DEVICE}"
+  --device "${EVAL_DEVICE}" \
+  --require-terminal-curriculum
 echo "artifacts in ${BASE}/main (checkpoint, resolved config, recovery_grid.png)"

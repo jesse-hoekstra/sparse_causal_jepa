@@ -67,8 +67,11 @@ class VisualToStateTrainer(Trainer):
         # tau was calibrated from.
         self.model.coordinate_scales.copy_(scales.to(self.device))
 
-    def _forward(self, batch: dict[str, Tensor]) -> VisualToStateOutput:  # type: ignore[override]
+    def _forward(  # type: ignore[override]
+        self, batch: dict[str, Tensor], rollout_len: int | None = None
+    ) -> VisualToStateOutput:
         """Frames are the only predictor input; states supply targets only."""
+        del rollout_len  # This regime has no autoregressive rollout branch.
         return self.model(
             batch["frames"].to(self.device),
             batch["states"].to(self.device),
@@ -92,10 +95,11 @@ class VisualToStateTrainer(Trainer):
     def _train_step(self, batch: dict[str, Tensor]) -> dict[str, float]:
         """Identical to the base step except that the loss is assignment-aware."""
         output = self._forward(batch)
+        sparsity_active = self._sparsity_active()
         pred_loss = self._prediction_loss(output)
         logit_loss = self.config.lambda_logit * output.logit_penalty
         total = pred_loss + logit_loss
-        if self.config.sparsity_enabled:
+        if sparsity_active:
             total = total + self.lagrangian.penalty_weight * output.sparsity
         constraint = (pred_loss + logit_loss).detach()  # Eq. 103, raw
 
@@ -123,8 +127,9 @@ class VisualToStateTrainer(Trainer):
         else:
             self.consecutive_skips = 0
             self.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
-            if self.config.sparsity_enabled:
+            if sparsity_active:
                 self.lagrangian.update(constraint)
+            self.successful_updates += 1
 
         num_decoded = output.causal_params.shape[1]
         with torch.no_grad():
@@ -144,11 +149,13 @@ class VisualToStateTrainer(Trainer):
             .mean()
             .item(),
             "sparsity/path_density_full": (output.path_matrix >= 0.5).float().mean().item(),
+            "sparsity/active": float(sparsity_active),
             # Not an anti-collapse objective (§6.5 needs none) — a cheap tell
             # that the visual encoder is still producing varied states.
             "health/latent_std": latent_std,
             "health/grad_norm": float(grad_norm.item()),
             "health/skipped_steps": float(self.total_skips),
+            "schedule/successful_updates": float(self.successful_updates),
         }
 
     def _eval_step(self) -> dict[str, float]:

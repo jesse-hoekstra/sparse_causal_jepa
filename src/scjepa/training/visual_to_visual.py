@@ -78,13 +78,15 @@ class VisualToVisualTrainer(Trainer):
 
     model: VisualToVisualModel
 
-    def _forward(self, batch: dict[str, Tensor]) -> VisualToVisualOutput:  # type: ignore[override]
+    def _forward(  # type: ignore[override]
+        self, batch: dict[str, Tensor], rollout_len: int | None
+    ) -> VisualToVisualOutput:
         """Read frames; the true states in the batch are for evaluation only."""
         frames = batch["frames"].to(self.device)
         return self.model(
             frames,
             context_len=self.config.context_len,
-            rollout_len=self.config.rollout_len,
+            rollout_len=rollout_len,
         )
 
     def _constraint(
@@ -133,8 +135,9 @@ class VisualToVisualTrainer(Trainer):
             device=self.config.device,
             context_len=self.config.context_len,
             lambda_logit=self.config.lambda_logit,
-            # Must mirror training exactly — this is the quantity tau_3 bounds.
-            rollout_len=self.config.rollout_len,
+            # Periodic eval mirrors the live stage; final evaluation reads the
+            # configured terminal horizon from resolved_config.yaml.
+            rollout_len=self._current_rollout_len(),
             lambda_roll=self.config.lambda_roll,
         )
         self.model.train()

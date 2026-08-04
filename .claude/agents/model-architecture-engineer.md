@@ -47,8 +47,10 @@ JEPA Using a SPARTAN"**. You write composable, shape-safe, configurable `nn.Modu
   document the exception.
 - Capacity knobs from the paper are config, not constants: N (slots — chosen by attending to objects
   across the whole video, per Nam et al.), d (roomy enough for Markovian state, ≈2k for
-  position+velocity), Th (history), Tp (eval-time autoregressive rollout length only — training
-  prediction is single-step, D6).
+  position+velocity), Th (history), and Tp. In Experiment 1, D35 keeps all 30 teacher-forced
+  suffix transitions while training Tp through the accepted-update curriculum
+  off/K=2/5/10/20/30 at 0/10k/15k/25k/40k/60k; the reportable final model trains and evaluates
+  at K=30 with `lambda_roll = 1.0`. Do not treat its rollout as eval-only.
 - Encoders train **from scratch** (D7): no pretrained-checkpoint loading paths, no init-from-SAVi
   machinery — emergence without reconstruction is part of the paper's claim.
 

@@ -39,7 +39,7 @@ def main() -> None:
     run_dirs: list[Path] = []
     for pattern in args.runs:
         run_dirs.extend(Path(p) for p in sorted(glob(pattern)))
-    records: list[dict[str, float]] = []
+    records: list[dict[str, object]] = []
     for run_dir in run_dirs:
         metrics_file = run_dir / "metrics.json"
         if metrics_file.exists():
@@ -51,7 +51,12 @@ def main() -> None:
 
     seeds = [r.get("seed") for r in records]
     print(f"aggregating {len(records)} runs (seeds {seeds}):\n")
-    skip = {"seed", "step", "eval_seed_offset", "num_samples"}
+    curricula = [record.get("rollout_curriculum") for record in records]
+    if len({json.dumps(value, sort_keys=True) for value in curricula}) != 1:
+        raise SystemExit("inconsistent rollout_curriculum across runs")
+    # The curriculum is structured provenance, not a scalar statistic. Keep it
+    # in aggregate.json after checking equality rather than trying to average it.
+    skip = {"seed", "step", "eval_seed_offset", "num_samples", "rollout_curriculum"}
     aggregate: dict[str, dict[str, float]] = {}
     header = (
         f"{'metric':>14} | {'mean':>8} {'sd':>8} | "
@@ -73,7 +78,16 @@ def main() -> None:
         )
 
     out_path = run_dirs[0].parent / "aggregate.json"
-    out_path.write_text(json.dumps({"seeds": seeds, "metrics": aggregate}, indent=2))
+    out_path.write_text(
+        json.dumps(
+            {
+                "seeds": seeds,
+                "rollout_curriculum": curricula[0],
+                "metrics": aggregate,
+            },
+            indent=2,
+        )
+    )
     print(f"\nsaved to {out_path}")
 
 

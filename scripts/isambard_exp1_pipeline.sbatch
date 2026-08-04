@@ -11,19 +11,18 @@
 #
 # Walltime: one job runs the dense reference then main (D12/D29 — the
 # token-local reference is a reused measured constant, not a third stage), so
-# TWO training stages, not three. The hybrid rollout branch adds K=10
-# SEQUENTIAL predictor calls per step on top of the single batched
-# teacher-forced call, so budget noticeably more than the 1.6 h/300k of the
-# pure-TF D30 run; 24 h still leaves ample headroom for both stages.
+# TWO training stages, not three. In each, rollout depth advances on ACCEPTED
+# updates: off -> K=2 -> 5 -> 10 -> 20 -> 30, with the final ~240k updates at
+# K=30. That is close to full-K=30 cost for most of the run; the 12 h request
+# covers the expected 8-12 h pipeline but leaves little room for queue preemption.
 #SBATCH --job-name=scjepa-bounce
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=64
 #SBATCH --time=12:00:00
 #SBATCH --output=slurm-%x-%j.out
-# workq_qos caps MaxWall at 1-00:00:00 (48h was rejected, 2026-07-19); ask
-# for the full 24h. Expected runtime is ~8-12h (2 training stages + ~60
-# periodic evals + final evals + pregen), but train.py has NO resume: a job
+# Expected runtime is ~8-12h (2 training stages + ~60 periodic evals + final
+# evals + pregen), but train.py has NO resume: a job
 # killed at the wall loses its in-flight stage entirely, while over-asking
 # costs only backfill priority on a busy queue.
 # If sbatch rejects with an ACCOUNT error, find yours via

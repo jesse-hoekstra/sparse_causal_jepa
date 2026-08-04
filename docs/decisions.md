@@ -387,6 +387,10 @@ D29 made Experiment 1 a pure teacher-forced one-step objective and deleted the r
 puts a rollout back, on a different footing: it is now a SECOND branch alongside teacher
 forcing, not a replacement for it, and it is inside the dual constraint.
 
+> **Superseded optimisation detail:** D35 retains the exact final K=30 objective below but
+> replaces fixed-K training and the later λ_roll ramp with an accepted-update horizon
+> curriculum. The fixed anchor, terminal horizon, weighting, and theoretical claim remain.
+
 **Objective (hybrid write-up Eq. 36, dual form).**
 
     sparse:  L = L_TF + lambda_roll*L_roll + lambda_logit*L_logit + lambda^-1 * L_path
@@ -490,3 +494,79 @@ cannot distinguish the two cases and that this one can.
 computes the same scalarised numerator, reading `rollout_len`/`lambda_roll` from the run's own
 config. **Still unmeasured:** Experiment 3 has never been run at length (D32 records it as
 "written and runs end-to-end", no run IDs), so none of these diagnostics has faced a real run.
+
+## D35 — Reach the exact K=30 objective through an accepted-update horizon curriculum (decided 2026-08-02, Jesse)
+
+D34's 1500-step fixed-horizon smokes did not predict long-run stability. The first full-weight
+K=30 launch entered a sustained BPTT gradient explosion early. Continuing `lambda_roll`
+linearly from zero over 10k attempted steps only delayed the same failure: in run `ecbjobkj`,
+the teacher-forced branch remained healthy while the rollout branch reached gradient norms of
+1e7–1e8 and the D18 guard aborted after 2000 consecutive rejected batches. Scaling the rollout
+coefficient therefore does not address the number of recurrent Jacobians traversed by backward.
+
+**The final scientific objective is unchanged.** The reportable model is still trained and
+evaluated with one fixed parameter estimate, one chain from Z_29 through Z_59, terminal K=30,
+dense prefix supervision, and `lambda_roll = 1.0`. The complete 60-state clip and all causal-event
+coverage are retained. The curriculum is an optimisation route to that objective, not a shorter
+trajectory claim. `L_TF` continues to cover all 30 suffix transitions at every stage; only the
+number of autoregressive compositions changes.
+
+**The schedule is indexed by successful optimizer updates, not attempted batches.** The horizon
+used for the next batch is:
+
+| Successful updates before the batch | Autoregressive branch |
+|---:|---:|
+| `[0, 10,000)` | off (teacher forcing only) |
+| `[10,000, 15,000)` | K=2 |
+| `[15,000, 25,000)` | K=5 |
+| `[25,000, 40,000)` | K=10 |
+| `[40,000, 60,000)` | K=20 |
+| `[60,000, ∞)` | K=30 |
+
+A successful update is exactly a batch for which the finite/pre-clip-gradient guard accepts the
+gradients and `optimizer.step()` executes. Gradient clipping does not make an accepted batch a
+skip. A rejected batch advances the ordinary attempted-step counter and skip diagnostics, but
+does not advance the curriculum, the optimizer, EMA hooks, or GECO. The accepted-update counter
+is checkpointed, and a checkpoint is written immediately after the final accepted update of each
+stage, before the next horizon is used. Resume restores that counter; it must not infer progress
+from attempted steps alone. Experiment 1 lowers the persistent-skip abort from the base default
+of 2000 to 50 consecutive batches: once a horizon is stuck, its accepted-update clock cannot
+advance into the next stage, so the correct recovery is the preceding boundary checkpoint.
+
+**`lambda_roll` has no schedule.** It is 1.0 whenever the rollout branch is present. The TF-only
+stage has no rollout term because no autoregressive branch exists, not because its coefficient is
+zero. The removed `lambda_roll_warmup_steps` continuation must not survive as a second hidden
+schedule. The resolved config records the full curriculum and retains `rollout_len: 30` as the
+terminal and post-hoc-evaluation horizon.
+
+**Path sparsity and GECO activate only at terminal K=30.** Tau is calibrated from a converged
+dense model under the full K=30 constraint
+
+    c_30 = L_TF + L_roll,30 + lambda_logit*L_logit.
+
+Using that tau while the live loss is TF-only or has K<30 would compare different constraints and
+usually create artificial slack. GECO would then lower lambda and impose pruning pressure before
+the full-rollout feasibility condition was even active. Therefore, in the sparse run, both the
+`lambda^-1*L_path` term and the GECO moving-average/update are disabled until the batch uses K=30;
+lambda and its moving average remain at their initialized values. At K=30 both activate together.
+This leaves approximately 240k exact-K=30 sparse updates in a healthy 300k-attempt run.
+
+**Evaluation has two deliberately different roles.** Periodic in-training evaluation follows the
+live curriculum horizon and is a stage-health diagnostic; its pre-K30 `constraint_loss` must not
+be compared with the final tau. Dense tau calibration and final/post-hoc evaluation always use the
+configured terminal K=30 and `lambda_roll=1`. A dense checkpoint that has not completed at least
+one terminal-horizon update cannot provide a reportable tau, even if it can be evaluated forward
+at K=30. Precisely 60,000 accepted updates is the boundary checkpoint: it has completed the K=20
+stage but trained zero K=30 batches. Reportability therefore requires
+`successful_updates > 60000`. Dense and sparse runs use the identical declared curriculum,
+although skips may make their horizon transitions occur at different attempted/W&B steps.
+
+**What changes and what does not.** Training is path-dependent and spends its first 60k accepted
+updates on dynamics pretraining rather than the final sparse objective. This introduces the fixed
+stage boundaries and reduces the fraction of a 300k budget spent with sparsity active. It does not
+truncate the declared window, detach the recurrent state, change `lambda_roll`, reset to ground
+truth inside the chain, or weaken final full-rollout equivalence. Tau must be recalibrated from a
+fresh dense D35 run; the failed ramp run and every D34/pre-D34 tau remain invalid.
+
+D35 applies to Experiment 1's current preset. Experiment 3 remains at its separately declared
+fixed K=30 protocol unless its own evidence motivates and explicitly configures a curriculum.

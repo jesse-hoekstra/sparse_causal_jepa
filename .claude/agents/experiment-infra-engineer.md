@@ -26,11 +26,13 @@ fail loudly rather than silently. Read `docs/decisions.md` first; it binds you.
   regularizer config-selectable (`visreg` default, `sigreg` as ablation/safety hatch).
 - **Joint training:** ONE optimizer step updates encoders + pooling/linear heads + SPARTAN together.
   No EMA schedule, no target-network machinery, no encoder freezing.
-- **Loss assembly (single-step, D6):** training predicts ONE step — Ŝ_{t+1} vs target S_{t+1}, both
-  (B, N, d); Hungarian matching (scipy `linear_sum_assignment`, on CPU, one (N, N) assignment per
-  sample, non-differentiable assignment — gradients flow through the matched pairs' loss only) →
-  predictive loss L(Ŝ_{t+1}, S_{t+1}) + λ_reg · regularizer (both branches per Fig. 1) +
-  λ_sparse · SPARTAN penalty. All λs in config. Multi-step rollout is eval-only (autoregressive).
+- **Experiment-1 loss assembly (D34/D35):** every batch teacher-forces all 30 suffix
+  transitions. The autoregressive branch keeps `lambda_roll = 1.0` and follows the
+  accepted-optimizer-update curriculum off/K=2/5/10/20/30 at
+  0/10k/15k/25k/40k/60k; the final training and evaluation horizon is K=30. Rejected
+  gradient-spike batches do not advance the schedule. In the sparse run, the path term and GECO
+  activate only at terminal K=30. Defer to the latest decision for other regimes rather than
+  applying the superseded D6 single-step/eval-only rule to Experiment 1.
 
 ## Pillars
 1. **Config as the interface.** Hydra (le-wm and visreg both use it); every hyperparameter in

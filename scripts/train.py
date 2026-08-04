@@ -7,7 +7,7 @@ development and CI never block on it.
 
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
@@ -53,6 +53,47 @@ def _source_of(key: str, overrides: list[str], preset: DictConfig | None) -> str
     return "config.yaml"
 
 
+def _parse_rollout_curriculum(cfg: DictConfig) -> tuple[tuple[int, int | None], ...] | None:
+    """Convert Hydra's structured stages to the trainer's immutable representation."""
+    raw = cfg.train.get("rollout_curriculum", None)
+    if raw is None:
+        return None
+    container_value = OmegaConf.to_container(raw, resolve=True)
+    if not isinstance(container_value, list):
+        raise ValueError("train.rollout_curriculum must be a list of stage mappings or null")
+    container = cast(list[object], container_value)
+    stages: list[tuple[int, int | None]] = []
+    for index, stage in enumerate(container):
+        if not isinstance(stage, dict):
+            raise ValueError(f"train.rollout_curriculum stage {index} must be a mapping")
+        stage_mapping = cast(dict[str, object], stage)
+        if set(stage_mapping) != {"start_update", "rollout_len"}:
+            raise ValueError(
+                "train.rollout_curriculum stage "
+                f"{index} must contain exactly start_update and rollout_len"
+            )
+        start_update = stage_mapping["start_update"]
+        raw_horizon = stage_mapping["rollout_len"]
+        if not isinstance(start_update, int) or isinstance(start_update, bool):
+            raise ValueError(f"rollout curriculum start_update {index} must be an integer")
+        if raw_horizon is not None and (
+            not isinstance(raw_horizon, int) or isinstance(raw_horizon, bool)
+        ):
+            raise ValueError(f"rollout curriculum rollout_len {index} must be an integer or null")
+        horizon = raw_horizon
+        stages.append((start_update, horizon))
+    return tuple(stages)
+
+
+def _format_rollout_curriculum(stages: tuple[tuple[int, int | None], ...] | None) -> str:
+    """Compact banner form: accepted-update boundary followed by its live K."""
+    if stages is None:
+        return "(fixed rollout_len)"
+    return " -> ".join(
+        f"{start}:{'off' if horizon is None else f'K{horizon}'}" for start, horizon in stages
+    )
+
+
 def _print_run_banner(cfg: DictConfig, experiment: str, phase: str, git_sha: str) -> None:
     """Print the decision-critical resolved values and where each came from.
 
@@ -71,6 +112,7 @@ def _print_run_banner(cfg: DictConfig, experiment: str, phase: str, git_sha: str
         preset = loaded if isinstance(loaded, DictConfig) else None
 
     sparsity_on = bool(cfg.train.sparsity_enabled)
+    rollout_curriculum = _parse_rollout_curriculum(cfg)
     rows: list[tuple[str, str, str]] = [
         ("experiment", experiment, "preset"),
         ("phase", phase, "-"),
@@ -91,14 +133,14 @@ def _print_run_banner(cfg: DictConfig, experiment: str, phase: str, git_sha: str
             _source_of("train.lambda_roll", overrides, preset),
         ),
         (
-            "train.lambda_roll_warmup_steps",
-            str(cfg.train.get("lambda_roll_warmup_steps", 0)),
-            _source_of("train.lambda_roll_warmup_steps", overrides, preset),
-        ),
-        (
             "train.rollout_len",
             str(cfg.train.get("rollout_len", None)),
             _source_of("train.rollout_len", overrides, preset),
+        ),
+        (
+            "train.rollout_curriculum",
+            _format_rollout_curriculum(rollout_curriculum),
+            _source_of("train.rollout_curriculum", overrides, preset),
         ),
         (
             "train.sparsity_lambda_init",
@@ -199,7 +241,7 @@ def main(cfg: DictConfig) -> None:
         lambda_logit=float(cfg.train.lambda_logit),  # mandatory: .get() would mask MISSING
         rollout_len=cfg.train.get("rollout_len", None),
         lambda_roll=float(cfg.train.get("lambda_roll", 0.0)),
-        lambda_roll_warmup_steps=int(cfg.train.get("lambda_roll_warmup_steps", 0)),
+        rollout_curriculum=_parse_rollout_curriculum(cfg),
         seed=cfg.train.seed,
         device=cfg.train.device,
         context_len=cfg.train.get("context_len", None),

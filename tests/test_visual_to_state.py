@@ -138,9 +138,9 @@ def test_perfect_predictions_under_a_permutation_give_zero_loss() -> None:
     targets = torch.randn(2, 3, 5, 4)
     permutation = torch.stack([torch.randperm(5) for _ in range(2)])
     index = permutation[:, None, :, None].expand(2, 3, 5, 4)
-    output = model(
-        torch.rand(2, 6, 3, 64, 64), torch.randn(2, 6, 5, 4), context_len=3
-    )._replace(prediction=torch.gather(targets, 2, index), target=targets)
+    output = model(torch.rand(2, 6, 3, 64, 64), torch.randn(2, 6, 5, 4), context_len=3)._replace(
+        prediction=torch.gather(targets, 2, index), target=targets
+    )
     assert float(trainer._prediction_loss(output)) == pytest.approx(0.0, abs=1e-10)
 
 
@@ -175,6 +175,8 @@ def test_training_step_runs() -> None:
     assert metrics["health/skipped_steps"] == 0.0
     assert metrics["health/latent_std"] >= 0.0
     assert metrics["loss/sparsity"] > 0.0
+    assert trainer.successful_updates == 1
+    assert metrics["schedule/successful_updates"] == 1.0
 
 
 def test_evaluation_reports_the_shared_metric_keys() -> None:
