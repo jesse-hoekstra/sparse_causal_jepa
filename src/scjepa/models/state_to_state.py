@@ -20,11 +20,15 @@ transition (Eq. 33's fresh Gumbel noise), which falls out of flattening the K
 transitions into the batch axis of one SPARTAN call.
 
 The hybrid objective adds a SECOND branch alongside this one (hybrid write-up
-§4.2): a dense K-step autoregressive rollout from a sampled start, in which the
-predictor consumes its own output and every prefix k = 1..K is supervised. The
-teacher-forced branch keeps the mechanism anchored at observed states; the
-rollout branch is what forces one fixed θ̂ to remain valid along a generated
-trajectory (§4.4(ii)). Both branches share the single θ̂ pooled above.
+§4.2): one or more K-step autoregressive rollouts, in which the predictor
+consumes its own output and every prefix k = 1..K is supervised. Local
+curriculum windows may begin from several observed states. A later continuous
+full-trajectory phase may truncate only the backward graph at selected steps:
+the predicted state value continues forward unchanged, but gradients through
+the recurrent state edge stop there. The teacher-forced branch keeps the
+mechanism anchored at observed states; the rollout branch is what forces one
+fixed θ̂ to remain valid along a generated trajectory (§4.4(ii)). Every
+window and every transition share the single attached θ̂ pooled above.
 
 There is no target encoder and no representation-collapse regularizer; the
 targets are the fixed observed states Z_{t+1} (§6.2 "Training uses aligned
@@ -62,8 +66,10 @@ class TransitionOutput(NamedTuple):
     mean_gate_probability: Float[Tensor, ""]
     gate_entropy: Float[Tensor, ""]
     # Hybrid Eqs. 33-35; None when the rollout branch is disabled.
-    rollout_prediction: Float[Tensor, "b j n k"] | None = None
-    rollout_target: Float[Tensor, "b j n k"] | None = None
+    # Legacy single-window output is (B, H, N, k). Explicit ``rollout_starts``
+    # retains the window axis and returns (B, W, H, N, k), including for W=1.
+    rollout_prediction: Float[Tensor, "b j n k"] | Float[Tensor, "b w j n k"] | None = None
+    rollout_target: Float[Tensor, "b j n k"] | Float[Tensor, "b w j n k"] | None = None
 
 
 class StateToStateModel(nn.Module):
@@ -80,6 +86,8 @@ class StateToStateModel(nn.Module):
         states: Float[Tensor, "b t n k"],
         context_len: int | None = None,
         rollout_len: int | None = None,
+        rollout_starts: tuple[int, ...] | None = None,
+        rollout_gradient_cuts: tuple[int, ...] | None = None,
     ) -> TransitionOutput:
         """θ̂ from the context window, then the two branches of the hybrid objective.
 
@@ -90,6 +98,15 @@ class StateToStateModel(nn.Module):
             context_len: Tpar (the state-to-state regime: 30). None -> T-1 (K = 1).
             rollout_len: K for the autoregressive branch (hybrid Eqs. 33-35).
                 None disables it, reproducing the pure teacher-forced objective.
+            rollout_starts: Fixed zero-based offsets from the legacy anchor
+                ``Tpar - 1``. For example, ``(0, 10, 20)`` creates three
+                true-anchored local windows. ``None`` preserves the legacy
+                single-window output shape; an explicit tuple retains a window
+                axis, even when it contains one start.
+            rollout_gradient_cuts: One-based completed rollout steps after
+                which the predicted state is detached before being fed to the
+                next transition. A cut changes only backward propagation: it
+                never resets the forward state and never detaches θ̂.
         """
         if states.ndim != 4 or states.shape[1] < 2:
             raise ValueError(f"expected (B, T>=2, N, k), got {tuple(states.shape)}")
@@ -106,9 +123,17 @@ class StateToStateModel(nn.Module):
         out = self.predictor(anchors, params)
 
         rollout_prediction = rollout_target = None
-        if rollout_len is not None:
+        if rollout_len is None:
+            if rollout_starts is not None or rollout_gradient_cuts is not None:
+                raise ValueError("rollout_starts and rollout_gradient_cuts require rollout_len")
+        else:
             rollout_prediction, rollout_target = self._rollout(
-                states, tpar, rollout_len, causal_params
+                states,
+                tpar,
+                rollout_len,
+                causal_params,
+                starts=rollout_starts,
+                gradient_cuts=rollout_gradient_cuts,
             )
         return TransitionOutput(
             prediction=out.prediction,
@@ -130,37 +155,86 @@ class StateToStateModel(nn.Module):
         tpar: int,
         horizon: int,
         causal_params: Float[Tensor, "b n 1"],
-    ) -> tuple[Float[Tensor, "b j n k"], Float[Tensor, "b j n k"]]:
-        """Hybrid Eqs. 33-34: dense K-step autoregressive rollout.
+        starts: tuple[int, ...] | None = None,
+        gradient_cuts: tuple[int, ...] | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Hybrid Eqs. 33-34: one or more K-step autoregressive rollouts.
 
             Ŝ^[0]_t := S^on_t,   Ŝ^[k]_{t+k} := f_gamma(Ŝ^[k-1]_{t+k-1}, θ̂)
 
-        The chain starts at t = Tpar-1, the first state after the parameter
-        context and the same anchor the first teacher-forced transition uses,
-        and runs over t+1, …, t+K. There is no sampling of the start: one fixed
-        anchor per episode makes train and eval compute the same quantity,
-        which matters because τ is calibrated on the eval constraint.
+        By default the chain starts at t = Tpar-1, the same anchor the first
+        teacher-forced transition uses, and runs over t+1, …, t+K. Explicit
+        ``starts`` are fixed offsets from that anchor. They are true-anchored
+        local windows, vectorised into the predictor batch while reusing the
+        one θ̂ that was already computed from the context.
 
         For k >= 2 the predictor consumes its own previous output, never a
         fresh encoding — this is what forces one fixed θ̂ to stay valid along a
-        generated trajectory (§4.4(ii)). The same θ̂ is reused at every step.
+        generated trajectory (§4.4(ii)). The same attached θ̂ is reused at
+        every step and in every window. A gradient cut is applied only after
+        its prediction has been saved, so that prediction keeps its own loss
+        path while later losses cannot backpropagate across the boundary.
         Gates are resampled per step (Eq. 33's fresh noise) because each step
         is a separate SPARTAN call.
         """
         length = states.shape[1]
-        if tpar + horizon > length:
+        if horizon < 1:
+            raise ValueError(f"rollout_len must be positive, got {horizon}")
+        keep_window_axis = starts is not None
+        relative_starts = (0,) if starts is None else starts
+        if not relative_starts:
+            raise ValueError("rollout_starts must contain at least one start")
+        if any(start < 0 for start in relative_starts):
+            raise ValueError(f"rollout_starts must be non-negative, got {relative_starts}")
+        if len(set(relative_starts)) != len(relative_starts):
+            raise ValueError(f"rollout_starts must be distinct, got {relative_starts}")
+
+        cuts = () if gradient_cuts is None else gradient_cuts
+        if len(set(cuts)) != len(cuts) or any(cut < 1 or cut >= horizon for cut in cuts):
             raise ValueError(
-                f"rollout_len={horizon} runs past the episode: need Tpar-1+K <= T-1, "
-                f"got {tpar - 1}+{horizon} > {length - 1} (T={length}, Tpar={tpar})"
+                "rollout_gradient_cuts must be distinct completed steps in "
+                f"[1, rollout_len-1={horizon - 1}], got {cuts}"
             )
-        state = states[:, tpar - 1]  # Ŝ^[0] := S^on_t, t = Tpar-1 (Eq. 33)
+        cut_steps = set(cuts)
+
+        latest_start = max(relative_starts)
+        if tpar + latest_start + horizon > length:
+            raise ValueError(
+                "rollout window runs past the episode: need "
+                "Tpar-1+start+K <= T-1, got "
+                f"{tpar - 1}+{latest_start}+{horizon} > {length - 1} "
+                f"(T={length}, Tpar={tpar})"
+            )
+
+        # (B, W, N, k) -> (B·W, N, k). Expand, rather than recompute, the one
+        # attached θ̂ per episode; autograd sums all window/step contributions
+        # back into that same encoder output.
+        anchors = torch.stack([states[:, tpar - 1 + start] for start in relative_starts], dim=1)
+        batch, num_windows = anchors.shape[:2]
+        state = anchors.flatten(0, 1)
+        window_params = (
+            causal_params[:, None]
+            .expand(-1, num_windows, -1, -1)
+            .reshape(batch * num_windows, *causal_params.shape[1:])
+        )
         predictions: list[Tensor] = []
-        for _ in range(horizon):
-            state = self.predictor(state, causal_params).prediction  # Eq. 34
+        for step in range(1, horizon + 1):
+            state = self.predictor(state, window_params).prediction  # Eq. 34
             predictions.append(state)
+            if step in cut_steps:
+                state = state.detach()
+
+        prediction = torch.stack(predictions, dim=1).reshape(
+            batch, num_windows, horizon, *states.shape[2:]
+        )
         # Targets S̄_{t+1}, …, S̄_{t+K}; .detach() is Eq. 35's sg(·).
-        target = states[:, tpar : tpar + horizon].detach()
-        return torch.stack(predictions, dim=1), target
+        target = torch.stack(
+            [states[:, tpar + start : tpar + start + horizon] for start in relative_starts],
+            dim=1,
+        ).detach()
+        if not keep_window_axis:
+            return prediction[:, 0], target[:, 0]
+        return prediction, target
 
 
 def build_state_to_state(

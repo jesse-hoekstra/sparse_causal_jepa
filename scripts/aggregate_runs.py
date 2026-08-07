@@ -16,6 +16,46 @@ import statistics
 from glob import glob
 from pathlib import Path
 
+# Non-scalar fields emitted by eval_identifiability.py. They describe which
+# experiment was evaluated and must match across seeds; averaging them would be
+# meaningless. Keeping this explicit also makes schema drift fail loudly.
+PROVENANCE_KEYS = (
+    "step",
+    "eval_seed_offset",
+    "num_samples",
+    "successful_updates",
+    "total_skips",
+    "successful_updates_checkpointed",
+    "rollout_curriculum",
+    "curriculum_current_rollout_len",
+    "curriculum_current_rollout_starts",
+    "curriculum_current_gradient_cuts",
+    "curriculum_terminal_start_update",
+    "curriculum_terminal_reached",
+    "terminal_rollout_updates",
+    "evaluation_rollout_len",
+    "evaluation_rollout_starts",
+    "evaluation_gradient_cuts",
+    "lambda_roll",
+)
+
+
+def shared_provenance(records: list[dict[str, object]]) -> dict[str, object]:
+    """Return common run provenance, rejecting missing or unequal fields."""
+    provenance: dict[str, object] = {}
+    for key in PROVENANCE_KEYS:
+        present = [key in record for record in records]
+        if not any(present):
+            continue  # preserve support for older, pre-provenance reports
+        if not all(present):
+            raise ValueError(f"provenance field {key!r} is missing from some runs")
+        values = [record[key] for record in records]
+        encoded = {json.dumps(value, sort_keys=True) for value in values}
+        if len(encoded) != 1:
+            raise ValueError(f"inconsistent {key} across runs")
+        provenance[key] = values[0]
+    return provenance
+
 
 def five_number(values: list[float]) -> dict[str, float]:
     """Min, quartiles, max (matches box-plot whiskers/box of the source paper)."""
@@ -51,12 +91,13 @@ def main() -> None:
 
     seeds = [r.get("seed") for r in records]
     print(f"aggregating {len(records)} runs (seeds {seeds}):\n")
-    curricula = [record.get("rollout_curriculum") for record in records]
-    if len({json.dumps(value, sort_keys=True) for value in curricula}) != 1:
-        raise SystemExit("inconsistent rollout_curriculum across runs")
-    # The curriculum is structured provenance, not a scalar statistic. Keep it
-    # in aggregate.json after checking equality rather than trying to average it.
-    skip = {"seed", "step", "eval_seed_offset", "num_samples", "rollout_curriculum"}
+    try:
+        provenance = shared_provenance(records)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    # These fields are provenance, not scalar statistics. Keep them in
+    # aggregate.json after checking equality rather than trying to average them.
+    skip = {"seed", *PROVENANCE_KEYS}
     aggregate: dict[str, dict[str, float]] = {}
     header = (
         f"{'metric':>14} | {'mean':>8} {'sd':>8} | "
@@ -67,7 +108,15 @@ def main() -> None:
     for key in records[0]:
         if key in skip:
             continue
-        values = [float(r[key]) for r in records]
+        numeric_values: list[int | float] = []
+        for record in records:
+            value = record[key]
+            if not isinstance(value, int | float):
+                raise SystemExit(
+                    f"non-scalar field {key!r} is not declared as structured provenance"
+                )
+            numeric_values.append(value)
+        values = [float(value) for value in numeric_values]
         stats = {"mean": statistics.mean(values), "sd": statistics.stdev(values)}
         stats.update(five_number(values))
         aggregate[key] = stats
@@ -82,7 +131,10 @@ def main() -> None:
         json.dumps(
             {
                 "seeds": seeds,
-                "rollout_curriculum": curricula[0],
+                # Preserve the historical top-level location for downstream
+                # notebooks while retaining all structured fields together.
+                "rollout_curriculum": provenance.get("rollout_curriculum"),
+                "provenance": provenance,
                 "metrics": aggregate,
             },
             indent=2,

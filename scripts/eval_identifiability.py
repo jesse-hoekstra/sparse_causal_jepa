@@ -26,14 +26,28 @@ from scjepa.training.factory import build_dataset, build_model
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-EXPECTED_ROLLOUT_CURRICULUM: tuple[tuple[int, int | None], ...] = (
-    (0, None),
-    (10_000, 2),
-    (15_000, 5),
-    (25_000, 10),
-    (40_000, 20),
-    (60_000, 30),
+RolloutStage = tuple[int, int | None, tuple[int, ...], tuple[int, ...]]
+
+EXPECTED_ROLLOUT_CURRICULUM: tuple[RolloutStage, ...] = (
+    (0, None, (), ()),
+    (10_000, 2, (0, 10, 20), ()),
+    (20_000, 5, (0, 10, 20), ()),
+    (30_000, 10, (0, 10, 20), ()),
+    (50_000, 30, (0,), (10, 20)),
+    (70_000, 30, (0,), (15,)),
+    (85_000, 30, (0,), (20,)),
+    (100_000, 30, (0,), (25,)),
+    (115_000, 30, (0,), ()),
 )
+
+
+class CurriculumStageRecord(TypedDict):
+    """JSON representation of one accepted-update rollout stage."""
+
+    start_update: int
+    rollout_len: int | None
+    rollout_starts: list[int]
+    gradient_cuts: list[int]
 
 
 class CurriculumProvenance(TypedDict):
@@ -42,16 +56,34 @@ class CurriculumProvenance(TypedDict):
     successful_updates: int
     total_skips: int
     successful_updates_checkpointed: bool
-    rollout_curriculum: list[dict[str, int | None]]
+    rollout_curriculum: list[CurriculumStageRecord]
     curriculum_current_rollout_len: int | None
+    curriculum_current_rollout_starts: list[int]
+    curriculum_current_gradient_cuts: list[int]
     curriculum_terminal_start_update: int
     curriculum_terminal_reached: bool
     terminal_rollout_updates: int
     evaluation_rollout_len: int | None
+    evaluation_rollout_starts: list[int]
+    evaluation_gradient_cuts: list[int]
     lambda_roll: float
 
 
-def _rollout_curriculum(cfg: DictConfig) -> tuple[tuple[int, int | None], ...]:
+def _integer_list(value: object, *, field: str, stage_index: int) -> tuple[int, ...]:
+    """Validate and freeze one stage's start/cut list."""
+    if not isinstance(value, list):
+        raise ValueError(f"rollout curriculum {field} {stage_index} must be a list")
+    integers: list[int] = []
+    for item_index, item in enumerate(cast(list[object], value)):
+        if not isinstance(item, int) or isinstance(item, bool):
+            raise ValueError(
+                f"rollout curriculum {field} {stage_index}[{item_index}] must be an integer"
+            )
+        integers.append(item)
+    return tuple(integers)
+
+
+def _rollout_curriculum(cfg: DictConfig) -> tuple[RolloutStage, ...]:
     """Read the accepted-update curriculum from a resolved run config."""
     raw = cfg.train.get("rollout_curriculum", None)
     if raw is None:
@@ -60,14 +92,16 @@ def _rollout_curriculum(cfg: DictConfig) -> tuple[tuple[int, int | None], ...]:
     if not isinstance(container_value, list):
         raise ValueError("train.rollout_curriculum must be a list")
     container = cast(list[object], container_value)
-    stages: list[tuple[int, int | None]] = []
+    stages: list[RolloutStage] = []
     for index, stage in enumerate(container):
         if not isinstance(stage, dict):
             raise ValueError(f"rollout curriculum stage {index} must be a mapping")
         stage_mapping = cast(dict[str, object], stage)
-        if set(stage_mapping) != {"start_update", "rollout_len"}:
+        expected_fields = {"start_update", "rollout_len", "rollout_starts", "gradient_cuts"}
+        if set(stage_mapping) != expected_fields:
             raise ValueError(
-                f"rollout curriculum stage {index} must contain start_update and rollout_len"
+                f"rollout curriculum stage {index} must contain exactly "
+                "start_update, rollout_len, rollout_starts, and gradient_cuts"
             )
         start_update = stage_mapping["start_update"]
         raw_horizon = stage_mapping["rollout_len"]
@@ -77,7 +111,13 @@ def _rollout_curriculum(cfg: DictConfig) -> tuple[tuple[int, int | None], ...]:
             not isinstance(raw_horizon, int) or isinstance(raw_horizon, bool)
         ):
             raise ValueError(f"rollout curriculum rollout_len {index} must be an integer or null")
-        stages.append((start_update, raw_horizon))
+        starts = _integer_list(
+            stage_mapping["rollout_starts"], field="rollout_starts", stage_index=index
+        )
+        cuts = _integer_list(
+            stage_mapping["gradient_cuts"], field="gradient_cuts", stage_index=index
+        )
+        stages.append((start_update, raw_horizon, starts, cuts))
     return tuple(stages)
 
 
@@ -92,14 +132,22 @@ def _curriculum_provenance(cfg: DictConfig, checkpoint: dict[str, Any]) -> Curri
     terminal_rollout = None if terminal_rollout is None else int(terminal_rollout)
 
     current_rollout: int | None = terminal_rollout
+    current_starts: tuple[int, ...] = (0,) if terminal_rollout is not None else ()
+    current_cuts: tuple[int, ...] = ()
     if stages:
         current_rollout = None
-        for start_update, rollout_len in stages:
+        current_starts = ()
+        current_cuts = ()
+        for start_update, rollout_len, rollout_starts, gradient_cuts in stages:
             if start_update > successful_updates:
                 break
             current_rollout = rollout_len
+            current_starts = rollout_starts
+            current_cuts = gradient_cuts
     terminal_start = stages[-1][0] if stages else 0
-    terminal_stage_matches = bool(stages and stages[-1][1] == terminal_rollout)
+    terminal_stage_matches = bool(
+        stages and stages[-1][1] == terminal_rollout and stages[-1][2] == (0,) and not stages[-1][3]
+    )
     terminal_reached = terminal_stage_matches and successful_updates >= terminal_start
     terminal_updates = max(successful_updates - terminal_start, 0) if terminal_reached else 0
     return {
@@ -107,14 +155,25 @@ def _curriculum_provenance(cfg: DictConfig, checkpoint: dict[str, Any]) -> Curri
         "total_skips": total_skips,
         "successful_updates_checkpointed": counter_checkpointed,
         "rollout_curriculum": [
-            {"start_update": start_update, "rollout_len": rollout_len}
-            for start_update, rollout_len in stages
+            {
+                "start_update": start_update,
+                "rollout_len": rollout_len,
+                "rollout_starts": list(rollout_starts),
+                "gradient_cuts": list(gradient_cuts),
+            }
+            for start_update, rollout_len, rollout_starts, gradient_cuts in stages
         ],
         "curriculum_current_rollout_len": current_rollout,
+        "curriculum_current_rollout_starts": list(current_starts),
+        "curriculum_current_gradient_cuts": list(current_cuts),
         "curriculum_terminal_start_update": terminal_start,
         "curriculum_terminal_reached": terminal_reached,
         "terminal_rollout_updates": terminal_updates,
         "evaluation_rollout_len": terminal_rollout,
+        # The post-hoc evaluator always measures one complete mathematical
+        # rollout. Gradient cuts are a training-only backward-pass operation.
+        "evaluation_rollout_starts": [0] if terminal_rollout is not None else [],
+        "evaluation_gradient_cuts": [],
         "lambda_roll": float(cfg.train.get("lambda_roll", 0.0)),
     }
 
@@ -133,6 +192,8 @@ def _require_reportable_terminal_curriculum(
         )
     if float(cfg.train.get("lambda_roll", 0.0)) != 1.0:
         problems.append(f"lambda_roll is {cfg.train.get('lambda_roll', None)!r}, expected 1.0")
+    if stages and (stages[-1][2] != (0,) or stages[-1][3]):
+        problems.append("terminal stage must be one rollout from start 0 with no gradient cuts")
     if not bool(provenance["successful_updates_checkpointed"]):
         problems.append("checkpoint has no explicit successful_updates counter")
     if provenance["successful_updates"] + provenance["total_skips"] != int(checkpoint["step"]):
@@ -181,8 +242,8 @@ def main() -> None:
         "--require-terminal-curriculum",
         action="store_true",
         help=(
-            "require the exact accepted-update curriculum, at least one successful K=30 "
-            "update, and a completed checkpoint before emitting reportable metrics"
+            "require the exact accepted-update curriculum, at least one successful full-BPTT "
+            "K=30 update, and a completed checkpoint before emitting reportable metrics"
         ),
     )
     args = parser.parse_args()
@@ -217,12 +278,18 @@ def main() -> None:
         lambda_logit=cfg.train.get("lambda_logit", 0.0),
         rollout_len=cfg.train.get("rollout_len", None),
         lambda_roll=float(cfg.train.get("lambda_roll", 0.0)),
+        # Retain terminal-step and trajectory-third evidence in the final
+        # observational-equivalence report. The harness reuses the live K=30
+        # values, so this does not perform a duplicate rollout.
+        full_rollout_len=cfg.train.get("rollout_len", None),
     )
 
     print(f"identifiability report for {args.run_dir} (step {payload['step']}):")
     print(f"  {'successful_updates':>22}: {provenance['successful_updates']}")
     print(f"  {'terminal_rollout_updates':>22}: {provenance['terminal_rollout_updates']}")
     print(f"  {'evaluation_rollout_len':>22}: {provenance['evaluation_rollout_len']}")
+    print(f"  {'evaluation_rollout_starts':>22}: {provenance['evaluation_rollout_starts']}")
+    print(f"  {'evaluation_gradient_cuts':>22}: {provenance['evaluation_gradient_cuts']}")
     for key, value in report.metrics.items():
         print(f"  {key:>22}: {value:.10g}")
     for key, value in report.diagnostics.items():
@@ -349,10 +416,15 @@ def _log_to_wandb(
         for key in (
             "successful_updates",
             "total_skips",
+            "curriculum_current_rollout_len",
             "curriculum_terminal_start_update",
             "curriculum_terminal_reached",
             "terminal_rollout_updates",
             "evaluation_rollout_len",
+            "curriculum_current_rollout_starts",
+            "curriculum_current_gradient_cuts",
+            "evaluation_rollout_starts",
+            "evaluation_gradient_cuts",
             "lambda_roll",
         ):
             payload[f"final/{key}"] = provenance[key]

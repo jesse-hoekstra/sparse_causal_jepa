@@ -13,7 +13,14 @@ import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
-from scjepa.training import MetricLogger, NoopLogger, TrainConfig, Trainer, seed_everything
+from scjepa.training import (
+    MetricLogger,
+    NoopLogger,
+    RolloutStage,
+    TrainConfig,
+    Trainer,
+    seed_everything,
+)
 from scjepa.training.factory import build_dataset, build_model
 from scjepa.training.visual_to_state import VisualToStateTrainer
 from scjepa.training.visual_to_visual import VisualToVisualTrainer
@@ -53,7 +60,17 @@ def _source_of(key: str, overrides: list[str], preset: DictConfig | None) -> str
     return "config.yaml"
 
 
-def _parse_rollout_curriculum(cfg: DictConfig) -> tuple[tuple[int, int | None], ...] | None:
+def _parse_int_list(value: object, *, field: str, index: int) -> tuple[int, ...]:
+    """Validate one curriculum list without accepting booleans as integers."""
+    if not isinstance(value, list):
+        raise ValueError(f"rollout curriculum {field} {index} must be a list of integers")
+    items = cast(list[object], value)
+    if any(not isinstance(item, int) or isinstance(item, bool) for item in items):
+        raise ValueError(f"rollout curriculum {field} {index} must be a list of integers")
+    return tuple(cast(int, item) for item in items)
+
+
+def _parse_rollout_curriculum(cfg: DictConfig) -> tuple[RolloutStage, ...] | None:
     """Convert Hydra's structured stages to the trainer's immutable representation."""
     raw = cfg.train.get("rollout_curriculum", None)
     if raw is None:
@@ -62,15 +79,15 @@ def _parse_rollout_curriculum(cfg: DictConfig) -> tuple[tuple[int, int | None], 
     if not isinstance(container_value, list):
         raise ValueError("train.rollout_curriculum must be a list of stage mappings or null")
     container = cast(list[object], container_value)
-    stages: list[tuple[int, int | None]] = []
+    stages: list[RolloutStage] = []
     for index, stage in enumerate(container):
         if not isinstance(stage, dict):
             raise ValueError(f"train.rollout_curriculum stage {index} must be a mapping")
         stage_mapping = cast(dict[str, object], stage)
-        if set(stage_mapping) != {"start_update", "rollout_len"}:
+        required = {"start_update", "rollout_len", "rollout_starts", "gradient_cuts"}
+        if set(stage_mapping) != required:
             raise ValueError(
-                "train.rollout_curriculum stage "
-                f"{index} must contain exactly start_update and rollout_len"
+                f"train.rollout_curriculum stage {index} must contain exactly {sorted(required)}"
             )
         start_update = stage_mapping["start_update"]
         raw_horizon = stage_mapping["rollout_len"]
@@ -80,18 +97,26 @@ def _parse_rollout_curriculum(cfg: DictConfig) -> tuple[tuple[int, int | None], 
             not isinstance(raw_horizon, int) or isinstance(raw_horizon, bool)
         ):
             raise ValueError(f"rollout curriculum rollout_len {index} must be an integer or null")
-        horizon = raw_horizon
-        stages.append((start_update, horizon))
+        stages.append(
+            RolloutStage(
+                start_update=start_update,
+                rollout_len=raw_horizon,
+                rollout_starts=_parse_int_list(
+                    stage_mapping["rollout_starts"], field="rollout_starts", index=index
+                ),
+                gradient_cuts=_parse_int_list(
+                    stage_mapping["gradient_cuts"], field="gradient_cuts", index=index
+                ),
+            )
+        )
     return tuple(stages)
 
 
-def _format_rollout_curriculum(stages: tuple[tuple[int, int | None], ...] | None) -> str:
-    """Compact banner form: accepted-update boundary followed by its live K."""
+def _format_rollout_curriculum(stages: tuple[RolloutStage, ...] | None) -> str:
+    """Compact banner form with every value/backward choice made explicit."""
     if stages is None:
         return "(fixed rollout_len)"
-    return " -> ".join(
-        f"{start}:{'off' if horizon is None else f'K{horizon}'}" for start, horizon in stages
-    )
+    return " -> ".join(f"{stage.start_update}:{stage.label}" for stage in stages)
 
 
 def _print_run_banner(cfg: DictConfig, experiment: str, phase: str, git_sha: str) -> None:
@@ -278,7 +303,9 @@ def main(cfg: DictConfig) -> None:
         "visual_to_visual": VisualToVisualTrainer,
     }
     trainer_class = trainers[str(cfg.model.get("regime", "state_to_state"))]
-    final = trainer_class(model, dataset, train_config, logger, eval_dataset=eval_dataset).train()
+    final = trainer_class(
+        cast(Any, model), dataset, train_config, logger, eval_dataset=eval_dataset
+    ).train()
     print(
         f"done at step {train_config.steps}: " + ", ".join(f"{k}={v:.4g}" for k, v in final.items())
     )

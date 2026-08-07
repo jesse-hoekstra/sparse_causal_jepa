@@ -1,7 +1,7 @@
 #!/bin/bash
 # Isambard-AI multi-GPU dense sweep for Baumgartner's unspecified lambda_logit.
 # Submit from the repository root, optionally overriding the colon-separated
-# grid or the usual 300k-step/full-eval defaults:
+# grid or the D36 355k-step/full-eval defaults:
 #
 #   sbatch --account=<PROJECT> scripts/isambard_logit_sweep.sbatch logit_seed0 0
 #   LAMBDA_LOGIT_GRID='0:1e-6:3e-6:1e-5:3e-5:1e-4:3e-4:1e-3' \
@@ -29,12 +29,12 @@ case "${SEED}" in
   ''|*[!0-9]*) echo "SEED must be a non-negative integer, got: ${SEED}" >&2; exit 2 ;;
 esac
 GRID=${LAMBDA_LOGIT_GRID:-0:1e-6:3e-6:1e-5:3e-5:1e-4:3e-4:1e-3}
-STEPS=${SWEEP_STEPS:-300000}
+STEPS=${SWEEP_STEPS:-355000}
 EVAL_EPISODES=${EVAL_EPISODES:-5000}
 VALIDATION_SEED_OFFSET=${VALIDATION_SEED_OFFSET:-23}
 NUM_CLIPS=${NUM_CLIPS:-100000}
-if [ "${STEPS}" != 300000 ]; then
-  echo "NOTE: SWEEP_STEPS=${STEPS}; non-300k selection is smoke/ablation provenance" >&2
+if [ "${STEPS}" != 355000 ]; then
+  echo "NOTE: SWEEP_STEPS=${STEPS}; non-355k selection is smoke/ablation provenance" >&2
 fi
 if [ "${SEED}" -eq 0 ]; then
   PRELOAD="data/bounce_train_v2_${NUM_CLIPS}.pt"
