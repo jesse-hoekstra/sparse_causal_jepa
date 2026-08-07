@@ -71,6 +71,9 @@ def evaluate_identifiability(
     lambda_logit: float = 0.0,
     rollout_len: int | None = None,
     lambda_roll: float = 0.0,
+    rollout_starts: tuple[int, ...] | None = None,
+    rollout_gradient_cuts: tuple[int, ...] | None = None,
+    full_rollout_len: int | None = None,
 ) -> IdentifiabilityReport:
     """Evaluate prediction / constraint / SHD / MCC over the dataset.
 
@@ -87,6 +90,13 @@ def evaluate_identifiability(
             since τ is calibrated on the constraint this function reports.
             None disables the branch (pure teacher-forced constraint).
         lambda_roll: Training's rollout weight inside the scalarised bound.
+        rollout_starts: Live curriculum start offsets. Multiple starts retain
+            a window axis and are averaged without changing loss scale.
+        rollout_gradient_cuts: Live backward-only cuts. Evaluation has no
+            gradients, but passing them pins the exact stage provenance.
+        full_rollout_len: Optional always-on, uncut rollout from offset zero.
+            Its metrics diagnose the terminal observational-equivalence target
+            even while a shorter/local curriculum stage is trained.
     """
     model = model.to(device).eval()
     # DataLoader draws a worker/base seed even with shuffle=False. Give it a
@@ -100,6 +110,11 @@ def evaluate_identifiability(
     num_slots: int | None = None
     pred_losses: list[Tensor] = []
     rollout_losses: list[Tensor] = []
+    full_rollout_losses: list[Tensor] = []
+    full_rollout_terminal: list[Tensor] = []
+    full_rollout_first: list[Tensor] = []
+    full_rollout_middle: list[Tensor] = []
+    full_rollout_last: list[Tensor] = []
     logit_penalties: list[Tensor] = []
     learned_graphs: list[Tensor] = []
     true_graphs: list[Tensor] = []
@@ -116,19 +131,63 @@ def evaluate_identifiability(
         if max_batches is not None and index >= max_batches:
             break
         states = batch["states"].to(device)
-        output: TransitionOutput = model(states, context_len=context_len, rollout_len=rollout_len)
+        output: TransitionOutput = model(
+            states,
+            context_len=context_len,
+            rollout_len=rollout_len,
+            rollout_starts=rollout_starts,
+            rollout_gradient_cuts=rollout_gradient_cuts,
+        )
         batch_weights.append(states.shape[0])
         num_slots = output.prediction.shape[1]
         pred_losses.append(aligned_mse(output.prediction, output.target).cpu())
         if output.rollout_prediction is not None and output.rollout_target is not None:
-            weights = rollout_weights(
-                output.rollout_prediction.shape[1], device=output.rollout_prediction.device
-            )
+            rollout_prediction = output.rollout_prediction
+            rollout_target = output.rollout_target
+            if rollout_prediction.ndim == 5:
+                rollout_prediction = rollout_prediction.flatten(0, 1)
+                rollout_target = rollout_target.flatten(0, 1)
+            weights = rollout_weights(rollout_prediction.shape[1], device=rollout_prediction.device)
             rollout_losses.append(
-                weighted_rollout_mse(
-                    output.rollout_prediction, output.rollout_target, weights
-                ).cpu()
+                weighted_rollout_mse(rollout_prediction, rollout_target, weights).cpu()
             )
+        if full_rollout_len is not None:
+            # Once the live stage is already one full start-0 trajectory, its
+            # values ARE the terminal diagnostic: detach is forward identity.
+            # Reuse them instead of doubling every periodic K=30 eval.
+            live_is_terminal_forward = rollout_len == full_rollout_len and rollout_starts in (
+                None,
+                (0,),
+            )
+            if live_is_terminal_forward:
+                terminal_prediction = output.rollout_prediction
+                terminal_target = output.rollout_target
+            else:
+                terminal_output = model(
+                    states,
+                    context_len=context_len,
+                    rollout_len=full_rollout_len,
+                    rollout_starts=(0,),
+                    rollout_gradient_cuts=(),
+                )
+                terminal_prediction = terminal_output.rollout_prediction
+                terminal_target = terminal_output.rollout_target
+            assert terminal_prediction is not None
+            assert terminal_target is not None
+            if terminal_prediction.ndim == 5:
+                terminal_prediction = terminal_prediction[:, 0]
+                terminal_target = terminal_target[:, 0]
+            terminal_weights = rollout_weights(full_rollout_len, device=terminal_prediction.device)
+            full_rollout_losses.append(
+                weighted_rollout_mse(terminal_prediction, terminal_target, terminal_weights).cpu()
+            )
+            per_step = (terminal_prediction - terminal_target).square().mean(dim=(0, 2, 3))
+            first_end = full_rollout_len // 3
+            middle_end = 2 * full_rollout_len // 3
+            full_rollout_terminal.append(per_step[-1].cpu())
+            full_rollout_first.append(per_step[:first_end].mean().cpu())
+            full_rollout_middle.append(per_step[first_end:middle_end].mean().cpu())
+            full_rollout_last.append(per_step[middle_end:].mean().cpu())
         logit_penalties.append(output.logit_penalty.cpu())
         # One ground-truth local graph per predicted transition (Eqs. 8/9),
         # flattened to match the model's (B·K, ...) transition rows.
@@ -189,6 +248,14 @@ def evaluate_identifiability(
         "mcc": recovery.score.item(),
         "path_density": _weighted_mean(path_density, batch_weights),
     }
+    if full_rollout_losses:
+        metrics |= {
+            "full_rollout_loss": lambda_roll * _weighted_mean(full_rollout_losses, batch_weights),
+            "full_rollout_terminal_mse": _weighted_mean(full_rollout_terminal, batch_weights),
+            "full_rollout_first_third_mse": _weighted_mean(full_rollout_first, batch_weights),
+            "full_rollout_middle_third_mse": _weighted_mean(full_rollout_middle, batch_weights),
+            "full_rollout_last_third_mse": _weighted_mean(full_rollout_last, batch_weights),
+        }
     diagnostics = {
         "logit_penalty": logit_penalty,
         "logit_weighted": weighted_logit,

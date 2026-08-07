@@ -19,31 +19,52 @@ from typing import Any, cast
 
 from omegaconf import DictConfig, OmegaConf
 
-EXPECTED_ROLLOUT_CURRICULUM: tuple[tuple[int, int | None], ...] = (
-    (0, None),
-    (10_000, 2),
-    (15_000, 5),
-    (25_000, 10),
-    (40_000, 20),
-    (60_000, 30),
+RolloutStage = tuple[int, int | None, tuple[int, ...], tuple[int, ...]]
+
+EXPECTED_ROLLOUT_CURRICULUM: tuple[RolloutStage, ...] = (
+    (0, None, (), ()),
+    (10_000, 2, (0, 10, 20), ()),
+    (20_000, 5, (0, 10, 20), ()),
+    (30_000, 10, (0, 10, 20), ()),
+    (50_000, 30, (0,), (10, 20)),
+    (70_000, 30, (0,), (15,)),
+    (85_000, 30, (0,), (20,)),
+    (100_000, 30, (0,), (25,)),
+    (115_000, 30, (0,), ()),
 )
 
 
-def _curriculum(value: object) -> tuple[tuple[int, int | None], ...]:
+def _integer_list(value: object, *, field: str, stage_index: int) -> tuple[int, ...]:
+    """Validate and freeze one stage's starts or gradient cuts."""
+    if not isinstance(value, list):
+        raise ValueError(f"rollout curriculum {field} {stage_index} must be a list")
+    integers: list[int] = []
+    for item_index, item in enumerate(cast(list[object], value)):
+        if not isinstance(item, int) or isinstance(item, bool):
+            raise ValueError(
+                f"rollout curriculum {field} {stage_index}[{item_index}] must be an integer"
+            )
+        integers.append(item)
+    return tuple(integers)
+
+
+def _curriculum(value: object) -> tuple[RolloutStage, ...]:
     """Normalize a JSON/OmegaConf curriculum for validation and comparison."""
     if OmegaConf.is_config(value):
         value = OmegaConf.to_container(value, resolve=True)
     if not isinstance(value, list):
         raise ValueError("rollout_curriculum must be a list")
     stages_value = cast(list[object], value)
-    stages: list[tuple[int, int | None]] = []
+    stages: list[RolloutStage] = []
     for index, stage in enumerate(stages_value):
         if not isinstance(stage, dict):
             raise ValueError(f"rollout curriculum stage {index} must be a mapping")
         stage_mapping = cast(dict[str, object], stage)
-        if set(stage_mapping) != {"start_update", "rollout_len"}:
+        expected_fields = {"start_update", "rollout_len", "rollout_starts", "gradient_cuts"}
+        if set(stage_mapping) != expected_fields:
             raise ValueError(
-                f"rollout curriculum stage {index} must contain start_update and rollout_len"
+                f"rollout curriculum stage {index} must contain exactly "
+                "start_update, rollout_len, rollout_starts, and gradient_cuts"
             )
         start_update = stage_mapping["start_update"]
         raw_horizon = stage_mapping["rollout_len"]
@@ -53,7 +74,13 @@ def _curriculum(value: object) -> tuple[tuple[int, int | None], ...]:
             not isinstance(raw_horizon, int) or isinstance(raw_horizon, bool)
         ):
             raise ValueError(f"rollout curriculum rollout_len {index} must be an integer or null")
-        stages.append((start_update, raw_horizon))
+        starts = _integer_list(
+            stage_mapping["rollout_starts"], field="rollout_starts", stage_index=index
+        )
+        cuts = _integer_list(
+            stage_mapping["gradient_cuts"], field="gradient_cuts", stage_index=index
+        )
+        stages.append((start_update, raw_horizon, starts, cuts))
     return tuple(stages)
 
 
@@ -99,8 +126,21 @@ def _load_record(run_dir: Path) -> dict[str, Any]:
         "terminal_curriculum_reached": bool(metrics["curriculum_terminal_reached"]),
         "successful_updates_checkpointed": bool(metrics["successful_updates_checkpointed"]),
         "rollout_curriculum": metric_curriculum,
+        "current_rollout_len": int(metrics["curriculum_current_rollout_len"]),
+        "current_rollout_starts": tuple(
+            int(value) for value in metrics["curriculum_current_rollout_starts"]
+        ),
+        "current_gradient_cuts": tuple(
+            int(value) for value in metrics["curriculum_current_gradient_cuts"]
+        ),
         "terminal_stage_start_update": int(metrics["curriculum_terminal_start_update"]),
         "evaluation_rollout_len": int(metrics["evaluation_rollout_len"]),
+        "evaluation_rollout_starts": tuple(
+            int(value) for value in metrics["evaluation_rollout_starts"]
+        ),
+        "evaluation_gradient_cuts": tuple(
+            int(value) for value in metrics["evaluation_gradient_cuts"]
+        ),
         "lambda_roll": float(metrics["lambda_roll"]),
         "num_samples": int(metrics["num_samples"]),
         "eval_seed_offset": int(metrics["eval_seed_offset"]),
@@ -108,7 +148,7 @@ def _load_record(run_dir: Path) -> dict[str, Any]:
         "train_seed": int(cfg.train.seed),
         "data_seed": int(cfg.data.seed),
         "train_steps": int(cfg.train.steps),
-        "protocol_300k_steps": int(cfg.train.steps) == 300_000,
+        "protocol_355k_steps": int(cfg.train.steps) == 355_000,
         "batch_size": int(cfg.train.batch_size),
         "learning_rate": float(cfg.train.lr),
         "num_clips": int(cfg.data.num_clips),
@@ -139,10 +179,32 @@ def _load_record(run_dir: Path) -> dict[str, Any]:
         )
     if record["evaluation_rollout_len"] != 30 or record["lambda_roll"] != 1.0:
         raise ValueError(f"{run_dir}: final evaluation must use K=30 and lambda_roll=1")
+    if record["evaluation_rollout_starts"] != (0,) or record["evaluation_gradient_cuts"]:
+        raise ValueError(
+            f"{run_dir}: final evaluation must use one rollout from start 0 with no gradient cuts"
+        )
+    if metric_curriculum[-1][2] != (0,) or metric_curriculum[-1][3]:
+        raise ValueError(
+            f"{run_dir}: terminal training stage must use one rollout from start 0 "
+            "with no gradient cuts"
+        )
+    if record["terminal_stage_start_update"] != metric_curriculum[-1][0]:
+        raise ValueError(f"{run_dir}: terminal-stage boundary disagrees with the curriculum")
+    if (
+        record["current_rollout_len"] != 30
+        or record["current_rollout_starts"] != (0,)
+        or record["current_gradient_cuts"]
+    ):
+        raise ValueError(f"{run_dir}: checkpoint did not finish in the uncut one-window K=30 stage")
     if not record["successful_updates_checkpointed"]:
         raise ValueError(f"{run_dir}: checkpoint did not persist successful_updates")
     if not record["terminal_curriculum_reached"] or record["terminal_rollout_updates"] < 1:
         raise ValueError(f"{run_dir}: checkpoint completed no update at terminal K=30")
+    expected_terminal_updates = max(
+        record["successful_updates"] - record["terminal_stage_start_update"], 0
+    )
+    if record["terminal_rollout_updates"] != expected_terminal_updates:
+        raise ValueError(f"{run_dir}: terminal rollout update count is inconsistent")
     if record["successful_updates"] + record["total_skips"] != record["step"]:
         raise ValueError(
             f"{run_dir}: successful_updates + total_skips does not equal attempted step"
@@ -202,9 +264,9 @@ def main() -> None:
     baseline = baselines[0]
     if baseline["pred_loss"] <= 0:
         raise SystemExit("lambda_logit=0 prediction loss must be positive")
-    if not baseline["protocol_300k_steps"]:
+    if not baseline["protocol_355k_steps"]:
         print(
-            "WARNING: non-300k sweep; selection is smoke/ablation provenance, "
+            "WARNING: non-355k sweep; selection is smoke/ablation provenance, "
             "not the reportable protocol"
         )
 
@@ -221,6 +283,8 @@ def main() -> None:
         "rollout_curriculum",
         "terminal_stage_start_update",
         "evaluation_rollout_len",
+        "evaluation_rollout_starts",
+        "evaluation_gradient_cuts",
         "lambda_roll",
         "num_slots",
         "param_encoder_dim",
@@ -228,6 +292,11 @@ def main() -> None:
         "spartan_embed_dim",
         "num_samples",
         "eval_seed_offset",
+        # D36 phases advance on accepted updates, not attempted batches. A
+        # coefficient comparison must therefore have equal terminal exposure.
+        "successful_updates",
+        "total_skips",
+        "terminal_rollout_updates",
     )
     for key in provenance_keys:
         values = {record[key] for record in records}
@@ -288,7 +357,7 @@ def main() -> None:
             "logit_reduction_fraction": args.logit_reduction_fraction,
             "target_logit_excess": target_excess,
             "uses_mass_labels": False,
-            "protocol_300k_steps": bool(selected["protocol_300k_steps"]),
+            "protocol_355k_steps": bool(selected["protocol_355k_steps"]),
             "description": (
                 "Among Pareto coefficients within the prediction tolerance, choose the smallest "
                 "one achieving the requested fraction of the best logit-excess reduction. "

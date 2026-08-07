@@ -12,7 +12,9 @@ data:
   preload: data/bounce_train_v2_100000.pt
 
 train:
-  steps: 300000 # Baumgartner Fig. 17 scale
+  # Attempted-batch stop. A healthy zero-skip D36 run spends 115k accepted
+  # updates reaching the terminal gradient and 240k at full K=30 BPTT.
+  steps: 355000
   batch_size: 16 # x30 teacher-forced transitions per episode
   context_len: 30 # Tpar (Eq. 17); I_TF = {29, ..., 58}
   # Hybrid rollout branch (write-up Eqs. 33-35): ONE chain anchored at the
@@ -27,17 +29,23 @@ train:
   # therefore changes BPTT depth while keeping the live coefficient fixed.
   rollout_len: 30
   lambda_roll: 1.0
-  # Increase BPTT depth only after ACCEPTED optimizer updates; rejected
-  # grad-spike batches do not advance this clock. lambda_roll remains exactly 1
-  # whenever the branch is live. rollout_len above remains the terminal K used
-  # for final evaluation and dense tau calibration.
+  # D36 rollout continuation, indexed only by ACCEPTED optimizer updates.
+  # First train three true-anchored windows spanning the early/middle/late
+  # suffix. Then evaluate ONE continuous full-K=30 forward trajectory while
+  # removing feedback-gradient cuts: 10 -> 15 -> 20 -> 25 -> 30 BPTT depth.
+  # detach is applied only after saving a boundary prediction; it never resets
+  # the value to ground truth and never detaches the shared theta_hat.
+  # lambda_roll remains exactly 1 whenever the branch is live.
   rollout_curriculum:
-    - {start_update: 0, rollout_len: null}
-    - {start_update: 10000, rollout_len: 2}
-    - {start_update: 15000, rollout_len: 5}
-    - {start_update: 25000, rollout_len: 10}
-    - {start_update: 40000, rollout_len: 20}
-    - {start_update: 60000, rollout_len: 30}
+    - {start_update: 0, rollout_len: null, rollout_starts: [], gradient_cuts: []}
+    - {start_update: 10000, rollout_len: 2, rollout_starts: [0, 10, 20], gradient_cuts: []}
+    - {start_update: 20000, rollout_len: 5, rollout_starts: [0, 10, 20], gradient_cuts: []}
+    - {start_update: 30000, rollout_len: 10, rollout_starts: [0, 10, 20], gradient_cuts: []}
+    - {start_update: 50000, rollout_len: 30, rollout_starts: [0], gradient_cuts: [10, 20]}
+    - {start_update: 70000, rollout_len: 30, rollout_starts: [0], gradient_cuts: [15]}
+    - {start_update: 85000, rollout_len: 30, rollout_starts: [0], gradient_cuts: [20]}
+    - {start_update: 100000, rollout_len: 30, rollout_starts: [0], gradient_cuts: [25]}
+    - {start_update: 115000, rollout_len: 30, rollout_starts: [0], gradient_cuts: []}
   eval_every: 5000 # a metric that CAN leave its failure value MUST be watched
   log_every: 100
   # A stalled accepted-update clock cannot advance out of an unstable horizon.

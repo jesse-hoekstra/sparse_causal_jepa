@@ -124,6 +124,40 @@ def test_identifiability_harness_end_to_end() -> None:
     assert report.recovery_matrix.shape == (N, N)
 
 
+def test_harness_reports_live_multi_window_and_terminal_forward_rollout() -> None:
+    """D36 evaluates its local stage and the fixed uncut terminal trajectory."""
+    dataset = BounceDataset(
+        num_episodes=6,
+        clip_len=8,
+        num_balls=N,
+        seed=4,
+        render=False,
+        mass_normal=(1.5, 0.5),
+        radius_from_mass=True,
+    )
+    report = evaluate_identifiability(
+        tiny_model(),
+        dataset,
+        batch_size=3,
+        context_len=3,
+        rollout_len=2,
+        rollout_starts=(0, 2, 3),
+        rollout_gradient_cuts=(),
+        full_rollout_len=5,
+        lambda_roll=1.0,
+    )
+    for key in (
+        "rollout_loss",
+        "full_rollout_loss",
+        "full_rollout_terminal_mse",
+        "full_rollout_first_third_mse",
+        "full_rollout_middle_third_mse",
+        "full_rollout_last_third_mse",
+    ):
+        assert key in report.metrics
+        assert torch.isfinite(torch.tensor(report.metrics[key])), key
+
+
 def test_harness_batches_gt_graphs_per_transition() -> None:
     """K > 1: one ground-truth local graph per predicted transition."""
     dataset = BounceDataset(

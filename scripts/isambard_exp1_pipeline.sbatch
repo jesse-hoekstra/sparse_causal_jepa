@@ -1,5 +1,5 @@
 #!/bin/bash
-# Isambard-AI (GH200, aarch64, Slurm) launch for the D26 bounce_baumgartner
+# Isambard-AI (GH200, aarch64, Slurm) launch for the D36 bounce_baumgartner
 # pipeline. Submit FROM THE REPO ROOT:
 #
 #   sbatch --account=<PROJECT> scripts/isambard_exp1_pipeline.sbatch RUN_TAG LAMBDA_LOGIT [SEED]
@@ -11,17 +11,17 @@
 #
 # Walltime: one job runs the dense reference then main (D12/D29 — the
 # token-local reference is a reused measured constant, not a third stage), so
-# TWO training stages, not three. In each, rollout depth advances on ACCEPTED
-# updates: off -> K=2 -> 5 -> 10 -> 20 -> 30, with the final ~240k updates at
-# K=30. That is close to full-K=30 cost for most of the run; the 12 h request
-# covers the expected 8-12 h pipeline but leaves little room for queue preemption.
+# TWO training stages, not three. Each uses D36's accepted-update continuation:
+# TF -> three local windows H=2/5/10 -> one continuous K=30 rollout with
+# backward cuts giving depth 10/15/20/25 -> uncut depth 30. The zero-skip
+# 355k budget leaves the final 240k updates at exact K=30 full BPTT.
 #SBATCH --job-name=scjepa-bounce
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=64
-#SBATCH --time=12:00:00
+#SBATCH --time=16:00:00
 #SBATCH --output=slurm-%x-%j.out
-# Expected runtime is ~8-12h (2 training stages + ~60 periodic evals + final
+# Expected runtime is ~10-16h (2 longer training stages + periodic evals + final
 # evals + pregen), but train.py has NO resume: a job
 # killed at the wall loses its in-flight stage entirely, while over-asking
 # costs only backfill priority on a busy queue.
@@ -73,7 +73,7 @@ python scripts/pregenerate_bounce.py \
 
 bash scripts/run_bounce_example.sh \
   "--run-tag=${RUN_TAG}" \
-  --main-steps=300000 \
+  --main-steps=355000 \
   --eval-episodes=5000 \
   --final-seed-offset=29 \
   --eval-device=cuda \

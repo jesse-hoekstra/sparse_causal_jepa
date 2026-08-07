@@ -12,9 +12,9 @@
 #                        labelled slack ablation.
 #   --calib-steps=N      dense reference length (default: same as main run).
 #                        Reportable tau requires completion plus accepted
-#                        updates beyond the K=30 boundary at 60k; a short
+#                        updates beyond D36's exact-K=30 boundary at 115k; a short
 #                        override remains a smoke/ablation, not convergence.
-#   --main-steps=300000  main run length (default: config value)
+#   --main-steps=355000  D36 main run length (default: config value)
 #   --eval-episodes=5000 final identifiability sample size (App. F.1: 5000)
 #   --final-seed-offset=29 held-out TEST split; tau calibration uses offset 17
 #   --eval-device=cpu

@@ -17,7 +17,7 @@
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=08:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=slurm-%x-%j.out
 
 set -euo pipefail
@@ -29,7 +29,7 @@ fi
 RUN_TAG=$1
 TAU=$2
 LAMBDA_LOGIT=$3
-STEPS=${4:-300000}
+STEPS=${4:-355000}
 SEED=${5:-0}
 shift $(( $# < 5 ? $# : 5 ))
 EXTRA_OVERRIDES=("$@")
@@ -70,5 +70,6 @@ python scripts/train.py \
 
 echo "== final identifiability evaluation =="
 python scripts/eval_identifiability.py "${OUT_DIR}" \
-  --episodes 5000 --seed-offset 29 --device cuda
+  --episodes 5000 --seed-offset 29 --device cuda \
+  --require-terminal-curriculum
 echo "artifacts in ${OUT_DIR} (checkpoint, resolved config, recovery_grid.png)"

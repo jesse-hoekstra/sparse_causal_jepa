@@ -13,6 +13,7 @@ from scjepa.training.lagrangian import SparsityLagrangian
 from scjepa.training.loop import (
     MetricLogger,
     NoopLogger,
+    RolloutStage,
     TrainConfig,
     Trainer,
     seed_everything,
@@ -21,6 +22,7 @@ from scjepa.training.loop import (
 __all__ = [
     "MetricLogger",
     "NoopLogger",
+    "RolloutStage",
     "SparsityLagrangian",
     "TrainConfig",
     "Trainer",

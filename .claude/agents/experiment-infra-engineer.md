@@ -26,13 +26,15 @@ fail loudly rather than silently. Read `docs/decisions.md` first; it binds you.
   regularizer config-selectable (`visreg` default, `sigreg` as ablation/safety hatch).
 - **Joint training:** ONE optimizer step updates encoders + pooling/linear heads + SPARTAN together.
   No EMA schedule, no target-network machinery, no encoder freezing.
-- **Experiment-1 loss assembly (D34/D35):** every batch teacher-forces all 30 suffix
-  transitions. The autoregressive branch keeps `lambda_roll = 1.0` and follows the
-  accepted-optimizer-update curriculum off/K=2/5/10/20/30 at
-  0/10k/15k/25k/40k/60k; the final training and evaluation horizon is K=30. Rejected
-  gradient-spike batches do not advance the schedule. In the sparse run, the path term and GECO
-  activate only at terminal K=30. Defer to the latest decision for other regimes rather than
-  applying the superseded D6 single-step/eval-only rule to Experiment 1.
+- **Experiment-1 loss assembly (D34/D36):** every batch teacher-forces all 30 suffix
+  transitions and `lambda_roll` remains 1.0 whenever the rollout branch is live. D36 uses
+  three true-anchored windows at offsets `[0,10,20]`, with H=2/5/10 beginning at accepted
+  updates 10k/20k/30k. At 50k it switches to one uninterrupted forward K=30 rollout with
+  feedback-gradient cuts `[10,20]`, then `[15]`/`[20]`/`[25]` at 70k/85k/100k; all cuts are
+  removed at 115k. Rejected gradient-spike batches do not advance this accepted-update clock.
+  The window loss is averaged, one attached theta estimate is reused everywhere, and in the
+  sparse run the path term and GECO activate only in the final uncut stage. Defer to the latest
+  decision for other regimes rather than applying the superseded D6 rule to Experiment 1.
 
 ## Pillars
 1. **Config as the interface.** Hydra (le-wm and visreg both use it); every hyperparameter in

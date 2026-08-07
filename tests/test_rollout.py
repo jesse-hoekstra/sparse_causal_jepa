@@ -107,6 +107,62 @@ def test_rollout_targets_are_t_plus_1_through_t_plus_K() -> None:
         torch.testing.assert_close(out.rollout_target[:, k - 1], states[:, tpar - 1 + k])
 
 
+def test_multiple_true_anchored_windows_share_one_parameter_encoding() -> None:
+    """Relative starts align values/targets and do not re-encode θ̂ per window."""
+    model = tiny_model()
+    model.eval()
+    states = episodes(batch=2, length=9)
+    tpar, horizon = 3, 2
+    starts = (0, 2, 4)
+    encoder_calls: list[None] = []
+    handle = model.parameter_encoder.register_forward_hook(
+        lambda _module, _inputs, _output: encoder_calls.append(None)
+    )
+    try:
+        with torch.no_grad():
+            out = model(
+                states,
+                context_len=tpar,
+                rollout_len=horizon,
+                rollout_starts=starts,
+            )
+    finally:
+        handle.remove()
+
+    assert len(encoder_calls) == 1
+    assert out.rollout_prediction is not None
+    assert out.rollout_target is not None
+    assert out.rollout_prediction.shape == (2, 3, horizon, N, STATE_DIM)
+    assert out.rollout_target.shape == out.rollout_prediction.shape
+
+    expected_windows: list[torch.Tensor] = []
+    with torch.no_grad():
+        for start in starts:
+            state = states[:, tpar - 1 + start]
+            predictions: list[torch.Tensor] = []
+            for _ in range(horizon):
+                state = model.predictor(state, out.causal_params).prediction
+                predictions.append(state)
+            expected_windows.append(torch.stack(predictions, dim=1))
+    torch.testing.assert_close(out.rollout_prediction, torch.stack(expected_windows, dim=1))
+    for window, start in enumerate(starts):
+        torch.testing.assert_close(
+            out.rollout_target[:, window],
+            states[:, tpar + start : tpar + start + horizon],
+        )
+
+
+def test_explicit_single_start_retains_the_window_axis() -> None:
+    """Explicit starts have one stable (B, W, H, ...) interface even when W=1."""
+    model = tiny_model()
+    states = episodes()
+    out = model(states, context_len=3, rollout_len=2, rollout_starts=(0,))
+    assert out.rollout_prediction is not None
+    assert out.rollout_target is not None
+    assert out.rollout_prediction.shape == (4, 1, 2, N, STATE_DIM)
+    assert out.rollout_target.shape == out.rollout_prediction.shape
+
+
 def test_targets_are_identical_in_train_and_eval_mode() -> None:
     """τ is calibrated on the eval constraint, so the anchor must not move."""
     model = tiny_model()
@@ -134,6 +190,10 @@ def test_rollout_start_range_respects_context_and_episode_end() -> None:
     with pytest.raises(ValueError, match="runs past the episode"):
         model(states, context_len=3, rollout_len=6)
 
+    # The same bound includes a local window's offset from the legacy anchor.
+    with pytest.raises(ValueError, match="runs past the episode"):
+        model(states, context_len=3, rollout_len=3, rollout_starts=(0, 3))
+
 
 def test_rollout_disabled_reproduces_teacher_forced_output() -> None:
     """rollout_len=None must leave the original objective bit-identical."""
@@ -148,11 +208,81 @@ def test_rollout_disabled_reproduces_teacher_forced_output() -> None:
     torch.testing.assert_close(without.sparsity, with_rollout.sparsity)
 
 
-def test_rollout_gradients_reach_the_parameter_encoder() -> None:
-    """θ̂ must be trained THROUGH the rollout — that is §4.4(ii)'s whole point."""
+def test_gradient_cuts_do_not_change_continuous_rollout_values() -> None:
+    """Detach truncates backward only: it never resets the predicted state."""
+    model = tiny_model()
+    model.eval()
+    states = episodes(batch=2, length=9)
+    without_cuts = model(states, context_len=3, rollout_len=5)
+    with_cuts = model(
+        states,
+        context_len=3,
+        rollout_len=5,
+        rollout_gradient_cuts=(2, 4),
+    )
+    assert without_cuts.rollout_prediction is not None
+    assert without_cuts.rollout_target is not None
+    assert with_cuts.rollout_prediction is not None
+    assert with_cuts.rollout_target is not None
+    torch.testing.assert_close(with_cuts.rollout_prediction, without_cuts.rollout_prediction)
+    torch.testing.assert_close(with_cuts.rollout_target, without_cuts.rollout_target)
+
+
+def test_gradient_cut_stops_later_losses_but_not_the_boundary_loss() -> None:
+    """A cut after step 2 blocks L4 -> z0 while the saved z2 still trains z0."""
+    model = tiny_model()
+    model.eval()
+    base_states = episodes(batch=2, length=8)
+    base_params = torch.randn(2, N, 1)
+    tpar, horizon = 3, 4
+
+    full_states = base_states.detach().clone().requires_grad_(True)
+    full_params = base_params.detach().clone().requires_grad_(True)
+    full_prediction, _ = model._rollout(  # pyright: ignore[reportPrivateUsage]
+        full_states, tpar, horizon, full_params
+    )
+    full_state_grad, full_param_grad = torch.autograd.grad(
+        full_prediction[:, -1].square().sum(), (full_states, full_params)
+    )
+    assert float(full_state_grad[:, tpar - 1].abs().sum()) > 0
+    assert float(full_param_grad.abs().sum()) > 0
+
+    cut_states = base_states.detach().clone().requires_grad_(True)
+    cut_params = base_params.detach().clone().requires_grad_(True)
+    cut_prediction, _ = model._rollout(  # pyright: ignore[reportPrivateUsage]
+        cut_states,
+        tpar,
+        horizon,
+        cut_params,
+        gradient_cuts=(2,),
+    )
+    # The step-2 prediction was saved before detach, so its own loss still has
+    # the complete two-transition path into the true anchor.
+    boundary_state_grad = torch.autograd.grad(
+        cut_prediction[:, 1].square().sum(), cut_states, retain_graph=True
+    )[0]
+    assert float(boundary_state_grad[:, tpar - 1].abs().sum()) > 0
+
+    cut_state_grad, cut_param_grad = torch.autograd.grad(
+        cut_prediction[:, -1].square().sum(),
+        (cut_states, cut_params),
+        allow_unused=True,
+    )
+    assert cut_state_grad is None or float(cut_state_grad.abs().sum()) == 0.0
+    assert cut_param_grad is not None
+    assert float(cut_param_grad.abs().sum()) > 0
+
+
+def test_rollout_gradients_reach_the_parameter_encoder_across_cuts() -> None:
+    """θ̂ stays attached and receives direct gradients from every backward chunk."""
     model = tiny_model()
     states = episodes()
-    out = model(states, context_len=3, rollout_len=3)
+    out = model(
+        states,
+        context_len=3,
+        rollout_len=3,
+        rollout_gradient_cuts=(1, 2),
+    )
     assert out.rollout_prediction is not None
     assert out.rollout_target is not None
     loss = weighted_rollout_mse(out.rollout_prediction, out.rollout_target, rollout_weights(3))

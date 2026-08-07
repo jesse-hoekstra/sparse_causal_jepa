@@ -17,13 +17,14 @@ is scalarised here into ONE bound with the same λ_roll that weights the
 objective, so a single dual variable and a single τ remain. c still excludes
 the path penalty, and no representation regularizer exists in this experiment.
 
-For the K=30 experiment, λ_roll stays fixed at its declared value (1.0). The
-autoregressive depth instead follows a curriculum indexed by SUCCESSFUL
-optimizer updates: teacher forcing only, then K=2, 5, 10, 20, and finally 30.
-Rejected gradient-spike batches do not advance this schedule. In sparse runs,
-the path penalty and GECO controller remain frozen until the terminal K=30
-stage, because τ is calibrated on the full K=30 constraint; applying that τ to
-a shorter loss would create artificial slack and premature pruning.
+For the K=30 experiment, λ_roll stays fixed at 1.0. D36 first trains three
+true-anchored local windows at early/middle/late offsets and then switches to
+one continuous full-K=30 forward trajectory. Backward-only feedback cuts are
+removed so maximum BPTT depth grows 10 -> 15 -> 20 -> 25 -> 30 without ever
+resetting the forward state. Rejected gradient-spike batches do not advance
+this accepted-update schedule. In sparse runs, the path penalty and GECO stay
+frozen until the exact one-window, uncut K=30 stage, because τ is calibrated on
+that terminal constraint and preterminal gradients are deliberately truncated.
 
 CRITICAL: τ is calibrated as 1.0x the held-out c of a dense reference, so
 ``scjepa.eval.harness`` must compute c with the identical rollout settings —
@@ -42,8 +43,9 @@ and dataloader position, and the periodic held-out identifiability eval.
 import random
 from collections.abc import Iterator
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 import numpy as np
 import torch
@@ -55,7 +57,48 @@ from scjepa.losses import aligned_mse, rollout_weights, weighted_rollout_mse
 from scjepa.models.state_to_state import StateToStateModel, TransitionOutput
 from scjepa.training.lagrangian import SparsityLagrangian
 
-RolloutCurriculum = tuple[tuple[int, int | None], ...]
+
+@dataclass(frozen=True)
+class RolloutStage:
+    """One accepted-update stage of the rollout continuation protocol.
+
+    ``rollout_starts`` are zero-based offsets from the first prediction anchor
+    ``S_[Tpar-1]``.  Multiple starts are independent, true-anchored local
+    windows.  ``gradient_cuts`` are one-based completed steps of a SINGLE
+    continuous rollout: the predicted value continues forward unchanged, but
+    its recurrent feedback edge is detached for backward.  The inferred
+    system parameters are never detached.
+    """
+
+    start_update: int
+    rollout_len: int | None
+    rollout_starts: tuple[int, ...] = ()
+    gradient_cuts: tuple[int, ...] = ()
+
+    @property
+    def num_windows(self) -> int:
+        """Number of true-anchored rollout chains evaluated per episode."""
+        return len(self.rollout_starts) if self.rollout_len is not None else 0
+
+    @property
+    def max_bptt_depth(self) -> int:
+        """Longest recurrent Jacobian product allowed by this stage."""
+        if self.rollout_len is None:
+            return 0
+        boundaries = (0, *self.gradient_cuts, self.rollout_len)
+        return max(right - left for left, right in pairwise(boundaries))
+
+    @property
+    def label(self) -> str:
+        """Filesystem/W&B-friendly stage description for debugging provenance."""
+        if self.rollout_len is None:
+            return "tf"
+        starts = "-".join(str(start) for start in self.rollout_starts)
+        cuts = "none" if not self.gradient_cuts else "-".join(map(str, self.gradient_cuts))
+        return f"w{self.num_windows}_k{self.rollout_len}_s{starts}_c{cuts}"
+
+
+RolloutCurriculum = tuple[RolloutStage, ...]
 
 
 def seed_everything(seed: int) -> None:
@@ -105,9 +148,10 @@ class TrainConfig:
     # Episodes shorter than Tpar-1+K raise — set it explicitly for tiny configs.
     rollout_len: int | None = 30
     lambda_roll: float = 1.0
-    # Optional (successful_updates, K) stages. ``None`` K disables only the
-    # autoregressive branch; teacher forcing still covers the whole suffix.
-    # ``rollout_len`` remains the terminal/post-hoc-evaluation horizon.
+    # Optional accepted-update stages. Multiple ``rollout_starts`` train
+    # separate true-anchored local windows; ``gradient_cuts`` truncate only
+    # the backward graph of one continuous rollout. ``rollout_len`` remains
+    # the terminal/post-hoc-evaluation horizon.
     rollout_curriculum: RolloutCurriculum | None = None
     seed: int = 0
     device: str = "cpu"
@@ -194,31 +238,62 @@ class Trainer:
             raise ValueError("rollout curriculum requires lambda_roll=1.0")
         if self.config.rollout_len is None:
             raise ValueError("rollout curriculum requires a terminal train.rollout_len")
-        if not curriculum or curriculum[0][0] != 0:
+        if not curriculum or curriculum[0].start_update != 0:
             raise ValueError("rollout_curriculum must start at successful update 0")
 
         previous_start = -1
-        previous_horizon = 0
-        for index, (start, horizon) in enumerate(curriculum):
+        previous_bptt_depth = 0
+        for index, stage in enumerate(curriculum):
+            start = stage.start_update
+            horizon = stage.rollout_len
             if start <= previous_start:
                 raise ValueError("rollout_curriculum starts must be strictly increasing")
             if horizon is None:
                 if index != 0:
                     raise ValueError("only the first rollout_curriculum stage may disable rollout")
+                if stage.rollout_starts or stage.gradient_cuts:
+                    raise ValueError("disabled rollout stage must have no starts or gradient cuts")
             else:
                 if horizon < 2:
                     raise ValueError("curriculum rollout horizons must be >= 2")
-                if horizon < previous_horizon:
-                    raise ValueError("curriculum rollout horizons must be non-decreasing")
-                if horizon == self.config.rollout_len and index != len(curriculum) - 1:
+                if not stage.rollout_starts:
+                    raise ValueError("enabled rollout stage requires at least one rollout start")
+                if tuple(sorted(set(stage.rollout_starts))) != stage.rollout_starts:
+                    raise ValueError("rollout starts must be sorted unique integers")
+                if any(start_offset < 0 for start_offset in stage.rollout_starts):
+                    raise ValueError("rollout starts must be non-negative")
+                terminal_horizon = int(self.config.rollout_len)
+                if any(
+                    start_offset + horizon > terminal_horizon
+                    for start_offset in stage.rollout_starts
+                ):
                     raise ValueError(
-                        "terminal rollout_len may only appear in the final curriculum stage"
+                        "rollout window runs past terminal rollout_len: "
+                        f"starts={stage.rollout_starts}, K={horizon}, terminal={terminal_horizon}"
                     )
-                previous_horizon = horizon
+                if tuple(sorted(set(stage.gradient_cuts))) != stage.gradient_cuts:
+                    raise ValueError("gradient cuts must be sorted unique integers")
+                if any(cut <= 0 or cut >= horizon for cut in stage.gradient_cuts):
+                    raise ValueError("gradient cuts must lie strictly inside the rollout")
+                if stage.gradient_cuts and stage.rollout_starts != (0,):
+                    raise ValueError(
+                        "gradient cuts require one continuous rollout starting at offset 0"
+                    )
+                if stage.max_bptt_depth < previous_bptt_depth:
+                    raise ValueError("curriculum maximum BPTT depth must be non-decreasing")
+                previous_bptt_depth = stage.max_bptt_depth
             previous_start = start
 
-        if curriculum[-1][1] != self.config.rollout_len:
-            raise ValueError("rollout_curriculum terminal horizon must equal train.rollout_len")
+        terminal = curriculum[-1]
+        if (
+            terminal.rollout_len != self.config.rollout_len
+            or terminal.rollout_starts != (0,)
+            or terminal.gradient_cuts
+        ):
+            raise ValueError(
+                "rollout_curriculum must end with one uncut rollout from offset 0 "
+                "at train.rollout_len"
+            )
 
     # ------------------------------------------------------------- data ----
     def _epoch_loader(self, epoch: int) -> DataLoader[dict[str, Tensor]]:
@@ -260,17 +335,31 @@ class Trainer:
     # but changes three things: it reads frames, its dual sees a
     # variance-normalized constraint (Eq. 123), and it must step an EMA target
     # after each optimizer step. Those are the only overrides.
-    def _current_rollout_len(self) -> int | None:
-        """Return K for the next batch, indexed by accepted optimizer updates."""
+    def _fixed_rollout_stage(self) -> RolloutStage:
+        """Represent a non-curriculum rollout using the same internal contract."""
+        horizon = self.config.rollout_len
+        return RolloutStage(
+            start_update=0,
+            rollout_len=horizon,
+            rollout_starts=(0,) if horizon is not None else (),
+            gradient_cuts=(),
+        )
+
+    def _current_rollout_stage(self) -> RolloutStage:
+        """Return the exact rollout specification for the next accepted update."""
         curriculum = self.config.rollout_curriculum
         if curriculum is None:
-            return self.config.rollout_len
-        horizon: int | None = None
-        for start, stage_horizon in curriculum:
-            if self.successful_updates < start:
+            return self._fixed_rollout_stage()
+        stage = curriculum[0]
+        for candidate in curriculum:
+            if self.successful_updates < candidate.start_update:
                 break
-            horizon = stage_horizon
-        return horizon
+            stage = candidate
+        return stage
+
+    def _current_rollout_len(self) -> int | None:
+        """Compatibility accessor for regimes whose curriculum changes only K."""
+        return self._current_rollout_stage().rollout_len
 
     def _sparsity_active(self) -> bool:
         """Enable path/GECO only when their calibrated constraint is live."""
@@ -278,15 +367,32 @@ class Trainer:
             return False
         if self.config.rollout_curriculum is None:
             return True
-        return self._current_rollout_len() == self.config.rollout_len
+        return self._current_rollout_stage() == self.config.rollout_curriculum[-1]
 
     def _forward(self, batch: dict[str, Tensor], rollout_len: int | None) -> TransitionOutput:
         """Run the model on one batch (the state-to-state regime: true states)."""
         states = batch["states"].to(self.device)
+        stage = self._current_rollout_stage()
+        if stage.rollout_len != rollout_len:
+            raise RuntimeError(
+                f"rollout stage changed during a batch: expected K={rollout_len}, got {stage}"
+            )
         return self.model(
             states,
             context_len=self.config.context_len,
             rollout_len=rollout_len,
+            # Explicit starts opt into the multi-window shape. Fixed-rollout
+            # callers retain the legacy shape/API used by the visual regimes.
+            rollout_starts=(
+                stage.rollout_starts
+                if self.config.rollout_curriculum is not None and rollout_len is not None
+                else None
+            ),
+            rollout_gradient_cuts=(
+                stage.gradient_cuts
+                if self.config.rollout_curriculum is not None and rollout_len is not None
+                else None
+            ),
         )
 
     def _rollout_loss(self, output: TransitionOutput) -> Tensor:
@@ -300,6 +406,15 @@ class Trainer:
             return torch.zeros((), device=self.device)
         target = output.rollout_target
         assert target is not None
+        # Explicit multi-window curricula return (B,W,H,N,D). Flattening B,W
+        # makes the existing Eq. 35 mean average over windows as well as
+        # episodes, so three windows improve coverage without tripling the
+        # rollout coefficient. Fixed/single legacy rollouts remain (B,H,N,D).
+        if prediction.ndim == 5:
+            prediction = prediction.flatten(0, 1)
+            target = target.flatten(0, 1)
+        if prediction.ndim != 4:
+            raise ValueError(f"unexpected rollout prediction shape {tuple(prediction.shape)}")
         horizon = prediction.shape[1]
         weights = self._rollout_weight_cache.get(horizon)
         if weights is None:
@@ -312,16 +427,24 @@ class Trainer:
         trainable_parameters = tuple(
             parameter for parameter in self.model.parameters() if parameter.requires_grad
         )
-        gradients = torch.autograd.grad(
-            loss,
-            trainable_parameters,
-            retain_graph=True,
-            allow_unused=True,
+        gradients = cast(
+            tuple[Tensor | None, ...],
+            torch.autograd.grad(
+                loss,
+                trainable_parameters,
+                retain_graph=True,
+                allow_unused=True,
+            ),
         )
-        norms = [gradient.detach().norm(2) for gradient in gradients if gradient is not None]
-        if not norms:
+        squared_norm: Tensor | None = None
+        for gradient in gradients:
+            if gradient is None:
+                continue
+            contribution = gradient.detach().square().sum()
+            squared_norm = contribution if squared_norm is None else squared_norm + contribution
+        if squared_norm is None:
             return 0.0
-        return float(torch.stack(norms).norm(2))
+        return float(squared_norm.sqrt().item())
 
     def _constraint(
         self, pred_loss: Tensor, logit_loss: Tensor, output: TransitionOutput
@@ -345,7 +468,9 @@ class Trainer:
 
     def _train_step(self, batch: dict[str, Tensor]) -> dict[str, float]:
         """One optimizer step over the hybrid Eq. 36; returns scalar metrics."""
-        current_rollout_len = self._current_rollout_len()
+        successful_updates_before_batch = self.successful_updates
+        current_stage = self._current_rollout_stage()
+        current_rollout_len = current_stage.rollout_len
         sparsity_active = self._sparsity_active()
         output = self._forward(batch, current_rollout_len)
 
@@ -449,8 +574,31 @@ class Trainer:
                 "sparsity/active": float(sparsity_active),
                 "health/grad_norm": float(grad_norm.item()),
                 "health/skipped_steps": float(self.total_skips),
+                # The loss metrics in this record were computed with the stage
+                # selected from this pre-batch counter. Keep the post-batch
+                # counter too, but do not make boundary records ambiguous.
+                "schedule/successful_updates_before_batch": float(successful_updates_before_batch),
                 "schedule/successful_updates": float(self.successful_updates),
+                "schedule/stage_start_update": float(current_stage.start_update),
                 "schedule/rollout_len": float(current_rollout_len or 0),
+                "schedule/rollout_windows": float(current_stage.num_windows),
+                "schedule/max_bptt_depth": float(current_stage.max_bptt_depth),
+                "schedule/gradient_cut_count": float(len(current_stage.gradient_cuts)),
+                "schedule/rollout_start_0": float(
+                    current_stage.rollout_starts[0] if current_stage.num_windows > 0 else -1
+                ),
+                "schedule/rollout_start_1": float(
+                    current_stage.rollout_starts[1] if current_stage.num_windows > 1 else -1
+                ),
+                "schedule/rollout_start_2": float(
+                    current_stage.rollout_starts[2] if current_stage.num_windows > 2 else -1
+                ),
+                "schedule/gradient_cut_0": float(
+                    current_stage.gradient_cuts[0] if current_stage.gradient_cuts else -1
+                ),
+                "schedule/gradient_cut_1": float(
+                    current_stage.gradient_cuts[1] if len(current_stage.gradient_cuts) > 1 else -1
+                ),
                 "schedule/lambda_roll": self.config.lambda_roll,
             }
         )
@@ -463,14 +611,17 @@ class Trainer:
         metrics: dict[str, float] = {}
         batches = self._batches()
         while self.step < self.config.steps:
-            rollout_len_before = self._current_rollout_len()
+            rollout_stage_before = self._current_rollout_stage()
             metrics = self._train_step(next(batches))
             self.step += 1
-            rollout_len_after = self._current_rollout_len()
-            if rollout_len_after != rollout_len_before:
-                next_stage = "tf" if rollout_len_after is None else f"k{rollout_len_after}"
+            rollout_stage_after = self._current_rollout_stage()
+            if rollout_stage_after != rollout_stage_before:
                 self.save_checkpoint(
-                    out_dir / f"curriculum_success_{self.successful_updates}_before_{next_stage}.pt"
+                    out_dir
+                    / (
+                        f"curriculum_success_{self.successful_updates}_before_"
+                        f"{rollout_stage_after.label}.pt"
+                    )
                 )
             if self.step % self.config.log_every == 0 or self.step == self.config.steps:
                 self.logger.log(self.step, metrics)
@@ -493,6 +644,7 @@ class Trainer:
     def _eval_step(self) -> dict[str, float]:
         """Held-out identifiability metrics, prefixed for separate W&B charts."""
         assert self.eval_dataset is not None
+        stage = self._current_rollout_stage()
         report = evaluate_identifiability(
             self.model,
             self.eval_dataset,
@@ -502,8 +654,24 @@ class Trainer:
             lambda_logit=self.config.lambda_logit,
             # Periodic eval follows the live curriculum stage. Final/post-hoc
             # calibration deliberately uses config.rollout_len (terminal K).
-            rollout_len=self._current_rollout_len(),
+            rollout_len=stage.rollout_len,
             lambda_roll=self.config.lambda_roll,
+            rollout_starts=(
+                stage.rollout_starts
+                if self.config.rollout_curriculum is not None and stage.rollout_len is not None
+                else None
+            ),
+            rollout_gradient_cuts=(
+                stage.gradient_cuts
+                if self.config.rollout_curriculum is not None and stage.rollout_len is not None
+                else None
+            ),
+            # D36's one invariant diagnostic: observe the exact terminal
+            # forward trajectory at every periodic evaluation. No gradient is
+            # involved, and this never changes the live optimization loss.
+            full_rollout_len=(
+                self.config.rollout_len if self.config.rollout_curriculum is not None else None
+            ),
         )
         self.model.train()  # the harness switches to eval mode
         # Every run mode logs the FULL eval key set (2026-07-25, Jesse): in the
@@ -527,6 +695,11 @@ class Trainer:
                 "rng_python": random.getstate(),
                 "rng_numpy": np.random.get_state(),  # noqa: NPY002
                 "rng_torch": torch.get_rng_state(),
+                # Gumbel gates draw from the active CUDA generator. Saving only
+                # CPU RNG made an Isambard boundary resume numerically diverge.
+                "rng_cuda": (
+                    torch.cuda.get_rng_state(self.device) if self.device.type == "cuda" else None
+                ),
             },
             path,
         )
@@ -546,12 +719,16 @@ class Trainer:
         random.setstate(payload["rng_python"])
         np.random.set_state(payload["rng_numpy"])  # noqa: NPY002
         torch.set_rng_state(payload["rng_torch"])
+        cuda_rng = payload.get("rng_cuda")
+        if cuda_rng is not None and self.device.type == "cuda":
+            torch.cuda.set_rng_state(cuda_rng, self.device)
 
 
 __all__ = [
     "MetricLogger",
     "NoopLogger",
     "RolloutCurriculum",
+    "RolloutStage",
     "TrainConfig",
     "Trainer",
     "seed_everything",

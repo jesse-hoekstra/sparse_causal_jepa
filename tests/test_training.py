@@ -10,16 +10,19 @@ from omegaconf import DictConfig, OmegaConf
 import scjepa.training.loop as training_loop
 from scjepa.data import BounceDataset
 from scjepa.models import StateToStateModel, build_state_to_state
-from scjepa.training import SparsityLagrangian, TrainConfig, Trainer
+from scjepa.training import RolloutStage, SparsityLagrangian, TrainConfig, Trainer
 
 N = 3
-PAPER_ROLLOUT_CURRICULUM: tuple[tuple[int, int | None], ...] = (
-    (0, None),
-    (10_000, 2),
-    (15_000, 5),
-    (25_000, 10),
-    (40_000, 20),
-    (60_000, 30),
+PAPER_ROLLOUT_CURRICULUM: tuple[RolloutStage, ...] = (
+    RolloutStage(0, None),
+    RolloutStage(10_000, 2, (0, 10, 20)),
+    RolloutStage(20_000, 5, (0, 10, 20)),
+    RolloutStage(30_000, 10, (0, 10, 20)),
+    RolloutStage(50_000, 30, (0,), (10, 20)),
+    RolloutStage(70_000, 30, (0,), (15,)),
+    RolloutStage(85_000, 30, (0,), (20,)),
+    RolloutStage(100_000, 30, (0,), (25,)),
+    RolloutStage(115_000, 30, (0,)),
 )
 
 
@@ -131,7 +134,7 @@ def test_rollout_weight_stays_one_and_raw_equals_applied(tmp_path: Path) -> None
 
 
 def test_rollout_curriculum_exact_successful_update_boundaries(tmp_path: Path) -> None:
-    """The next forward's K changes only at the six declared accepted-update stages."""
+    """Every value/backward stage changes at its declared accepted-update boundary."""
     trainer = Trainer(
         tiny_model(),
         tiny_dataset(),
@@ -141,23 +144,29 @@ def test_rollout_curriculum_exact_successful_update_boundaries(tmp_path: Path) -
             rollout_curriculum=PAPER_ROLLOUT_CURRICULUM,
         ),
     )
-    boundaries = (
-        (0, None),
-        (9_999, None),
-        (10_000, 2),
-        (14_999, 2),
-        (15_000, 5),
-        (24_999, 5),
-        (25_000, 10),
-        (39_999, 10),
-        (40_000, 20),
-        (59_999, 20),
-        (60_000, 30),
-        (75_000, 30),
+    boundaries: tuple[tuple[int, RolloutStage], ...] = (
+        (0, PAPER_ROLLOUT_CURRICULUM[0]),
+        (9_999, PAPER_ROLLOUT_CURRICULUM[0]),
+        (10_000, PAPER_ROLLOUT_CURRICULUM[1]),
+        (19_999, PAPER_ROLLOUT_CURRICULUM[1]),
+        (20_000, PAPER_ROLLOUT_CURRICULUM[2]),
+        (29_999, PAPER_ROLLOUT_CURRICULUM[2]),
+        (30_000, PAPER_ROLLOUT_CURRICULUM[3]),
+        (49_999, PAPER_ROLLOUT_CURRICULUM[3]),
+        (50_000, PAPER_ROLLOUT_CURRICULUM[4]),
+        (69_999, PAPER_ROLLOUT_CURRICULUM[4]),
+        (70_000, PAPER_ROLLOUT_CURRICULUM[5]),
+        (84_999, PAPER_ROLLOUT_CURRICULUM[5]),
+        (85_000, PAPER_ROLLOUT_CURRICULUM[6]),
+        (99_999, PAPER_ROLLOUT_CURRICULUM[6]),
+        (100_000, PAPER_ROLLOUT_CURRICULUM[7]),
+        (114_999, PAPER_ROLLOUT_CURRICULUM[7]),
+        (115_000, PAPER_ROLLOUT_CURRICULUM[8]),
+        (355_000, PAPER_ROLLOUT_CURRICULUM[8]),
     )
-    for successful_updates, expected_horizon in boundaries:
+    for successful_updates, expected_stage in boundaries:
         trainer.successful_updates = successful_updates
-        assert trainer._current_rollout_len() == expected_horizon
+        assert trainer._current_rollout_stage() == expected_stage
 
 
 def test_paper_preset_declares_the_exact_curriculum() -> None:
@@ -165,14 +174,58 @@ def test_paper_preset_declares_the_exact_curriculum() -> None:
     path = Path(__file__).parents[1] / "configs" / "experiment" / "bounce_baumgartner.yaml"
     preset = OmegaConf.load(path)
     assert isinstance(preset, DictConfig)
+    assert int(preset.train.steps) == 355_000
     assert float(preset.train.lambda_roll) == 1.0
     assert OmegaConf.to_container(preset.train.rollout_curriculum, resolve=True) == [
-        {"start_update": 0, "rollout_len": None},
-        {"start_update": 10_000, "rollout_len": 2},
-        {"start_update": 15_000, "rollout_len": 5},
-        {"start_update": 25_000, "rollout_len": 10},
-        {"start_update": 40_000, "rollout_len": 20},
-        {"start_update": 60_000, "rollout_len": 30},
+        {"start_update": 0, "rollout_len": None, "rollout_starts": [], "gradient_cuts": []},
+        {
+            "start_update": 10_000,
+            "rollout_len": 2,
+            "rollout_starts": [0, 10, 20],
+            "gradient_cuts": [],
+        },
+        {
+            "start_update": 20_000,
+            "rollout_len": 5,
+            "rollout_starts": [0, 10, 20],
+            "gradient_cuts": [],
+        },
+        {
+            "start_update": 30_000,
+            "rollout_len": 10,
+            "rollout_starts": [0, 10, 20],
+            "gradient_cuts": [],
+        },
+        {
+            "start_update": 50_000,
+            "rollout_len": 30,
+            "rollout_starts": [0],
+            "gradient_cuts": [10, 20],
+        },
+        {
+            "start_update": 70_000,
+            "rollout_len": 30,
+            "rollout_starts": [0],
+            "gradient_cuts": [15],
+        },
+        {
+            "start_update": 85_000,
+            "rollout_len": 30,
+            "rollout_starts": [0],
+            "gradient_cuts": [20],
+        },
+        {
+            "start_update": 100_000,
+            "rollout_len": 30,
+            "rollout_starts": [0],
+            "gradient_cuts": [25],
+        },
+        {
+            "start_update": 115_000,
+            "rollout_len": 30,
+            "rollout_starts": [0],
+            "gradient_cuts": [],
+        },
     ]
     assert "lambda_roll_warmup_steps" not in preset.train
     assert int(preset.train.grad_skip_max_consecutive) == 50
@@ -182,28 +235,75 @@ def test_paper_preset_declares_the_exact_curriculum() -> None:
     ("overrides", "message"),
     [
         (
-            {"rollout_curriculum": ((0, None), (1, 2)), "lambda_roll": 2.0},
+            {
+                "rollout_curriculum": (
+                    RolloutStage(0, None),
+                    RolloutStage(1, 2, (0,)),
+                ),
+                "lambda_roll": 2.0,
+            },
             "requires lambda_roll=1.0",
         ),
         (
-            {"rollout_curriculum": ((1, None), (2, 2))},
+            {
+                "rollout_curriculum": (
+                    RolloutStage(1, None),
+                    RolloutStage(2, 2, (0,)),
+                )
+            },
             "must start at successful update 0",
         ),
         (
-            {"rollout_len": 5, "rollout_curriculum": ((0, None), (1, 2), (1, 5))},
+            {
+                "rollout_len": 5,
+                "rollout_curriculum": (
+                    RolloutStage(0, None),
+                    RolloutStage(1, 2, (0,)),
+                    RolloutStage(1, 5, (0,)),
+                ),
+            },
             "starts must be strictly increasing",
         ),
         (
-            {"rollout_curriculum": ((0, 5), (1, 2))},
-            "horizons must be non-decreasing",
+            {
+                "rollout_len": 5,
+                "rollout_curriculum": (
+                    RolloutStage(0, 5, (0,)),
+                    RolloutStage(1, 2, (0,)),
+                ),
+            },
+            "BPTT depth must be non-decreasing",
         ),
         (
-            {"rollout_len": 5, "rollout_curriculum": ((0, None), (1, 2))},
-            "terminal horizon must equal train.rollout_len",
+            {
+                "rollout_len": 5,
+                "rollout_curriculum": (
+                    RolloutStage(0, None),
+                    RolloutStage(1, 2, (0,)),
+                ),
+            },
+            "must end with one uncut rollout",
         ),
         (
-            {"rollout_len": 1, "rollout_curriculum": ((0, None), (1, 1))},
+            {
+                "rollout_len": 1,
+                "rollout_curriculum": (
+                    RolloutStage(0, None),
+                    RolloutStage(1, 1, (0,)),
+                ),
+            },
             "horizons must be >= 2",
+        ),
+        (
+            {
+                "rollout_len": 5,
+                "rollout_curriculum": (
+                    RolloutStage(0, None),
+                    RolloutStage(1, 4, (0, 1), (2,)),
+                    RolloutStage(2, 5, (0,)),
+                ),
+            },
+            "gradient cuts require one continuous rollout",
         ),
     ],
 )
@@ -223,7 +323,7 @@ def test_only_accepted_updates_advance_curriculum_and_make_boundary_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A clipped accepted step advances K; the following rejected attempt does not."""
-    curriculum = ((0, None), (1, 2))
+    curriculum = (RolloutStage(0, None), RolloutStage(1, 2, (0,)))
     trainer = Trainer(
         tiny_model(),
         tiny_dataset(),
@@ -252,9 +352,11 @@ def test_only_accepted_updates_advance_curriculum_and_make_boundary_checkpoint(
     assert trainer.total_skips == 1
     assert trainer._current_rollout_len() == 2
     assert metrics["schedule/rollout_len"] == pytest.approx(2.0)
+    assert metrics["schedule/successful_updates_before_batch"] == pytest.approx(1.0)
     assert metrics["schedule/successful_updates"] == pytest.approx(1.0)
+    assert metrics["schedule/stage_start_update"] == pytest.approx(1.0)
 
-    boundary = tmp_path / "curriculum_success_1_before_k2.pt"
+    boundary = tmp_path / "curriculum_success_1_before_w1_k2_s0_cnone.pt"
     assert boundary.exists()
     payload = torch.load(boundary, weights_only=False)
     assert payload["step"] == 1
@@ -270,7 +372,7 @@ def test_tf_only_curriculum_stage_keeps_all_teacher_forced_suffixes(tmp_path: Pa
         tiny_config(
             tmp_path,
             rollout_len=5,
-            rollout_curriculum=((0, None), (1, 5)),
+            rollout_curriculum=(RolloutStage(0, None), RolloutStage(1, 5, (0,))),
         ),
     )
     batch = next(iter(trainer._epoch_loader(0)))
@@ -291,7 +393,7 @@ def test_rollout_weights_follow_dynamic_k(tmp_path: Path) -> None:
             tmp_path,
             steps=2,
             rollout_len=5,
-            rollout_curriculum=((0, 2), (1, 5)),
+            rollout_curriculum=(RolloutStage(0, 2, (0,)), RolloutStage(1, 5, (0,))),
             sparsity_enabled=False,
         ),
     )
@@ -317,7 +419,11 @@ def test_sparsity_and_dual_wait_for_terminal_curriculum_k(tmp_path: Path) -> Non
             tmp_path,
             steps=3,
             rollout_len=5,
-            rollout_curriculum=((0, None), (1, 2), (2, 5)),
+            rollout_curriculum=(
+                RolloutStage(0, None),
+                RolloutStage(1, 2, (0,)),
+                RolloutStage(2, 5, (0,)),
+            ),
             sparsity_enabled=True,
             sparsity_tau=-1.0,
             sparsity_step_size=0.1,
@@ -375,7 +481,7 @@ def test_references_train_without_path_penalty(tmp_path: Path) -> None:
 
 def test_resume_is_exact(tmp_path: Path) -> None:
     """Resume exactly across the successful-update boundary from TF to K=2."""
-    curriculum = ((0, None), (2, 2))
+    curriculum = (RolloutStage(0, None), RolloutStage(2, 2, (0,)))
     config_a = tiny_config(tmp_path / "a", steps=4, rollout_curriculum=curriculum)
     trainer_a = Trainer(tiny_model(), tiny_dataset(), config_a)
     final_a = trainer_a.train()
@@ -400,7 +506,11 @@ def test_resume_is_exact(tmp_path: Path) -> None:
 
 def test_checkpoint_restores_success_count_and_legacy_fallback(tmp_path: Path) -> None:
     """New checkpoints restore the counter; old ones derive it from attempts minus skips."""
-    curriculum = ((0, None), (4, 2), (5, 5))
+    curriculum = (
+        RolloutStage(0, None),
+        RolloutStage(4, 2, (0,)),
+        RolloutStage(5, 5, (0,)),
+    )
     config = tiny_config(
         tmp_path,
         rollout_len=5,
@@ -423,6 +533,7 @@ def test_checkpoint_restores_success_count_and_legacy_fallback(tmp_path: Path) -
     assert restored._current_rollout_len() == 2
 
     payload = torch.load(checkpoint, weights_only=False)
+    assert payload["rng_cuda"] is None
     del payload["successful_updates"]
     legacy_checkpoint = tmp_path / "legacy.pt"
     torch.save(payload, legacy_checkpoint)
@@ -536,8 +647,11 @@ def test_periodic_eval_uses_current_curriculum_k(
             "device": "cpu",
             "context_len": 2,
             "lambda_logit": 1e-3,
-            "rollout_len": 5,
+            "rollout_len": 2,
             "lambda_roll": 1.0,
+            "rollout_starts": (0, 10, 20),
+            "rollout_gradient_cuts": (),
+            "full_rollout_len": 30,
         }
     ]
 

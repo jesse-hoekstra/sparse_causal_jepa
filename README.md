@@ -12,12 +12,14 @@ and parameters (SHD/MCC against ground truth) without any reconstruction objecti
 **Decision log:** [`docs/decisions.md`](docs/decisions.md) is the source of truth for settled
 design decisions: a short list of standing rules (framework, vendoring, tooling, SPARTAN
 interpretations, simulator contract, pipeline consistency, grad-skip guard) followed by
-D27–D30, which define the two metrics, the Experiment-1 architecture, and the verified result.
+D27–D36, which define the metrics, Experiment-1 architecture, verified result, and current rollout
+continuation protocol.
 Read it before changing anything it covers.
 
-> **NOTE (2026-07-25):** the sections below still describe the pre-D29 pipeline and are stale —
-> `--identity-check`, `train.lambda_reg`, `health/target_slot_std_*` and `mass_mcc` no longer
-> exist. See `CLAUDE.md` for current commands and metrics until this file is rewritten.
+> **NOTE:** the historical architecture/ladder discussion below still contains pre-D29 material.
+> Its removed `--identity-check`, `train.lambda_reg`, `health/target_slot_std_*`, and `mass_mcc`
+> names are not current APIs. The launch block and D36 budget are updated; see `CLAUDE.md` and
+> D36 in `docs/decisions.md` for the complete active protocol.
 
 ## Repo map
 
@@ -71,21 +73,21 @@ The GT-embedding diagnostic regime (`model.type: states`) runs the channel split
 ground-truth object states — slot i ≡ ball i by construction — so the identifiability metrics
 are directly meaningful.
 
-**One command runs the whole procedure** — τ calibration (fully-connected reference, sparsity
-off), the main sparsity run with the calibrated τ, and identifiability evaluation. Add
-`--identity-check` for a matched mass-blind reference and automatic feasibility guard:
+**One command runs the current procedure** — τ calibration (fully-connected reference, sparsity
+off), the main sparsity run with the calibrated τ, and terminal identifiability evaluation. Supply
+the `lambda_logit` selected by the dense sweep:
 
 ```bash
-bash scripts/run_bounce_example.sh                                   # 5-ball default
-bash scripts/run_bounce_example.sh --identity-check                 # paper-grade guard
-bash scripts/run_bounce_example.sh data.num_balls=3 train.steps=25000  # smaller/faster instance
-#    -> prints calibrated tau, then pred_loss, graph scores, mass_mcc, path_density
+LAMBDA_LOGIT=YOUR_SELECTED_VALUE
+bash scripts/run_bounce_example.sh --run-tag=seed0 \
+  "train.lambda_logit=${LAMBDA_LOGIT}"
+#    -> prints calibrated tau, then pred_loss, rollout diagnostics, SHD, MCC, path_density
 #    -> saves recovery_grid.png with all mass/latent pairs and the global assignment
 ```
 
 Hydra overrides are passed to every run, so the references and main run cannot diverge
 in config (the D12 rule). Knobs are script flags — `--tau-factor` (τ = factor ×
-fully-connected held-out constraint loss, default 1.0), `--identity-check`, `--calib-steps`,
+fully-connected held-out constraint loss, default 1.0), `--calib-steps`,
 `--main-steps` (main run only), and `--run-tag` (required for parallel launches) — a mistyped
 flag errors loudly; the equivalent env vars still work as a fallback.
 
@@ -131,13 +133,13 @@ LAMBDA_LOGIT=YOUR_SELECTED_VALUE
 # Rung 1 — Baumgartner-aligned environment with a true-state JEPA (radius∝mass,
 # logit loss). Their Fig. 3 MCC ≈ 0.9+ is context, not a like-for-like target:
 # the encoder/objective differ. Successful recovery still gives sharp marginals.
-bash scripts/run_bounce_example.sh --identity-check --tau-factor=1.0 \
+bash scripts/run_bounce_example.sh --tau-factor=1.0 \
   experiment=bounce_baumgartner "train.lambda_logit=${LAMBDA_LOGIT}"
 
 # Rung 1-ablation — ±sparsity (their MLP/Transformer comparison; note their own
 # finding: on bounce even an unregularised Transformer disentangles, so expect a
 # smaller gap here than on dual particle):
-bash scripts/run_bounce_example.sh --identity-check --tau-factor=1.0 \
+bash scripts/run_bounce_example.sh --tau-factor=1.0 \
   experiment=bounce_baumgartner \
   "train.lambda_logit=${LAMBDA_LOGIT}" \
   train.sparsity_enabled=false
@@ -145,7 +147,7 @@ bash scripts/run_bounce_example.sh --identity-check --tau-factor=1.0 \
 # Rung 2 — invisible mass (equal radii, uniform masses): identical otherwise, so
 # any MCC drop vs rung 1 isolates the weaker sufficient-variability (mass acts
 # only through collision impulses). MCC ≈ rung 1 -> method robust; MCC ≈ 0 -> edge found.
-bash scripts/run_bounce_example.sh --identity-check --tau-factor=1.0 \
+bash scripts/run_bounce_example.sh --tau-factor=1.0 \
   experiment=bounce_baumgartner \
   "train.lambda_logit=${LAMBDA_LOGIT}" \
   data.radius_from_mass=false data.mass_normal=null
@@ -166,8 +168,10 @@ python scripts/train.py data.name=bounce data.clip_len=10 train.steps=...   # vi
 python scripts/train.py data.name=bounce data.radius_from_mass=true ...
 ```
 
-Scale: their setting is ~300k steps × 8 seeds (their Fig. 17/3). Baumgartner does not specify
-the numerical `lambda_logit`, so first run the controlled dense-model sweep on Isambard:
+Scale: Baumgartner's setting is ~300k steps × 8 seeds (their Fig. 17/3); current D36 runs use a
+355k attempted-batch budget so a zero-skip run retains 240k accepted updates in the terminal
+uncut stage. Baumgartner does not specify the numerical `lambda_logit`, so first run the controlled
+dense-model sweep on Isambard:
 
 ```bash
 sbatch --account=<PROJECT> scripts/isambard_logit_sweep.sbatch logit_seed0 0
@@ -182,7 +186,7 @@ by more than 5%, and selects the smallest Pareto coefficient that obtains 90% of
 admissible reduction in the excess logit penalty above its theoretical floor of 2. Mass recovery
 is displayed as a validation diagnostic, not used by that rule. Dense attention can only screen
 the coefficient; the gated pipeline must still reach τ, move λ away from its ceiling, reduce path
-density/SHD, and retain `mass_mcc`.
+density/SHD, and retain `mcc`.
 
 If compute nodes have no internet, add `wandb.mode=offline` and sync afterwards. Every final eval
 writes `metrics.json`; aggregate seeded runs with

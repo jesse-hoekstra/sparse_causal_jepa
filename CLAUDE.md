@@ -3,25 +3,30 @@
 PyTorch research codebase for Jesse's paper (`sources/my_paper.pdf`). SPARTAN predictor
 (`sources/SPARTAN.pdf`, no public code) inside a JEPA, with the bounce identifiability
 experiment replicated from Baumgartner et al. (`sources/dynamical_system.pdf`).
-Settled design decisions live in `docs/decisions.md` (D1–D35) and BIND all work.
+Settled design decisions live in `docs/decisions.md` (D1–D36) and BIND all work.
 Subagent roster and shared conventions: `.claude/agents/README.md`.
 
 **STATUS: Experiment 1's mechanisms are confirmed, but the OBJECTIVE and its optimisation
-protocol changed in D34/D35.**
+protocol changed in D34/D36.**
 Under the pure teacher-forced objective, sparsification pruned the graph AND recovered the
 masses (D30, run 7cq3h2ur): `mcc` 0.948, `shd` 4.81, `path_density` 0.223, L_path 12.3, zero
 skipped steps in 300k, at τ=0.02 (a TEST value, ~1.5–2× dense, not the §6.1.3 τ=1.0×dense).
 
 **D34 replaced that objective with the HYBRID one: teacher forcing PLUS a full-window K=30
-autoregressive rollout, with the rollout inside the dual constraint. D35 keeps that final
-objective but reaches it through an accepted-update horizon curriculum.** λ_roll stays exactly
-1.0; K is off/2/5/10/20/30 from accepted updates 0/10k/15k/25k/40k/60k. Every stage still
-teacher-forces all 30 suffix transitions. The path penalty and GECO stay inactive until K=30,
-because a τ calibrated at K=30 would give artificial slack at a shorter horizon. Consequences
-that bite immediately: τ is on a NEW SCALE and every pre-D34 τ (0.02 included) is void; D30's
-four-phase trajectory was measured pre-hybrid so its NUMBERS are not comparable (its structure
-should be); and no full 300k hybrid run exists yet. Treat the first D35 run as unexplored
-territory, not as a repeat of 7cq3h2ur.
+autoregressive rollout, with the rollout inside the dual constraint. D36 keeps that final
+objective but supersedes D35's prefix-horizon route with a fixed debugging curriculum:** TF-only
+to 10k accepted updates; three true-anchored windows at offsets `[0,10,20]` with H=2/5/10 to
+20k/30k/50k; then one continuous forward K=30 rollout with backward cuts `{10,20}`, `{15}`,
+`{20}`, `{25}` to 70k/85k/100k/115k; then no cuts and exact full BPTT through the 355k-attempt
+budget. Every
+stage teacher-forces all 30 suffix transitions, uses λ_roll=1 whenever a rollout exists, and
+reuses one unchanged attached θ̂ per episode across every step/window. The path penalty and
+GECO stay inactive until the no-cut stage at 115k, leaving 240k exact terminal updates when the
+healthy run has zero skips (always report the actual accepted count otherwise).
+Consequences that bite immediately: τ is on a NEW SCALE and every pre-D34 τ (0.02 included)
+is void; D30's four-phase trajectory was measured pre-hybrid so its NUMBERS are not comparable
+(its structure should be); and no full D36 hybrid run exists yet. D36 is intentionally the
+current simple debugging protocol and may be iterated only through another recorded decision.
 
 ## Non-negotiable working rules
 - **Verify against the paper, not the name.** Never state a name-based or memory-based guess
@@ -40,9 +45,9 @@ phases are a property of the GECO dual and should survive the hybrid change; its
 not be expected to (c now carries λ_roll·L_roll, so τ, `sparsity/constraint` and the λ
 trajectory are all on a new scale). Compare a new run against the SHAPE below, not the values —
 the metrics are supposed to move a long way, and most "failures" reported before D30 were
-phase 1 mistaken for death. These ranges are historical D30 coordinates. Under D35 the dual is
-frozen until the next batch switches to K=30 at the 60k boundary, so none of these GECO phases
-can begin before then; do not mechanically add 60k because the dynamics-pretrained starting
+phase 1 mistaken for death. These ranges are historical D30 coordinates. Under D36 the dual is
+frozen until the first no-cut full-BPTT batch at the 115k boundary, so none of these GECO phases
+can begin before then; do not mechanically add 115k because the dynamics-pretrained starting
 point is also different.
 1. **Saturation (~0–75k):** c > τ, so `sparsity/lambda` CLIMBS (1e4 → 4.5e7), `path_density`
    → 1.0, `loss/sparsity` rises to ~2400, `shd` parks at ~42, `mcc` loiters 0.25–0.30.
@@ -58,13 +63,15 @@ point is also different.
    and `attention/gate_entropy` FALLING (0.25 → 0.19) = gates committing, not sitting in the
    p≈0.5 limbo that killed D26.
 
-Point checks that still apply: `health/grad_norm` must be interpreted at the logged
-`schedule/rollout_len`; 7cq3h2ur (pure TF) ran max 1.42 / mean 0.47, while fixed-horizon
-1500-step smokes reached 4.02 at K=10 and 4.43 at K=30. `health/skipped_steps` should remain
-zero, and rejected batches must leave `schedule/successful_updates` and K unchanged. K=0 in
-the schedule metric means the rollout branch is off. `sparsity/active` must remain 0 before
-K=30 and become 1 at the terminal stage in a sparse run; before then neither the live
-constraint nor periodic eval is comparable with the final K=30 τ. Once K=30 is active,
+Point checks that still apply: `health/grad_norm` must be interpreted against the logged D36
+phase, including window count/horizon or gradient-cut set; 7cq3h2ur (pure TF) ran max 1.42 /
+mean 0.47, while fixed-horizon 1500-step smokes reached 4.02 at K=10 and 4.43 at K=30.
+`health/skipped_steps` should remain zero, and rejected batches must leave
+`schedule/successful_updates` and the phase unchanged. `sparsity/active` must remain 0 through
+the cut-at-25 phase and become 1 only when the no-cut stage begins at 115k accepted updates.
+Before 50k the live multi-window constraint is not the final K=30 constraint; from 50k onward
+the numerical forward rollout is already the complete K=30 trajectory, although its training
+gradient stays truncated until 115k. Once the terminal no-cut stage is active,
 `eval/path_density` should be strictly between 1/T and 1. Train `loss/pred` vs
 `eval/pred_loss` gap should stay below ~3x, and at 100k clips eval should be BETTER than train
 (0.0142 vs 0.019); a large gap the other way = memorization (run jkslgj4o 2026-07-19: 14x gap
@@ -88,9 +95,10 @@ D34 and git history if ever needed):
    Eq. 9, not an oversight (D34).
 3. **Full-horizon BPTT explosion** (run ecbjobkj, 2026-08-02): the 10k λ_roll ramp did not
    fix fixed-K=30 training. Teacher-forced gradients remained ordinary while rollout gradients
-   reached 1e7–1e8 and the guard aborted after 2000 consecutive skips. D35 removes the
-   coefficient ramp: λ_roll is always 1, and the number of recurrent compositions grows only
-   after accepted optimizer updates.
+   reached 1e7–1e8 and the guard aborted after 2000 consecutive skips. D36 keeps λ_roll=1,
+   first covers the three trajectory regions with short true-anchored windows, then uses one
+   uninterrupted K=30 forward rollout while cuts limit recurrent backward depth to
+   10/15/20/25 before exact full BPTT. A cut is forward identity, never a ground-truth reset.
 
 The D18 grad-spike guard stays in the loop regardless: a non-finite or absurd pre-clip grad norm
 rejects the whole update (optimizer AND dual), and persistent skipping raises. Its origin was a
@@ -98,51 +106,75 @@ finite ~1e30 loss that passed `isfinite`, overflowed the backward pass to grad_n
 let clipping multiply every gradient by zero — a run that "finished" 230k frozen steps with
 byte-identical eval rows. That signature is worth recognising now that BPTT exists again.
 
-## Key mechanics (Experiment 1, hybrid objective — D34/D35)
-- **The objective has TWO prediction branches sharing one θ̂** (pooled once from observations
-  0..29). Hybrid write-up Eq. 36, dual form:
+## Key mechanics (Experiment 1, hybrid objective — D34/D36)
+- **The objective has TWO prediction branches sharing one θ̂** (pooled exactly once per episode
+  from observations 0..29). The same attached θ̂ tensor is reused unchanged at every predictor
+  call in every window/chunk; never re-encode or detach it within an episode. Hybrid write-up
+  Eq. 36, dual form:
 
       L = L_TF + λ_roll·L_roll + λ_logit·L_logit + λ⁻¹·L_path
       c = L_TF + λ_roll·L_roll + λ_logit·L_logit  ≤  τ      (path penalty excluded)
 
   `L_TF` (Eq. 32/39) = 30 teacher-forced one-step predictions, each anchored at the TRUE Z_t,
-  t ∈ I_TF = {29,…,58}. `L_roll` (Eq. 35) = ONE autoregressive chain anchored at the true Z_29
-  and rolled to Z_59 (K=30, fixed anchor, no sampling), every prefix supervised. w_1 = 0 always
-  — at k=1 the chain recomputes the TF term at t=29 — and the remaining w_k are uniform,
-  normalised so K⁻¹Σw_k = 1, making L_roll a MEAN per-step error so λ_roll survives a change of
-  K. λ_roll = 1. K=30 fits the existing 60-step clips exactly: **no preload change.**
-  No VISReg, no Hungarian matching, no variance normalization in Experiment 1.
-- **Training changes K, never λ_roll or the teacher-forced coverage.** The horizon for the next
-  batch is selected from the number of successful optimizer updates: `[0,10k)` is TF-only,
-  `[10k,15k)` uses K=2, `[15k,25k)` K=5, `[25k,40k)` K=10, `[40k,60k)` K=20, and
-  `[60k,∞)` K=30. A successful update means `optimizer.step()` ran; a gradient-spike skip
-  advances the attempted step but not this counter. A checkpoint is saved at every transition.
-  All stages retain the same 30 teacher-forced transitions over t={29,…,58}. Experiment 1
-  aborts after 50 consecutive skips, because a stalled accepted-update clock cannot escape the
-  unstable stage; restore the checkpoint saved at the preceding boundary.
+  t ∈ I_TF = {29,…,58}. The terminal `L_roll` (Eq. 35) = ONE autoregressive chain anchored at
+  true Z_29 and rolled to Z_59 (K=30), every prefix supervised. w_1 = 0 always — at k=1 the
+  chain recomputes the TF term at t=29 — and remaining weights are uniform and normalised so
+  K⁻¹Σw_k=1. The three-window preparation loss is averaged across windows rather than summed,
+  preserving this rollout scale and λ_roll=1. K=30 fits the existing 60-step clips exactly:
+  **no preload change.** No VISReg, Hungarian matching, or variance normalization in Exp 1.
+- **D36's accepted-update schedule is the current debugging protocol:**
+
+  | Accepted updates | Rollout training branch |
+  |---:|---|
+  | `[0,10k)` | off; TF only |
+  | `[10k,20k)` | three true-anchored windows, offsets `[0,10,20]`, H=2 |
+  | `[20k,30k)` | same three windows, H=5 |
+  | `[30k,50k)` | same three windows, H=10 |
+  | `[50k,70k)` | continuous forward K=30; cuts `{10,20}` |
+  | `[70k,85k)` | continuous forward K=30; cut `{15}` |
+  | `[85k,100k)` | continuous forward K=30; cut `{20}` |
+  | `[100k,115k)` | continuous forward K=30; cut `{25}` |
+  | `[115k,∞)` | continuous K=30; no cuts, exact full BPTT |
+
+  Starts are relative to Z_29, so offsets `[0,10,20]` are true anchors
+  `[Z_29,Z_39,Z_49]`. TF still covers all 30 transitions in every phase. A successful update
+  means `optimizer.step()` ran; rejected batches do not advance the phase. Save and resume the
+  accepted counter at every boundary. `train.steps=355k` is an attempted-batch stop; it yields
+  the intended 240k terminal accepted updates only in the zero-skip healthy case. This fixed
+  schedule is expected to be debugged and may be
+  replaced only by a new recorded decision, not ad hoc run-specific changes.
+- **Cuts truncate only backward.** From 50k onward there is always one numerical trajectory
+  `Z_29 -> Zhat_30 -> ... -> Zhat_59`; at a boundary, `state.detach()` is passed forward, with
+  the identical predicted value and no true-state reset. Its backward derivative across that
+  boundary is zero. Thus cuts `{10,20}` make three maximum-depth-10 backward paths, followed by
+  maximum depths 15, 20, 25, then 30 when all cuts are removed. Predictor weights are shared
+  and the common θ̂ remains attached across every chunk.
 - **Both prediction terms AND the logit term sit inside the bound, and that is Baumgartner, not
   a liberty.** Their Eq. 9 (p7) is `min L_path s.t. L_rec + L_KL + L_logit ≤ L*` (L_KL absent
   for us: no cVAE), and their `L_rec` reconstructs Eq. 2's autoregressive trajectory, so a
   rollout under the bound moves TOWARD their formulation. §4.3's "bounds" (plural) are
   scalarised into one, keeping a single dual variable and a single τ.
-- **The eval harness must mirror the relevant constraint exactly.** Periodic evaluation follows
-  the live curriculum K. Final/post-hoc evaluation and τ calibration deliberately use terminal
-  K=30 and λ_roll=1 from the run's config. Exactly 60k accepted updates is only the boundary
-  checkpoint and contains zero K=30 updates; reportable τ calibration requires
-  `successful_updates > 60000`. Changing the terminal horizon or coefficient on one side alone
-  silently invalidates τ. This is the most breakable thing in the design.
+- **The eval harness must mirror the relevant constraint exactly.** Final/post-hoc evaluation
+  and τ calibration use one uninterrupted forward K=30 rollout and λ_roll=1 from the run's
+  config; detach cannot change that scalar forward value. Pre-50k multi-window losses are stage
+  diagnostics, not the final constraint. Exactly 115k accepted updates is only the last cut-phase
+  boundary and contains zero no-cut updates; reportable τ calibration requires
+  `successful_updates > 115000`; a zero-skip production run contains 240k no-cut updates, and
+  provenance reports the actual number otherwise.
+  Changing the terminal horizon or coefficient on one side silently invalidates τ.
 - Model: `ParameterEncoder` (Eqs. 16–26: relational attention per timestep FIRST, then
   per-track temporal pooling, then a bare scalar head) + `Spartan` (Eqs. 27–37) with one
   FIXED non-trainable track key κ_i shared by state and parameter token i (buffer,
   seed-0 codebook, scale 0.02 = our choice). Dense A≡1 / token-local A≡0 references share
   the same modules and codebook. Verified endpoints: dense L_path = 6655, token-local = 5.
-- Dual: log λ += α·MA[c − τ], UNCLAMPED both directions (§6.1.3), but under D35 both
-  this update and the `λ⁻¹·L_path` term are inactive before K=30. The controller therefore
-  reaches the terminal stage with its initial λ and moving average untouched. α = 2e-2 is the
-  one free numerical knob. λ₀ = 1e6 is the write-up's value and the code default; D30 used
-  1e4. Pre-D29 runs are NOT comparable.
+- Dual: log λ += α·MA[c − τ], UNCLAMPED both directions (§6.1.3), but under D36 both
+  this update and the `λ⁻¹·L_path` term are inactive until the no-cut full-BPTT stage at
+  115k accepted updates. The controller reaches that terminal stage with initial λ and moving
+  average untouched. α=2e-2 is the one free numerical knob. λ₀=1e6 is the write-up's value
+  and code default; D30 used 1e4. Pre-D29 runs are NOT comparable.
 - **Working configuration: λ_logit = 1e-5, λ_roll = 1.0, terminal K = 30, accepted-update
-  curriculum off/2/5/10/20/30, λ₀ = 1e4, α = 2e-2.** τ is NOT
+  D36 curriculum `TF -> 3x(H2/H5/H10) -> continuous K30 cuts(10/15/20/25) -> full BPTT`,
+  355k attempted batches (zero-skip target), λ₀ = 1e4, α = 2e-2.** τ is NOT
   a number you carry over — **D30's τ=0.02 is void under the hybrid constraint** (c now includes
   λ_roll·L_roll, which ran ~1.5× L_TF in the smoke). Let the pipeline calibrate it.
 - Protocol τ = 1.0 × the held-out `constraint_loss` of ONE converged full-length dense run per
@@ -202,10 +234,10 @@ byte-identical eval rows. That signature is worth recognising now that BPTT exis
   NO identity stage since D29, NO `--tau-max` gate since D34; `--calib-steps` only for smokes;
   other hydra overrides go to BOTH runs, D12).
 - Cheap stability smoke (~3–5 min, CPU): 1500–3000 steps via `Trainer` directly with
-  `data.num_clips=200` at paper geometry (clip_len 60, context_len 30). Under the declared D35
-  schedule this tests only the TF stage; to test a recurrent depth cheaply, disable the
-  curriculum and set the desired fixed `rollout_len` explicitly. Healthy means zero skipped
-  steps; compare gradient norms only with a smoke at the same K.
+  `data.num_clips=200` at paper geometry (clip_len 60, context_len 30). Under D36 this tests only
+  the TF stage; to test rollout mechanics cheaply, explicitly select the desired window/cut
+  phase rather than pretending a 1500-step run traversed the schedule. Healthy means zero
+  skipped steps; compare gradient norms only at the same forward horizon and backward-cut depth.
 - **NEVER regenerate `data/bounce_train_v2_100000.pt`.** The simulator is deterministic on a
   given machine but NOT across machines: regenerating the identical config on the Mac vs the
   server diverges chaotically (measured n=200: 194/200 episodes differ, max |delta| 3.4, and

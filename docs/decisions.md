@@ -387,9 +387,10 @@ D29 made Experiment 1 a pure teacher-forced one-step objective and deleted the r
 puts a rollout back, on a different footing: it is now a SECOND branch alongside teacher
 forcing, not a replacement for it, and it is inside the dual constraint.
 
-> **Superseded optimisation detail:** D35 retains the exact final K=30 objective below but
-> replaces fixed-K training and the later λ_roll ramp with an accepted-update horizon
-> curriculum. The fixed anchor, terminal horizon, weighting, and theoretical claim remain.
+> **Superseded optimisation detail:** D36 retains the exact final K=30 objective below but
+> replaces fixed-K training, the later λ_roll ramp, and D35's prefix-horizon curriculum with
+> a spatial-coverage-to-truncated-BPTT continuation. The fixed anchor, terminal horizon,
+> weighting, and theoretical claim remain.
 
 **Objective (hybrid write-up Eq. 36, dual form).**
 
@@ -497,6 +498,11 @@ config. **Still unmeasured:** Experiment 3 has never been run at length (D32 rec
 
 ## D35 — Reach the exact K=30 objective through an accepted-update horizon curriculum (decided 2026-08-02, Jesse)
 
+> **SUPERSEDED by D36.** This entry is retained as the historical diagnosis of the failed
+> coefficient ramp and the first continuation attempt. Its off/2/5/10/20/30 optimisation route,
+> 60k terminal boundary, and 300k budget are no longer active. D36 leaves D34's final scientific
+> objective unchanged.
+
 D34's 1500-step fixed-horizon smokes did not predict long-run stability. The first full-weight
 K=30 launch entered a sustained BPTT gradient explosion early. Continuing `lambda_roll`
 linearly from zero over 10k attempted steps only delayed the same failure: in run `ecbjobkj`,
@@ -568,5 +574,84 @@ truncate the declared window, detach the recurrent state, change `lambda_roll`, 
 truth inside the chain, or weaken final full-rollout equivalence. Tau must be recalibrated from a
 fresh dense D35 run; the failed ramp run and every D34/pre-D34 tau remain invalid.
 
-D35 applies to Experiment 1's current preset. Experiment 3 remains at its separately declared
-fixed K=30 protocol unless its own evidence motivates and explicitly configures a curriculum.
+D35 applied to Experiment 1's preset until D36 superseded it. Experiment 3 remained, and still
+remains, at its separately declared fixed K=30 protocol unless its own evidence motivates and
+explicitly configures a curriculum.
+
+## D36 — Cover the trajectory locally, then remove gradient cuts from one continuous K=30 rollout (decided 2026-08-07, Jesse)
+
+D35 increased one prefix from the fixed start, but that can leave the later trajectory regions
+untrained until a long recurrent graph reaches them. Three independently true-anchored windows
+solve the coverage problem, but they can still hide compounding drift because the starts at
+offsets 10 and 20 reset to ground truth. The current route therefore has two deliberately simple
+parts: learn all three regions locally, then run the exact full forward trajectory while gradually
+lengthening only its backward paths. **This is the current debugging protocol and is likely to be
+iterated until the full-BPTT code path is demonstrably stable; record any replacement as another
+decision rather than silently changing these boundaries.**
+
+**The final objective and observational-equivalence target are unchanged.** The terminal model
+still uses one autonomous chain from `Z_29` through `Z_59`, supervises every declared prefix,
+uses `lambda_roll = 1.0`, and performs exact K=30 BPTT. `L_TF` remains active over all 30 true-
+anchored suffix transitions in every phase. D36 supersedes only D35's optimisation route.
+
+**One parameter estimate per episode, everywhere.** The parameter encoder runs once on the
+episode context to produce `theta_hat`. The exact same attached `theta_hat` tensor is reused at
+every predictor call, across all three local windows and every step of the continuous rollout.
+It is never recomputed, changed, or detached within a batch/episode; different episodes may of
+course have different estimates.
+
+**The schedule is indexed by accepted optimizer updates.** Starts below are offsets relative to
+the prediction anchor `Z_29`, so `[0, 10, 20]` means true anchors `[Z_29, Z_39, Z_49]`.
+
+| Accepted updates before the batch | Rollout training branch |
+|---:|---|
+| `[0, 10,000)` | off; teacher forcing only |
+| `[10,000, 20,000)` | three true-anchored windows, starts `[0,10,20]`, each H=2 |
+| `[20,000, 30,000)` | same three true-anchored windows, each H=5 |
+| `[30,000, 50,000)` | same three true-anchored windows, each H=10 |
+| `[50,000, 70,000)` | one continuous forward K=30 rollout; gradient cuts after steps `{10,20}` |
+| `[70,000, 85,000)` | one continuous forward K=30 rollout; gradient cut after step `{15}` |
+| `[85,000, 100,000)` | one continuous forward K=30 rollout; gradient cut after step `{20}` |
+| `[100,000, 115,000)` | one continuous forward K=30 rollout; gradient cut after step `{25}` |
+| `[115,000, ∞)` | one continuous K=30 rollout with no cuts: exact full BPTT |
+
+The configured stop remains 355,000 attempted batches. In the intended healthy zero-skip run all
+355,000 attempts are accepted, leaving 240,000 terminal updates. Any isolated skips reduce that
+number and must be reported from the checkpoint's accepted counter; persistent skips abort under
+D18. Checkpoints are written at every listed boundary, and resume restores that counter.
+Each training record logs both the pre-batch accepted count that selected the stage and the
+post-batch count, plus the stage boundary, window count, maximum BPTT depth, starts, and cuts.
+This makes the single record that crosses a boundary unambiguous during debugging.
+
+**The three-window loss does not grow threefold.** Each window is autoregressive only within
+itself and begins at its stated true anchor. The three window losses are averaged, preserving the
+scale of `L_roll` and hence the meaning of `lambda_roll = 1.0`. At H=10 the three windows tile all
+30 suffix transitions. This phase provides coverage, not yet a claim that errors stitch into one
+autonomous trajectory.
+
+**A gradient cut is not a state reset.** From accepted update 50k onward, the forward computation
+is always the same uninterrupted numerical trajectory
+
+    Z_29 -> Zhat_30 -> ... -> Zhat_39 -> ... -> Zhat_49 -> ... -> Zhat_59.
+
+After a designated step, the predicted state passed to the next call is `state.detach()`. In the
+forward pass `detach(state) == state`; no true state is inserted and the scalar K=30 rollout loss
+is unchanged. In the backward pass its derivative with respect to the computation before the cut
+is zero. Cuts `{10,20}` therefore give one continuous 30-step forward rollout but three backward
+paths of maximum depth 10. A cut `{15}` gives two paths of depth 15; `{20}` and `{25}` increase
+the maximum recurrent backward depth to 20 and 25. Removing the last cut at 115k restores the
+exact derivative through all 30 compositions. Predictor weights remain shared across chunks, and
+the undetached shared `theta_hat` receives gradients from every predictor call.
+
+**Sparsity is deliberately postponed.** The path penalty and GECO moving-average/dual update
+remain inactive through every local-window and gradient-cut phase. They activate together only
+for batches in the no-cut stage beginning at 115,000 accepted updates. This cleanly separates
+stabilising exact full-horizon differentiation from imposing the constrained sparse objective.
+Tau must be calibrated from a fresh, converged dense D36 run under the terminal K=30 evaluation;
+no D35 or earlier tau is transferable. A boundary checkpoint at exactly 115,000 accepted updates
+has completed zero no-cut updates and is not reportable; reportability requires
+`successful_updates > 115000`. The 355k attempted-batch budget yields the intended 240k terminal
+updates in a zero-skip run; provenance records the actual terminal accepted count otherwise.
+
+D36 currently applies only to Experiment 1. Experiment 3 retains its separately declared fixed
+K=30 protocol unless its own evidence motivates an explicit change.
