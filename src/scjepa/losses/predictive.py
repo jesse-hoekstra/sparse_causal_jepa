@@ -1,4 +1,4 @@
-"""Prediction losses — the two branches of the hybrid objective.
+"""Prediction losses for the SCJEPA regimes.
 
 Teacher forcing (experiments.pdf Eq. 39 == hybrid Eq. 32)
 
@@ -10,35 +10,18 @@ objects), so no assignment of any kind is performed here; the visual
 experiments use a single detached trajectory-level assignment on the LOSS side
 (§6.5), never per-step rematching.
 
-Dense K-step autoregressive rollout (hybrid Eq. 35)
+State-to-state local composition auxiliary
 
-    L_roll^(K) = (1/K) Σ_{k=1..K} w_k (1 / (N d_s)) ||Ŝ^[k]_{t+k} - sg(S̄_{t+k})||²_F
+    L_AR2 = mean_(b,w,n,d) ||S_hat_(t+2) - S_(t+2)||²
 
-supervises EVERY autoregressive prefix, not just the terminal state — that is
-the stated difference from V-JEPA 2-AC (hybrid Remark 4).
+supervises only the endpoint after one generated state has been fed back. The
+first transition is already covered by ``L_TF``. The mean includes the window
+axis, so changing or duplicating the number of anchors cannot multiply the
+coefficient's scale.
 
-CHOICE OF w_k (Eq. 35 leaves them free; this is our decision, not the paper's):
-
-* w_1 = 0, ALWAYS. At k=1 the rollout computes f_gamma(S^on_t, θ̂) against
-  S̄_{t+1} — bit-for-bit the teacher-forced term at the same t, differing only
-  by the gate draw. Since the rollout starts at t = Tpar-1 and I_TF =
-  {Tpar-1, …, T-2}, the start is ALWAYS inside I_TF, so the write-up's coverage
-  condition ("every state in the rollout prefix constrained by either term") is
-  satisfied by L_TF structurally, not just for the current numbers. Keeping
-  w_1 > 0 would only double-count one transition inside a bound that has no
-  slack to spare.
-* Uniform over the remaining k, normalised so K⁻¹ Σ_k w_k = 1 — the third
-  option the write-up offers. Uniform because §4.4(ii) requires only that every
-  prefix be constrained, so any positive profile satisfies the theory and a
-  non-uniform one would be an unmotivated hyperparameter. Normalising means
-  L_roll is the MEAN per-step error, so λ_roll keeps its meaning if K changes
-  (it would otherwise silently rescale the constraint).
-
-The alternative worth knowing about is a geometric discount w_k ~ gamma^(k-1),
-which counteracts late steps dominating as error compounds. In the 1500-step
-CPU smoke (paper geometry, K=10) L_roll stayed within ~1.4x of L_TF rather than
-running away, so there is nothing to counteract yet; revisit only if the ratio
-of L_roll to L_TF grows large during a real run.
+``weighted_rollout_mse`` and ``rollout_weights`` remain only for the separately
+defined visual-to-visual experiment, whose latent-space objective has not been
+changed by the state-to-state simplification.
 """
 
 import torch
@@ -56,16 +39,32 @@ def aligned_mse(pred: Float[Tensor, "b n k"], target: Float[Tensor, "b n k"]) ->
     return F.mse_loss(pred, target)
 
 
+def rollout_t2_endpoint_mse(
+    pred: Float[Tensor, "b w n d"],
+    target: Float[Tensor, "b w n d"],
+) -> Float[Tensor, ""]:
+    """Mean endpoint error for independently anchored two-step rollouts.
+
+    Both tensors contain only ``S_hat_(t+2)`` / ``S_(t+2)``. A plain
+    elementwise mean therefore implements the required average over episodes,
+    windows, objects, and coordinates without an intermediate-step loss.
+    """
+    if pred.shape != target.shape or pred.ndim != 4:
+        raise ValueError(
+            f"expected matching (B, W, N, d), got {tuple(pred.shape)} vs {tuple(target.shape)}"
+        )
+    return F.mse_loss(pred, target)
+
+
 def weighted_rollout_mse(
     pred: Float[Tensor, "b j n k"],
     target: Float[Tensor, "b j n k"],
     weights: Float[Tensor, "j"],
 ) -> Float[Tensor, ""]:
-    """Hybrid Eq. 35: dense prefix supervision of a K-step rollout.
+    """Experiment 3's fixed latent K-step rollout loss.
 
     ``pred[:, k-1]`` is Ŝ^[k]_{t+k} and ``target[:, k-1]`` is S̄_{t+k}; the
-    target must already carry the stop-gradient (in Experiment 1 it is fixed
-    observed data, so sg is a no-op, but the EMA-target regime needs it).
+    target must already carry the stop-gradient from the EMA target branch.
 
     The 1/(N d_s) normalisation is the mean over the trailing (N, k) axes and
     the outer 1/K is the mean over the horizon axis. With ``rollout_weights``
@@ -84,7 +83,7 @@ def weighted_rollout_mse(
 
 
 def rollout_weights(horizon: int, device: torch.device | None = None) -> Float[Tensor, "j"]:
-    """Eq. 35 weights: w_1 = 0, uniform over k = 2..K, normalised to mean 1.
+    """Experiment 3 weights: w_1 = 0, uniform over k = 2..K, mean one.
 
     w_1 = 0 always — see the module docstring: at k=1 the rollout recomputes the
     teacher-forced term, and the rollout start is structurally inside I_TF, so
@@ -99,4 +98,9 @@ def rollout_weights(horizon: int, device: torch.device | None = None) -> Float[T
     return weights
 
 
-__all__ = ["aligned_mse", "rollout_weights", "weighted_rollout_mse"]
+__all__ = [
+    "aligned_mse",
+    "rollout_t2_endpoint_mse",
+    "rollout_weights",
+    "weighted_rollout_mse",
+]

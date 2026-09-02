@@ -1,18 +1,17 @@
-"""Identifiability evaluation: ``python scripts/eval_identifiability.py <run_dir>``.
+"""Evaluate an Experiment-1 checkpoint on a fixed held-out split.
 
-Loads a training run's ``resolved_config.yaml`` + ``last.pt``, rebuilds the
-model through the same factory the trainer used, evaluates prediction, sparse
-graphs and Baumgartner App. F.1 mass-recovery MCC on a held-out split, and saves
-the full pairwise R² matrix next to the checkpoint.
-
-Experiment 1: slot i ≡ tracked object i by construction (ζ = id).
+Loads ``resolved_config.yaml`` and ``last.pt``, evaluates the final
+teacher-forcing-plus-T=2 constraint, graph recovery, MCC, and the no-gradient
+K=30 sampled observational-equivalence diagnostic. The resulting tolerance
+rate estimates approximate agreement on held-out trajectories; it is not a
+proof of population observational equivalence.
 """
 
 # pyright: reportUnknownMemberType=false
-# (matplotlib's Axes API is partially typed; this file is a thin plotting shell)
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
@@ -26,199 +25,73 @@ from scjepa.training.factory import build_dataset, build_model
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-RolloutStage = tuple[int, int | None, tuple[int, ...], tuple[int, ...]]
 
-EXPECTED_ROLLOUT_CURRICULUM: tuple[RolloutStage, ...] = (
-    (0, None, (), ()),
-    (10_000, 2, (0, 10, 20), ()),
-    (20_000, 5, (0, 10, 20), ()),
-    (30_000, 10, (0, 10, 20), ()),
-    (50_000, 30, (0,), (10, 20)),
-    (70_000, 30, (0,), (15,)),
-    (85_000, 30, (0,), (20,)),
-    (100_000, 30, (0,), (25,)),
-    (115_000, 30, (0,), ()),
-)
+class ProtocolProvenance(TypedDict):
+    """Fixed objective/evaluation values attached to every final report."""
 
-
-class CurriculumStageRecord(TypedDict):
-    """JSON representation of one accepted-update rollout stage."""
-
-    start_update: int
-    rollout_len: int | None
-    rollout_starts: list[int]
-    gradient_cuts: list[int]
-
-
-class CurriculumProvenance(TypedDict):
-    """Scalar and structured evidence tying final metrics to the trained horizon."""
-
-    successful_updates: int
     total_skips: int
-    successful_updates_checkpointed: bool
-    rollout_curriculum: list[CurriculumStageRecord]
-    curriculum_current_rollout_len: int | None
-    curriculum_current_rollout_starts: list[int]
-    curriculum_current_gradient_cuts: list[int]
-    curriculum_terminal_start_update: int
-    curriculum_terminal_reached: bool
-    terminal_rollout_updates: int
-    evaluation_rollout_len: int | None
-    evaluation_rollout_starts: list[int]
-    evaluation_gradient_cuts: list[int]
-    lambda_roll: float
+    lambda_rollout_t2: float
+    num_rollout_t2_anchors: int
+    rollout_t2_horizon: int
+    oe_eval_horizon: int
+    oe_tolerance_nrmse: float
+    oe_coordinate_std: list[float]
 
 
-def _integer_list(value: object, *, field: str, stage_index: int) -> tuple[int, ...]:
-    """Validate and freeze one stage's start/cut list."""
-    if not isinstance(value, list):
-        raise ValueError(f"rollout curriculum {field} {stage_index} must be a list")
-    integers: list[int] = []
-    for item_index, item in enumerate(cast(list[object], value)):
-        if not isinstance(item, int) or isinstance(item, bool):
-            raise ValueError(
-                f"rollout curriculum {field} {stage_index}[{item_index}] must be an integer"
-            )
-        integers.append(item)
-    return tuple(integers)
-
-
-def _rollout_curriculum(cfg: DictConfig) -> tuple[RolloutStage, ...]:
-    """Read the accepted-update curriculum from a resolved run config."""
-    raw = cfg.train.get("rollout_curriculum", None)
-    if raw is None:
-        return ()
-    container_value = OmegaConf.to_container(raw, resolve=True)
-    if not isinstance(container_value, list):
-        raise ValueError("train.rollout_curriculum must be a list")
-    container = cast(list[object], container_value)
-    stages: list[RolloutStage] = []
-    for index, stage in enumerate(container):
-        if not isinstance(stage, dict):
-            raise ValueError(f"rollout curriculum stage {index} must be a mapping")
-        stage_mapping = cast(dict[str, object], stage)
-        expected_fields = {"start_update", "rollout_len", "rollout_starts", "gradient_cuts"}
-        if set(stage_mapping) != expected_fields:
-            raise ValueError(
-                f"rollout curriculum stage {index} must contain exactly "
-                "start_update, rollout_len, rollout_starts, and gradient_cuts"
-            )
-        start_update = stage_mapping["start_update"]
-        raw_horizon = stage_mapping["rollout_len"]
-        if not isinstance(start_update, int) or isinstance(start_update, bool):
-            raise ValueError(f"rollout curriculum start_update {index} must be an integer")
-        if raw_horizon is not None and (
-            not isinstance(raw_horizon, int) or isinstance(raw_horizon, bool)
-        ):
-            raise ValueError(f"rollout curriculum rollout_len {index} must be an integer or null")
-        starts = _integer_list(
-            stage_mapping["rollout_starts"], field="rollout_starts", stage_index=index
-        )
-        cuts = _integer_list(
-            stage_mapping["gradient_cuts"], field="gradient_cuts", stage_index=index
-        )
-        stages.append((start_update, raw_horizon, starts, cuts))
-    return tuple(stages)
-
-
-def _curriculum_provenance(cfg: DictConfig, checkpoint: dict[str, Any]) -> CurriculumProvenance:
-    """Describe which accepted-update stage the evaluated checkpoint reached."""
-    stages = _rollout_curriculum(cfg)
-    step = int(checkpoint["step"])
-    total_skips = int(checkpoint.get("total_skips", 0))
-    counter_checkpointed = "successful_updates" in checkpoint
-    successful_updates = int(checkpoint.get("successful_updates", max(step - total_skips, 0)))
-    terminal_rollout = cfg.train.get("rollout_len", None)
-    terminal_rollout = None if terminal_rollout is None else int(terminal_rollout)
-
-    current_rollout: int | None = terminal_rollout
-    current_starts: tuple[int, ...] = (0,) if terminal_rollout is not None else ()
-    current_cuts: tuple[int, ...] = ()
-    if stages:
-        current_rollout = None
-        current_starts = ()
-        current_cuts = ()
-        for start_update, rollout_len, rollout_starts, gradient_cuts in stages:
-            if start_update > successful_updates:
-                break
-            current_rollout = rollout_len
-            current_starts = rollout_starts
-            current_cuts = gradient_cuts
-    terminal_start = stages[-1][0] if stages else 0
-    terminal_stage_matches = bool(
-        stages and stages[-1][1] == terminal_rollout and stages[-1][2] == (0,) and not stages[-1][3]
-    )
-    terminal_reached = terminal_stage_matches and successful_updates >= terminal_start
-    terminal_updates = max(successful_updates - terminal_start, 0) if terminal_reached else 0
+def _protocol_provenance(cfg: DictConfig, checkpoint: dict[str, Any]) -> ProtocolProvenance:
+    """Extract the fixed protocol without any schedule-dependent state."""
+    scales = cfg.train.get("oe_coordinate_std", None)
+    if scales is None:
+        raise ValueError("resolved config has no fixed train.oe_coordinate_std")
+    values = [float(value) for value in scales]
+    if not values or any(not math.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("train.oe_coordinate_std must contain finite positive values")
     return {
-        "successful_updates": successful_updates,
-        "total_skips": total_skips,
-        "successful_updates_checkpointed": counter_checkpointed,
-        "rollout_curriculum": [
-            {
-                "start_update": start_update,
-                "rollout_len": rollout_len,
-                "rollout_starts": list(rollout_starts),
-                "gradient_cuts": list(gradient_cuts),
-            }
-            for start_update, rollout_len, rollout_starts, gradient_cuts in stages
-        ],
-        "curriculum_current_rollout_len": current_rollout,
-        "curriculum_current_rollout_starts": list(current_starts),
-        "curriculum_current_gradient_cuts": list(current_cuts),
-        "curriculum_terminal_start_update": terminal_start,
-        "curriculum_terminal_reached": terminal_reached,
-        "terminal_rollout_updates": terminal_updates,
-        "evaluation_rollout_len": terminal_rollout,
-        # The post-hoc evaluator always measures one complete mathematical
-        # rollout. Gradient cuts are a training-only backward-pass operation.
-        "evaluation_rollout_starts": [0] if terminal_rollout is not None else [],
-        "evaluation_gradient_cuts": [],
-        "lambda_roll": float(cfg.train.get("lambda_roll", 0.0)),
+        "total_skips": int(checkpoint.get("total_skips", 0)),
+        "lambda_rollout_t2": float(cfg.train.lambda_rollout_t2),
+        "num_rollout_t2_anchors": int(cfg.train.num_rollout_t2_anchors),
+        "rollout_t2_horizon": int(cfg.train.rollout_t2_horizon),
+        "oe_eval_horizon": int(cfg.train.oe_eval_horizon),
+        "oe_tolerance_nrmse": float(cfg.train.oe_tolerance_nrmse),
+        "oe_coordinate_std": values,
     }
 
 
-def _require_reportable_terminal_curriculum(
-    cfg: DictConfig, checkpoint: dict[str, Any], provenance: CurriculumProvenance
+def _require_complete_protocol(
+    cfg: DictConfig,
+    checkpoint: dict[str, Any],
+    provenance: ProtocolProvenance,
 ) -> None:
-    """Reject tau/final reports that never trained under the terminal K=30 objective."""
-    stages = _rollout_curriculum(cfg)
+    """Reject incomplete or non-primary checkpoints used for tau/final reports."""
     problems: list[str] = []
-    if stages != EXPECTED_ROLLOUT_CURRICULUM:
-        problems.append(f"curriculum is {stages!r}, expected {EXPECTED_ROLLOUT_CURRICULUM!r}")
-    if cfg.train.get("rollout_len", None) != 30:
-        problems.append(
-            f"terminal rollout_len is {cfg.train.get('rollout_len', None)!r}, expected 30"
-        )
-    if float(cfg.train.get("lambda_roll", 0.0)) != 1.0:
-        problems.append(f"lambda_roll is {cfg.train.get('lambda_roll', None)!r}, expected 1.0")
-    if stages and (stages[-1][2] != (0,) or stages[-1][3]):
-        problems.append("terminal stage must be one rollout from start 0 with no gradient cuts")
-    if not bool(provenance["successful_updates_checkpointed"]):
-        problems.append("checkpoint has no explicit successful_updates counter")
-    if provenance["successful_updates"] + provenance["total_skips"] != int(checkpoint["step"]):
-        problems.append("successful_updates + total_skips does not equal checkpoint step")
-    if not bool(provenance["curriculum_terminal_reached"]):
-        problems.append(
-            "terminal curriculum stage was not reached "
-            f"(successful_updates={provenance['successful_updates']})"
-        )
-    elif int(provenance["terminal_rollout_updates"]) < 1:
-        problems.append("checkpoint reached the K=30 boundary but completed no K=30 update")
+    if provenance["lambda_rollout_t2"] != 1.0:
+        problems.append("lambda_rollout_t2 must equal 1.0")
+    if provenance["num_rollout_t2_anchors"] != 8:
+        problems.append("num_rollout_t2_anchors must equal 8")
+    if provenance["rollout_t2_horizon"] != 2:
+        problems.append("rollout_t2_horizon must equal 2")
+    if provenance["oe_eval_horizon"] != 30:
+        problems.append("oe_eval_horizon must equal 30")
     if int(checkpoint["step"]) != int(cfg.train.steps):
         problems.append(
-            f"checkpoint step {int(checkpoint['step'])} != configured train.steps "
-            f"{int(cfg.train.steps)}"
+            f"checkpoint step {int(checkpoint['step'])} != configured steps {int(cfg.train.steps)}"
         )
+    obsolete = {
+        "rollout_curriculum",
+        "rollout_len",
+        "lambda_roll",
+    }.intersection(cfg.train.keys())
+    if obsolete:
+        problems.append(f"resolved config retains obsolete state rollout keys {sorted(obsolete)}")
     if problems:
-        raise SystemExit("not a reportable terminal-curriculum checkpoint: " + "; ".join(problems))
+        raise SystemExit("not a complete fixed T=2 protocol checkpoint: " + "; ".join(problems))
 
 
 def main() -> None:
-    """Load run, evaluate, print report, and save recovery artifacts."""
+    """Load a run, evaluate it, save artifacts, and optionally update W&B."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "run_dir", type=Path, help="Hydra run dir with resolved_config.yaml + last.pt"
+        "run_dir", type=Path, help="Hydra run dir with resolved_config.yaml and last.pt"
     )
     parser.add_argument(
         "--episodes",
@@ -236,15 +109,12 @@ def main() -> None:
         "--seed-offset",
         type=int,
         default=17,
-        help="held-out split offset (use a different value for validation and final test)",
+        help="held-out split offset (use distinct validation and final-test values)",
     )
     parser.add_argument(
-        "--require-terminal-curriculum",
+        "--require-complete-protocol",
         action="store_true",
-        help=(
-            "require the exact accepted-update curriculum, at least one successful full-BPTT "
-            "K=30 update, and a completed checkpoint before emitting reportable metrics"
-        ),
+        help="require the fixed 8-anchor T=2 protocol and a completed checkpoint",
     )
     args = parser.parse_args()
 
@@ -252,50 +122,39 @@ def main() -> None:
     if not isinstance(cfg, DictConfig):
         raise SystemExit("resolved_config.yaml must contain a mapping")
     model = build_model(cfg.model)
-    # Always deserialize through CPU so checkpoints written on a GPU machine
-    # remain inspectable elsewhere; the harness moves the model to --device.
     payload = cast(
         dict[str, Any],
         torch.load(args.run_dir / "last.pt", map_location="cpu", weights_only=False),
     )
-    provenance = _curriculum_provenance(cfg, payload)
-    if args.require_terminal_curriculum:
-        _require_reportable_terminal_curriculum(cfg, payload, provenance)
+    provenance = _protocol_provenance(cfg, payload)
+    if args.require_complete_protocol:
+        _require_complete_protocol(cfg, payload, provenance)
     model.load_state_dict(payload["model"])
 
     eval_cfg = OmegaConf.merge(cfg.data, {"num_clips": args.episodes})
     assert isinstance(eval_cfg, DictConfig)
     dataset = build_dataset(eval_cfg, seed_offset=args.seed_offset)
-    # Final evaluation deliberately uses the configured TERMINAL horizon, not
-    # the live stage at the checkpoint. Reportable callers additionally require
-    # proof above that training reached and updated under this exact K=30 stage.
     report = evaluate_identifiability(
         model,  # pyright: ignore[reportArgumentType]
         dataset,
         batch_size=args.batch_size,
         device=args.device,
         context_len=cfg.train.get("context_len", None),
-        lambda_logit=cfg.train.get("lambda_logit", 0.0),
-        rollout_len=cfg.train.get("rollout_len", None),
-        lambda_roll=float(cfg.train.get("lambda_roll", 0.0)),
-        # Retain terminal-step and trajectory-third evidence in the final
-        # observational-equivalence report. The harness reuses the live K=30
-        # values, so this does not perform a duplicate rollout.
-        full_rollout_len=cfg.train.get("rollout_len", None),
+        lambda_logit=float(cfg.train.lambda_logit),
+        lambda_rollout_t2=provenance["lambda_rollout_t2"],
+        num_rollout_t2_anchors=provenance["num_rollout_t2_anchors"],
+        rollout_t2_horizon=provenance["rollout_t2_horizon"],
+        oe_eval_horizon=provenance["oe_eval_horizon"],
+        oe_tolerance_nrmse=provenance["oe_tolerance_nrmse"],
+        oe_coordinate_std=provenance["oe_coordinate_std"],
     )
 
     print(f"identifiability report for {args.run_dir} (step {payload['step']}):")
-    print(f"  {'successful_updates':>22}: {provenance['successful_updates']}")
-    print(f"  {'terminal_rollout_updates':>22}: {provenance['terminal_rollout_updates']}")
-    print(f"  {'evaluation_rollout_len':>22}: {provenance['evaluation_rollout_len']}")
-    print(f"  {'evaluation_rollout_starts':>22}: {provenance['evaluation_rollout_starts']}")
-    print(f"  {'evaluation_gradient_cuts':>22}: {provenance['evaluation_gradient_cuts']}")
     for key, value in report.metrics.items():
-        print(f"  {key:>22}: {value:.10g}")
+        print(f"  {key:>38}: {value:.10g}")
     for key, value in report.diagnostics.items():
-        print(f"  {key:>22}: {value:.10g}")
+        print(f"  {key:>38}: {value:.10g}")
 
-    # Machine-readable copy for cross-seed aggregation (scripts/aggregate_runs.py).
     record: dict[str, object] = dict(report.metrics)
     record.update(report.diagnostics)
     record.update(
@@ -310,7 +169,6 @@ def main() -> None:
     metrics_path.write_text(json.dumps(record, indent=2))
     print(f"  metrics saved to {metrics_path}")
 
-    # Rows are true masses, columns are learned coordinates (App. F.1's I x J).
     matrix_record: dict[str, object] = {
         "orientation": "nonlinear_r2[true_mass][learned_coordinate]",
         "nonlinear_r2": [[float(value) for value in row] for row in report.recovery_matrix],
@@ -319,17 +177,16 @@ def main() -> None:
     matrix_path.write_text(json.dumps(matrix_record, indent=2))
     print(f"  MCC R^2 matrix saved to {matrix_path}")
 
-    # Recovery grid: rows are physical masses, columns are learned parameter
-    # coordinates. The green outline marks each row's argmax — the cell that
-    # actually enters MCC = mean_i max_j R^2_ij. An off-diagonal green cell
-    # means the mass is recoverable, but not from its own track's coordinate.
     num_slots = report.true_parameters.shape[1]
-    best_for_mass = report.recovery_matrix.argmax(dim=1)  # per true mass: argmax_j
+    best_for_mass = report.recovery_matrix.argmax(dim=1)
     grid_fig, grid_axes = plt.subplots(
-        num_slots, num_slots, figsize=(1.75 * num_slots, 1.75 * num_slots), squeeze=False
+        num_slots,
+        num_slots,
+        figsize=(1.75 * num_slots, 1.75 * num_slots),
+        squeeze=False,
     )
-    for i in range(num_slots):  # row: true mass of ball i
-        for j in range(num_slots):  # column: learned tracked parameter slot j
+    for i in range(num_slots):
+        for j in range(num_slots):
             cell = grid_axes[i][j]
             cell.scatter(
                 report.learned_coordinates[:, j].numpy(),
@@ -376,20 +233,13 @@ def main() -> None:
 def _log_to_wandb(
     run_dir: Path,
     cfg: DictConfig,
-    report: object,
+    report: IdentifiabilityReport,
     grid_path: Path,
     step: int,
     seed_offset: int,
-    provenance: CurriculumProvenance,
+    provenance: ProtocolProvenance,
 ) -> None:
-    """Attach the final eval + recovery grid to the TRAINING run's W&B page.
-
-    ``scripts/train.py`` writes ``wandb_run_id.txt`` next to the checkpoint, so
-    this resumes that run rather than creating a detached second entry. Silently
-    does nothing when the run was not tracked (``wandb.enabled=false``, CI, or
-    an older run dir without the id file) — evaluation must never fail because
-    of logging.
-    """
+    """Attach final metrics to the original W&B run when one exists."""
     id_file = run_dir / "wandb_run_id.txt"
     if not cfg.get("wandb", {}).get("enabled", False) or not id_file.exists():
         return
@@ -398,7 +248,6 @@ def _log_to_wandb(
     except ImportError:
         print("  wandb not installed — skipping upload")
         return
-    assert isinstance(report, IdentifiabilityReport)
     try:
         run = wandb.init(
             project=cfg.wandb.project,
@@ -406,32 +255,17 @@ def _log_to_wandb(
             resume="allow",
             mode=cfg.wandb.get("mode", "online"),
         )
-        # Prefix distinguishes the 5000-episode final numbers from the periodic
-        # eval/* curves logged during training on a much smaller sample.
         payload: dict[str, object] = {
             f"final/{key}": value for key, value in {**report.metrics, **report.diagnostics}.items()
         }
         payload["final/recovery_grid"] = wandb.Image(str(grid_path))
         payload["final/eval_seed_offset"] = seed_offset
-        for key in (
-            "successful_updates",
-            "total_skips",
-            "curriculum_current_rollout_len",
-            "curriculum_terminal_start_update",
-            "curriculum_terminal_reached",
-            "terminal_rollout_updates",
-            "evaluation_rollout_len",
-            "curriculum_current_rollout_starts",
-            "curriculum_current_gradient_cuts",
-            "evaluation_rollout_starts",
-            "evaluation_gradient_cuts",
-            "lambda_roll",
-        ):
-            payload[f"final/{key}"] = provenance[key]
+        for key, value in provenance.items():
+            payload[f"final/{key}"] = value
         run.log(payload, step=step)
         run.finish()
         print(f"  recovery grid + final metrics logged to W&B run {run.id}")
-    except Exception as error:  # logging must never fail the evaluation
+    except Exception as error:  # logging must never fail evaluation
         print(f"  W&B upload skipped ({type(error).__name__}: {error})")
 
 

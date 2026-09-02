@@ -1,5 +1,6 @@
-"""End-to-end training tests: dual controller, smoke, resume, guards, eval."""
+"""End-to-end tests for the fixed teacher-forcing-plus-T=2 trainer."""
 
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,20 +11,9 @@ from omegaconf import DictConfig, OmegaConf
 import scjepa.training.loop as training_loop
 from scjepa.data import BounceDataset
 from scjepa.models import StateToStateModel, build_state_to_state
-from scjepa.training import RolloutStage, SparsityLagrangian, TrainConfig, Trainer
+from scjepa.training import SparsityLagrangian, TrainConfig, Trainer
 
 N = 3
-PAPER_ROLLOUT_CURRICULUM: tuple[RolloutStage, ...] = (
-    RolloutStage(0, None),
-    RolloutStage(10_000, 2, (0, 10, 20)),
-    RolloutStage(20_000, 5, (0, 10, 20)),
-    RolloutStage(30_000, 10, (0, 10, 20)),
-    RolloutStage(50_000, 30, (0,), (10, 20)),
-    RolloutStage(70_000, 30, (0,), (15,)),
-    RolloutStage(85_000, 30, (0,), (20,)),
-    RolloutStage(100_000, 30, (0,), (25,)),
-    RolloutStage(115_000, 30, (0,)),
-)
 
 
 def tiny_model(dense: bool = False, identity: bool = False) -> StateToStateModel:
@@ -42,7 +32,7 @@ def tiny_model(dense: bool = False, identity: bool = False) -> StateToStateModel
     )
 
 
-def tiny_dataset(num_episodes: int = 8, clip_len: int = 4) -> BounceDataset:
+def tiny_dataset(num_episodes: int = 8, clip_len: int = 6) -> BounceDataset:
     return BounceDataset(
         num_episodes=num_episodes,
         clip_len=clip_len,
@@ -56,570 +46,260 @@ def tiny_dataset(num_episodes: int = 8, clip_len: int = 4) -> BounceDataset:
 
 
 def tiny_config(out_dir: Path, steps: int = 3, **overrides: object) -> TrainConfig:
-    defaults: dict[str, object] = dict(
-        steps=steps,
-        batch_size=4,
-        sparsity_tau=0.5,
-        context_len=2,
-        lambda_logit=1e-3,
-        # T=4, Tpar=2: the chain starts at t=1 and its last target is S̄_3,
-        # so K=2 keeps the hybrid branch live in every training test.
-        rollout_len=2,
-        log_every=1,
-        checkpoint_every=1000,
-        out_dir=str(out_dir),
-        seed=0,
-    )
+    defaults: dict[str, object] = {
+        "steps": steps,
+        "batch_size": 4,
+        "sparsity_tau": 0.5,
+        "context_len": 2,
+        "lambda_logit": 1e-3,
+        # T=6/C=2 has three valid T=2 offsets: 0,1,2.
+        "lambda_rollout_t2": 1.0,
+        "num_rollout_t2_anchors": 3,
+        "rollout_t2_horizon": 2,
+        "oe_eval_horizon": 4,
+        "oe_coordinate_std": (1.0, 1.0, 1.0, 1.0),
+        "log_every": 1,
+        "checkpoint_every": 1000,
+        "out_dir": str(out_dir),
+        "seed": 0,
+    }
     defaults.update(overrides)
     return TrainConfig(**defaults)  # pyright: ignore[reportArgumentType]
 
 
 def test_lagrangian_dual_dynamics() -> None:
-    """Log lambda += alpha * MA[c - tau], UNCLAMPED in both directions (§6.1.3)."""
-    controller = SparsityLagrangian(tau=0.1, step_size=1.0, lambda_init=1e6, momentum=0.0)
+    controller = SparsityLagrangian(tau=0.1, step_size=1.0, lambda_init=1e4, momentum=0.0)
     start = float(controller.log_lambda)
-    controller.update(torch.tensor(1.1))  # c > tau: lambda RISES above its init
+    controller.update(torch.tensor(1.1))
     assert float(controller.log_lambda) == pytest.approx(start + 1.0)
     for _ in range(40):
-        controller.update(torch.tensor(0.0))  # c < tau: lambda falls freely
+        controller.update(torch.tensor(0.0))
     assert float(controller.log_lambda) < start - 2.0
     assert controller.penalty_weight.item() == pytest.approx(
         float(torch.exp(-controller.log_lambda))
     )
 
 
-def test_training_smoke(tmp_path: Path) -> None:
-    """Eq. 40 objective end-to-end: finite losses, metrics logged, checkpoint."""
+def test_training_smoke_has_finite_fixed_objective_and_no_schedule_keys(tmp_path: Path) -> None:
     trainer = Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path))
     metrics = trainer.train()
-    for key in (
-        "loss/total",
-        "loss/pred",
-        "loss/rollout_raw",
-        "loss/rollout",
+    required = {
+        "train/loss_teacher_forcing",
+        "train/loss_rollout_t2_raw",
+        "train/loss_rollout_t2_weighted",
+        "train/loss_total",
+        "train/grad_norm_teacher_forcing",
+        "train/grad_norm_rollout_t2_weighted",
         "loss/logit",
         "loss/sparsity",
         "sparsity/constraint",
         "sparsity/lambda",
         "sparsity/path_density",
         "health/grad_norm",
-        "health/grad_norm_tf",
-        "health/grad_norm_rollout_raw",
-        "health/grad_norm_rollout",
-        "schedule/lambda_roll",
-    ):
-        assert key in metrics
-        assert torch.isfinite(torch.tensor(metrics[key])), key
-    # Hybrid §4.3 dual form: the bound covers the teacher-forced AND rollout
-    # errors, scalarised, and still excludes the path penalty.
+        "health/skipped_steps",
+    }
+    assert required <= metrics.keys()
+    assert all(torch.isfinite(torch.tensor(metrics[key])) for key in required)
     assert metrics["sparsity/constraint"] == pytest.approx(
-        metrics["loss/pred"] + metrics["loss/rollout"] + metrics["loss/logit"], rel=1e-6
+        metrics["train/loss_teacher_forcing"]
+        + metrics["train/loss_rollout_t2_weighted"]
+        + metrics["loss/logit"],
+        rel=1e-6,
     )
+    assert not any(key.startswith("schedule/") for key in metrics)
     assert (tmp_path / "last.pt").exists()
 
 
-def test_rollout_weight_stays_one_and_raw_equals_applied(tmp_path: Path) -> None:
-    """Depth changes, never lambda_roll: raw and applied rollout quantities coincide."""
-    config = tiny_config(tmp_path, steps=1, lambda_roll=1.0)
-    assert not hasattr(config, "lambda_roll_warmup_steps")
-    trainer = Trainer(tiny_model(), tiny_dataset(), config)
-    metrics = trainer._train_step(next(trainer._batches()))
-    assert metrics["schedule/lambda_roll"] == pytest.approx(1.0)
-    assert metrics["loss/rollout"] == pytest.approx(metrics["loss/rollout_raw"], rel=1e-6)
-    assert metrics["health/grad_norm_tf"] > 0.0
-    assert metrics["health/grad_norm_rollout_raw"] > 0.0
-    assert metrics["health/grad_norm_rollout"] == pytest.approx(
-        metrics["health/grad_norm_rollout_raw"], rel=1e-6
-    )
-
-
-def test_rollout_curriculum_exact_successful_update_boundaries(tmp_path: Path) -> None:
-    """Every value/backward stage changes at its declared accepted-update boundary."""
-    trainer = Trainer(
-        tiny_model(),
-        tiny_dataset(),
-        tiny_config(
-            tmp_path,
-            rollout_len=30,
-            rollout_curriculum=PAPER_ROLLOUT_CURRICULUM,
-        ),
-    )
-    boundaries: tuple[tuple[int, RolloutStage], ...] = (
-        (0, PAPER_ROLLOUT_CURRICULUM[0]),
-        (9_999, PAPER_ROLLOUT_CURRICULUM[0]),
-        (10_000, PAPER_ROLLOUT_CURRICULUM[1]),
-        (19_999, PAPER_ROLLOUT_CURRICULUM[1]),
-        (20_000, PAPER_ROLLOUT_CURRICULUM[2]),
-        (29_999, PAPER_ROLLOUT_CURRICULUM[2]),
-        (30_000, PAPER_ROLLOUT_CURRICULUM[3]),
-        (49_999, PAPER_ROLLOUT_CURRICULUM[3]),
-        (50_000, PAPER_ROLLOUT_CURRICULUM[4]),
-        (69_999, PAPER_ROLLOUT_CURRICULUM[4]),
-        (70_000, PAPER_ROLLOUT_CURRICULUM[5]),
-        (84_999, PAPER_ROLLOUT_CURRICULUM[5]),
-        (85_000, PAPER_ROLLOUT_CURRICULUM[6]),
-        (99_999, PAPER_ROLLOUT_CURRICULUM[6]),
-        (100_000, PAPER_ROLLOUT_CURRICULUM[7]),
-        (114_999, PAPER_ROLLOUT_CURRICULUM[7]),
-        (115_000, PAPER_ROLLOUT_CURRICULUM[8]),
-        (355_000, PAPER_ROLLOUT_CURRICULUM[8]),
-    )
-    for successful_updates, expected_stage in boundaries:
-        trainer.successful_updates = successful_updates
-        assert trainer._current_rollout_stage() == expected_stage
-
-
-def test_paper_preset_declares_the_exact_curriculum() -> None:
-    """The shipped Experiment-1 config must not drift from the audited schedule."""
+def test_shipped_state_protocol_is_fixed_and_has_no_obsolete_schema() -> None:
     path = Path(__file__).parents[1] / "configs" / "experiment" / "bounce_baumgartner.yaml"
     preset = OmegaConf.load(path)
     assert isinstance(preset, DictConfig)
-    assert int(preset.train.steps) == 355_000
-    assert float(preset.train.lambda_roll) == 1.0
-    assert OmegaConf.to_container(preset.train.rollout_curriculum, resolve=True) == [
-        {"start_update": 0, "rollout_len": None, "rollout_starts": [], "gradient_cuts": []},
-        {
-            "start_update": 10_000,
-            "rollout_len": 2,
-            "rollout_starts": [0, 10, 20],
-            "gradient_cuts": [],
-        },
-        {
-            "start_update": 20_000,
-            "rollout_len": 5,
-            "rollout_starts": [0, 10, 20],
-            "gradient_cuts": [],
-        },
-        {
-            "start_update": 30_000,
-            "rollout_len": 10,
-            "rollout_starts": [0, 10, 20],
-            "gradient_cuts": [],
-        },
-        {
-            "start_update": 50_000,
-            "rollout_len": 30,
-            "rollout_starts": [0],
-            "gradient_cuts": [10, 20],
-        },
-        {
-            "start_update": 70_000,
-            "rollout_len": 30,
-            "rollout_starts": [0],
-            "gradient_cuts": [15],
-        },
-        {
-            "start_update": 85_000,
-            "rollout_len": 30,
-            "rollout_starts": [0],
-            "gradient_cuts": [20],
-        },
-        {
-            "start_update": 100_000,
-            "rollout_len": 30,
-            "rollout_starts": [0],
-            "gradient_cuts": [25],
-        },
-        {
-            "start_update": 115_000,
-            "rollout_len": 30,
-            "rollout_starts": [0],
-            "gradient_cuts": [],
-        },
-    ]
-    assert "lambda_roll_warmup_steps" not in preset.train
-    assert int(preset.train.grad_skip_max_consecutive) == 50
+    assert int(preset.train.steps) == 300_000
+    assert float(preset.train.lambda_rollout_t2) == 1.0
+    assert int(preset.train.num_rollout_t2_anchors) == 8
+    assert int(preset.train.rollout_t2_horizon) == 2
+    assert int(preset.train.oe_eval_horizon) == 30
+    assert float(preset.train.oe_tolerance_nrmse) == pytest.approx(0.10)
+    assert float(preset.train.lambda_logit) == pytest.approx(1e-5)
+    assert float(preset.train.sparsity_lambda_init) == pytest.approx(1e4)
+    obsolete = {"rollout_curriculum", "rollout_len", "lambda_roll"}
+    assert obsolete.isdisjoint(preset.train.keys())
+    assert obsolete.isdisjoint(field.name for field in fields(TrainConfig))
 
 
 @pytest.mark.parametrize(
-    ("overrides", "message"),
+    ("override", "message"),
     [
-        (
-            {
-                "rollout_curriculum": (
-                    RolloutStage(0, None),
-                    RolloutStage(1, 2, (0,)),
-                ),
-                "lambda_roll": 2.0,
-            },
-            "requires lambda_roll=1.0",
-        ),
-        (
-            {
-                "rollout_curriculum": (
-                    RolloutStage(1, None),
-                    RolloutStage(2, 2, (0,)),
-                )
-            },
-            "must start at successful update 0",
-        ),
-        (
-            {
-                "rollout_len": 5,
-                "rollout_curriculum": (
-                    RolloutStage(0, None),
-                    RolloutStage(1, 2, (0,)),
-                    RolloutStage(1, 5, (0,)),
-                ),
-            },
-            "starts must be strictly increasing",
-        ),
-        (
-            {
-                "rollout_len": 5,
-                "rollout_curriculum": (
-                    RolloutStage(0, 5, (0,)),
-                    RolloutStage(1, 2, (0,)),
-                ),
-            },
-            "BPTT depth must be non-decreasing",
-        ),
-        (
-            {
-                "rollout_len": 5,
-                "rollout_curriculum": (
-                    RolloutStage(0, None),
-                    RolloutStage(1, 2, (0,)),
-                ),
-            },
-            "must end with one uncut rollout",
-        ),
-        (
-            {
-                "rollout_len": 1,
-                "rollout_curriculum": (
-                    RolloutStage(0, None),
-                    RolloutStage(1, 1, (0,)),
-                ),
-            },
-            "horizons must be >= 2",
-        ),
-        (
-            {
-                "rollout_len": 5,
-                "rollout_curriculum": (
-                    RolloutStage(0, None),
-                    RolloutStage(1, 4, (0, 1), (2,)),
-                    RolloutStage(2, 5, (0,)),
-                ),
-            },
-            "gradient cuts require one continuous rollout",
-        ),
+        ({"rollout_t2_horizon": 3}, "must equal 2"),
+        ({"lambda_rollout_t2": -1.0}, "non-negative"),
+        ({"num_rollout_t2_anchors": 0}, "positive"),
+        ({"oe_eval_horizon": 0}, "positive"),
+        ({"oe_tolerance_nrmse": -0.1}, "non-negative"),
     ],
 )
-def test_rollout_curriculum_validation(
-    tmp_path: Path, overrides: dict[str, object], message: str
+def test_fixed_protocol_validation(
+    tmp_path: Path, override: dict[str, object], message: str
 ) -> None:
-    """Malformed curricula fail at construction instead of changing the objective silently."""
     with pytest.raises(ValueError, match=message):
-        Trainer(
-            tiny_model(),
-            tiny_dataset(),
-            tiny_config(tmp_path, **overrides),  # pyright: ignore[reportArgumentType]
-        )
+        Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path, **override))
 
 
-def test_only_accepted_updates_advance_curriculum_and_make_boundary_checkpoint(
+def test_lambda_zero_bypasses_auxiliary_calls_and_reproduces_tf_rng(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A clipped accepted step advances K; the following rejected attempt does not."""
-    curriculum = (RolloutStage(0, None), RolloutStage(1, 2, (0,)))
+    trainer = Trainer(
+        tiny_model(),
+        tiny_dataset(),
+        tiny_config(tmp_path, steps=1, lambda_rollout_t2=0.0, sparsity_enabled=False),
+    )
+    batch = next(trainer._batches())
+    states = batch["states"]
+    trainer.model.train()
+
+    torch.manual_seed(123)  # pyright: ignore[reportUnknownMemberType]
+    expected = trainer.model(states, context_len=2)
+    expected_rng = torch.get_rng_state().clone()
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("lambda=0 must not construct a T=2 branch")
+
+    monkeypatch.setattr(trainer.model, "rollout_t2_from_offsets", forbidden)
+    torch.manual_seed(123)  # pyright: ignore[reportUnknownMemberType]
+    actual = trainer._forward(batch)
+    actual_rng = torch.get_rng_state().clone()
+    torch.testing.assert_close(actual.prediction, expected.prediction)
+    torch.testing.assert_close(actual.target, expected.target)
+    torch.testing.assert_close(actual.causal_params, expected.causal_params)
+    assert actual.rollout_t2_prediction is None
+    assert torch.equal(actual_rng, expected_rng)
+
+    metrics = trainer._train_step(batch)
+    assert metrics["train/loss_rollout_t2_raw"] == 0.0
+    assert metrics["train/loss_rollout_t2_weighted"] == 0.0
+    assert metrics["train/loss_total"] == pytest.approx(
+        metrics["train/loss_teacher_forcing"] + metrics["loss/logit"], rel=1e-6
+    )
+
+
+def test_training_builds_only_tf_plus_two_recurrent_calls_not_k30(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = tiny_model()
+    calls: list[None] = []
+    hook = model.predictor.register_forward_hook(
+        lambda _module, _inputs, _output: calls.append(None)
+    )
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("K=30 evaluation may not participate in training")
+
+    monkeypatch.setattr(model, "rollout_for_evaluation", forbidden)
+    try:
+        trainer = Trainer(model, tiny_dataset(), tiny_config(tmp_path, steps=1))
+        trainer._train_step(next(trainer._batches()))
+    finally:
+        hook.remove()
+    assert len(calls) == 3  # one B*K TF call, then exactly two B*W calls
+
+
+def test_sparsity_and_geco_are_active_from_first_fixed_update(tmp_path: Path) -> None:
     trainer = Trainer(
         tiny_model(),
         tiny_dataset(),
         tiny_config(
             tmp_path,
-            steps=2,
-            rollout_curriculum=curriculum,
-            grad_clip=1.0,
-            grad_skip_threshold=3.0,
-            grad_skip_max_consecutive=3,
-        ),
-    )
-    reported_norms = iter((torch.tensor(2.0), torch.tensor(4.0)))
-
-    def scripted_grad_norm(*args: object, **kwargs: object) -> torch.Tensor:
-        del args, kwargs
-        return next(reported_norms)
-
-    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", scripted_grad_norm)
-    metrics = trainer.train()
-
-    # The first norm exceeds grad_clip but not the skip threshold, so its
-    # optimizer step counts. The second attempt is rejected at K=2.
-    assert trainer.step == 2
-    assert trainer.successful_updates == 1
-    assert trainer.total_skips == 1
-    assert trainer._current_rollout_len() == 2
-    assert metrics["schedule/rollout_len"] == pytest.approx(2.0)
-    assert metrics["schedule/successful_updates_before_batch"] == pytest.approx(1.0)
-    assert metrics["schedule/successful_updates"] == pytest.approx(1.0)
-    assert metrics["schedule/stage_start_update"] == pytest.approx(1.0)
-
-    boundary = tmp_path / "curriculum_success_1_before_w1_k2_s0_cnone.pt"
-    assert boundary.exists()
-    payload = torch.load(boundary, weights_only=False)
-    assert payload["step"] == 1
-    assert payload["successful_updates"] == 1
-
-
-def test_tf_only_curriculum_stage_keeps_all_teacher_forced_suffixes(tmp_path: Path) -> None:
-    """K=None disables only recurrence, not any of the full-window TF pairs."""
-    dataset = tiny_dataset(clip_len=7)
-    trainer = Trainer(
-        tiny_model(),
-        dataset,
-        tiny_config(
-            tmp_path,
-            rollout_len=5,
-            rollout_curriculum=(RolloutStage(0, None), RolloutStage(1, 5, (0,))),
-        ),
-    )
-    batch = next(iter(trainer._epoch_loader(0)))
-    with torch.no_grad():
-        output = trainer._forward(batch, trainer._current_rollout_len())
-    assert output.rollout_prediction is None
-    assert output.rollout_target is None
-    assert output.prediction.shape[0] == trainer.config.batch_size * (7 - 2)
-    assert output.target.shape == output.prediction.shape
-
-
-def test_rollout_weights_follow_dynamic_k(tmp_path: Path) -> None:
-    """Moving K=2 -> K=5 builds matching Eq. 35 weights instead of reusing K=2's."""
-    trainer = Trainer(
-        tiny_model(),
-        tiny_dataset(clip_len=7),
-        tiny_config(
-            tmp_path,
-            steps=2,
-            rollout_len=5,
-            rollout_curriculum=(RolloutStage(0, 2, (0,)), RolloutStage(1, 5, (0,))),
-            sparsity_enabled=False,
-        ),
-    )
-    batches = trainer._batches()
-    at_k2 = trainer._train_step(next(batches))
-    assert trainer.successful_updates == 1
-    assert at_k2["schedule/rollout_len"] == pytest.approx(2.0)
-    at_k5 = trainer._train_step(next(batches))
-    assert at_k5["schedule/rollout_len"] == pytest.approx(5.0)
-    assert at_k2["loss/rollout"] == pytest.approx(at_k2["loss/rollout_raw"], rel=1e-6)
-    assert at_k5["loss/rollout"] == pytest.approx(at_k5["loss/rollout_raw"], rel=1e-6)
-    assert set(trainer._rollout_weight_cache) == {2, 5}
-    assert trainer._rollout_weight_cache[2].shape == (2,)
-    assert trainer._rollout_weight_cache[5].shape == (5,)
-
-
-def test_sparsity_and_dual_wait_for_terminal_curriculum_k(tmp_path: Path) -> None:
-    """The K=30-calibrated GECO constraint must not see easier prefix stages."""
-    trainer = Trainer(
-        tiny_model(),
-        tiny_dataset(clip_len=7),
-        tiny_config(
-            tmp_path,
-            steps=3,
-            rollout_len=5,
-            rollout_curriculum=(
-                RolloutStage(0, None),
-                RolloutStage(1, 2, (0,)),
-                RolloutStage(2, 5, (0,)),
-            ),
+            steps=1,
             sparsity_enabled=True,
             sparsity_tau=-1.0,
-            sparsity_step_size=0.1,
             sparsity_momentum=0.0,
             grad_skip_threshold=float("inf"),
         ),
     )
-    batches = trainer._batches()
-    initial_log_lambda = trainer.lagrangian.log_lambda.clone()
-    initial_ma_error = trainer.lagrangian.ma_error.clone()
-
-    tf_metrics = trainer._train_step(next(batches))
-    assert tf_metrics["sparsity/active"] == 0.0
-    assert tf_metrics["loss/total"] == pytest.approx(
-        tf_metrics["loss/pred"] + tf_metrics["loss/logit"], rel=1e-6
+    initial = trainer.lagrangian.log_lambda.clone()
+    metrics = trainer._train_step(next(trainer._batches()))
+    assert metrics["sparsity/active"] == 1.0
+    assert not torch.equal(trainer.lagrangian.log_lambda, initial)
+    predictive = (
+        metrics["train/loss_teacher_forcing"]
+        + metrics["train/loss_rollout_t2_weighted"]
+        + metrics["loss/logit"]
     )
-    torch.testing.assert_close(trainer.lagrangian.log_lambda, initial_log_lambda)
-    torch.testing.assert_close(trainer.lagrangian.ma_error, initial_ma_error)
-
-    k2_metrics = trainer._train_step(next(batches))
-    assert k2_metrics["schedule/rollout_len"] == 2.0
-    assert k2_metrics["sparsity/active"] == 0.0
-    assert k2_metrics["loss/total"] == pytest.approx(
-        k2_metrics["loss/pred"] + k2_metrics["loss/rollout"] + k2_metrics["loss/logit"],
-        rel=1e-6,
-    )
-    torch.testing.assert_close(trainer.lagrangian.log_lambda, initial_log_lambda)
-    torch.testing.assert_close(trainer.lagrangian.ma_error, initial_ma_error)
-
-    terminal_metrics = trainer._train_step(next(batches))
-    assert terminal_metrics["schedule/rollout_len"] == 5.0
-    assert terminal_metrics["sparsity/active"] == 1.0
-    terminal_prediction_terms = (
-        terminal_metrics["loss/pred"]
-        + terminal_metrics["loss/rollout"]
-        + terminal_metrics["loss/logit"]
-    )
-    assert terminal_metrics["loss/total"] > terminal_prediction_terms
-    assert not torch.equal(trainer.lagrangian.ma_error, initial_ma_error)
-    assert not torch.equal(trainer.lagrangian.log_lambda, initial_log_lambda)
-    assert trainer.successful_updates == 3
+    assert metrics["train/loss_total"] > predictive
 
 
-def test_references_train_without_path_penalty(tmp_path: Path) -> None:
-    """Dense / token-local references: sparsity disabled, lambda frozen."""
-    for model in (tiny_model(dense=True), tiny_model(identity=True)):
-        trainer = Trainer(model, tiny_dataset(), tiny_config(tmp_path, sparsity_enabled=False))
-        metrics = trainer.train()
-        assert metrics["loss/total"] == pytest.approx(
-            metrics["loss/pred"] + metrics["loss/rollout"] + metrics["loss/logit"],
-            rel=1e-6,
-        )
-        assert metrics["sparsity/lambda"] == pytest.approx(1e6)
+def test_checkpoint_resume_restores_t2_anchor_sampling_sequence(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    trained = Trainer(tiny_model(), tiny_dataset(), tiny_config(run_dir, steps=2))
+    trained.train()
+    checkpoint = run_dir / "last.pt"
 
+    def next_offsets() -> torch.Tensor:
+        restored = Trainer(tiny_model(), tiny_dataset(), tiny_config(run_dir, steps=3))
+        restored.load_checkpoint(checkpoint)
+        output = restored._forward(next(restored._batches()))
+        assert output.rollout_t2_offsets is not None
+        return output.rollout_t2_offsets.clone()
 
-def test_resume_is_exact(tmp_path: Path) -> None:
-    """Resume exactly across the successful-update boundary from TF to K=2."""
-    curriculum = (RolloutStage(0, None), RolloutStage(2, 2, (0,)))
-    config_a = tiny_config(tmp_path / "a", steps=4, rollout_curriculum=curriculum)
-    trainer_a = Trainer(tiny_model(), tiny_dataset(), config_a)
-    final_a = trainer_a.train()
-    assert trainer_a.successful_updates == 4
-
-    config_b2 = tiny_config(tmp_path / "b", steps=2, rollout_curriculum=curriculum)
-    trainer_b = Trainer(tiny_model(), tiny_dataset(), config_b2)
-    trainer_b.train()
-    assert trainer_b.successful_updates == 2
-    config_b4 = tiny_config(tmp_path / "b", steps=4, rollout_curriculum=curriculum)
-    trainer_b4 = Trainer(tiny_model(), tiny_dataset(), config_b4)
-    trainer_b4.load_checkpoint(tmp_path / "b" / "last.pt")
-    assert trainer_b4.step == 2
-    assert trainer_b4.successful_updates == 2
-    assert trainer_b4._current_rollout_len() == 2
-    final_b = trainer_b4.train()
-    assert trainer_b4.successful_updates == 4
-
-    for key, value in final_a.items():
-        assert final_b[key] == pytest.approx(value, rel=1e-5), key
-
-
-def test_checkpoint_restores_success_count_and_legacy_fallback(tmp_path: Path) -> None:
-    """New checkpoints restore the counter; old ones derive it from attempts minus skips."""
-    curriculum = (
-        RolloutStage(0, None),
-        RolloutStage(4, 2, (0,)),
-        RolloutStage(5, 5, (0,)),
-    )
-    config = tiny_config(
-        tmp_path,
-        rollout_len=5,
-        rollout_curriculum=curriculum,
-    )
-    trainer = Trainer(tiny_model(), tiny_dataset(clip_len=7), config)
-    trainer.step = 7
-    trainer.successful_updates = 4
-    trainer.total_skips = 3
-    trainer.consecutive_skips = 2
-    checkpoint = tmp_path / "counter.pt"
-    trainer.save_checkpoint(checkpoint)
-
-    restored = Trainer(tiny_model(), tiny_dataset(clip_len=7), config)
-    restored.load_checkpoint(checkpoint)
-    assert restored.step == 7
-    assert restored.successful_updates == 4
-    assert restored.total_skips == 3
-    assert restored.consecutive_skips == 2
-    assert restored._current_rollout_len() == 2
-
+    torch.testing.assert_close(next_offsets(), next_offsets())
     payload = torch.load(checkpoint, weights_only=False)
-    assert payload["rng_cuda"] is None
-    del payload["successful_updates"]
-    legacy_checkpoint = tmp_path / "legacy.pt"
-    torch.save(payload, legacy_checkpoint)
-    legacy = Trainer(tiny_model(), tiny_dataset(clip_len=7), config)
-    legacy.load_checkpoint(legacy_checkpoint)
-    assert legacy.successful_updates == 4  # step 7 minus the 3 recorded skips
-    assert legacy._current_rollout_len() == 2
+    assert tuple(payload["oe_coordinate_std"]) == (1.0, 1.0, 1.0, 1.0)
+    assert "successful_updates" not in payload
 
 
-def test_grad_skip_guard_rejects_updates_and_raises_when_persistent(tmp_path: Path) -> None:
-    """D18: absurd grad norms freeze the update; persistent skips fail loudly."""
-    config = tiny_config(tmp_path, steps=3, grad_skip_threshold=1e-12, grad_skip_max_consecutive=2)
-    trainer = Trainer(tiny_model(), tiny_dataset(), config)
-    with pytest.raises(RuntimeError, match="consecutive grad-spike skips"):
-        trainer.train()
-    assert trainer.total_skips >= 2
-
-
-def test_rolling_checkpoints_are_kept(tmp_path: Path) -> None:
-    config = tiny_config(tmp_path, steps=4, checkpoint_keep_every=2)
-    Trainer(tiny_model(), tiny_dataset(), config).train()
-    assert (tmp_path / "step_2.pt").exists()
-    assert (tmp_path / "step_4.pt").exists()
-
-
-def test_sparsity_ablation_toggle(tmp_path: Path) -> None:
-    """sparsity_enabled=false removes the path term and freezes the dual."""
-    config = tiny_config(tmp_path, sparsity_enabled=False)
-    trainer = Trainer(tiny_model(), tiny_dataset(), config)
-    metrics = trainer.train()
-    assert metrics["sparsity/lambda"] == pytest.approx(1e6)
-    assert metrics["loss/total"] == pytest.approx(
-        metrics["loss/pred"] + metrics["loss/rollout"] + metrics["loss/logit"], rel=1e-6
-    )
-
-
-def test_periodic_eval_logs_metrics(tmp_path: Path) -> None:
-    """eval_every wires the harness in; the logged key set is exact."""
-
-    class Capture:
-        def __init__(self) -> None:
-            self.records: list[dict[str, float]] = []
-
-        def log(self, step: int, metrics: dict[str, float]) -> None:  # noqa: ARG002
-            self.records.append(metrics)
-
-    logger = Capture()
-    config = tiny_config(tmp_path, steps=2, eval_every=2)
-    trainer = Trainer(
-        tiny_model(), tiny_dataset(), config, logger=logger, eval_dataset=tiny_dataset(6)
-    )
+def test_checkpoint_rejects_a_different_oe_ruler(tmp_path: Path) -> None:
+    trainer = Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path, steps=1))
     trainer.train()
-    eval_records = [r for r in logger.records if any(k.startswith("eval/") for k in r)]
-    assert eval_records
-    expected_eval_keys = {
-        "eval/pred_loss",
-        "eval/rollout_loss",
-        "eval/mean_abs_logit",
-        "eval/gate_entropy",
-        "eval/constraint_loss",
-        "eval/shd",
-        "eval/mcc",
-        "eval/path_density",
-    }
-    for record in eval_records:
-        assert set(record) == expected_eval_keys
-    # Reference modes log the SAME full key set (constant curves are cheap;
-    # missing curves have previously hidden dead runs).
-    logger2 = Capture()
-    trainer2 = Trainer(
-        tiny_model(dense=True),
+    incompatible = Trainer(
+        tiny_model(),
         tiny_dataset(),
-        tiny_config(tmp_path / "dense", steps=2, eval_every=2, sparsity_enabled=False),
-        logger=logger2,
-        eval_dataset=tiny_dataset(6),
+        tiny_config(tmp_path, steps=2, oe_coordinate_std=(2.0, 1.0, 1.0, 1.0)),
     )
-    trainer2.train()
-    dense_records = [r for r in logger2.records if any(k.startswith("eval/") for k in r)]
-    assert dense_records
-    assert set(dense_records[0]) == expected_eval_keys
+    with pytest.raises(ValueError, match="oe_coordinate_std"):
+        incompatible.load_checkpoint(tmp_path / "last.pt")
 
 
-def test_periodic_eval_uses_current_curriculum_k(
+def test_gradient_spike_rejects_primal_and_dual_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Periodic reports mirror live K; post-hoc calibration alone uses terminal K=30."""
+    trainer = Trainer(
+        tiny_model(),
+        tiny_dataset(),
+        tiny_config(tmp_path, steps=1, grad_skip_threshold=10.0),
+    )
+    before_model = {key: value.clone() for key, value in trainer.model.state_dict().items()}
+    before_dual = trainer.lagrangian.log_lambda.clone()
+
+    def oversized_norm(*_args: object, **_kwargs: object) -> torch.Tensor:
+        return torch.tensor(11.0)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", oversized_norm)
+    trainer._train_step(next(trainer._batches()))
+    assert trainer.total_skips == 1
+    assert torch.equal(trainer.lagrangian.log_lambda, before_dual)
+    for key, value in trainer.model.state_dict().items():
+        torch.testing.assert_close(value, before_model[key])
+
+
+def test_sparsity_ablation_removes_path_term_and_freezes_dual(tmp_path: Path) -> None:
+    trainer = Trainer(
+        tiny_model(), tiny_dataset(), tiny_config(tmp_path, steps=1, sparsity_enabled=False)
+    )
+    initial = trainer.lagrangian.log_lambda.clone()
+    metrics = trainer.train()
+    assert torch.equal(trainer.lagrangian.log_lambda, initial)
+    assert metrics["train/loss_total"] == pytest.approx(
+        metrics["train/loss_teacher_forcing"]
+        + metrics["train/loss_rollout_t2_weighted"]
+        + metrics["loss/logit"],
+        rel=1e-6,
+    )
+
+
+def test_periodic_eval_passes_fixed_objective_and_oe_ruler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     calls: list[dict[str, object]] = []
 
     def fake_evaluate(*args: object, **kwargs: object) -> SimpleNamespace:
@@ -631,15 +311,9 @@ def test_periodic_eval_uses_current_curriculum_k(
     trainer = Trainer(
         tiny_model(),
         tiny_dataset(),
-        tiny_config(
-            tmp_path,
-            rollout_len=30,
-            rollout_curriculum=PAPER_ROLLOUT_CURRICULUM,
-            eval_every=1,
-        ),
+        tiny_config(tmp_path, eval_every=1),
         eval_dataset=tiny_dataset(6),
     )
-    trainer.successful_updates = 15_000
     assert trainer._eval_step() == {"eval/constraint_loss": 0.25}
     assert calls == [
         {
@@ -647,26 +321,28 @@ def test_periodic_eval_uses_current_curriculum_k(
             "device": "cpu",
             "context_len": 2,
             "lambda_logit": 1e-3,
-            "rollout_len": 2,
-            "lambda_roll": 1.0,
-            "rollout_starts": (0, 10, 20),
-            "rollout_gradient_cuts": (),
-            "full_rollout_len": 30,
+            "lambda_rollout_t2": 1.0,
+            "num_rollout_t2_anchors": 3,
+            "rollout_t2_horizon": 2,
+            "oe_eval_horizon": 4,
+            "oe_tolerance_nrmse": 0.1,
+            "oe_coordinate_std": (1.0, 1.0, 1.0, 1.0),
         }
     ]
 
 
-def test_eval_requires_dataset(tmp_path: Path) -> None:
+def test_eval_requires_dataset_and_fixed_training_scales(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="eval_every"):
         Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path, eval_every=1))
+    with pytest.raises(ValueError, match="oe_coordinate_std"):
+        Trainer(
+            tiny_model(),
+            tiny_dataset(),
+            tiny_config(tmp_path, eval_every=1, oe_coordinate_std=None),
+            eval_dataset=tiny_dataset(6),
+        )
 
 
 def test_dataset_smaller_than_one_batch_raises(tmp_path: Path) -> None:
-    """drop_last=True on a too-small dataset yields ZERO batches.
-
-    Before the guard this spun through empty epochs forever — regenerating
-    data, never stepping, never erroring — so a misconfigured run looked like
-    a slow one. It must fail at construction instead.
-    """
     with pytest.raises(ValueError, match="yields no batches"):
         Trainer(tiny_model(), tiny_dataset(4), tiny_config(tmp_path, batch_size=8))

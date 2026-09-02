@@ -52,8 +52,8 @@ def main() -> None:
         lambda_logit=float(cfg.train.get("lambda_logit", 0.0)),
         # From the run's OWN config: tau_3 is calibrated on the constraint this
         # reports, so a mismatch with training silently rescales the bound.
-        rollout_len=cfg.train.get("rollout_len", None),
-        lambda_roll=float(cfg.train.get("lambda_roll", 0.0)),
+        rollout_len=cfg.train.get("visual_rollout_len", None),
+        lambda_roll=float(cfg.train.get("lambda_visual_rollout", 0.0)),
         resolution=int(cfg.data.resolution),
     )
     metrics = dict(report.metrics)

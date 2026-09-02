@@ -8,7 +8,13 @@ is the shared causal visual substrate for Experiments 2 and 3 (§6.3).
 from scjepa.models.parameter_encoder import ParameterEncoder
 from scjepa.models.savi import SAViEncoder
 from scjepa.models.spartan import Spartan, SpartanLayer, SpartanOutput
-from scjepa.models.state_to_state import StateToStateModel, TransitionOutput, build_state_to_state
+from scjepa.models.state_to_state import (
+    StateToStateModel,
+    TransitionOutput,
+    build_state_to_state,
+    num_valid_rollout_t2_offsets,
+    sample_rollout_t2_offsets,
+)
 
 __all__ = [
     "ParameterEncoder",
@@ -19,4 +25,6 @@ __all__ = [
     "StateToStateModel",
     "TransitionOutput",
     "build_state_to_state",
+    "num_valid_rollout_t2_offsets",
+    "sample_rollout_t2_offsets",
 ]

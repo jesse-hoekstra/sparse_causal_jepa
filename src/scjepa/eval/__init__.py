@@ -15,14 +15,24 @@ from scjepa.eval.graph import (
     structural_hamming_distance,
 )
 from scjepa.eval.harness import IdentifiabilityReport, evaluate_identifiability
+from scjepa.eval.observational_equivalence import (
+    OeSummary,
+    oe_worst_step_nrmse,
+    summarize_oe,
+    training_coordinate_std,
+)
 from scjepa.eval.parameters import MccReport, nonlinear_mcc
 
 __all__ = [
     "IdentifiabilityReport",
     "MccReport",
+    "OeSummary",
     "evaluate_identifiability",
     "gt_causal_graph_from_contacts",
     "nonlinear_mcc",
+    "oe_worst_step_nrmse",
     "read_learned_graph",
     "structural_hamming_distance",
+    "summarize_oe",
+    "training_coordinate_std",
 ]

@@ -18,10 +18,13 @@ empirical continuation requirement — a run with vanishing content variance or
 degenerate effective rank is rejected, not reported.
 """
 
+from typing import cast
+
 import torch
 from torch import Tensor
 
 from scjepa.eval.visual_to_visual import evaluate_visual_to_visual
+from scjepa.losses import rollout_weights, weighted_rollout_mse
 from scjepa.models.visual_to_visual import VisualToVisualModel, VisualToVisualOutput
 from scjepa.training.loop import Trainer
 
@@ -78,22 +81,67 @@ class VisualToVisualTrainer(Trainer):
 
     model: VisualToVisualModel
 
-    def _forward(  # type: ignore[override]
-        self, batch: dict[str, Tensor], rollout_len: int | None
-    ) -> VisualToVisualOutput:
+    def _forward(self, batch: dict[str, Tensor]) -> VisualToVisualOutput:  # type: ignore[override]
         """Read frames; the true states in the batch are for evaluation only."""
         frames = batch["frames"].to(self.device)
         return self.model(
             frames,
             context_len=self.config.context_len,
-            rollout_len=rollout_len,
+            rollout_len=self.config.visual_rollout_len,
         )
+
+    def _auxiliary_loss(self, output: VisualToVisualOutput) -> Tensor:  # type: ignore[override]
+        """Retain Experiment 3's separately declared fixed latent rollout."""
+        if output.rollout_prediction is None:
+            return torch.zeros((), device=self.device)
+        assert output.rollout_target is not None
+        weights = rollout_weights(
+            output.rollout_prediction.shape[1], device=output.rollout_prediction.device
+        )
+        return weighted_rollout_mse(
+            output.rollout_prediction,
+            output.rollout_target,
+            weights,
+        )
+
+    def _auxiliary_weight(self) -> float:
+        """Return Experiment 3's visual-only rollout coefficient."""
+        return self.config.lambda_visual_rollout
+
+    def _predictive_metrics(
+        self,
+        teacher_forcing: Tensor,
+        raw_auxiliary: Tensor,
+        weighted_auxiliary: Tensor,
+        total: Tensor,
+    ) -> dict[str, float]:
+        """Keep Experiment 3 metrics distinct from state-to-state T=2 keys."""
+        return {
+            "loss/pred": teacher_forcing.item(),
+            "loss/visual_rollout_raw": raw_auxiliary.item(),
+            "loss/visual_rollout": weighted_auxiliary.item(),
+            "loss/total": total.item(),
+        }
+
+    def _branch_gradient_metrics(
+        self,
+        teacher_forcing: Tensor,
+        weighted_auxiliary: Tensor,
+        auxiliary_enabled: bool,
+    ) -> dict[str, float]:
+        """Use visual-specific names; never masquerade as state T=2 metrics."""
+        metrics = {"health/grad_norm_tf": self._branch_gradient_norm(teacher_forcing)}
+        if auxiliary_enabled:
+            metrics["health/grad_norm_visual_rollout"] = self._branch_gradient_norm(
+                weighted_auxiliary
+            )
+        return metrics
 
     def _constraint(
         self,
-        pred_loss: Tensor,
+        predictive_loss: Tensor,
         logit_loss: Tensor,
-        output: VisualToVisualOutput,  # type: ignore[override]
+        output: object,
     ) -> Tensor:
         """Eq. 123: normalize ONLY the scalar handed to the dual controller.
 
@@ -102,15 +150,16 @@ class VisualToVisualTrainer(Trainer):
         epsilon_var stops a collapsing target from making the constraint look
         satisfiable by shrinking itself.
 
-        Under the hybrid objective ``pred_loss`` arrives as L_TF +
+        Under the hybrid objective ``predictive_loss`` arrives as L_TF +
         lambda_roll*L_roll (the caller scalarises §4.3's two bounds into one).
         Both are squared errors in the same target space, so both scale with the
         representation exactly as ``target_variance`` does: the ratio stays
         scale-free with the rollout term in it. What the normalization does NOT
         see is a target frozen in time — watch ``collapse/*/temporal_var``.
         """
-        denominator = torch.clamp(output.target_variance, min=self.model.variance_floor)
-        return (pred_loss.detach() / denominator + logit_loss.detach()).detach()
+        visual_output = cast(VisualToVisualOutput, output)
+        denominator = torch.clamp(visual_output.target_variance, min=self.model.variance_floor)
+        return (predictive_loss.detach() / denominator + logit_loss.detach()).detach()
 
     def _after_optimizer_step(self, output: VisualToVisualOutput) -> None:  # type: ignore[override]
         """Eq. 111: the target moves only through the EMA, never by gradient."""
@@ -135,10 +184,8 @@ class VisualToVisualTrainer(Trainer):
             device=self.config.device,
             context_len=self.config.context_len,
             lambda_logit=self.config.lambda_logit,
-            # Periodic eval mirrors the live stage; final evaluation reads the
-            # configured terminal horizon from resolved_config.yaml.
-            rollout_len=self._current_rollout_len(),
-            lambda_roll=self.config.lambda_roll,
+            rollout_len=self.config.visual_rollout_len,
+            lambda_roll=self.config.lambda_visual_rollout,
         )
         self.model.train()
         return {f"eval/{key}": value for key, value in report.metrics.items()}

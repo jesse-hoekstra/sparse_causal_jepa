@@ -23,21 +23,13 @@ PROVENANCE_KEYS = (
     "step",
     "eval_seed_offset",
     "num_samples",
-    "successful_updates",
-    "total_skips",
-    "successful_updates_checkpointed",
-    "rollout_curriculum",
-    "curriculum_current_rollout_len",
-    "curriculum_current_rollout_starts",
-    "curriculum_current_gradient_cuts",
-    "curriculum_terminal_start_update",
-    "curriculum_terminal_reached",
-    "terminal_rollout_updates",
-    "evaluation_rollout_len",
-    "evaluation_rollout_starts",
-    "evaluation_gradient_cuts",
-    "lambda_roll",
+    "lambda_rollout_t2",
+    "num_rollout_t2_anchors",
+    "rollout_t2_horizon",
+    "oe_eval_horizon",
+    "oe_tolerance_nrmse",
 )
+STRUCTURED_PER_RUN_KEYS = ("oe_coordinate_std",)
 
 
 def shared_provenance(records: list[dict[str, object]]) -> dict[str, object]:
@@ -97,7 +89,7 @@ def main() -> None:
         raise SystemExit(str(error)) from error
     # These fields are provenance, not scalar statistics. Keep them in
     # aggregate.json after checking equality rather than trying to average them.
-    skip = {"seed", *PROVENANCE_KEYS}
+    skip = {"seed", *PROVENANCE_KEYS, *STRUCTURED_PER_RUN_KEYS}
     aggregate: dict[str, dict[str, float]] = {}
     header = (
         f"{'metric':>14} | {'mean':>8} {'sd':>8} | "
@@ -131,10 +123,10 @@ def main() -> None:
         json.dumps(
             {
                 "seeds": seeds,
-                # Preserve the historical top-level location for downstream
-                # notebooks while retaining all structured fields together.
-                "rollout_curriculum": provenance.get("rollout_curriculum"),
                 "provenance": provenance,
+                "oe_coordinate_std_by_seed": {
+                    str(record.get("seed")): record.get("oe_coordinate_std") for record in records
+                },
                 "metrics": aggregate,
             },
             indent=2,

@@ -1,24 +1,21 @@
-"""Identifiability evaluation for the state-to-state regime (experiments.pdf §6.1.3 / §6.7).
+"""Held-out identifiability and trajectory diagnostics for state-to-state SCJEPA.
 
-Consumes an ``StateToStateModel`` plus a bounce dataset whose items carry the
-ground truth (``params``, ``contacts``). Two headline numbers, one from each
-source paper: ``mcc`` is Baumgartner App. F.1's recovery score (D27, see
-``scjepa.eval.parameters``) and ``shd`` is SPARTAN's Structural Hamming
-Distance between the learned graph and the ground-truth causal graph (D28, see
-``scjepa.eval.graph``). NEITHER is meaningful alone — see D28.
+The GECO calibration quantity mirrors the training predictive objective::
 
-The constraint is reported exactly as the dual sees it (raw units):
-``constraint_loss = pred_loss + lambda_roll * rollout_loss + lambda_logit *
-logit_penalty``, the scalarised hybrid §4.3 bound. Calibrate τ on THAT
-quantity, and pass the SAME ``rollout_len``/``lambda_roll`` used in training —
-a mismatch on either side silently invalidates τ. Evaluation runs in eval mode,
-so gates are the deterministic Eq. 34 thresholds; the rollout is anchored at
-the fixed t = Tpar-1 in both modes, so the reported constraint is reproducible.
+    constraint_loss = L_TF + lambda_rollout_t2 * L_AR2
+                      + lambda_logit * L_logit.
 
-Everything is in tracked-object order by construction (ζ = id, Eq. 132): no
-permutation of parameter coordinates or graph axes is fitted anywhere.
+For deterministic calibration, ``L_AR2`` is averaged exhaustively over every
+valid two-step offset. This is the exact uniform-anchor expectation estimated by
+the eight-window training sample, without evaluation sampling noise.
+
+A separate no-gradient open-loop rollout reports approximate trajectory
+agreement on a fixed held-out sample. It is monitoring only: it never enters
+``constraint_loss`` and does not prove population observational equivalence.
 """
 
+import math
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import torch
@@ -30,18 +27,18 @@ from scjepa.eval.graph import (
     read_learned_graph,
     structural_hamming_distance,
 )
+from scjepa.eval.observational_equivalence import oe_worst_step_nrmse, summarize_oe
 from scjepa.eval.parameters import nonlinear_mcc
-from scjepa.losses import aligned_mse, rollout_weights, weighted_rollout_mse
-from scjepa.models.state_to_state import StateToStateModel, TransitionOutput
+from scjepa.losses import aligned_mse, rollout_t2_endpoint_mse
+from scjepa.models.state_to_state import (
+    StateToStateModel,
+    TransitionOutput,
+    num_valid_rollout_t2_offsets,
+)
 
 
 class IdentifiabilityReport(NamedTuple):
-    """Periodic metrics plus final-only recovery diagnostics.
-
-    ``metrics`` is deliberately compact because every entry becomes a W&B
-    curve. ``recovery_matrix[i, j]`` is the held-out R² of learned coordinate
-    ``j`` predicting true mass ``i`` — App. F.1's I x J orientation.
-    """
+    """Periodic metrics plus final-only recovery diagnostics."""
 
     metrics: dict[str, float]
     diagnostics: dict[str, float]
@@ -51,7 +48,7 @@ class IdentifiabilityReport(NamedTuple):
 
 
 def _weighted_mean(values: list[Tensor], weights: list[int]) -> float:
-    """Average per-batch scalar values without overweighting the last batch."""
+    """Average per-batch scalar values without overweighting a short last batch."""
     if len(values) != len(weights) or not values:
         raise ValueError("weighted mean requires one positive weight per value")
     denominator = float(sum(weights))
@@ -69,38 +66,39 @@ def evaluate_identifiability(
     device: str = "cpu",
     context_len: int | None = None,
     lambda_logit: float = 0.0,
-    rollout_len: int | None = None,
-    lambda_roll: float = 0.0,
-    rollout_starts: tuple[int, ...] | None = None,
-    rollout_gradient_cuts: tuple[int, ...] | None = None,
-    full_rollout_len: int | None = None,
+    lambda_rollout_t2: float = 0.0,
+    num_rollout_t2_anchors: int = 8,
+    rollout_t2_horizon: int = 2,
+    oe_eval_horizon: int | None = None,
+    oe_tolerance_nrmse: float = 0.10,
+    oe_coordinate_std: Tensor | Sequence[float] | None = None,
 ) -> IdentifiabilityReport:
-    """Evaluate prediction / constraint / SHD / MCC over the dataset.
+    """Evaluate prediction, graph, recovery, and sampled trajectory agreement.
 
-    Args:
-        model: The state-to-state model (eval mode is set here).
-        dataset: Items with ``states``, ``params`` and ``contacts``.
-        batch_size: Eval batch size.
-        max_batches: Optional cap for quick runs.
-        device: Device string.
-        context_len: Tpar — must match training.
-        lambda_logit: Training's attention-logit weight, included in the
-            reported constraint exactly as in the training dual.
-        rollout_len: K for the hybrid rollout branch — must match training,
-            since τ is calibrated on the constraint this function reports.
-            None disables the branch (pure teacher-forced constraint).
-        lambda_roll: Training's rollout weight inside the scalarised bound.
-        rollout_starts: Live curriculum start offsets. Multiple starts retain
-            a window axis and are averaged without changing loss scale.
-        rollout_gradient_cuts: Live backward-only cuts. Evaluation has no
-            gradients, but passing them pins the exact stage provenance.
-        full_rollout_len: Optional always-on, uncut rollout from offset zero.
-            Its metrics diagnose the terminal observational-equivalence target
-            even while a shorter/local curriculum stage is trained.
+    ``L_AR2`` is exhaustive over valid offsets during evaluation. Since the
+    training loss is a mean over a uniform sample without replacement, this is
+    its deterministic held-out expectation and therefore the appropriate
+    quantity for fresh tau calibration.
     """
+    if rollout_t2_horizon != 2:
+        raise ValueError(f"rollout_t2_horizon must equal 2, got {rollout_t2_horizon}")
+    if not math.isfinite(lambda_rollout_t2) or lambda_rollout_t2 < 0:
+        raise ValueError("lambda_rollout_t2 must be finite and non-negative")
+    if num_rollout_t2_anchors < 1:
+        raise ValueError("num_rollout_t2_anchors must be positive")
+    if oe_eval_horizon is not None and oe_eval_horizon < 1:
+        raise ValueError("oe_eval_horizon must be positive or None")
+    if not math.isfinite(oe_tolerance_nrmse) or oe_tolerance_nrmse < 0:
+        raise ValueError("oe_tolerance_nrmse must be finite and non-negative")
+    coordinate_std = None
+    if oe_eval_horizon is not None:
+        if oe_coordinate_std is None:
+            raise ValueError("oe_coordinate_std is required when OE evaluation is enabled")
+        coordinate_std = torch.as_tensor(oe_coordinate_std, dtype=torch.float32, device=device)
+
     model = model.to(device).eval()
-    # DataLoader draws a worker/base seed even with shuffle=False. Give it a
-    # private generator so periodic evaluation cannot advance training RNG.
+    # The loader has a private generator and no shuffle so evaluation neither
+    # depends on nor advances the training sampling stream.
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -108,13 +106,8 @@ def evaluate_identifiability(
         generator=torch.Generator().manual_seed(0),
     )
     num_slots: int | None = None
-    pred_losses: list[Tensor] = []
-    rollout_losses: list[Tensor] = []
-    full_rollout_losses: list[Tensor] = []
-    full_rollout_terminal: list[Tensor] = []
-    full_rollout_first: list[Tensor] = []
-    full_rollout_middle: list[Tensor] = []
-    full_rollout_last: list[Tensor] = []
+    teacher_forcing_losses: list[Tensor] = []
+    rollout_t2_losses: list[Tensor] = []
     logit_penalties: list[Tensor] = []
     learned_graphs: list[Tensor] = []
     true_graphs: list[Tensor] = []
@@ -125,75 +118,47 @@ def evaluate_identifiability(
     mean_abs_logits: list[Tensor] = []
     mean_gate_probabilities: list[Tensor] = []
     gate_entropies: list[Tensor] = []
+    oe_errors: list[Tensor] = []
     batch_weights: list[int] = []
 
     for index, batch in enumerate(loader):
         if max_batches is not None and index >= max_batches:
             break
         states = batch["states"].to(device)
-        output: TransitionOutput = model(
-            states,
-            context_len=context_len,
-            rollout_len=rollout_len,
-            rollout_starts=rollout_starts,
-            rollout_gradient_cuts=rollout_gradient_cuts,
-        )
-        batch_weights.append(states.shape[0])
-        num_slots = output.prediction.shape[1]
-        pred_losses.append(aligned_mse(output.prediction, output.target).cpu())
-        if output.rollout_prediction is not None and output.rollout_target is not None:
-            rollout_prediction = output.rollout_prediction
-            rollout_target = output.rollout_target
-            if rollout_prediction.ndim == 5:
-                rollout_prediction = rollout_prediction.flatten(0, 1)
-                rollout_target = rollout_target.flatten(0, 1)
-            weights = rollout_weights(rollout_prediction.shape[1], device=rollout_prediction.device)
-            rollout_losses.append(
-                weighted_rollout_mse(rollout_prediction, rollout_target, weights).cpu()
-            )
-        if full_rollout_len is not None:
-            # Once the live stage is already one full start-0 trajectory, its
-            # values ARE the terminal diagnostic: detach is forward identity.
-            # Reuse them instead of doubling every periodic K=30 eval.
-            live_is_terminal_forward = rollout_len == full_rollout_len and rollout_starts in (
-                None,
-                (0,),
-            )
-            if live_is_terminal_forward:
-                terminal_prediction = output.rollout_prediction
-                terminal_target = output.rollout_target
-            else:
-                terminal_output = model(
-                    states,
-                    context_len=context_len,
-                    rollout_len=full_rollout_len,
-                    rollout_starts=(0,),
-                    rollout_gradient_cuts=(),
-                )
-                terminal_prediction = terminal_output.rollout_prediction
-                terminal_target = terminal_output.rollout_target
-            assert terminal_prediction is not None
-            assert terminal_target is not None
-            if terminal_prediction.ndim == 5:
-                terminal_prediction = terminal_prediction[:, 0]
-                terminal_target = terminal_target[:, 0]
-            terminal_weights = rollout_weights(full_rollout_len, device=terminal_prediction.device)
-            full_rollout_losses.append(
-                weighted_rollout_mse(terminal_prediction, terminal_target, terminal_weights).cpu()
-            )
-            per_step = (terminal_prediction - terminal_target).square().mean(dim=(0, 2, 3))
-            first_end = full_rollout_len // 3
-            middle_end = 2 * full_rollout_len // 3
-            full_rollout_terminal.append(per_step[-1].cpu())
-            full_rollout_first.append(per_step[:first_end].mean().cpu())
-            full_rollout_middle.append(per_step[first_end:middle_end].mean().cpu())
-            full_rollout_last.append(per_step[middle_end:].mean().cpu())
-        logit_penalties.append(output.logit_penalty.cpu())
-        # One ground-truth local graph per predicted transition (Eqs. 8/9),
-        # flattened to match the model's (B·K, ...) transition rows.
         length = states.shape[1]
         tpar = context_len if context_len is not None else length - 1
-        contacts = batch["contacts"].to(device)  # (B, T-1, N, N)
+        output: TransitionOutput = model(states, context_len=tpar)
+        batch_weights.append(states.shape[0])
+        num_slots = output.prediction.shape[1]
+        teacher_forcing_losses.append(aligned_mse(output.prediction, output.target).cpu())
+
+        if lambda_rollout_t2 > 0:
+            valid = num_valid_rollout_t2_offsets(length, tpar)
+            if num_rollout_t2_anchors > valid:
+                raise ValueError(
+                    f"num_rollout_t2_anchors={num_rollout_t2_anchors} exceeds {valid} valid offsets"
+                )
+            offsets = torch.arange(valid, device=states.device).expand(states.shape[0], -1)
+            endpoint, endpoint_target, _ = model.rollout_t2_from_offsets(
+                states,
+                tpar,
+                output.causal_params,
+                offsets,
+            )
+            rollout_t2_losses.append(rollout_t2_endpoint_mse(endpoint, endpoint_target).cpu())
+
+        if oe_eval_horizon is not None:
+            assert coordinate_std is not None
+            prediction, target = model.rollout_for_evaluation(
+                states,
+                tpar,
+                oe_eval_horizon,
+                output.causal_params,
+            )
+            oe_errors.append(oe_worst_step_nrmse(prediction, target, coordinate_std).cpu())
+
+        logit_penalties.append(output.logit_penalty.cpu())
+        contacts = batch["contacts"].to(device)
         per_transition = contacts[:, tpar - 1 :].flatten(0, 1).unsqueeze(1)
         graph_gt = gt_causal_graph_from_contacts(per_transition)
         graph_learned = read_learned_graph(output.path_matrix, num_slots)
@@ -204,8 +169,6 @@ def evaluate_identifiability(
         mean_abs_logits.append(output.mean_abs_logit.cpu())
         mean_gate_probabilities.append(output.mean_gate_probability.cpu())
         gate_entropies.append(output.gate_entropy.cpu())
-        # One row per episode, matching App. F.1's "encoding all trajectories
-        # in a validation dataset into the learnt parameters".
         learned_coordinates.append(output.causal_params.flatten(1).cpu())
         true_parameters.append(batch["params"].flatten(1).cpu())
 
@@ -215,46 +178,38 @@ def evaluate_identifiability(
     episode_true = torch.cat(true_parameters)
     if episode_learned.shape[1] != num_slots or episode_true.shape[1] != num_slots:
         raise ValueError(
-            "mass recovery requires exactly one scalar parameter slot per object; "
-            f"got learned {tuple(episode_learned.shape)} and "
-            f"true {tuple(episode_true.shape)} for {num_slots} objects"
+            "mass recovery requires one scalar parameter slot per object; "
+            f"got {tuple(episode_learned.shape)} and {tuple(episode_true.shape)}"
         )
     recovery = nonlinear_mcc(episode_learned, episode_true)
-
-    # Every axis is already in tracked-object order: state row i, state column
-    # i and parameter column i all descend from simulator track i.
     learned_graph = torch.cat(learned_graphs)
     true_graph = torch.cat(true_graphs)
 
-    pred_loss = _weighted_mean(pred_losses, batch_weights)
+    teacher_forcing = _weighted_mean(teacher_forcing_losses, batch_weights)
+    raw_rollout_t2 = _weighted_mean(rollout_t2_losses, batch_weights) if rollout_t2_losses else 0.0
+    weighted_rollout_t2 = lambda_rollout_t2 * raw_rollout_t2
     logit_penalty = _weighted_mean(logit_penalties, batch_weights)
     weighted_logit = lambda_logit * logit_penalty
-    # Hybrid §4.3 dual form, scalarised: the bound covers the teacher-forced
-    # AND rollout errors. τ is calibrated on exactly this number.
-    raw_rollout = _weighted_mean(rollout_losses, batch_weights) if rollout_losses else 0.0
-    rollout_loss = lambda_roll * raw_rollout  # the term as it enters the bound
-    constraint_loss = pred_loss + rollout_loss + weighted_logit  # raw units
+    constraint_loss = teacher_forcing + weighted_rollout_t2 + weighted_logit
     metrics = {
-        "pred_loss": pred_loss,
-        "rollout_loss": rollout_loss,
+        # ``pred_loss`` remains the historical teacher-forcing/MCC sweep key.
+        "pred_loss": teacher_forcing,
+        "loss_rollout_t2_raw": raw_rollout_t2,
+        "loss_rollout_t2_weighted": weighted_rollout_t2,
         "mean_abs_logit": _weighted_mean(mean_abs_logits, batch_weights),
         "gate_entropy": _weighted_mean(gate_entropies, batch_weights),
         "constraint_loss": constraint_loss,
-        # SPARTAN's graph metric (their Table 1): SHD between the learned
-        # graph and the ground-truth causal graph over the decoded rows.
-        # Lower is better; range [0, 2N^2]. D28.
         "shd": structural_hamming_distance(learned_graph, true_graph).item(),
-        # The one mass-recovery number: Baumgartner et al. App. F.1 MCC. D27.
         "mcc": recovery.score.item(),
         "path_density": _weighted_mean(path_density, batch_weights),
     }
-    if full_rollout_losses:
+    if oe_errors:
+        oe = summarize_oe(torch.cat(oe_errors), oe_tolerance_nrmse)
+        suffix = f"k{oe_eval_horizon}"
         metrics |= {
-            "full_rollout_loss": lambda_roll * _weighted_mean(full_rollout_losses, batch_weights),
-            "full_rollout_terminal_mse": _weighted_mean(full_rollout_terminal, batch_weights),
-            "full_rollout_first_third_mse": _weighted_mean(full_rollout_first, batch_weights),
-            "full_rollout_middle_third_mse": _weighted_mean(full_rollout_middle, batch_weights),
-            "full_rollout_last_third_mse": _weighted_mean(full_rollout_last, batch_weights),
+            f"oe_sample_satisfaction_{suffix}": oe.satisfaction,
+            f"oe_{suffix}_worst_step_nrmse_p50": oe.p50,
+            f"oe_{suffix}_worst_step_nrmse_p95": oe.p95,
         }
     diagnostics = {
         "logit_penalty": logit_penalty,

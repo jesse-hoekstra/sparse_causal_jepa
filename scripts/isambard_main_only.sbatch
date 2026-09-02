@@ -29,7 +29,7 @@ fi
 RUN_TAG=$1
 TAU=$2
 LAMBDA_LOGIT=$3
-STEPS=${4:-355000}
+STEPS=${4:-300000}
 SEED=${5:-0}
 shift $(( $# < 5 ? $# : 5 ))
 EXTRA_OVERRIDES=("$@")
@@ -71,5 +71,5 @@ python scripts/train.py \
 echo "== final identifiability evaluation =="
 python scripts/eval_identifiability.py "${OUT_DIR}" \
   --episodes 5000 --seed-offset 29 --device cuda \
-  --require-terminal-curriculum
+  --require-complete-protocol
 echo "artifacts in ${OUT_DIR} (checkpoint, resolved config, recovery_grid.png)"
