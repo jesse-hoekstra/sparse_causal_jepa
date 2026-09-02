@@ -1,23 +1,23 @@
 #!/bin/bash
-# Portable Slurm launcher for the D36 Experiment-1 pipeline on the shared
+# Portable Slurm launcher for the fixed T=2 Experiment-1 pipeline on the shared
 # multi-GPU x86_64 server (L40/RTX Ada), requesting exactly ONE GPU.
 #
 # Submit FROM THE REPOSITORY ROOT. Account and partition names are deliberately
 # not hard-coded because they are site-specific:
 #
-#   sbatch scripts/l40_exp1_pipeline.sbatch d36_full_seed0_l40 1e-5 0
+#   sbatch scripts/l40_exp1_pipeline.sbatch t2_seed0_l40 1e-5 0
 #
 # If the site requires them, add them on the command line:
 #
 #   sbatch --account=<ACCOUNT> --partition=<GPU_PARTITION> \
-#     scripts/l40_exp1_pipeline.sbatch d36_full_seed0_l40 1e-5 0
+#     scripts/l40_exp1_pipeline.sbatch t2_seed0_l40 1e-5 0
 #
 # This is not the Isambard wrapper: it uses the repository's x86_64 `.venv`,
 # never regenerates the cross-machine-sensitive physics preload, and allows a
 # multi-day runtime. Command-line sbatch options can override the resources.
 # The pipeline remains single-device; requesting a second GPU would not speed it
 # up and would unnecessarily consume the shared server's two-GPU allowance.
-#SBATCH --job-name=scjepa-d36-l40
+#SBATCH --job-name=scjepa-t2-l40
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
@@ -97,7 +97,7 @@ echo "preload=${PRELOAD} sha256=$(sha256sum "${PRELOAD}" | awk '{print $1}')"
 
 bash scripts/run_bounce_example.sh \
   "--run-tag=${RUN_TAG}" \
-  --main-steps=355000 \
+  --main-steps=300000 \
   --eval-episodes=5000 \
   --final-seed-offset=29 \
   --eval-device=cuda \

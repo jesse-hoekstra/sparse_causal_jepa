@@ -13,14 +13,8 @@ import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
-from scjepa.training import (
-    MetricLogger,
-    NoopLogger,
-    RolloutStage,
-    TrainConfig,
-    Trainer,
-    seed_everything,
-)
+from scjepa.eval.observational_equivalence import training_coordinate_std
+from scjepa.training import MetricLogger, NoopLogger, TrainConfig, Trainer, seed_everything
 from scjepa.training.factory import build_dataset, build_model
 from scjepa.training.visual_to_state import VisualToStateTrainer
 from scjepa.training.visual_to_visual import VisualToVisualTrainer
@@ -60,65 +54,6 @@ def _source_of(key: str, overrides: list[str], preset: DictConfig | None) -> str
     return "config.yaml"
 
 
-def _parse_int_list(value: object, *, field: str, index: int) -> tuple[int, ...]:
-    """Validate one curriculum list without accepting booleans as integers."""
-    if not isinstance(value, list):
-        raise ValueError(f"rollout curriculum {field} {index} must be a list of integers")
-    items = cast(list[object], value)
-    if any(not isinstance(item, int) or isinstance(item, bool) for item in items):
-        raise ValueError(f"rollout curriculum {field} {index} must be a list of integers")
-    return tuple(cast(int, item) for item in items)
-
-
-def _parse_rollout_curriculum(cfg: DictConfig) -> tuple[RolloutStage, ...] | None:
-    """Convert Hydra's structured stages to the trainer's immutable representation."""
-    raw = cfg.train.get("rollout_curriculum", None)
-    if raw is None:
-        return None
-    container_value = OmegaConf.to_container(raw, resolve=True)
-    if not isinstance(container_value, list):
-        raise ValueError("train.rollout_curriculum must be a list of stage mappings or null")
-    container = cast(list[object], container_value)
-    stages: list[RolloutStage] = []
-    for index, stage in enumerate(container):
-        if not isinstance(stage, dict):
-            raise ValueError(f"train.rollout_curriculum stage {index} must be a mapping")
-        stage_mapping = cast(dict[str, object], stage)
-        required = {"start_update", "rollout_len", "rollout_starts", "gradient_cuts"}
-        if set(stage_mapping) != required:
-            raise ValueError(
-                f"train.rollout_curriculum stage {index} must contain exactly {sorted(required)}"
-            )
-        start_update = stage_mapping["start_update"]
-        raw_horizon = stage_mapping["rollout_len"]
-        if not isinstance(start_update, int) or isinstance(start_update, bool):
-            raise ValueError(f"rollout curriculum start_update {index} must be an integer")
-        if raw_horizon is not None and (
-            not isinstance(raw_horizon, int) or isinstance(raw_horizon, bool)
-        ):
-            raise ValueError(f"rollout curriculum rollout_len {index} must be an integer or null")
-        stages.append(
-            RolloutStage(
-                start_update=start_update,
-                rollout_len=raw_horizon,
-                rollout_starts=_parse_int_list(
-                    stage_mapping["rollout_starts"], field="rollout_starts", index=index
-                ),
-                gradient_cuts=_parse_int_list(
-                    stage_mapping["gradient_cuts"], field="gradient_cuts", index=index
-                ),
-            )
-        )
-    return tuple(stages)
-
-
-def _format_rollout_curriculum(stages: tuple[RolloutStage, ...] | None) -> str:
-    """Compact banner form with every value/backward choice made explicit."""
-    if stages is None:
-        return "(fixed rollout_len)"
-    return " -> ".join(f"{stage.start_update}:{stage.label}" for stage in stages)
-
-
 def _print_run_banner(cfg: DictConfig, experiment: str, phase: str, git_sha: str) -> None:
     """Print the decision-critical resolved values and where each came from.
 
@@ -137,7 +72,7 @@ def _print_run_banner(cfg: DictConfig, experiment: str, phase: str, git_sha: str
         preset = loaded if isinstance(loaded, DictConfig) else None
 
     sparsity_on = bool(cfg.train.sparsity_enabled)
-    rollout_curriculum = _parse_rollout_curriculum(cfg)
+    regime = str(cfg.model.get("regime", "state_to_state"))
     rows: list[tuple[str, str, str]] = [
         ("experiment", experiment, "preset"),
         ("phase", phase, "-"),
@@ -151,21 +86,6 @@ def _print_run_banner(cfg: DictConfig, experiment: str, phase: str, git_sha: str
             "train.lambda_logit",
             f"{float(cfg.train.lambda_logit):g}",
             _source_of("train.lambda_logit", overrides, preset),
-        ),
-        (
-            "train.lambda_roll",
-            f"{float(cfg.train.get('lambda_roll', 0.0)):g}",
-            _source_of("train.lambda_roll", overrides, preset),
-        ),
-        (
-            "train.rollout_len",
-            str(cfg.train.get("rollout_len", None)),
-            _source_of("train.rollout_len", overrides, preset),
-        ),
-        (
-            "train.rollout_curriculum",
-            _format_rollout_curriculum(rollout_curriculum),
-            _source_of("train.rollout_curriculum", overrides, preset),
         ),
         (
             "train.sparsity_lambda_init",
@@ -192,6 +112,47 @@ def _print_run_banner(cfg: DictConfig, experiment: str, phase: str, git_sha: str
         ("data.preload", str(cfg.data.preload), _source_of("data.preload", overrides, preset)),
         ("git_sha", git_sha, "-"),
     ]
+    if regime == "state_to_state":
+        rows[4:4] = [
+            (
+                "train.lambda_rollout_t2",
+                f"{float(cfg.train.lambda_rollout_t2):g}",
+                _source_of("train.lambda_rollout_t2", overrides, preset),
+            ),
+            (
+                "train.num_rollout_t2_anchors",
+                str(cfg.train.num_rollout_t2_anchors),
+                _source_of("train.num_rollout_t2_anchors", overrides, preset),
+            ),
+            (
+                "train.rollout_t2_horizon",
+                str(cfg.train.rollout_t2_horizon),
+                _source_of("train.rollout_t2_horizon", overrides, preset),
+            ),
+            (
+                "train.oe_eval_horizon",
+                str(cfg.train.oe_eval_horizon),
+                _source_of("train.oe_eval_horizon", overrides, preset),
+            ),
+            (
+                "train.oe_tolerance_nrmse",
+                f"{float(cfg.train.oe_tolerance_nrmse):g}",
+                _source_of("train.oe_tolerance_nrmse", overrides, preset),
+            ),
+        ]
+    elif regime == "visual_to_visual":
+        rows[4:4] = [
+            (
+                "train.visual_rollout_len",
+                str(cfg.train.visual_rollout_len),
+                _source_of("train.visual_rollout_len", overrides, preset),
+            ),
+            (
+                "train.lambda_visual_rollout",
+                f"{float(cfg.train.lambda_visual_rollout):g}",
+                _source_of("train.lambda_visual_rollout", overrides, preset),
+            ),
+        ]
     width = max(len(name) for name, _, _ in rows)
     print("─" * 78)
     print("RUN CONFIGURATION")
@@ -238,11 +199,19 @@ def main(cfg: DictConfig) -> None:
     _print_run_banner(cfg, experiment, phase, git_sha)
 
     out_dir = Path(str(HydraConfig.get().runtime.output_dir))
+    dataset = build_dataset(cfg.data)
+    regime = str(cfg.model.get("regime", "state_to_state"))
+    if regime == "state_to_state":
+        # A fixed all-training-state population std is part of the OE ruler.
+        # Computing it before model construction uses only dataset-private RNGs
+        # and cannot perturb model initialization or anchor/Gumbel sampling.
+        scales = training_coordinate_std(dataset)
+        cfg.train.oe_coordinate_std = [float(value) for value in scales]
+
     resolved: dict[str, Any] = OmegaConf.to_container(cfg, resolve=True)  # pyright: ignore[reportAssignmentType]
     resolved["git_sha"] = git_sha
     OmegaConf.save(config=OmegaConf.create(resolved), f=out_dir / "resolved_config.yaml")
 
-    dataset = build_dataset(cfg.data)
     eval_dataset = None
     if cfg.train.get("eval_every") is not None:
         eval_cfg = OmegaConf.merge(
@@ -264,9 +233,18 @@ def main(cfg: DictConfig) -> None:
         sparsity_lambda_init=cfg.train.sparsity_lambda_init,
         sparsity_momentum=cfg.train.sparsity_momentum,
         lambda_logit=float(cfg.train.lambda_logit),  # mandatory: .get() would mask MISSING
-        rollout_len=cfg.train.get("rollout_len", None),
-        lambda_roll=float(cfg.train.get("lambda_roll", 0.0)),
-        rollout_curriculum=_parse_rollout_curriculum(cfg),
+        lambda_rollout_t2=float(cfg.train.lambda_rollout_t2),
+        num_rollout_t2_anchors=int(cfg.train.num_rollout_t2_anchors),
+        rollout_t2_horizon=int(cfg.train.rollout_t2_horizon),
+        oe_eval_horizon=int(cfg.train.oe_eval_horizon),
+        oe_tolerance_nrmse=float(cfg.train.oe_tolerance_nrmse),
+        oe_coordinate_std=(
+            tuple(float(value) for value in cfg.train.oe_coordinate_std)
+            if cfg.train.get("oe_coordinate_std") is not None
+            else None
+        ),
+        visual_rollout_len=cfg.train.get("visual_rollout_len", None),
+        lambda_visual_rollout=float(cfg.train.get("lambda_visual_rollout", 0.0)),
         seed=cfg.train.seed,
         device=cfg.train.device,
         context_len=cfg.train.get("context_len", None),

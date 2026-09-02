@@ -1,6 +1,6 @@
 #!/bin/bash
-# Isambard-AI (GH200, aarch64, Slurm) launch for the D36 bounce_baumgartner
-# pipeline. Submit FROM THE REPO ROOT:
+# Isambard-AI (GH200, aarch64, Slurm) launch for the fixed T=2
+# bounce_baumgartner pipeline. Submit FROM THE REPO ROOT:
 #
 #   sbatch --account=<PROJECT> scripts/isambard_exp1_pipeline.sbatch RUN_TAG LAMBDA_LOGIT [SEED]
 #
@@ -9,12 +9,9 @@
 # NOTE: unlike the omi box there is NO nohup here — sbatch detaches the job;
 # follow it with `tail -f slurm-scjepa-bounce-<jobid>.out` or `squeue --me`.
 #
-# Walltime: one job runs the dense reference then main (D12/D29 — the
-# token-local reference is a reused measured constant, not a third stage), so
-# TWO training stages, not three. Each uses D36's accepted-update continuation:
-# TF -> three local windows H=2/5/10 -> one continuous K=30 rollout with
-# backward cuts giving depth 10/15/20/25 -> uncut depth 30. The zero-skip
-# 355k budget leaves the final 240k updates at exact K=30 full BPTT.
+# Walltime: one job runs the dense reference and then the sparse main run, so
+# there are two training stages. Both use the same teacher-forcing-plus-T=2
+# objective, allowing tau to be freshly calibrated for the exact main protocol.
 #SBATCH --job-name=scjepa-bounce
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
@@ -73,7 +70,7 @@ python scripts/pregenerate_bounce.py \
 
 bash scripts/run_bounce_example.sh \
   "--run-tag=${RUN_TAG}" \
-  --main-steps=355000 \
+  --main-steps=300000 \
   --eval-episodes=5000 \
   --final-seed-offset=29 \
   --eval-device=cuda \

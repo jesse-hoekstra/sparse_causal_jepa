@@ -111,7 +111,15 @@ def test_identifiability_harness_end_to_end() -> None:
     report = evaluate_identifiability(
         tiny_model(), dataset, batch_size=6, max_batches=2, context_len=2, lambda_logit=1e-3
     )
-    for key in ("pred_loss", "constraint_loss", "shd", "mcc", "path_density"):
+    for key in (
+        "pred_loss",
+        "loss_rollout_t2_raw",
+        "loss_rollout_t2_weighted",
+        "constraint_loss",
+        "shd",
+        "mcc",
+        "path_density",
+    ):
         assert key in report.metrics
         assert torch.isfinite(torch.tensor(report.metrics[key])), key
     # Eq. 13 raw units: constraint = pred + lambda_logit * logit_penalty.
@@ -124,8 +132,8 @@ def test_identifiability_harness_end_to_end() -> None:
     assert report.recovery_matrix.shape == (N, N)
 
 
-def test_harness_reports_live_multi_window_and_terminal_forward_rollout() -> None:
-    """D36 evaluates its local stage and the fixed uncut terminal trajectory."""
+def test_harness_reports_t2_constraint_and_no_grad_oe_rollout() -> None:
+    """The deterministic held-out constraint and OE diagnostic are separate."""
     dataset = BounceDataset(
         num_episodes=6,
         clip_len=8,
@@ -140,22 +148,26 @@ def test_harness_reports_live_multi_window_and_terminal_forward_rollout() -> Non
         dataset,
         batch_size=3,
         context_len=3,
-        rollout_len=2,
-        rollout_starts=(0, 2, 3),
-        rollout_gradient_cuts=(),
-        full_rollout_len=5,
-        lambda_roll=1.0,
+        lambda_rollout_t2=1.0,
+        num_rollout_t2_anchors=3,
+        rollout_t2_horizon=2,
+        oe_eval_horizon=5,
+        oe_tolerance_nrmse=0.1,
+        oe_coordinate_std=torch.ones(4),
     )
     for key in (
-        "rollout_loss",
-        "full_rollout_loss",
-        "full_rollout_terminal_mse",
-        "full_rollout_first_third_mse",
-        "full_rollout_middle_third_mse",
-        "full_rollout_last_third_mse",
+        "loss_rollout_t2_raw",
+        "loss_rollout_t2_weighted",
+        "oe_sample_satisfaction_k5",
+        "oe_k5_worst_step_nrmse_p50",
+        "oe_k5_worst_step_nrmse_p95",
     ):
         assert key in report.metrics
         assert torch.isfinite(torch.tensor(report.metrics[key])), key
+    assert report.metrics["constraint_loss"] == pytest.approx(
+        report.metrics["pred_loss"] + report.metrics["loss_rollout_t2_weighted"],
+        rel=1e-7,
+    )
 
 
 def test_harness_batches_gt_graphs_per_transition() -> None:

@@ -67,11 +67,8 @@ class VisualToStateTrainer(Trainer):
         # tau was calibrated from.
         self.model.coordinate_scales.copy_(scales.to(self.device))
 
-    def _forward(  # type: ignore[override]
-        self, batch: dict[str, Tensor], rollout_len: int | None = None
-    ) -> VisualToStateOutput:
+    def _forward(self, batch: dict[str, Tensor]) -> VisualToStateOutput:  # type: ignore[override]
         """Frames are the only predictor input; states supply targets only."""
-        del rollout_len  # This regime has no autoregressive rollout branch.
         return self.model(
             batch["frames"].to(self.device),
             batch["states"].to(self.device),
@@ -129,7 +126,6 @@ class VisualToStateTrainer(Trainer):
             self.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
             if sparsity_active:
                 self.lagrangian.update(constraint)
-            self.successful_updates += 1
 
         num_decoded = output.causal_params.shape[1]
         with torch.no_grad():
@@ -155,7 +151,6 @@ class VisualToStateTrainer(Trainer):
             "health/latent_std": latent_std,
             "health/grad_norm": float(grad_norm.item()),
             "health/skipped_steps": float(self.total_skips),
-            "schedule/successful_updates": float(self.successful_updates),
         }
 
     def _eval_step(self) -> dict[str, float]:

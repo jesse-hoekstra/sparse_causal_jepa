@@ -26,15 +26,29 @@ fail loudly rather than silently. Read `docs/decisions.md` first; it binds you.
   regularizer config-selectable (`visreg` default, `sigreg` as ablation/safety hatch).
 - **Joint training:** ONE optimizer step updates encoders + pooling/linear heads + SPARTAN together.
   No EMA schedule, no target-network machinery, no encoder freezing.
-- **Experiment-1 loss assembly (D34/D36):** every batch teacher-forces all 30 suffix
-  transitions and `lambda_roll` remains 1.0 whenever the rollout branch is live. D36 uses
-  three true-anchored windows at offsets `[0,10,20]`, with H=2/5/10 beginning at accepted
-  updates 10k/20k/30k. At 50k it switches to one uninterrupted forward K=30 rollout with
-  feedback-gradient cuts `[10,20]`, then `[15]`/`[20]`/`[25]` at 70k/85k/100k; all cuts are
-  removed at 115k. Rejected gradient-spike batches do not advance this accepted-update clock.
-  The window loss is averaged, one attached theta estimate is reused everywhere, and in the
-  sparse run the path term and GECO activate only in the final uncut stage. Defer to the latest
-  decision for other regimes rather than applying the superseded D6 rule to Experiment 1.
+- **Experiment-1 loss assembly (D37):** every batch teacher-forces all 30 suffix transitions and
+  adds `lambda_rollout_t2 * L_AR2`, with `lambda_rollout_t2=1.0`. For each episode, uniformly
+  sample exactly eight distinct valid T=2 offsets without replacement, independently across
+  episodes and through the checkpointed training RNG. At C=30/T=60 the valid offsets are 0..28.
+  Every window starts from its true anchor, feeds the first generated prediction into the second
+  transition without detaching it, and supervises only the second prediction. Infer one
+  `theta_hat` from states 0..29 and reuse the same attached episode-level tensor for all
+  teacher-forced transitions and all eight windows. Average `L_AR2` over batch, window, object,
+  and coordinate dimensions. Setting the coefficient to zero must bypass sampling and both
+  auxiliary calls exactly.
+- **No state-to-state K=30 training machinery:** D34–D36's curriculum is superseded. Do not add
+  rollout stages, accepted-update transitions, horizon warmup, gradient cuts, delayed GECO/path
+  activation, schedule checkpoint state, or full-rollout backpropagation. In a D37 sparse run,
+  the path term and GECO are active from the start. Calibrate tau freshly for
+  `L_TF + lambda_rollout_t2*L_AR2 + lambda_logit*L_logit`; never use the no-gradient K=30
+  diagnostic or an old threshold as the constraint. This restriction is state-to-state only;
+  preserve Experiment 3's separately configured visual-to-visual fixed-K objective.
+- **Experiment-1 logging:** keep `train/loss_teacher_forcing`, `train/loss_rollout_t2_raw`,
+  `train/loss_rollout_t2_weighted`, and `train/loss_total`; branch norms may be
+  `train/grad_norm_teacher_forcing` and `train/grad_norm_rollout_t2_weighted`. Do not log
+  curriculum stage, successful-update progress, horizon, cut, or BPTT-depth metrics under old or
+  renamed keys. Ordinary optimizer/finite-gradient health, GECO, MCC, SHD, and sparsity metrics
+  remain.
 
 ## Pillars
 1. **Config as the interface.** Hydra (le-wm and visreg both use it); every hyperparameter in
@@ -54,6 +68,12 @@ fail loudly rather than silently. Read `docs/decisions.md` first; it binds you.
 - **Identifiability diagnostics** (synthetic data): SHD and MCC between SPARTAN's read-out
   interaction graph and ground truth; marginal plots of learned θ̂ dims vs. ground-truth
   parameters (Baumgartner-style); with/without-sparsity ablation as a config toggle.
+- **Experiment-1 observational-equivalence diagnostic:** on a fixed held-out set, use
+  `model.eval()` and `torch.no_grad()` for one K=30 generated chain from true `S_29` through
+  `Shat_59`, reusing the context's one `theta_hat`. Normalize coordinates by fixed training-set
+  standard deviations. Log tolerance satisfaction and worst-step NRMSE p50/p95. This is never a
+  training loss and is an empirical sampled diagnostic, not proof of population observational
+  equivalence.
 - **CLEVRER**: 128→160-frame imagined rollouts; export trajectories for ALOE downstream QA; compare
   vs. SlotFormer/C-JEPA numbers.
 - **Push-T**: MPC planning success rate (last-step action + Markovian rollout), runtime/token cost;

@@ -383,6 +383,11 @@ Experiment 3 is interpreted.
 
 ## D34 — Experiment 1 objective is HYBRID: teacher forcing + a full-window autoregressive rollout, both inside the constraint (decided 2026-07-27, Jesse)
 
+> **SUPERSEDED for Experiment 1 by D37.** The text below is retained as the historical
+> motivation for adding an autoregressive branch. Experiment 1 no longer trains through a
+> K=30 rollout. D34b's separate fixed-K visual-to-visual Experiment-3 protocol remains active
+> and is not changed by D37.
+
 D29 made Experiment 1 a pure teacher-forced one-step objective and deleted the rollout. D34
 puts a rollout back, on a different footing: it is now a SECOND branch alongside teacher
 forcing, not a replacement for it, and it is inside the dual constraint.
@@ -456,23 +461,26 @@ dual) but none of its numbers are comparable.
 Which regimes can carry the rollout branch is decided by a type, not by preference:
 Eq. 34's recursion needs `F_gamma` to map the representation space to ITSELF.
 
-* **Experiment 1** — raw true states in, raw true states out. Composable.
+* **Experiment 1** — raw true states in, raw true states out. Composable, but D37 now uses that
+  closure only for sampled T=2 windows during training; K=30 is evaluation-only.
 * **Experiment 3** — Eq. 118 gives the predictor `output_dim = state_dim`, so it maps the
-  learned latent width to itself. Composable. `rollout_len: 30`, `lambda_roll: 1.0`, same
-  geometry as Experiment 1 (anchor t = Tpar-1 = 29 on the ONLINE path per Eq. 33, rolled to
-  t+K = 59 = T-1, supervised against the EMA target which is already computed over every
-  frame). The same theta-hat AND the same per-episode track keys (§6.4) enter at every step;
-  resampling keys mid-chain would give each step a different episode-level permutation.
+  learned latent width to itself. Composable. `visual_rollout_len: 30` and
+  `lambda_visual_rollout: 1.0` retain the geometry that Experiment 3 originally shared with
+  pre-D37 Experiment 1: anchor t = Tpar-1 = 29 on the ONLINE path, roll to t+K = 59 = T-1,
+  and supervise against the EMA target computed over every frame. The same theta-hat AND the
+  same per-episode track keys (§6.4) enter at every step; resampling keys mid-chain would give
+  each step a different episode-level permutation.
 * **Experiment 2 — structurally excluded.** Its predictor takes a 32-dim latent state
   (Eq. 94) and decodes to a RAW 4-dim state (Eq. 95), so `f` cannot be composed with itself
   and Assumption 4's closure `F_gamma(S, theta-hat) in S` fails BY TYPE, not by approximation
   error. Making it composable would mean predicting the next latent and decoding only for the
   loss — a rewrite of Eqs. 94/95 that invalidates tau_2. Not done.
 
-**Consequence for the write-up:** §4.4(ii)'s trajectory argument, and the path-connectedness
-object of §5, are available to Experiments 1 and 3 and NOT to Experiment 2. The
-visual-to-state regime's identification argument rests on teacher forcing alone. §4 should say
-which regimes instantiate the rollout term rather than let Eq. 36 read as uniform.
+**Consequence for the write-up:** Experiment 1 now instantiates only D37's local T=2 training
+term and evaluates K=30 separately; Experiment 3 retains this fixed-K latent training term; and
+Experiment 2 has no composable rollout. The visual-to-state regime's identification argument
+rests on teacher forcing alone. The population trajectory assumption is not proved by any of
+these finite empirical objectives or diagnostics.
 
 **Eq. 123 needs no change.** L_TF and L_roll are both squared errors in the same target space,
 so both scale with the representation exactly as `target_variance` does: the variance-normalized
@@ -491,14 +499,16 @@ episode, reduced over the time axis FIRST — is the one statistic that separate
 dynamics" from "stopped moving". Added for both branches; a test pins that the pooled metrics
 cannot distinguish the two cases and that this one can.
 
-**tau_3 must be recalibrated**, exactly as for Experiment 1: `evaluate_visual_to_visual` now
-computes the same scalarised numerator, reading `rollout_len`/`lambda_roll` from the run's own
-config. **Still unmeasured:** Experiment 3 has never been run at length (D32 records it as
+**tau_3 must be recalibrated** for Experiment 3's own objective:
+`evaluate_visual_to_visual` computes its scalarised numerator, reading
+`visual_rollout_len`/`lambda_visual_rollout` from the run's resolved config. **Still
+unmeasured:** Experiment 3 has never been run at length (D32 records it as
 "written and runs end-to-end", no run IDs), so none of these diagnostics has faced a real run.
 
 ## D35 — Reach the exact K=30 objective through an accepted-update horizon curriculum (decided 2026-08-02, Jesse)
 
-> **SUPERSEDED by D36.** This entry is retained as the historical diagnosis of the failed
+> **SUPERSEDED by D36, and its K=30 target superseded for Experiment 1 by D37.** This entry is
+> retained as the historical diagnosis of the failed
 > coefficient ramp and the first continuation attempt. Its off/2/5/10/20/30 optimisation route,
 > 60k terminal boundary, and 300k budget are no longer active. D36 leaves D34's final scientific
 > objective unchanged.
@@ -580,14 +590,18 @@ explicitly configures a curriculum.
 
 ## D36 — Cover the trajectory locally, then remove gradient cuts from one continuous K=30 rollout (decided 2026-08-07, Jesse)
 
+> **SUPERSEDED for Experiment 1 by D37.** This entry is retained to document the exact
+> multi-window/cut schedule that was tried and why it was abandoned. None of its stages,
+> accepted-update transitions, gradient cuts, or K=30 training loss remains active. Experiment
+> 3's separately declared fixed-K latent-space rollout is outside D37's state-to-state scope.
+
 D35 increased one prefix from the fixed start, but that can leave the later trajectory regions
 untrained until a long recurrent graph reaches them. Three independently true-anchored windows
 solve the coverage problem, but they can still hide compounding drift because the starts at
-offsets 10 and 20 reset to ground truth. The current route therefore has two deliberately simple
+offsets 10 and 20 reset to ground truth. The D36 route therefore had two deliberately simple
 parts: learn all three regions locally, then run the exact full forward trajectory while gradually
-lengthening only its backward paths. **This is the current debugging protocol and is likely to be
-iterated until the full-BPTT code path is demonstrably stable; record any replacement as another
-decision rather than silently changing these boundaries.**
+lengthening only its backward paths. **This was D36's debugging protocol; D37 is its recorded
+replacement.**
 
 **The final objective and observational-equivalence target are unchanged.** The terminal model
 still uses one autonomous chain from `Z_29` through `Z_59`, supervises every declared prefix,
@@ -653,5 +667,101 @@ has completed zero no-cut updates and is not reportable; reportability requires
 `successful_updates > 115000`. The 355k attempted-batch budget yields the intended 240k terminal
 updates in a zero-skip run; provenance records the actual terminal accepted count otherwise.
 
-D36 currently applies only to Experiment 1. Experiment 3 retains its separately declared fixed
-K=30 protocol unless its own evidence motivates an explicit change.
+D36 applied only to Experiment 1. Experiment 3 retains its separately declared fixed K=30
+protocol unless its own evidence motivates an explicit change.
+
+## D37 — Experiment 1 returns to teacher forcing plus eight sampled two-step endpoints (decided 2026-09-02, Jesse)
+
+D34–D36 tried to make exact K=30 recurrent backpropagation part of Experiment 1's training
+objective. That route is retired. The continuation in D36 reached its uncut stage, but the
+production run `b8v5lxu2` again entered a recurrent-gradient failure: the teacher-forcing branch
+remained ordinary while the rollout branch dominated the gradient and the D18 guard stopped the
+run after 50 consecutive rejected updates. The forward K=30 prediction itself had not become
+non-finite. The evidence therefore points to the long recurrent backward graph, not to the
+existence of a usable local transition model. Adding more curriculum stages would preserve the
+same failure mode while making the result depend on a complicated training schedule.
+
+**Restore the known-stable foundation.** Experiment 1 again uses the D30 teacher-forcing
+geometry and 300,000-step budget. One `theta_hat` is inferred from the 30-state context
+`(S_0,...,S_29)` and reused for all 30 true-state transitions
+`S_29 -> S_30, ..., S_58 -> S_59`. The historical successful values
+`lambda_logit = 1e-5` and `sparsity_lambda_init = 1e4` are restored as initial settings. D30's
+`tau = 0.02` is *not* restored: tau was measured for teacher forcing alone and is on the wrong
+scale for the new predictive constraint.
+
+**The only new training branch is a fixed T=2 endpoint loss.** The predictive objective is
+
+    L_pred = L_TF + lambda_rollout_t2 * L_AR2,
+
+with `lambda_rollout_t2 = 1.0`, `num_rollout_t2_anchors = 8`, and
+`rollout_t2_horizon = 2`. Existing non-predictive terms retain their previous roles. In the
+sparse GECO objective this gives
+
+    L = L_pred + lambda_logit * L_logit + lambda_s^-1 * L_path
+    c = L_pred + lambda_logit * L_logit <= tau,
+
+where the path penalty remains outside the constraint. The dense reference and sparse run must
+use identical T=2 settings, and tau must be freshly calibrated from the converged dense
+teacher-forcing-plus-T=2 model. No threshold calibrated for D30 or D34–D36 is transferable.
+
+A **rollout anchor** is the true state from which one independent two-step generated window is
+launched. For sequence length `T` and context length `C`, relative offset `r` denotes
+
+    S_(C-1+r) -> Shat_(C+r) -> Shat_(C+1+r).
+
+Validity is computed from the actual tensor length: `0 <= r <= T-C-2`. Thus C=30 and T=60
+provide 29 valid offsets, `r in {0,...,28}`. For every episode and every training batch, sample
+exactly eight distinct offsets uniformly without replacement. Sampling is independent across
+episodes and uses the checkpointed training random-number stream, so a fixed seed and resume
+preserve the expected sequence. The offsets are not frozen across training.
+
+Every selected window starts from its true anchor. Its first prediction consumes that true
+state; its second prediction consumes the generated first prediction. The intermediate
+prediction is never detached, so the endpoint gradient traverses both transition calls. Only
+the second prediction is supervised by `L_AR2`: the first transition is already present in
+`L_TF`. All eight windows reuse the same episode-level `theta_hat`; it is neither recomputed nor
+detached. The endpoint loss is
+
+    L_AR2 = mean_(batch,window,object,coordinate)
+            (Shat_(t+2) - S_(t+2))^2.
+
+It is a mean, not a sum: duplicating a window or changing the number of sampled windows must not
+systematically rescale it. Setting `lambda_rollout_t2 = 0` bypasses sampling and both auxiliary
+predictor calls, recovering the teacher-forcing computation and random-number sequence exactly.
+
+**Training horizon H=2 and evaluation horizon K=30 differ intentionally.** The T=2 term teaches
+one local composition and exposes the transition model once to its own output, addressing local
+composition error and exposure bias without a long recurrent Jacobian product. It does not
+claim that two steps identify every physical parameter, nor does it replace the population
+observational-equivalence assumption. There is no K=30 training loss, rollout curriculum,
+horizon warmup, gradient-cut schedule, accepted-update stage state, or full-rollout
+backpropagation in Experiment 1.
+
+K=30 survives only as a deterministic held-out diagnostic. In evaluation mode and under
+`torch.no_grad()`, infer one `theta_hat` from `(S_0,...,S_29)`, start from true `S_29`, and feed
+each generated state into the next transition through `Shat_59`. The held-out episodes are
+fixed. Let `sigma_d` be fixed coordinate standard deviations computed once from the training
+set (or one for coordinates already standardized). For episode i and rollout step k,
+
+    e_(i,k) = sqrt(mean_(object,coordinate)
+                   ((Shat_(i,k) - S_(i,k)) / sigma)^2),
+    E_i = max_(k=1,...,30) e_(i,k).
+
+With `oe_tolerance_nrmse = 0.10`, report
+
+    OE_hat_0.10 = mean_i 1[E_i <= 0.10]
+
+as `eval/oe_sample_satisfaction_k30`, together with the median and 95th percentile of `E_i` as
+`eval/oe_k30_worst_step_nrmse_p50` and
+`eval/oe_k30_worst_step_nrmse_p95`. This is an empirical, tolerance-based estimate of
+approximate trajectory agreement on sampled held-out trajectories. It is comparable over
+training because the episodes and normalization are fixed, but it is not a proof of population
+observational equivalence.
+
+The schedule-specific D34–D36 logging is removed. Experiment 1's predictive training keys are
+`train/loss_teacher_forcing`, `train/loss_rollout_t2_raw`,
+`train/loss_rollout_t2_weighted`, and `train/loss_total`; branch gradient norms may additionally
+use `train/grad_norm_teacher_forcing` and `train/grad_norm_rollout_t2_weighted`. Ordinary
+finite-gradient/skip safeguards, dual/sparsity diagnostics, MCC, and SHD remain. D37 changes
+only the state-to-state Experiment-1 objective: Experiment 2 remains teacher-forcing-only by
+type, and Experiment 3 retains its separately specified latent-space fixed-K rollout.

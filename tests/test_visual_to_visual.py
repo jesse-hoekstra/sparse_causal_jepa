@@ -128,7 +128,15 @@ def test_track_keys_are_permuted_per_episode() -> None:
 def test_constraint_is_variance_normalized() -> None:
     """Eq. 123 divides by the target variance; Eq. 121's gradient objective does not."""
     model = _model()
-    config = TrainConfig(steps=1, batch_size=2, context_len=3, rollout_len=3, lambda_logit=0.0)
+    config = TrainConfig(
+        steps=1,
+        batch_size=2,
+        context_len=3,
+        lambda_rollout_t2=0.0,
+        visual_rollout_len=3,
+        lambda_visual_rollout=1.0,
+        lambda_logit=0.0,
+    )
     trainer = VisualToVisualTrainer(model, _dataset(), config, eval_dataset=None)
     output = model(torch.rand(2, 5, 3, 64, 64), context_len=3)
     pred = torch.tensor(0.5)
@@ -140,7 +148,14 @@ def test_constraint_is_variance_normalized() -> None:
 def test_variance_floor_bounds_the_constraint() -> None:
     """A collapsing target must not make the constraint look satisfiable."""
     model = _model(variance_floor=1e-2)
-    config = TrainConfig(steps=1, batch_size=2, context_len=3, rollout_len=3)
+    config = TrainConfig(
+        steps=1,
+        batch_size=2,
+        context_len=3,
+        lambda_rollout_t2=0.0,
+        visual_rollout_len=3,
+        lambda_visual_rollout=1.0,
+    )
     trainer = VisualToVisualTrainer(model, _dataset(), config, eval_dataset=None)
     output = model(torch.rand(2, 5, 3, 64, 64), context_len=3)._replace(
         target_variance=torch.tensor(0.0)
@@ -153,7 +168,14 @@ def test_training_step_runs_and_steps_the_ema() -> None:
     """One end-to-end step: frames in, EMA advanced, collapse metrics logged."""
     model = _model()
     config = TrainConfig(
-        steps=1, batch_size=2, context_len=3, rollout_len=3, device="cpu", out_dir="/tmp/e3"
+        steps=1,
+        batch_size=2,
+        context_len=3,
+        lambda_rollout_t2=0.0,
+        visual_rollout_len=3,
+        lambda_visual_rollout=1.0,
+        device="cpu",
+        out_dir="/tmp/e3",
     )
     trainer = VisualToVisualTrainer(model, _dataset(), config, eval_dataset=None)
     before = copy.deepcopy([t.clone() for t in model.target.parameters()])

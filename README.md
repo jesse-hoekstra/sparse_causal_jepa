@@ -1,25 +1,22 @@
 # sparse_causal_jepa
 
 Codebase for **"Causal Identification within JEPA Using a SPARTAN"** (Jesse Hoekstra, Oxford
-Statistics; manuscript in `sources/my_paper.pdf`). A joint-embedding predictive architecture over
-SAVi object slots whose predictor is a SPARTAN-style sparse transition model: a per-slot temporal
-attention pooling extracts time-invariant causal parameters from the slot history, a linear head
-carries the kinematic state, and SPARTAN predicts the next-step slots through a sparse interaction
-graph — trained end-to-end from scratch with a Hungarian-matched single-step predictive loss and a
-VISReg anti-collapse regularizer, so that causal structure can be identified from the learned graph
-and parameters (SHD/MCC against ground truth) without any reconstruction objective.
+Statistics; manuscript in `sources/my_paper.pdf`). It combines a temporal parameter encoder with
+a SPARTAN-style sparse transition model and evaluates causal-graph and parameter recovery with SHD
+and MCC. Experiment 1 operates directly on object states; Experiments 2 and 3 introduce visual
+encoders and their regime-specific representation losses.
 
 **Decision log:** [`docs/decisions.md`](docs/decisions.md) is the source of truth for settled
 design decisions: a short list of standing rules (framework, vendoring, tooling, SPARTAN
 interpretations, simulator contract, pipeline consistency, grad-skip guard) followed by
-D27–D36, which define the metrics, Experiment-1 architecture, verified result, and current rollout
-continuation protocol.
+D27–D37, which define the metrics, Experiment-1 architecture, verified result, and current
+teacher-forcing-plus-T=2 protocol.
 Read it before changing anything it covers.
 
 > **NOTE:** the historical architecture/ladder discussion below still contains pre-D29 material.
 > Its removed `--identity-check`, `train.lambda_reg`, `health/target_slot_std_*`, and `mass_mcc`
-> names are not current APIs. The launch block and D36 budget are updated; see `CLAUDE.md` and
-> D36 in `docs/decisions.md` for the complete active protocol.
+> names are not current APIs. D34–D36's K=30 state-to-state training curriculum is also
+> superseded. See `CLAUDE.md` and D37 in `docs/decisions.md` for the active protocol.
 
 ## Repo map
 
@@ -59,11 +56,38 @@ Sanity checks:
 python -c "import scjepa; print(scjepa.__version__)"
 ruff check .
 pyright
-pytest   # collects from tests/; 0 tests is expected until modules land
+pytest
 ```
 
 Stack: PyTorch · Hydra · Weights & Biases · einops · scipy · jaxtyping — exact pins and their
 rationale in `pyproject.toml`.
+
+## Current Experiment-1 predictive objective
+
+Experiment 1 has returned to the stable 30-transition teacher-forcing foundation and adds one
+fixed local-composition term:
+
+```text
+L_pred = L_TF + lambda_rollout_t2 * L_AR2
+```
+
+One `theta_hat` is inferred from `S_0,...,S_29` and reused for all 30 teacher-forced suffix
+transitions and all auxiliary windows. For each episode, training samples exactly eight distinct
+valid two-step offsets uniformly without replacement, independently of the other episodes in the
+batch. With context length 30 and sequence length 60, the offsets are `0,...,28`; offset `r`
+launches from the true anchor `S_(29+r)`, predicts `Shat_(30+r)`, feeds that generated state back,
+and predicts `Shat_(31+r)`. Only the second prediction is supervised by `L_AR2`, because the first
+transition is already covered by teacher forcing. The intermediate prediction is not detached.
+The loss is averaged over episodes, eight windows, objects, and coordinates.
+
+There is no K=30 training loss, horizon curriculum, warmup, gradient-cut schedule, or
+full-rollout backpropagation. A deterministic K=30 chain remains only as a fixed-held-out,
+no-gradient observational-equivalence diagnostic. It reports the fraction of episodes whose
+worst-step coordinate-normalized NRMSE is at most `oe_tolerance_nrmse`, plus p50 and p95 of that
+worst-step error. Training horizon 2 and evaluation horizon 30 intentionally differ: T=2 targets
+local composition and exposure bias; the held-out K=30 diagnostic measures approximate trajectory
+agreement. Neither establishes the population observational-equivalence assumption, and T=2 does
+not claim to identify every physical parameter by itself.
 
 ## Worked example: identifiability on bounce (CPU)
 
@@ -81,7 +105,7 @@ the `lambda_logit` selected by the dense sweep:
 LAMBDA_LOGIT=YOUR_SELECTED_VALUE
 bash scripts/run_bounce_example.sh --run-tag=seed0 \
   "train.lambda_logit=${LAMBDA_LOGIT}"
-#    -> prints calibrated tau, then pred_loss, rollout diagnostics, SHD, MCC, path_density
+#    -> prints a freshly calibrated tau, then TF/T=2 losses, OE diagnostics, SHD, MCC, path_density
 #    -> saves recovery_grid.png with all mass/latent pairs and the global assignment
 ```
 
@@ -91,28 +115,23 @@ fully-connected held-out constraint loss, default 1.0), `--calib-steps`,
 `--main-steps` (main run only), and `--run-tag` (required for parallel launches) — a mistyped
 flag errors loudly; the equivalent env vars still work as a fallback.
 
-**What to watch (two failure modes we hit while tuning this — see decisions.md D12):**
+**What to watch:**
 
-1. *Collapse-gaming the constraint.* τ is scale-dependent and the embeddings are trainable, so a
-   weak regularizer (`train.lambda_reg` < 1) lets the model satisfy `pred_loss ≤ τ` by shrinking
-   the target embeddings instead of learning dynamics. Symptom: `health/target_slot_std_*` falls
-   together with `loss/pred` while `sparsity/lambda` collapses and SHD worsens. Keep
-   `lambda_reg: 1.0`.
-2. *Stale τ.* τ calibrated under any other setting (different `lambda_reg`, clip length, …) is
-   meaningless: if the achievable loss sits above τ, λ_s rises to its clamp and sparsity never
-   engages (symptom: `sparsity/lambda` huge, `sparsity/path_density` never falls). Recalibrate
-   after any config change.
+1. *Branch stability.* `train/loss_teacher_forcing` and `train/loss_rollout_t2_raw` should remain
+   finite, as should the corresponding branch gradients when logged. The D18 skip guard remains
+   active; a sustained rejected-update sequence is a failure, not a curriculum phase.
+2. *Stale tau.* Tau is objective- and scale-dependent. Changing the T=2 coefficient, anchor
+   count, logit coefficient, data geometry, or model invalidates the old calibration. If the
+   achievable constraint remains above tau, the dual can grow without pruning. Recalibrate from
+   a matching dense run.
+3. *Trajectory agreement.* Watch all three fixed-held-out OE metrics together. Satisfaction is
+   thresholded, so interpret it with the continuous worst-step NRMSE p50/p95 curves. They are
+   diagnostics, not training losses or a population guarantee.
 
-Healthy training shows the SPARTAN A.2 dynamics: `sparsity/constraint` drops below τ first,
-then `sparsity/lambda` falls and decoded-state `sparsity/path_density` shrinks while the
-constraint stays near τ.
-Reference run (2026-07-10, `data.num_balls=3 train.steps=25000`, `TAU_FACTOR=2.0`, ~1 h CPU):
-FC pred_loss 0.026 → τ 0.051; main run ends with λ 1000→436 (pruning engaged, still in
-progress), target-slot std 0.83 (no collapse), held-out pred_loss 0.039, shd_state 4.4.
-Full pruning and parameter recovery (MCC) need longer runs — SPARTAN's own curves span ~10⁶
-steps — so treat the CPU run as the pipeline check and scale steps up (GPU/overnight) for the
-paper-grade numbers. Step counts per phase: `--calib-steps` always sets the calibration length;
-`--main-steps` (or a `train.steps=...` hydra override) sets the main run's.
+Healthy sparse training still shows the SPARTAN dual dynamics: `sparsity/constraint` crosses tau,
+then `sparsity/lambda` reverses and decoded-state `sparsity/path_density` shrinks while the
+constraint stays near tau. A short smoke run establishes finite computation and gradients only;
+it does not establish convergence, parameter recovery, or observational equivalence.
 
 ## The experiment ladder (bounce) — STALE, superseded by D29
 
@@ -168,9 +187,12 @@ python scripts/train.py data.name=bounce data.clip_len=10 train.steps=...   # vi
 python scripts/train.py data.name=bounce data.radius_from_mass=true ...
 ```
 
-Scale: Baumgartner's setting is ~300k steps × 8 seeds (their Fig. 17/3); current D36 runs use a
-355k attempted-batch budget so a zero-skip run retains 240k accepted updates in the terminal
-uncut stage. Baumgartner does not specify the numerical `lambda_logit`, so first run the controlled
+Scale: Baumgartner's setting is ~300k steps × 8 seeds (their Fig. 17/3); the D37
+state-to-state preset uses the last stable 300k-step budget. The historical successful
+teacher-forcing run used `lambda_logit=1e-5` and `sparsity_lambda_init=1e4`. Its `tau=0.02`
+must not be reused: the dense stage must calibrate tau for
+`L_TF + lambda_rollout_t2*L_AR2 + lambda_logit*L_logit`. Baumgartner does not specify the
+numerical `lambda_logit`, so first run the controlled
 dense-model sweep on Isambard:
 
 ```bash

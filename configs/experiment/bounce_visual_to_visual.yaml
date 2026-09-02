@@ -37,15 +37,18 @@ train:
   # adds a no-grad pass over T. Start at 4 and raise only if it fits.
   batch_size: 4
   context_len: 30 # Tpar (Eq. 106); I = {29, ..., 58}
-  # Hybrid rollout branch (write-up Eqs. 33-35), same geometry as Experiment 1:
-  # ONE chain anchored on the ONLINE path at t = Tpar-1 = 29, rolled to t+K = 59
-  # = T-1, supervised against the EMA target. Well-typed here because Eq. 118
+  # Visual-only latent rollout retained from D34b: ONE chain anchored on the
+  # ONLINE path at t = Tpar-1 = 29, rolled to t+K = 59 = T-1, and supervised
+  # against the EMA target. Unlike Experiment 1's D37 T=2 state auxiliary, this
+  # remains a separately declared fixed K=30 objective. It is well-typed here
+  # because Eq. 118
   # gives the predictor output_dim = state_dim; the visual-to-STATE regime
   # decodes to the raw 4-dim state (Eq. 95) and therefore has no rollout.
   # WATCH collapse/*/temporal_var: a target frozen in time satisfies the whole
   # rollout by the identity map, and the Eq. 123 normalization cannot see it.
-  rollout_len: 30
-  lambda_roll: 1.0
+  lambda_rollout_t2: 0.0
+  visual_rollout_len: 30
+  lambda_visual_rollout: 1.0
   # sparsity_tau is MANDATORY (`???` in configs/config.yaml) and read only when
   # sparsity_enabled=true, so the dense reference stage runs without it. The
   # pipeline supplies tau_3 from that stage; a placeholder here would silently

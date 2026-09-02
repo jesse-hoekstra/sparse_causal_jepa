@@ -1,45 +1,28 @@
-"""State-to-state regime: true object states in, true next state out.
+"""State-to-state SCJEPA: true object states in, true next states out.
 
-The oracle rung of the ladder — perception, state grounding and slot
-correspondence are all given, so a failure here is a failure of causal parameter
-identification and nothing else. Row i IS physical object i, so no track
-alignment exists anywhere in training or evaluation.
+The predictive objective has two deliberately small branches. Teacher forcing
+uses every observed suffix transition, while the auxiliary branch samples local
+two-step compositions::
 
-(experiments.pdf §6.2.)
+    L_pred = L_TF + lambda_rollout_t2 * L_AR2.
 
-The context encoder is the identity on states plus the parameter encoder
-(Eq. 15): E⁽¹⁾_ctx[Z_{0:Tpar-1}] = (Z_{Tpar-1}, θ̂) with θ̂ = P_η(Z_{0:Tpar-1}).
-SPARTAN then makes the |I| = K teacher-forced one-step predictions of Eq. 38,
+For an episode of length 60 with a 30-state context, ``L_TF`` covers the 30
+transitions ``S_29 -> S_30, ..., S_58 -> S_59``. ``L_AR2`` samples true
+anchors ``S_(29+r)`` with ``r in {0, ..., 28}``, predicts one state from the
+anchor, feeds that prediction back once, and supervises only the endpoint.
+Every transition and every sampled window reuses the one attached
+``theta_hat`` inferred from ``S_0, ..., S_29``.
 
-    Ẑ_{t+1} = f_gamma(Z_t, θ̂),    t ∈ I = {Tpar-1, …, T-2},
-
-every one anchored at the OBSERVED current state Z_t (these are 30 one-step
-predictions, not a 30-step open-loop rollout), reusing the same θ̂ for all
-transitions of the episode. Gates, logits, and adjacencies are resampled per
-transition (Eq. 33's fresh Gumbel noise), which falls out of flattening the K
-transitions into the batch axis of one SPARTAN call.
-
-The hybrid objective adds a SECOND branch alongside this one (hybrid write-up
-§4.2): one or more K-step autoregressive rollouts, in which the predictor
-consumes its own output and every prefix k = 1..K is supervised. Local
-curriculum windows may begin from several observed states. A later continuous
-full-trajectory phase may truncate only the backward graph at selected steps:
-the predicted state value continues forward unchanged, but gradients through
-the recurrent state edge stop there. The teacher-forced branch keeps the
-mechanism anchored at observed states; the rollout branch is what forces one
-fixed θ̂ to remain valid along a generated trajectory (§4.4(ii)). Every
-window and every transition share the single attached θ̂ pooled above.
-
-There is no target encoder and no representation-collapse regularizer; the
-targets are the fixed observed states Z_{t+1} (§6.2 "Training uses aligned
-raw-state MSE"). A constant or uninformative θ̂ is a failure to identify the
-parameters, not a collapsed trivial optimum.
+The model also exposes an evaluation-only autoregressive rollout. It refuses
+to run while gradients are enabled or the module is in training mode, so the
+K=30 observational-equivalence diagnostic cannot accidentally become a
+training objective.
 """
 
 from typing import NamedTuple
 
 import torch
-from jaxtyping import Float
+from jaxtyping import Float, Int
 from torch import Tensor, nn
 
 from scjepa.models.parameter_encoder import ParameterEncoder
@@ -47,17 +30,15 @@ from scjepa.models.spartan import Spartan
 
 
 class TransitionOutput(NamedTuple):
-    """One forward pass over an episode batch, flattened to (B·K, ...) rows.
+    """Teacher-forced predictions plus an optional batch of T=2 endpoints.
 
-    The graph quantities (``path_matrix``, ``sparsity``, ``logit_penalty`` and
-    the gate diagnostics) are those of the TEACHER-FORCED pass only. The
-    rollout branch reuses the same predictor and therefore the same gate
-    distribution, but its extra SPARTAN calls do not contribute to the path
-    objective — L_path stays the Eq. 11 quantity measured at observed states.
+    Graph quantities are produced by the teacher-forced predictor call only.
+    The auxiliary calls share the same predictor parameters and ``theta_hat``
+    but do not add duplicate path/logit regularizers.
     """
 
-    prediction: Float[Tensor, "bk n k"]
-    target: Float[Tensor, "bk n k"]
+    prediction: Float[Tensor, "bk n d"]
+    target: Float[Tensor, "bk n d"]
     causal_params: Float[Tensor, "b n 1"]
     path_matrix: Float[Tensor, "bk m m"]
     sparsity: Float[Tensor, ""]
@@ -65,76 +46,133 @@ class TransitionOutput(NamedTuple):
     mean_abs_logit: Float[Tensor, ""]
     mean_gate_probability: Float[Tensor, ""]
     gate_entropy: Float[Tensor, ""]
-    # Hybrid Eqs. 33-35; None when the rollout branch is disabled.
-    # Legacy single-window output is (B, H, N, k). Explicit ``rollout_starts``
-    # retains the window axis and returns (B, W, H, N, k), including for W=1.
-    rollout_prediction: Float[Tensor, "b j n k"] | Float[Tensor, "b w j n k"] | None = None
-    rollout_target: Float[Tensor, "b j n k"] | Float[Tensor, "b w j n k"] | None = None
+    rollout_t2_prediction: Float[Tensor, "b w n d"] | None = None
+    rollout_t2_target: Float[Tensor, "b w n d"] | None = None
+    rollout_t2_offsets: Int[Tensor, "b w"] | None = None
+    rollout_t2_intermediate: Float[Tensor, "b w n d"] | None = None
+
+
+def num_valid_rollout_t2_offsets(sequence_len: int, context_len: int) -> int:
+    """Return the number of true anchors whose two-step target is in bounds.
+
+    The first anchor is ``S_(context_len-1)``. An offset ``r`` is valid when
+    ``context_len - 1 + r + 2 <= sequence_len - 1``. Hence the number of
+    valid offsets is ``sequence_len - context_len - 1`` (29 for 60/30).
+    """
+    if not 1 <= context_len < sequence_len:
+        raise ValueError(f"context_len={context_len} must be in [1, T-1={sequence_len - 1}]")
+    return max(sequence_len - context_len - 1, 0)
+
+
+def sample_rollout_t2_offsets(
+    batch_size: int,
+    num_valid_offsets: int,
+    num_anchors: int,
+    *,
+    device: torch.device | str,
+    generator: torch.Generator | None = None,
+) -> Int[Tensor, "b w"]:
+    """Sample distinct offsets independently for every episode.
+
+    Sampling uses the active PyTorch RNG when ``generator`` is omitted. The
+    trainer checkpoints that RNG (CPU or CUDA), so resuming preserves the
+    sampling stream to the same standard as Gumbel-gate sampling.
+    """
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if num_valid_offsets < 1:
+        raise ValueError(f"no valid two-step rollout offsets ({num_valid_offsets})")
+    if not 1 <= num_anchors <= num_valid_offsets:
+        raise ValueError(f"num_anchors={num_anchors} must be in [1, {num_valid_offsets}]")
+    # Each row receives independent continuous random priorities. Taking the
+    # lowest W priorities is uniform sampling without replacement per row.
+    priorities = torch.rand(
+        batch_size,
+        num_valid_offsets,
+        device=device,
+        generator=generator,
+    )
+    return priorities.topk(num_anchors, dim=1, largest=False, sorted=False).indices
 
 
 class StateToStateModel(nn.Module):
-    """Parameter encoder P_η + SPARTAN f_gamma on ground-truth object states."""
+    """Parameter encoder ``P_eta`` plus SPARTAN state transition ``F_hat``."""
 
     def __init__(self, parameter_encoder: ParameterEncoder, predictor: Spartan) -> None:
-        """Compose the two modules of §6.2 — nothing else exists in this model."""
+        """Compose the parameter encoder and shared transition predictor."""
         super().__init__()
         self.parameter_encoder = parameter_encoder
         self.predictor = predictor
 
     def forward(
         self,
-        states: Float[Tensor, "b t n k"],
+        states: Float[Tensor, "b t n d"],
         context_len: int | None = None,
-        rollout_len: int | None = None,
-        rollout_starts: tuple[int, ...] | None = None,
-        rollout_gradient_cuts: tuple[int, ...] | None = None,
+        num_rollout_t2_anchors: int = 0,
+        rollout_t2_offsets: Int[Tensor, "b w"] | None = None,
     ) -> TransitionOutput:
-        """θ̂ from the context window, then the two branches of the hybrid objective.
+        """Infer one ``theta_hat``, then compute TF and optional T=2 branches.
 
         Args:
-            states: (B, T, N, k) episode batch; the parameter encoder sees
-                observations 0..Tpar-1, and the supervised pairs are
-                (Z_{Tpar-1}, Z_{Tpar}), …, (Z_{T-2}, Z_{T-1})  (Eq. 7).
-            context_len: Tpar (the state-to-state regime: 30). None -> T-1 (K = 1).
-            rollout_len: K for the autoregressive branch (hybrid Eqs. 33-35).
-                None disables it, reproducing the pure teacher-forced objective.
-            rollout_starts: Fixed zero-based offsets from the legacy anchor
-                ``Tpar - 1``. For example, ``(0, 10, 20)`` creates three
-                true-anchored local windows. ``None`` preserves the legacy
-                single-window output shape; an explicit tuple retains a window
-                axis, even when it contains one start.
-            rollout_gradient_cuts: One-based completed rollout steps after
-                which the predicted state is detached before being fed to the
-                next transition. A cut changes only backward propagation: it
-                never resets the forward state and never detaches θ̂.
+            states: Episode batch ``(B, T, N, d)``.
+            context_len: Number of states used to infer ``theta_hat``. The
+                teacher-forced anchors begin at ``context_len - 1``.
+            num_rollout_t2_anchors: Number of distinct offsets sampled per
+                episode. Zero disables the auxiliary branch without drawing
+                from the RNG, which exactly recovers teacher forcing.
+            rollout_t2_offsets: Optional explicit ``(B, W)`` offsets. This is
+                used by deterministic evaluation/tests; normal training leaves
+                it unset and samples with the active training RNG.
         """
         if states.ndim != 4 or states.shape[1] < 2:
-            raise ValueError(f"expected (B, T>=2, N, k), got {tuple(states.shape)}")
-        length = states.shape[1]
+            raise ValueError(f"expected (B, T>=2, N, d), got {tuple(states.shape)}")
+        batch, length = states.shape[:2]
         tpar = context_len if context_len is not None else length - 1
         if not 1 <= tpar < length:
             raise ValueError(f"context_len={tpar} must be in [1, T-1={length - 1}]")
-        num_transitions = length - tpar  # K
+        if num_rollout_t2_anchors < 0:
+            raise ValueError("num_rollout_t2_anchors must be non-negative")
+        num_transitions = length - tpar
 
-        causal_params = self.parameter_encoder(states[:, :tpar])  # (B, N, 1), Eq. 26
-        anchors = states[:, tpar - 1 : -1].flatten(0, 1)  # true Z_t, t ∈ I_TF
-        targets = states[:, tpar:].flatten(0, 1)  # true Z_{t+1}
-        params = causal_params.repeat_interleave(num_transitions, dim=0)  # same θ̂ ∀ t
+        # Exactly one episode-level parameter inference. The same attached
+        # tensor is expanded (never recomputed or detached) everywhere below.
+        causal_params = self.parameter_encoder(states[:, :tpar])
+        anchors = states[:, tpar - 1 : -1].flatten(0, 1)
+        targets = states[:, tpar:].flatten(0, 1)
+        params = causal_params.repeat_interleave(num_transitions, dim=0)
         out = self.predictor(anchors, params)
 
-        rollout_prediction = rollout_target = None
-        if rollout_len is None:
-            if rollout_starts is not None or rollout_gradient_cuts is not None:
-                raise ValueError("rollout_starts and rollout_gradient_cuts require rollout_len")
-        else:
-            rollout_prediction, rollout_target = self._rollout(
+        endpoint = endpoint_target = sampled_offsets = intermediate = None
+        if rollout_t2_offsets is not None:
+            if rollout_t2_offsets.ndim != 2 or rollout_t2_offsets.shape[0] != batch:
+                raise ValueError(
+                    "rollout_t2_offsets must have shape (B, W), got "
+                    f"{tuple(rollout_t2_offsets.shape)} for B={batch}"
+                )
+            if rollout_t2_offsets.dtype == torch.bool or rollout_t2_offsets.is_floating_point():
+                raise ValueError("rollout offsets must be integer indices")
+            if num_rollout_t2_anchors not in (0, rollout_t2_offsets.shape[1]):
+                raise ValueError(
+                    "num_rollout_t2_anchors must be zero or match explicit offset width"
+                )
+            sampled_offsets = rollout_t2_offsets.to(device=states.device, dtype=torch.long)
+        elif num_rollout_t2_anchors > 0:
+            valid = num_valid_rollout_t2_offsets(length, tpar)
+            sampled_offsets = sample_rollout_t2_offsets(
+                batch,
+                valid,
+                num_rollout_t2_anchors,
+                device=states.device,
+            )
+
+        if sampled_offsets is not None:
+            endpoint, endpoint_target, intermediate = self.rollout_t2_from_offsets(
                 states,
                 tpar,
-                rollout_len,
                 causal_params,
-                starts=rollout_starts,
-                gradient_cuts=rollout_gradient_cuts,
+                sampled_offsets,
             )
+
         return TransitionOutput(
             prediction=out.prediction,
             target=targets,
@@ -145,96 +183,96 @@ class StateToStateModel(nn.Module):
             mean_abs_logit=out.mean_abs_logit,
             mean_gate_probability=out.mean_gate_probability,
             gate_entropy=out.gate_entropy,
-            rollout_prediction=rollout_prediction,
-            rollout_target=rollout_target,
+            rollout_t2_prediction=endpoint,
+            rollout_t2_target=endpoint_target,
+            rollout_t2_offsets=sampled_offsets,
+            rollout_t2_intermediate=intermediate,
         )
 
-    def _rollout(
+    def rollout_t2_from_offsets(
         self,
-        states: Float[Tensor, "b t n k"],
-        tpar: int,
-        horizon: int,
+        states: Float[Tensor, "b t n d"],
+        context_len: int,
         causal_params: Float[Tensor, "b n 1"],
-        starts: tuple[int, ...] | None = None,
-        gradient_cuts: tuple[int, ...] | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """Hybrid Eqs. 33-34: one or more K-step autoregressive rollouts.
+        offsets: Int[Tensor, "b w"],
+    ) -> tuple[
+        Float[Tensor, "b w n d"],
+        Float[Tensor, "b w n d"],
+        Float[Tensor, "b w n d"],
+    ]:
+        """Vectorize independent true-anchored two-step windows.
 
-            Ŝ^[0]_t := S^on_t,   Ŝ^[k]_{t+k} := f_gamma(Ŝ^[k-1]_{t+k-1}, θ̂)
-
-        By default the chain starts at t = Tpar-1, the same anchor the first
-        teacher-forced transition uses, and runs over t+1, …, t+K. Explicit
-        ``starts`` are fixed offsets from that anchor. They are true-anchored
-        local windows, vectorised into the predictor batch while reusing the
-        one θ̂ that was already computed from the context.
-
-        For k >= 2 the predictor consumes its own previous output, never a
-        fresh encoding — this is what forces one fixed θ̂ to stay valid along a
-        generated trajectory (§4.4(ii)). The same attached θ̂ is reused at
-        every step and in every window. A gradient cut is applied only after
-        its prediction has been saved, so that prediction keeps its own loss
-        path while later losses cannot backpropagate across the boundary.
-        Gates are resampled per step (Eq. 33's fresh noise) because each step
-        is a separate SPARTAN call.
+        Only the second prediction is supervised. The intermediate is retained
+        for contract tests and is never detached before the second call.
         """
-        length = states.shape[1]
-        if horizon < 1:
-            raise ValueError(f"rollout_len must be positive, got {horizon}")
-        keep_window_axis = starts is not None
-        relative_starts = (0,) if starts is None else starts
-        if not relative_starts:
-            raise ValueError("rollout_starts must contain at least one start")
-        if any(start < 0 for start in relative_starts):
-            raise ValueError(f"rollout_starts must be non-negative, got {relative_starts}")
-        if len(set(relative_starts)) != len(relative_starts):
-            raise ValueError(f"rollout_starts must be distinct, got {relative_starts}")
+        batch, length = states.shape[:2]
+        valid = num_valid_rollout_t2_offsets(length, context_len)
+        if offsets.ndim != 2 or offsets.shape[0] != batch or offsets.shape[1] < 1:
+            raise ValueError(f"offsets must be non-empty (B, W), got {tuple(offsets.shape)}")
+        if offsets.dtype == torch.bool or offsets.is_floating_point():
+            raise ValueError("rollout offsets must be integer indices")
+        offsets = offsets.to(device=states.device, dtype=torch.long)
+        if bool((offsets < 0).any()) or bool((offsets >= valid).any()):
+            raise ValueError(f"rollout offsets must lie in [0, {valid - 1}]")
+        sorted_offsets = offsets.sort(dim=1).values
+        if sorted_offsets.shape[1] > 1 and bool(
+            (sorted_offsets[:, 1:] == sorted_offsets[:, :-1]).any()
+        ):
+            raise ValueError("rollout offsets must be distinct within every episode")
 
-        cuts = () if gradient_cuts is None else gradient_cuts
-        if len(set(cuts)) != len(cuts) or any(cut < 1 or cut >= horizon for cut in cuts):
-            raise ValueError(
-                "rollout_gradient_cuts must be distinct completed steps in "
-                f"[1, rollout_len-1={horizon - 1}], got {cuts}"
-            )
-        cut_steps = set(cuts)
-
-        latest_start = max(relative_starts)
-        if tpar + latest_start + horizon > length:
-            raise ValueError(
-                "rollout window runs past the episode: need "
-                "Tpar-1+start+K <= T-1, got "
-                f"{tpar - 1}+{latest_start}+{horizon} > {length - 1} "
-                f"(T={length}, Tpar={tpar})"
-            )
-
-        # (B, W, N, k) -> (B·W, N, k). Expand, rather than recompute, the one
-        # attached θ̂ per episode; autograd sums all window/step contributions
-        # back into that same encoder output.
-        anchors = torch.stack([states[:, tpar - 1 + start] for start in relative_starts], dim=1)
-        batch, num_windows = anchors.shape[:2]
-        state = anchors.flatten(0, 1)
+        num_windows = offsets.shape[1]
+        episode_index = torch.arange(batch, device=states.device)[:, None]
+        anchor_index = context_len - 1 + offsets
+        true_anchors = states[episode_index, anchor_index]
         window_params = (
             causal_params[:, None]
             .expand(-1, num_windows, -1, -1)
             .reshape(batch * num_windows, *causal_params.shape[1:])
         )
-        predictions: list[Tensor] = []
-        for step in range(1, horizon + 1):
-            state = self.predictor(state, window_params).prediction  # Eq. 34
-            predictions.append(state)
-            if step in cut_steps:
-                state = state.detach()
+        first = self.predictor(true_anchors.flatten(0, 1), window_params).prediction
+        # No detach: endpoint gradients traverse both transition calls.
+        second = self.predictor(first, window_params).prediction
+        target = states[episode_index, anchor_index + 2].detach()
+        shape = (batch, num_windows, *states.shape[2:])
+        return second.reshape(shape), target, first.reshape(shape)
 
-        prediction = torch.stack(predictions, dim=1).reshape(
-            batch, num_windows, horizon, *states.shape[2:]
-        )
-        # Targets S̄_{t+1}, …, S̄_{t+K}; .detach() is Eq. 35's sg(·).
-        target = torch.stack(
-            [states[:, tpar + start : tpar + start + horizon] for start in relative_starts],
-            dim=1,
-        ).detach()
-        if not keep_window_axis:
-            return prediction[:, 0], target[:, 0]
-        return prediction, target
+    def rollout_for_evaluation(
+        self,
+        states: Float[Tensor, "b t n d"],
+        context_len: int,
+        horizon: int,
+        causal_params: Float[Tensor, "b n 1"],
+    ) -> tuple[Float[Tensor, "b k n d"], Float[Tensor, "b k n d"]]:
+        """Run one open-loop trajectory strictly as a no-gradient diagnostic.
+
+        The chain begins at the true state ``S_(context_len-1)`` and feeds every
+        generated prediction into the next transition. This method is outside
+        :meth:`forward` so no training call can request K=30 BPTT.
+        """
+        if self.training:
+            raise RuntimeError("evaluation rollout requires model.eval()")
+        if torch.is_grad_enabled():
+            raise RuntimeError("evaluation rollout requires torch.no_grad()")
+        if states.ndim != 4:
+            raise ValueError(f"expected (B, T, N, d), got {tuple(states.shape)}")
+        if horizon < 1:
+            raise ValueError(f"evaluation horizon must be positive, got {horizon}")
+        length = states.shape[1]
+        if not 1 <= context_len < length:
+            raise ValueError(f"invalid context_len={context_len} for T={length}")
+        if context_len + horizon > length:
+            raise ValueError(
+                f"evaluation horizon {horizon} runs past T={length} from anchor S_{context_len - 1}"
+            )
+        if causal_params.shape[0] != states.shape[0]:
+            raise ValueError("causal_params batch does not match states")
+
+        state = states[:, context_len - 1]
+        predictions: list[Tensor] = []
+        for _ in range(horizon):
+            state = self.predictor(state, causal_params).prediction
+            predictions.append(state)
+        return torch.stack(predictions, dim=1), states[:, context_len : context_len + horizon]
 
 
 def build_state_to_state(
@@ -251,7 +289,7 @@ def build_state_to_state(
     spartan_dense: bool = False,
     spartan_identity: bool = False,
 ) -> StateToStateModel:
-    """Build the state-to-state model from plain config values (Hydra-friendly)."""
+    """Build the state-to-state model from plain configuration values."""
     return StateToStateModel(
         parameter_encoder=ParameterEncoder(
             state_dim=state_dim,
@@ -274,4 +312,10 @@ def build_state_to_state(
     )
 
 
-__all__ = ["StateToStateModel", "TransitionOutput", "build_state_to_state"]
+__all__ = [
+    "StateToStateModel",
+    "TransitionOutput",
+    "build_state_to_state",
+    "num_valid_rollout_t2_offsets",
+    "sample_rollout_t2_offsets",
+]

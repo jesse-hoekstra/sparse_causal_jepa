@@ -47,12 +47,18 @@ JEPA Using a SPARTAN"**. You write composable, shape-safe, configurable `nn.Modu
   document the exception.
 - Capacity knobs from the paper are config, not constants: N (slots — chosen by attending to objects
   across the whole video, per Nam et al.), d (roomy enough for Markovian state, ≈2k for
-  position+velocity), Th (history), and Tp. In Experiment 1, D36 keeps all 30 teacher-forced
-  suffix transitions while first training three true-anchored windows `[0,10,20]` at H=2/5/10,
-  then one continuous K=30 forward trajectory with backward-only cuts removed from depths
-  10→15→20→25→30. The exact uncut stage begins at 115k accepted updates and uses
-  `lambda_roll = 1.0`. Reuse one attached theta estimate across every step/window; never turn a
-  gradient cut into a state reset or treat the rollout as eval-only.
+  position+velocity), Th (history), and Tp. In Experiment 1, D37 keeps all 30 teacher-forced
+  suffix transitions and adds exactly eight independently sampled, distinct valid T=2 windows per
+  episode. A window starts from its true anchor, its second call consumes the generated first
+  prediction without a detach, and only the second prediction is supervised by the auxiliary
+  loss. Infer one attached `theta_hat` from states 0..29 and reuse it across every transition and
+  all eight vectorized windows. Derive valid offsets from actual tensor dimensions; at C=30/T=60
+  they are 0..28. There is no state-to-state K=30 training branch, curriculum, warmup, gradient
+  cut, accepted-update schedule state, or full-rollout backward graph.
+- Experiment 1's K=30 model path is evaluation-only: one chain begins at true `S_29`, recursively
+  consumes generated states through `Shat_59`, reuses the same `theta_hat`, and may only be called
+  in evaluation mode under `torch.no_grad()`. Keep this state-to-state diagnostic distinct from
+  Experiment 3's separately specified visual-to-visual fixed-K training objective.
 - Encoders train **from scratch** (D7): no pretrained-checkpoint loading paths, no init-from-SAVi
   machinery — emergence without reconstruction is part of the paper's claim.
 

@@ -44,8 +44,11 @@ train:
   # so f cannot be composed with itself and Assumption 4's closure
   # F_gamma(S, theta) in S fails by type, not by approximation error. The
   # identification argument for this regime therefore rests on teacher forcing
-  # alone; Experiments 1 and 3 carry the trajectory term (D34).
-  rollout_len: null
+  # alone. Experiment 1 now has a local T=2 endpoint auxiliary (D37), while
+  # Experiment 3 retains a separately specified latent fixed-K rollout.
+  lambda_rollout_t2: 0.0
+  visual_rollout_len: null
+  lambda_visual_rollout: 0.0
   # sparsity_tau is MANDATORY (`???` in configs/config.yaml) and read only when
   # sparsity_enabled=true, so the dense reference stage runs without it. The
   # pipeline supplies tau_2 from that stage; a placeholder here would silently

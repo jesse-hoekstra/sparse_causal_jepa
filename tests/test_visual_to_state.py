@@ -175,8 +175,7 @@ def test_training_step_runs() -> None:
     assert metrics["health/skipped_steps"] == 0.0
     assert metrics["health/latent_std"] >= 0.0
     assert metrics["loss/sparsity"] > 0.0
-    assert trainer.successful_updates == 1
-    assert metrics["schedule/successful_updates"] == 1.0
+    assert not any(key.startswith("schedule/") for key in metrics)
 
 
 def test_evaluation_reports_the_shared_metric_keys() -> None:

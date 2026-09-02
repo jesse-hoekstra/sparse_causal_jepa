@@ -1,13 +1,14 @@
 # Research goals and staged experimental roadmap
 
-**Status:** active roadmap, updated 2026-08-07 for D36's rollout continuation.
+**Status:** active roadmap, updated 2026-09-02 for D37's fixed TF+T=2 objective.
 
 This file records the research goal, the experimental ladder, the success criteria for each
 stage, and the implementation work needed to move between stages. It is a plan, not a replacement
 for settled design decisions. If this file conflicts with [`docs/decisions.md`](../docs/decisions.md),
-the latest non-superseded decision there wins. D36 is the current Experiment-1 optimisation
-protocol: local early/middle/late windows prepare one continuous K=30 forward rollout, then
-backward-only cuts are removed gradually until exact full BPTT. D34's final objective is unchanged.
+the latest non-superseded decision there wins. D37 is the current Experiment-1 protocol: all 30
+teacher-forced suffix transitions plus eight independently sampled, true-anchored T=2 endpoint
+windows per episode. D34–D36's state-to-state K=30 training objective and curriculum are
+superseded. Experiment 3's separate visual-to-visual K=30 protocol is unchanged.
 
 ## Central research question
 
@@ -38,12 +39,12 @@ model would strengthen the result, but a dramatic MCC gap is not required.
 | Name | Meaning | What it establishes |
 |---|---|---|
 | `train.lambda_logit` | Fixed coefficient multiplying Baumgartner's attention-logit penalty. This is what the current dense sweep selects. | Controls logit magnitude without materially damaging prediction. |
-| `sparsity/lambda` | GECO dual variable. It is frozen until D36's uncut K=30 stage; when active, the path-pressure weight is `1 / lambda`. | Shows whether the active constraint controller is moving into or out of the pruning phase. |
-| `sparsity/active` | Boolean indicating that the path penalty and GECO update are enabled. Under D36 it stays `0` through local windows and cut K=30 stages and becomes `1` only for uncut K=30. | Only says the pruning mechanism is switched on; it does **not** prove that pruning happened. |
-| `schedule/successful_updates` | Number of accepted batches for which `optimizer.step()` executed. | Drives D36's stage; rejected gradient-spike batches do not advance it. |
-| `schedule/successful_updates_before_batch` | Accepted-update count used to select the stage for the logged batch. | Removes the one-record boundary ambiguity caused by incrementing the accepted counter after a successful batch. |
-| `schedule/rollout_len` | Live autoregressive horizon; `0` means the branch is off. | Identifies local horizon, but not the cut stage after 50k; combine it with window, cut, max-depth, and stage-start metrics. |
-| `schedule/stage_start_update`, `schedule/rollout_windows`, `schedule/max_bptt_depth`, `schedule/gradient_cut_*` | Exact stage specification used for the logged loss. | Primary debugging provenance for distinguishing the four K=30 backward graphs. |
+| `train/loss_teacher_forcing` | Mean aligned MSE over all 30 true-anchored suffix transitions. | Tracks the restored stable predictive foundation. |
+| `train/loss_rollout_t2_raw` / `train/loss_rollout_t2_weighted` | Endpoint-only T=2 MSE before/after the fixed coefficient. The raw loss is averaged over episodes, eight windows, objects, and coordinates. | Tracks local composition error without a K=30 recurrent backward graph. |
+| `sparsity/lambda` | GECO dual variable. In a D37 sparse run it is active from the start; the path-pressure weight is `1 / lambda`. | Shows whether the active constraint controller is moving into or out of the pruning phase. |
+| `sparsity/active` | Boolean indicating that the path penalty and GECO update are enabled. There is no D37 schedule gate. | Only says the pruning mechanism is switched on; it does **not** prove that pruning happened. |
+| `eval/oe_sample_satisfaction_k30` | Fraction of fixed held-out episodes whose coordinate-normalized worst-step K=30 NRMSE is at most the configured tolerance. | Empirical sampled trajectory-agreement diagnostic, not a training loss or population proof. |
+| `eval/oe_k30_worst_step_nrmse_p50` / `eval/oe_k30_worst_step_nrmse_p95` | Continuous quantiles of each episode's worst K=30 normalized step error. | Makes the thresholded satisfaction rate interpretable. |
 | `loss/sparsity` | Sum of multilayer path multiplicities into decoded state rows. | The raw path statistic; it enters the objective only when `sparsity/active=1` and is not a normalized edge density. |
 | `path_density` | Fraction of source-token to decoded-state-output pairs with at least one path. | Primary, interpretable pruning curve. Identity is `0.1` and dense is `1.0` for the current ten-token system. |
 | `path_density_full` | Reachability density over all token-output rows, including parameter-token outputs that are not decoded. | Diagnostic only; it is not the pruning objective or primary graph metric. |
@@ -90,9 +91,9 @@ model would strengthen the result, but a dramatic MCC gap is not required.
    pilot seed. Any protocol change made after inspecting it is frozen before eight fresh
    confirmatory seeds, proposed as seeds 1-8. Scientific summaries include every completed
    confirmatory run, including valid optimization failures.
-10. **Do not compare constraints across rollout stages.** Experiment 1's tau is a terminal-K=30
-    quantity. Periodic TF/K<30 constraints are stage-health diagnostics only; they neither trigger
-    GECO nor establish final feasibility.
+10. **Keep training constraint and OE evaluation distinct.** Experiment 1's tau is calibrated for
+    `L_TF + lambda_rollout_t2 * L_AR2 + lambda_logit * L_logit`. The no-gradient K=30 OE
+    diagnostic is never part of the constraint and must not set tau.
 
 ## Stage 0: select `lambda_logit`
 
@@ -108,8 +109,8 @@ learned gates to prune.
 The current scripts already encode the rule:
 
 1. Include an exact `lambda_logit = 0` control.
-2. Train every candidate as the dense `A=1` model with sparsity disabled under identical
-   provenance, including D36's full accepted-update rollout specification.
+2. Train every candidate as the dense `A=1` model with sparsity disabled under identical D37
+   provenance, including the fixed T=2 coefficient, anchor count, and endpoint definition.
 3. Reject candidates whose held-out prediction loss is more than 5% worse than the zero control.
 4. Compute the excess logit penalty above its theoretical minimum of `2`.
 5. On the prediction/logit Pareto frontier, select the smallest non-zero coefficient achieving
@@ -138,7 +139,7 @@ Relevant implementation:
 
 ### Scientific goal
 
-Demonstrate that the current D36 system can recover the five masses and discover a sparse
+Demonstrate that the current D37 system can recover the five masses and discover a sparse
 parameter-to-state dependency structure while retaining the predictive performance required by
 the fully connected reference.
 
@@ -150,37 +151,42 @@ the fully connected reference.
   permutation is permitted during held-out mass evaluation; per-episode rematching is forbidden.
 - SPARTAN has five state tokens, five parameter tokens, three layers, and no auxiliary tokens.
 - Prediction is aligned raw MSE in a fixed physical coordinate system.
-- Training always uses all 30 teacher-forced suffix transitions and `lambda_roll = 1.0`.
-- Accepted updates 10k/20k/30k train three true-anchored windows from offsets `[0,10,20]`
-  at H=2/5/10. At 50k a single continuous K=30 forward chain begins with feedback-gradient
-  cuts `[10,20]`; stages at 70k/85k/100k use cuts `[15]`/`[20]`/`[25]`; 115k removes all cuts.
-  Detach is the identity forward, never resets to truth, and never detaches the one shared
-  `theta_hat`. Gradient-spike skips do not advance the accepted-update clock.
-- In the sparse run, both the path term and GECO remain inactive until the exact one-window,
-  uncut K=30 stage at 115k, then activate with the dual state untouched.
+- Training always uses all 30 teacher-forced suffix transitions and a fixed
+  `lambda_rollout_t2 = 1.0` auxiliary term.
+- For each episode, sample exactly eight distinct offsets uniformly without replacement from all
+  valid T=2 anchors, independently of the other episodes. At C=30/T=60 the valid offsets are
+  `0,...,28`. Each window begins from true `S_(29+r)`, feeds its first generated prediction into
+  the second predictor call without detaching it, and supervises only the second prediction.
+- Infer `theta_hat` once from `S_0,...,S_29` and reuse that same attached episode-level tensor for
+  every teacher-forced transition and all eight windows. Average the T=2 loss over episode,
+  window, object, and coordinate dimensions.
+- There is no K=30 training loss, rollout curriculum, horizon warmup, gradient-cut progression,
+  accepted-update stage state, delayed sparsity activation, or full-rollout backpropagation.
+  The path term and GECO are active from the beginning of a sparse run.
+- A K=30 chain from true `S_29` through generated `Shat_59` is retained only as a deterministic,
+  fixed-held-out `model.eval()`/`torch.no_grad()` OE diagnostic using fixed training-coordinate
+  standard deviations. It never contributes to training or tau.
 - The current sweep's selected `lambda_logit` is fixed before this pipeline begins.
 
 The operative config is
-[`bounce_baumgartner.yaml`](../configs/experiment/bounce_baumgartner.yaml), with D36 as the latest
+[`bounce_baumgartner.yaml`](../configs/experiment/bounce_baumgartner.yaml), with D37 as the latest
 protocol decision.
 
 ### Execution sequence for each seed
 
-1. **Dense reference:** train the deterministic `A=1` model for the full budget with path sparsity
-   disabled and the exact D36 continuation. It must have
-   `successful_updates > 115000`; exactly 115k is the boundary checkpoint and has trained zero
-   uncut full-BPTT K=30 batches.
-   The relevant held-out calibration quantity is the terminal-K=30 teacher-forced plus rollout
-   prediction term and `lambda_logit * logit_penalty`, not bare MSE or an earlier-stage loss.
+1. **Dense reference:** train the deterministic `A=1` model for the full 300k budget with path
+   sparsity disabled and the exact fixed D37 TF+T=2 objective. The relevant held-out calibration
+   quantity is teacher forcing plus the weighted T=2 endpoint term and
+   `lambda_logit * logit_penalty`, not bare teacher-forcing MSE or the K=30 OE diagnostic.
 2. **Identity reference:** train the deterministic `A=0` model under the same budget.
-3. **Pre-main calibration and feasibility gate:** evaluate dense and identity at terminal K=30 on
-   the same large validation set with paired per-episode constraints. Set tau to `1.0` times the
+3. **Pre-main calibration and feasibility gate:** evaluate dense and identity under the final
+   TF+T=2 constraint on the same large validation set with paired per-episode values. Set tau to
+   `1.0` times the
    large-set dense mean and require the 95% paired interval for
    `identity_constraint - dense_constraint` to lie above zero. If not, do not launch sparse.
 4. **Sparse main run:** only after that gate passes, train the gated model with the fixed
-   `lambda_logit`, the newly measured tau, and the identical D36 curriculum. `sparsity_enabled`
-   declares that sparsity will activate, but the path term and GECO remain frozen until the
-   uncut K=30 stage at 115k accepted updates.
+   `lambda_logit`, the newly measured tau, and identical D37 T=2 settings. `sparsity_enabled`
+   activates the path term and GECO from the first update; it is not schedule-dependent.
 5. **Common final evaluation:** after all choices are frozen, evaluate dense, identity, and sparse
    checkpoints on the same 5,000-episode test split. The current evaluator overwrites
    `metrics.json`, `recovery_alignment.json`, and `recovery_grid.png`; add split-suffixed output
@@ -216,11 +222,9 @@ sbatch --account=<PROJECT> scripts/isambard_exp1_pipeline.sbatch full_seed0 "$LA
 
 ### What counts as actual pruning
 
-Before terminal uncut K=30, `sparsity/active` must be zero. The local-window constraints before
-50k are not comparable with tau; from 50k onward the cut K=30 forward value is already on the
-terminal constraint scale because detach changes only its gradient. Once the 115k stage begins,
-`sparsity/active = 1` is necessary but not evidence. A successful pruning trajectory requires all
-of the following:
+Under D37, `sparsity/active = 1` from the first sparse update is necessary but not evidence of
+pruning. There is no pre-sparsity rollout stage. A successful pruning trajectory requires all of
+the following:
 
 1. The GECO controller's smoothed **training** constraint crosses tau, while the read-only held-out
    `eval/constraint_loss` approaches and remains near tau.
@@ -293,8 +297,8 @@ report.
 | Sparse has a small, consistent paired MCC advantage. | Strongest intended result; sparsity also improves or stabilizes parameter recovery. |
 | Dense identifies masses; sparse MCC is materially worse after pruning. | Pruning did not preserve identification, even if density decreased. |
 | MCC is high but parameter edges/ablation have no effect. | Mass is encoded but not shown to be used by the predictor. |
-| Before uncut K=30, lambda stays fixed and `sparsity/active=0`; density may drift through prediction gradients. | Expected D36 dynamics pretraining; do not call density movement path-driven pruning yet. |
-| After K=30, density stays near `1.0`, lambda stays capped, and constraint stays above tau. | Pruning never engaged; diagnose feasibility or gate commitment. |
+| Density stays near `1.0`, lambda stays capped, and the TF+T=2 constraint stays above tau. | Pruning never engages; diagnose feasibility, gate commitment, or stale tau. |
+| OE satisfaction is low while TF/T=2 losses are healthy. | The local objective is fitting but long held-out trajectories still drift; report it rather than treating OE as a hidden training loss. |
 | Density reaches `0.1` and MCC/prediction approach identity. | Empty-graph collapse. |
 | Density falls while `shd_param_aligned` worsens. | Indiscriminate rather than causal pruning. |
 | Tau is not below identity. | Invalid experiment: no feasible constraint can force parameter use. |
@@ -302,8 +306,7 @@ report.
 ### Validity checks
 
 Reserve **invalid/rerun** for external interruption, corrupt or missing artifacts, wrong/stale data,
-inconsistent provenance, `successful_updates <= 115000` in a reportable run, or execution that did
-not run the frozen protocol. A reproducible
+inconsistent provenance, or execution that did not run the frozen protocol. A reproducible
 non-finite trajectory, zombie/frozen optimizer, sustained gradient-skip episode, memorization gap,
 or other optimization pathology under the frozen protocol is a **valid failed outcome** and stays
 in the confirmatory denominator; do not rerun it until a favorable seed appears. A protocol change
@@ -923,8 +926,9 @@ prediction, correct graph structure, and retained mass identification are not.
 - [ ] Inspect `sweep_summary.json`, provenance, admissibility, and the zero control.
 - [ ] Freeze the selected `lambda_logit` for Stage 1.
 - [ ] Run one complete dense -> identity -> sparse Stage-1 pilot.
-- [ ] Check the first evaluation points for constraint motion, lambda response, density motion,
-      gradients, skips, and memorization before waiting for completion.
+- [ ] Check the first evaluation points for finite TF/T=2 losses and branch gradients, constraint
+      motion, lambda response, density motion, skips, memorization, and the fixed-held-out K=30 OE
+      satisfaction/p50/p95 curves before waiting for completion.
 - [ ] Add split-suffixed evaluation outputs or archive validation artifacts before evaluating a
       reference checkpoint on another split.
 - [ ] Strengthen dense/identity feasibility evaluation with a common large validation set and a
