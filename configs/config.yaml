@@ -19,8 +19,9 @@
 #     penalty in BOTH the objective and the dual constraint. Choose it from the
 #     label-free dense sweep (scripts/isambard_logit_sweep.sbatch); pass 0.0
 #     explicitly to run the no-penalty ablation deliberately.
-#   * `train.sparsity_tau` — must be 1.0x the held-out constraint of a converged
-#     dense reference (§6.1.3), which only a pipeline can compute. It is read
+#   * `train.sparsity_tau` — supplied by the relevant experiment pipeline from
+#     matched held-out references. Experiment 1 uses a fixed multiplier ladder
+#     with dense and identity references. It is read
 #     ONLY when `sparsity_enabled=true`, so dense/token-local reference stages
 #     run without supplying it.
 # Every run prints a RUN CONFIGURATION banner naming the source of each
@@ -66,7 +67,7 @@ train:
   lr: 5.0e-5 # SPARTAN App. A.1 (Adam)
   grad_clip: 1.0
   sparsity_enabled: true # false: dense / token-local references
-  sparsity_tau: ??? # MANDATORY: 1.0x a converged dense reference (§6.1.3).
+  sparsity_tau: ??? # MANDATORY: calibrated from the experiment's held-out references.
   # Read only when sparsity_enabled=true, so reference stages omit it.
   sparsity_step_size: 2.0e-2 # alpha, the one numerical knob the papers leave open
   sparsity_lambda_init: 1.0e6 # §6.1.3: lambda starts at 1e6 (path weight 1e-6)

@@ -23,7 +23,9 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=1-00:00:00
+# Three full training stages now run serially; request headroom beyond the old
+# two-stage 24-hour allocation. Override this at submission if the site caps it.
+#SBATCH --time=1-12:00:00
 #SBATCH --output=slurm-%x-%j.out
 
 set -euo pipefail
@@ -101,7 +103,6 @@ bash scripts/run_bounce_example.sh \
   --eval-episodes=5000 \
   --final-seed-offset=29 \
   --eval-device=cuda \
-  --tau-factor=1.0 \
   experiment=bounce_baumgartner \
   wandb.enabled=true \
   train.device=cuda \
