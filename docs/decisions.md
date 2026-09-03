@@ -765,3 +765,23 @@ use `train/grad_norm_teacher_forcing` and `train/grad_norm_rollout_t2_weighted`.
 finite-gradient/skip safeguards, dual/sparsity diagnostics, MCC, and SHD remain. D37 changes
 only the state-to-state Experiment-1 objective: Experiment 2 remains teacher-forcing-only by
 type, and Experiment 3 retains its separately specified latent-space fixed-K rollout.
+
+## D38 — Gate Experiment-1 tau with a freshly trained identity reference (decided 2026-09-03)
+
+D29's Experiment-1 rule `tau = 1.0 * C_dense` with no identity stage is superseded. Under the
+D37 teacher-forcing-plus-T=2 objective, the zero-slack threshold can make the learned-gate model
+chase the dense optimum without ever entering a useful pruning regime. The old teacher-forcing
+identity loss is also on the wrong objective scale and cannot certify feasibility for D37.
+
+Every Experiment-1 pipeline therefore trains a dense reference and then an identity
+(`A = 0`, token-local) reference with the same seed, data, optimization settings, objective, and
+training length. Both are evaluated on 256 held-out episodes at seed offset 17. Starting from
+the most permissive candidate, the pipeline selects the first factor in
+`[2.0, 1.8, 1.6, 1.4]` satisfying the strict empirical gate
+
+    C_dense < tau = factor * C_dense < C_identity.
+
+If no candidate satisfies the inequality, the pipeline stops before sparse training. The
+selected factor is a declared slack heuristic, not a value fixed by the identification theorem;
+the identity comparison ensures only empirical feasibility on the matched reference split.
+Terminal sparse evaluation remains on the disjoint seed-offset-29 split.

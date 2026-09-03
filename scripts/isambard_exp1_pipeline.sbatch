@@ -9,16 +9,17 @@
 # NOTE: unlike the omi box there is NO nohup here — sbatch detaches the job;
 # follow it with `tail -f slurm-scjepa-bounce-<jobid>.out` or `squeue --me`.
 #
-# Walltime: one job runs the dense reference and then the sparse main run, so
-# there are two training stages. Both use the same teacher-forcing-plus-T=2
-# objective, allowing tau to be freshly calibrated for the exact main protocol.
+# Walltime: one job runs dense and identity references, then the sparse main
+# run, so there are three training stages. All use the same
+# teacher-forcing-plus-T=2 objective. The reference losses select the largest
+# feasible tau factor from 2.0, 1.8, 1.6, and 1.4.
 #SBATCH --job-name=scjepa-bounce
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=64
-#SBATCH --time=16:00:00
+#SBATCH --time=1-00:00:00
 #SBATCH --output=slurm-%x-%j.out
-# Expected runtime is ~10-16h (2 longer training stages + periodic evals + final
+# Expected runtime is ~15-24h (3 longer training stages + periodic evals + final
 # evals + pregen), but train.py has NO resume: a job
 # killed at the wall loses its in-flight stage entirely, while over-asking
 # costs only backfill priority on a busy queue.
@@ -27,9 +28,8 @@
 # and submit with --account=<it>.
 
 set -euo pipefail
-# Paper-faithful SPARTAN App. A.2: tau is exactly the converged fully connected
-# reference loss. If the gated model cannot reach it, diagnose gate commitment;
-# do not silently loosen the reported constraint.
+# Tau is selected in-pipeline only after the dense and identity reference
+# losses establish C_dense < tau < C_identity.
 if [ "$#" -lt 2 ]; then
   echo "usage: sbatch $0 RUN_TAG LAMBDA_LOGIT [SEED]" >&2
   echo "choose LAMBDA_LOGIT from scripts/isambard_logit_sweep.sbatch first" >&2
@@ -74,7 +74,6 @@ bash scripts/run_bounce_example.sh \
   --eval-episodes=5000 \
   --final-seed-offset=29 \
   --eval-device=cuda \
-  --tau-factor=1.0 \
   experiment=bounce_baumgartner \
   wandb.enabled=true \
   train.device=cuda \

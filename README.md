@@ -97,23 +97,25 @@ The GT-embedding diagnostic regime (`model.type: states`) runs the channel split
 ground-truth object states — slot i ≡ ball i by construction — so the identifiability metrics
 are directly meaningful.
 
-**One command runs the current procedure** — τ calibration (fully-connected reference, sparsity
-off), the main sparsity run with the calibrated τ, and terminal identifiability evaluation. Supply
-the `lambda_logit` selected by the dense sweep:
+**One command runs the current procedure** — dense and identity reference runs, held-out
+feasibility selection of τ, the main sparsity run, and terminal identifiability evaluation.
+Supply the `lambda_logit` selected by the dense sweep:
 
 ```bash
 LAMBDA_LOGIT=YOUR_SELECTED_VALUE
 bash scripts/run_bounce_example.sh --run-tag=seed0 \
   "train.lambda_logit=${LAMBDA_LOGIT}"
-#    -> prints a freshly calibrated tau, then TF/T=2 losses, OE diagnostics, SHD, MCC, path_density
+#    -> prints both reference losses and the selected tau, then TF/T=2 losses,
+#       OE diagnostics, SHD, MCC, path_density
 #    -> saves recovery_grid.png with all mass/latent pairs and the global assignment
 ```
 
 Hydra overrides are passed to every run, so the references and main run cannot diverge
-in config (the D12 rule). Knobs are script flags — `--tau-factor` (τ = factor ×
-fully-connected held-out constraint loss, default 1.0), `--calib-steps`,
-`--main-steps` (main run only), and `--run-tag` (required for parallel launches) — a mistyped
-flag errors loudly; the equivalent env vars still work as a fallback.
+in config (the D12 rule). The script tries tau factors `2.0`, `1.8`, `1.6`, then `1.4`,
+selecting the first whose tau lies strictly between the held-out dense and identity losses;
+it aborts before sparse training if none is feasible. Knobs are script flags —
+`--calib-steps`, `--main-steps` (main run only), and `--run-tag` (required for parallel
+launches) — and a mistyped flag errors loudly; the equivalent env vars still work as a fallback.
 
 **What to watch:**
 
@@ -152,21 +154,18 @@ LAMBDA_LOGIT=YOUR_SELECTED_VALUE
 # Rung 1 — Baumgartner-aligned environment with a true-state JEPA (radius∝mass,
 # logit loss). Their Fig. 3 MCC ≈ 0.9+ is context, not a like-for-like target:
 # the encoder/objective differ. Successful recovery still gives sharp marginals.
-bash scripts/run_bounce_example.sh --tau-factor=1.0 \
+bash scripts/run_bounce_example.sh \
   experiment=bounce_baumgartner "train.lambda_logit=${LAMBDA_LOGIT}"
 
 # Rung 1-ablation — ±sparsity (their MLP/Transformer comparison; note their own
 # finding: on bounce even an unregularised Transformer disentangles, so expect a
-# smaller gap here than on dual particle):
-bash scripts/run_bounce_example.sh --tau-factor=1.0 \
-  experiment=bounce_baumgartner \
-  "train.lambda_logit=${LAMBDA_LOGIT}" \
-  train.sparsity_enabled=false
+# smaller gap here than on dual particle). This stale ablation must be launched
+# separately: the current pipeline deliberately enforces a sparse main stage.
 
 # Rung 2 — invisible mass (equal radii, uniform masses): identical otherwise, so
 # any MCC drop vs rung 1 isolates the weaker sufficient-variability (mass acts
 # only through collision impulses). MCC ≈ rung 1 -> method robust; MCC ≈ 0 -> edge found.
-bash scripts/run_bounce_example.sh --tau-factor=1.0 \
+bash scripts/run_bounce_example.sh \
   experiment=bounce_baumgartner \
   "train.lambda_logit=${LAMBDA_LOGIT}" \
   data.radius_from_mass=false data.mass_normal=null

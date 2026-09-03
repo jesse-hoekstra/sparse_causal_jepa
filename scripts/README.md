@@ -16,9 +16,11 @@ only and must not be reconstructed through launch overrides.
 The full pipeline remains:
 
 1. train a dense reference with the same teacher-forcing-plus-T=2 settings as the sparse run;
-2. evaluate its held-out final constraint and calibrate a fresh tau;
-3. train the sparse model with that tau;
-4. run terminal identifiability and observational-equivalence evaluation.
+2. train an identity reference with exactly the same settings;
+3. evaluate both references on the same held-out split and select the first factor in
+   `[2.0, 1.8, 1.6, 1.4]` for which `C_dense < factor * C_dense < C_identity`;
+4. abort if no candidate is feasible; otherwise train the sparse model with the selected tau;
+5. run terminal identifiability and observational-equivalence evaluation.
 
 Do not carry forward D30's `tau=0.02` or any threshold calibrated for the K=30 training
 objective. The historical stable setup supplies the 300k-step budget, `lambda_logit=1e-5`, and
