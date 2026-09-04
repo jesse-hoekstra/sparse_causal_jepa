@@ -107,6 +107,7 @@ def test_exact_synthetic_k30_predictor_has_full_sample_satisfaction() -> None:
         oe_coordinate_std=torch.ones(D),
     )
     assert report.metrics["oe_sample_satisfaction_k30"] == 1.0
+    assert report.metrics["trajectory_reconstruction_mse_k30"] == pytest.approx(0.0, abs=1e-12)
     assert report.metrics["oe_k30_worst_step_nrmse_p50"] == pytest.approx(0.0, abs=1e-6)
     assert report.metrics["oe_k30_worst_step_nrmse_p95"] == pytest.approx(0.0, abs=1e-6)
     assert report.metrics["pred_loss"] == pytest.approx(0.0, abs=1e-12)

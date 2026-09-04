@@ -9,9 +9,10 @@ For deterministic calibration, ``L_AR2`` is averaged exhaustively over every
 valid two-step offset. This is the exact uniform-anchor expectation estimated by
 the eight-window training sample, without evaluation sampling noise.
 
-A separate no-gradient open-loop rollout reports approximate trajectory
-agreement on a fixed held-out sample. It is monitoring only: it never enters
-``constraint_loss`` and does not prove population observational equivalence.
+A separate no-gradient open-loop rollout reports both raw trajectory
+reconstruction MSE and normalized approximate agreement on a fixed held-out
+sample. They are monitoring only: neither enters ``constraint_loss`` or proves
+population observational equivalence.
 """
 
 import math
@@ -119,6 +120,7 @@ def evaluate_identifiability(
     mean_gate_probabilities: list[Tensor] = []
     gate_entropies: list[Tensor] = []
     oe_errors: list[Tensor] = []
+    trajectory_reconstruction_losses: list[Tensor] = []
     batch_weights: list[int] = []
 
     for index, batch in enumerate(loader):
@@ -155,6 +157,7 @@ def evaluate_identifiability(
                 oe_eval_horizon,
                 output.causal_params,
             )
+            trajectory_reconstruction_losses.append((prediction - target).square().mean().cpu())
             oe_errors.append(oe_worst_step_nrmse(prediction, target, coordinate_std).cpu())
 
         logit_penalties.append(output.logit_penalty.cpu())
@@ -207,6 +210,9 @@ def evaluate_identifiability(
         oe = summarize_oe(torch.cat(oe_errors), oe_tolerance_nrmse)
         suffix = f"k{oe_eval_horizon}"
         metrics |= {
+            f"trajectory_reconstruction_mse_{suffix}": _weighted_mean(
+                trajectory_reconstruction_losses, batch_weights
+            ),
             f"oe_sample_satisfaction_{suffix}": oe.satisfaction,
             f"oe_{suffix}_worst_step_nrmse_p50": oe.p50,
             f"oe_{suffix}_worst_step_nrmse_p95": oe.p95,
