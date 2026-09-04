@@ -2,8 +2,9 @@
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -75,6 +76,89 @@ def test_reportability_rejects_obsolete_rollout_config() -> None:
     provenance = eval_identifiability._protocol_provenance(cfg, checkpoint)
     with pytest.raises(SystemExit, match="obsolete"):
         eval_identifiability._require_complete_protocol(cfg, checkpoint, provenance)
+
+
+def test_final_wandb_metrics_append_after_training_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "wandb_run_id.txt").write_text("existing-run")
+    grid_path = run_dir / "recovery_grid.png"
+
+    logged: list[tuple[dict[str, object], int | None]] = []
+
+    class FakeRun:
+        id = "existing-run"
+        # Simulate one prior terminal evaluation, so ``checkpoint + 1`` would
+        # also collide; implicit W&B stepping must remain safe on reruns.
+        last_step = 300_001
+        finished = False
+
+        def log(
+            self,
+            payload: dict[str, object],
+            step: int | None = None,
+            commit: bool | None = None,
+        ) -> None:
+            assert commit is True
+            if step is not None and step <= self.last_step:
+                raise AssertionError("non-increasing explicit W&B step")
+            self.last_step = self.last_step + 1 if step is None else step
+            logged.append((payload, step))
+
+        def finish(self) -> None:
+            self.finished = True
+
+    fake_run = FakeRun()
+
+    class FakeWandb(ModuleType):
+        def init(self, **_kwargs: object) -> FakeRun:
+            return fake_run
+
+        def Image(self, value: str) -> str:
+            return f"image:{value}"
+
+    fake_wandb = FakeWandb("wandb")
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    cfg = OmegaConf.create(
+        {"wandb": {"enabled": True, "project": "test-project", "mode": "online"}}
+    )
+    report = SimpleNamespace(
+        metrics={"constraint_loss": 0.04, "mcc": 0.95},
+        diagnostics={"path_density": 0.23},
+    )
+    provenance = {
+        "total_skips": 0,
+        "lambda_rollout_t2": 1.0,
+        "num_rollout_t2_anchors": 8,
+        "rollout_t2_horizon": 2,
+        "oe_eval_horizon": 30,
+        "oe_tolerance_nrmse": 0.1,
+        "oe_coordinate_std": [0.25, 0.25, 0.52, 0.52],
+    }
+
+    eval_identifiability._log_to_wandb(
+        run_dir,
+        cfg,
+        report,
+        grid_path,
+        step=300_000,
+        seed_offset=29,
+        provenance=provenance,
+    )
+
+    assert len(logged) == 1
+    payload, wandb_step = logged[0]
+    assert wandb_step is None
+    assert payload["final/checkpoint_step"] == 300_000
+    assert payload["final/constraint_loss"] == 0.04
+    assert payload["final/mcc"] == 0.95
+    assert payload["final/path_density"] == 0.23
+    assert payload["final/eval_seed_offset"] == 29
+    assert payload["final/total_skips"] == 0
+    assert fake_run.finished
 
 
 def test_aggregate_compares_fixed_protocol_but_allows_health_to_vary() -> None:
