@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # Eight-seed, fixed-tau Experiment-1 confirmation on the shared L40 server.
 #
-# Submit from the repository root and provide ONLY the already selected tau:
+# On the manually managed L40 server, expose exactly two GPUs and provide ONLY
+# the already selected tau. The two worker lanes run four seeds each:
+#
+#   SCJEPA_BATCH_ID=d38_8seed_fixed_tau_l40 CUDA_VISIBLE_DEVICES=4,5 \
+#     bash scripts/l40_exp1_8seed_pipeline.sbatch 0.05330275518342852
+#
+# The same file can instead be submitted to Slurm, which supplies the array
+# task variables itself:
 #
 #   sbatch scripts/l40_exp1_8seed_pipeline.sbatch 0.05330275518342852
 #
@@ -26,14 +33,12 @@
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
-  echo "usage: sbatch $0 TAU" >&2
+  echo "usage: CUDA_VISIBLE_DEVICES=GPU_A,GPU_B bash $0 TAU" >&2
+  echo "   or: sbatch $0 TAU" >&2
   exit 2
 fi
 
 TAU=$1
-SEED=${SLURM_ARRAY_TASK_ID:?this file must be submitted as its 0-7 Slurm array}
-ARRAY_JOB_ID=${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:?missing Slurm job id}}
-
 REPO_ROOT=${SLURM_SUBMIT_DIR:-$PWD}
 cd "${REPO_ROOT}"
 if [ ! -f pyproject.toml ] || [ ! -f scripts/eval_identifiability.py ]; then
@@ -51,6 +56,71 @@ export PYTHONUNBUFFERED=1
 "${PYTHON}" -c \
   'import math,sys; value=float(sys.argv[1]); assert math.isfinite(value) and value > 0, "tau must be finite and positive"' \
   "${TAU}"
+
+# Direct execution mirrors the way the earlier single-seed L40 script was
+# launched. Each lane receives one physical GPU, so every child Python process
+# still sees exactly one CUDA device. Under Slurm this block is skipped and the
+# scheduler-provided 0-7 array performs the same work.
+if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
+  DIRECT_BATCH_ID=${SCJEPA_BATCH_ID:-direct_$(date +%Y%m%d_%H%M%S)_$$}
+  if [[ ! "${DIRECT_BATCH_ID}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "SCJEPA_BATCH_ID may contain only letters, digits, dot, underscore, and dash" >&2
+    exit 2
+  fi
+
+  IFS=',' read -r GPU_A GPU_B GPU_EXTRA <<< "${CUDA_VISIBLE_DEVICES:-}"
+  if [ -z "${GPU_A}" ] || [ -z "${GPU_B}" ] || [ -n "${GPU_EXTRA:-}" ]; then
+    echo "direct mode requires exactly two comma-separated CUDA devices" >&2
+    echo "example: CUDA_VISIBLE_DEVICES=4,5 bash $0 ${TAU}" >&2
+    exit 2
+  fi
+  if [ "${GPU_A}" = "${GPU_B}" ]; then
+    echo "direct mode requires two distinct CUDA devices" >&2
+    exit 2
+  fi
+
+  echo "direct two-GPU run: batch_id=${DIRECT_BATCH_ID} tau=${TAU}"
+  echo "GPU ${GPU_A}: seeds 0 2 4 6"
+  echo "GPU ${GPU_B}: seeds 1 3 5 7"
+
+  run_lane() {
+    local lane_gpu=$1
+    shift
+    local lane_seed
+    for lane_seed in "$@"; do
+      echo "launching seed ${lane_seed} on physical GPU ${lane_gpu}"
+      CUDA_VISIBLE_DEVICES="${lane_gpu}" \
+        SLURM_ARRAY_TASK_ID="${lane_seed}" \
+        SLURM_ARRAY_JOB_ID="${DIRECT_BATCH_ID}" \
+        SLURM_JOB_ID="${DIRECT_BATCH_ID}_${lane_seed}" \
+        SLURM_SUBMIT_DIR="${REPO_ROOT}" \
+        SLURM_CPUS_PER_TASK="${SCJEPA_CPUS_PER_GPU:-16}" \
+        bash "${REPO_ROOT}/scripts/l40_exp1_8seed_pipeline.sbatch" "${TAU}"
+    done
+  }
+
+  run_lane "${GPU_A}" 0 2 4 6 &
+  LANE_A_PID=$!
+  run_lane "${GPU_B}" 1 3 5 7 &
+  LANE_B_PID=$!
+  DIRECT_STATUS=0
+  if ! wait "${LANE_A_PID}"; then
+    DIRECT_STATUS=1
+  fi
+  if ! wait "${LANE_B_PID}"; then
+    DIRECT_STATUS=1
+  fi
+  if [ "${DIRECT_STATUS}" -ne 0 ]; then
+    echo "at least one GPU lane failed; inspect the combined and per-seed logs" >&2
+    exit "${DIRECT_STATUS}"
+  fi
+  echo "all runs and plots complete: outputs/l40_exp1_8seed_job${DIRECT_BATCH_ID}"
+  exit 0
+fi
+
+SEED=${SLURM_ARRAY_TASK_ID}
+ARRAY_JOB_ID=${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:?missing Slurm job id}}
+
 "${PYTHON}" -c \
   'import sys; value=int(sys.argv[1]); assert 0 <= value <= 7, "array seed must be in 0..7"' \
   "${SEED}"

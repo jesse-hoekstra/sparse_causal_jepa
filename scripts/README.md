@@ -26,16 +26,20 @@ Do not carry forward D30's `tau=0.02` or any threshold calibrated for the K=30 t
 objective. The historical stable setup supplies the 300k-step budget, `lambda_logit=1e-5`, and
 `sparsity_lambda_init=1e4`; tau is newly measured for the final predictive objective.
 
-Once a fixed tau has been selected, the L40 eight-seed confirmation is one submission:
+Once a fixed tau has been selected, the manually managed L40 server can run two worker lanes
+on GPUs 4 and 5:
 
 ```bash
-sbatch scripts/l40_exp1_8seed_pipeline.sbatch TAU
+SCJEPA_BATCH_ID=d38_8seed_fixed_tau_l40 CUDA_VISIBLE_DEVICES=4,5 \
+  bash scripts/l40_exp1_8seed_pipeline.sbatch TAU
 ```
 
-The Slurm array covers seeds 0–7 and limits itself to two concurrent one-GPU tasks. Each task
-trains a dense and sparse model with the same seed/data and evaluates both on 5,000 held-out
-episodes at offset 29. Missing seed-specific preloads for seeds 1–7 are generated on the L40;
-the canonical seed-0 preload must already be present. Outputs live under
+GPU 4 processes seeds 0/2/4/6 and GPU 5 processes seeds 1/3/5/7. On a Slurm-managed server,
+the same file can instead be submitted with `sbatch scripts/l40_exp1_8seed_pipeline.sbatch TAU`;
+its `0-7%2` array provides the same two-way concurrency. Each task trains a dense and sparse
+model with the same seed/data and evaluates both on 5,000 held-out episodes at offset 29.
+Missing seed-specific preloads for seeds 1–7 are generated on the L40; the canonical seed-0
+preload must already be present. Outputs live under
 `outputs/l40_exp1_8seed_job<ARRAY_JOB_ID>/seed<SEED>/{dense,sparse}`. After all eight pairs
 succeed, the final task writes validated summary JSON and paired box plots under the root's
 `aggregate/` directory.
