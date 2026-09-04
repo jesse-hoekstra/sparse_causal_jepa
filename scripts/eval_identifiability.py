@@ -260,9 +260,13 @@ def _log_to_wandb(
         }
         payload["final/recovery_grid"] = wandb.Image(str(grid_path))
         payload["final/eval_seed_offset"] = seed_offset
+        payload["final/checkpoint_step"] = step
         for key, value in provenance.items():
             payload[f"final/{key}"] = value
-        run.log(payload, step=step)
+        # A resumed run has already committed the training record at ``step``.
+        # Let W&B append at its next internal step; explicitly reusing the
+        # checkpoint step makes W&B discard the final scalar payload.
+        run.log(payload, commit=True)
         run.finish()
         print(f"  recovery grid + final metrics logged to W&B run {run.id}")
     except Exception as error:  # logging must never fail evaluation
