@@ -10,6 +10,7 @@ outputs/
 logs/
 sources/
 multirun/
+/slurm-*.out
 *.ckpt
 *.pt
 *.pth

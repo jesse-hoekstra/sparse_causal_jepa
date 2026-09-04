@@ -158,6 +158,7 @@ def test_harness_reports_t2_constraint_and_no_grad_oe_rollout() -> None:
     for key in (
         "loss_rollout_t2_raw",
         "loss_rollout_t2_weighted",
+        "trajectory_reconstruction_mse_k5",
         "oe_sample_satisfaction_k5",
         "oe_k5_worst_step_nrmse_p50",
         "oe_k5_worst_step_nrmse_p95",

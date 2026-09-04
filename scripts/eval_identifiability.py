@@ -2,9 +2,10 @@
 
 Loads ``resolved_config.yaml`` and ``last.pt``, evaluates the final
 teacher-forcing-plus-T=2 constraint, graph recovery, MCC, and the no-gradient
-K=30 sampled observational-equivalence diagnostic. The resulting tolerance
-rate estimates approximate agreement on held-out trajectories; it is not a
-proof of population observational equivalence.
+K=30 trajectory-reconstruction MSE and sampled observational-equivalence
+diagnostics. The resulting tolerance rate estimates approximate agreement on
+held-out trajectories; it is not a proof of population observational
+equivalence.
 """
 
 # pyright: reportUnknownMemberType=false
