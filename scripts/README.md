@@ -107,11 +107,35 @@ One job requests
 two L40s and runs the production dense visual model on one GPU and then two, with global batch
 four, eight total data workers, and identical CPU thread limits. It uses the recorded seed-zero
 preload and reports the last logging interval after warm-up. W&B and evaluation are disabled;
-run configs/checkpoints, stdout logs, and `benchmark.json` go under
+run configs/checkpoints, stdout/stderr logs, and `benchmark.json` go under
 `outputs/bounce_exp2_benchmark_<RUN_TAG>`. Any skipped update invalidates the speed report. This
 is a short dense-stage scaling measurement; sparse training and convergence require full runs.
 It includes the normal single-GPU branch-gradient logging, which DDP omits as described above,
 so it compares practical training throughput. Repeat with unique tags if the timings are noisy.
+
+The benchmark prints progress every 100 updates even with W&B disabled. Startup messages
+identify dataset loading, DDP initialization, the first batch, and the first update. Older
+versions only printed the configuration and the final result, so silence did not establish a hang.
+
+If two GPUs stall during startup, stop that benchmark before checking communication alone.
+On a manually managed Linux server, from the repository root with your two GPU IDs:
+
+```bash
+mkdir -p logs
+set -o pipefail
+timeout -k 10s 90s env CUDA_VISIBLE_DEVICES=4,5 NCCL_DEBUG=INFO \
+  .venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  --local-addr=127.0.0.1 scripts/check_nccl.py 2>&1 | tee logs/nccl_check.log
+```
+
+This checks broadcast and all-reduce without loading the dataset or visual model; expect
+`PASS` on both ranks. The script sets a 60-second process-group timeout; the outer Linux
+`timeout` also bounds startup and teardown. A successful check does not establish training
+throughput or exclude a failure later in training. If it stalls, repeat the same check with
+`NCCL_P2P_DISABLE=1` added after `env` and save a separate log. If only that check succeeds,
+the direct GPU communication path is implicated. Treat the setting as a diagnostic workaround;
+re-measure throughput before using it for the full run. See
+[NVIDIA's GPU communication troubleshooting](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/gpu_troubleshooting.html).
 
 CUDA training now pins batches in the data loader and submits input copies without a host wait.
 The five-slot context assignment is solved exactly on-device, and scalar monitoring metrics are
