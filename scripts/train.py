@@ -47,6 +47,16 @@ class WandbLogger:
         self._run.log(metrics, step=step)
 
 
+class ConsoleLogger:
+    """Keep W&B-disabled runs visibly progressing without dumping every metric."""
+
+    def log(self, step: int, metrics: dict[str, float]) -> None:
+        """Print timing and update health at the configured logging interval."""
+        keys = ("train/seconds_per_step", "train/loss_total", "health/skipped_steps")
+        values = ", ".join(f"{key}={metrics[key]:.4g}" for key in keys if key in metrics)
+        print(f"step {step}: {values}", flush=True)
+
+
 def _source_of(key: str, overrides: list[str], preset: DictConfig | None) -> str:
     """Where a config key's value came from — CLI, experiment preset, or base.
 
@@ -211,7 +221,11 @@ def _train(cfg: DictConfig) -> None:
         _print_run_banner(cfg, experiment, phase, git_sha)
 
     out_dir = Path(str(HydraConfig.get().runtime.output_dir))
+    if is_main_process():
+        print("Loading training dataset...", flush=True)
     dataset = build_dataset(cfg.data)
+    if is_main_process():
+        print("Training dataset ready.", flush=True)
     regime = str(cfg.model.get("regime", "state_to_state"))
     if regime == "state_to_state":
         # A fixed all-training-state population std is part of the OE ruler.
@@ -242,6 +256,8 @@ def _train(cfg: DictConfig) -> None:
         )
         eval_dataset = build_dataset(eval_cfg, seed_offset=17)  # pyright: ignore[reportArgumentType]
     model = build_model(cfg.model)
+    if is_main_process():
+        print("Model constructed.", flush=True)
     train_config = TrainConfig(
         steps=cfg.train.steps,
         batch_size=cfg.train.batch_size,
@@ -286,6 +302,8 @@ def _train(cfg: DictConfig) -> None:
     logger: MetricLogger = (
         WandbLogger(project=cfg.wandb.project, mode=cfg.wandb.mode, config=resolved, name=run_name)
         if cfg.wandb.enabled and is_main_process()
+        else ConsoleLogger()
+        if is_main_process()
         else NoopLogger()
     )
     # Record the run id so scripts/eval_identifiability.py can attach the final

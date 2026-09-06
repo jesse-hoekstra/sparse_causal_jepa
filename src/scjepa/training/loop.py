@@ -128,6 +128,7 @@ class Trainer:
         self._validate_fixed_protocol()
         self._forward_model: nn.Module = self.model
         if world_size() > 1:
+            print(f"[rank {rank()}] Initializing DDP on {self.device}...", flush=True)
             self._forward_model = DistributedDataParallel(
                 self.model,
                 device_ids=[self.device.index] if self.device.type == "cuda" else None,
@@ -138,6 +139,7 @@ class Trainer:
                 # predictors can bypass gates. Detect these rather than hang.
                 find_unused_parameters=True,
             )
+            print(f"[rank {rank()}] DDP ready.", flush=True)
         self.lagrangian = SparsityLagrangian(
             tau=config.sparsity_tau,
             step_size=config.sparsity_step_size,
@@ -441,13 +443,20 @@ class Trainer:
         interval_started = time.perf_counter()
         interval_step = self.step
         interval_training_seconds = 0.0
+        first_step = self.step
+        print(f"[rank {rank()}] Loading first training batch...", flush=True)
         while self.step < self.config.steps:
             upcoming_step = self.step + 1
             log_step = (
                 upcoming_step % self.config.log_every == 0 or upcoming_step == self.config.steps
             )
-            metrics = self._train_step(next(batches), collect_metrics=log_step)
+            batch = next(batches)
+            if self.step == first_step:
+                print(f"[rank {rank()}] First batch ready; running first update...", flush=True)
+            metrics = self._train_step(batch, collect_metrics=log_step)
             self.step += 1
+            if self.step == first_step + 1:
+                print(f"[rank {rank()}] First update finished.", flush=True)
             eval_step = (
                 self.config.eval_every is not None
                 and self.eval_dataset is not None
@@ -488,6 +497,8 @@ class Trainer:
                 # queued CUDA work from those operations. Data loading stays in.
                 self._synchronize_device()
                 interval_started = time.perf_counter()
+        if is_main_process():
+            print("Training finished; saving final checkpoint...", flush=True)
         self.save_checkpoint(out_dir / "last.pt")
         return metrics
 

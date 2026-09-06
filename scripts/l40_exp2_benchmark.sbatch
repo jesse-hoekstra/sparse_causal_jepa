@@ -63,7 +63,7 @@ for NUM_GPUS in 1 2; do
     data.seed=0 "data.preload=${PRELOAD}" data.cache=false \
     data.uniform_appearance=true data.render_radius_from_mass=false \
     hydra.output_subdir=null hydra/job_logging=disabled \
-    "hydra.run.dir=${ROOT}/gpu${NUM_GPUS}" | tee "${ROOT}/gpu${NUM_GPUS}.log"
+    "hydra.run.dir=${ROOT}/gpu${NUM_GPUS}" 2>&1 | tee "${ROOT}/gpu${NUM_GPUS}.log"
 done
 
 "${PYTHON}" - "${ROOT}" "${STEPS}" <<'PY'
