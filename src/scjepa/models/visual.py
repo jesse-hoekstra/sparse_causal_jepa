@@ -1,9 +1,8 @@
-"""Shared visual front-end for the pixel experiments (experiments.pdf §6.3, Eqs. 41-89).
+"""Visual front-end for Experiment 2 (outdated_experiments.pdf §6.3, Eqs. 41-89).
 
 The recurrent SAVi encoder Q_psi maps a causal frame prefix to N posterior object
 slots per timestep (Eq. 42), and a shared row-wise head g_omega maps each slot to
-the latent state interface SPARTAN consumes (Eq. 87). The visual regimes use the
-same architecture and train it separately; the visual-to-visual regime additionally keeps an EMA
+the latent state interface SPARTAN consumes (Eq. 87). Experiment 2 keeps an EMA
 copy of exactly this path as its target encoder (Eq. 109), which is why the two
 modules are bundled into one object rather than wired up ad hoc per experiment.
 
@@ -34,6 +33,8 @@ class VisualState(NamedTuple):
     """Posterior object slots S~ (Eq. 42) — the parameter encoder's input."""
     states: Float[Tensor, "b t n s"]
     """Latent states S = g_omega(S~) (Eq. 87) — SPARTAN's state interface."""
+    allocations: Float[Tensor, "b t n p"] | None = None
+    """Optional detached spatial maps, captured in the same encoder pass."""
 
 
 class VisualStatePath(nn.Module):
@@ -81,9 +82,15 @@ class VisualStatePath(nn.Module):
         # objectives and is checked afterwards with frozen held-out probes.
         self.state_head = nn.Linear(slot_size, state_dim)
 
-    def forward(self, frames: Float[Tensor, "b t c h w"]) -> VisualState:
+    def forward(
+        self, frames: Float[Tensor, "b t c h w"], capture_allocations: bool = False
+    ) -> VisualState:
         """Run the causal recurrence once over the prefix (Eqs. 78/115)."""
         if frames.ndim != 5:
             raise ValueError(f"expected (B, T, C, H, W), got {tuple(frames.shape)}")
-        slots = self.encoder(frames)
-        return VisualState(slots=slots, states=self.state_head(slots))
+        allocations = None
+        if capture_allocations:
+            slots, allocations = self.encoder.forward_with_allocations(frames)
+        else:
+            slots = self.encoder(frames)
+        return VisualState(slots=slots, states=self.state_head(slots), allocations=allocations)

@@ -16,9 +16,9 @@ JEPA Using a SPARTAN"**. You write composable, shape-safe, configurable `nn.Modu
 `docs/decisions.md` before acting; it binds you.
 
 ## Project facts (do not deviate silently)
-- **No EMA target, no frozen encoder, no stop-gradient asymmetry.** Context and target SAVi
-  encoders are jointly trained; collapse prevention is the VISReg/SIGReg loss term (owned by the
-  losses/ code), NOT architectural. Do not add BYOL/I-JEPA-style machinery out of habit.
+- **Experiment 2 uses EMA targets (D39).** The context encoder/head receive gradients; the
+  independent target encoder/head receive no gradients and update by EMA after accepted steps.
+  No reconstruction or anti-collapse regularizer is active; non-collapse must be measured.
 - **Modules to build/adapt:**
   1. **SAVi encoder** (not SAVi++ — D2): adapt a proven PyTorch implementation (e.g. SlotFormer's)
      into `third_party/` + a thin wrapper in models/; validate shapes/behavior against the official
@@ -26,7 +26,7 @@ JEPA Using a SPARTAN"**. You write composable, shape-safe, configurable `nn.Modu
   2. **Channel split** (D4 — implement exactly):
      - `AttnPooling`: per-slot temporal PMA block, shared weights across slots, single learned
        query + temporal positional encodings, collapses the time axis: `(B, Th, N, d) → (B, N, d)`
-       = θ̂. No cross-slot mixing — relational effects are SPARTAN's job.
+       after relational cross-slot attention; a scalar head yields one parameter per track.
      - `KinematicHead`: linear layer on last-step slots `(B, N, d) → (B, N, d)` = S_t,
        disassociating it from θ̂.
   3. **SPARTAN predictor** (from paper, spec via paper-to-code-translator): sparse transformer over
@@ -57,8 +57,9 @@ JEPA Using a SPARTAN"**. You write composable, shape-safe, configurable `nn.Modu
   cut, accepted-update schedule state, or full-rollout backward graph.
 - Experiment 1's K=30 model path is evaluation-only: one chain begins at true `S_29`, recursively
   consumes generated states through `Shat_59`, reuses the same `theta_hat`, and may only be called
-  in evaluation mode under `torch.no_grad()`. Keep this state-to-state diagnostic distinct from
-  Experiment 3's separately specified visual-to-visual fixed-K training objective.
+  in evaluation mode under `torch.no_grad()`. Experiment 2 also trains only sampled T=2 windows;
+  its longer latent rollout is evaluation-only. Match the two visual branches using one fixed
+  context-prefix slot assignment per episode, never physical truth or future-frame rematching.
 - Encoders train **from scratch** (D7): no pretrained-checkpoint loading paths, no init-from-SAVi
   machinery — emergence without reconstruction is part of the paper's claim.
 
@@ -66,7 +67,7 @@ JEPA Using a SPARTAN"**. You write composable, shape-safe, configurable `nn.Modu
 1. Read decisions.md, the vendored reference code, and the spec/symbol table from
    paper-to-code-translator.
 2. Build bottom-up; per module write a smoke check: forward on tiny random input, expected shapes,
-   finite outputs, backward populates grads in BOTH encoders, sane parameter counts.
+   finite outputs, backward populates online gradients and no target gradients, sane parameter counts.
 3. Keep everything importable and pure; hand config schemas to experiment-infra-engineer and test
    design to test-and-ci-engineer.
 

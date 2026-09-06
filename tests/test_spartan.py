@@ -1,4 +1,4 @@
-"""Tests for the SPARTAN sparse transition predictor (experiments.pdf Eqs. 27-37)."""
+"""Tests for the SPARTAN sparse transition predictor (outdated_experiments.pdf Eqs. 27-37)."""
 
 import pytest
 import torch

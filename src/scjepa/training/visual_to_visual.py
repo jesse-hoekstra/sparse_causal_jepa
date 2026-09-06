@@ -11,11 +11,10 @@ it depends on where the target comes from. Exactly three things differ:
    unnormalized c would silently retune itself;
 3. the EMA target is stepped after every optimizer step (Eq. 111).
 
-A fourth addition is monitoring rather than objective: Eq. 124's collapse
-diagnostics are logged every step. The EMA asymmetry does NOT make a constant
-representation mathematically impossible, so §6.6 makes non-collapse an
-empirical continuation requirement — a run with vanishing content variance or
-degenerate effective rank is rejected, not reported.
+The predictive objective and metrics match Experiment 1: teacher forcing plus
+sampled T=2 endpoint loss. Collapse diagnostics are monitoring, not an
+anti-collapse objective. A low latent loss alone is insufficient evidence of
+success; object grounding and held-out state probes must also improve.
 """
 
 from typing import cast
@@ -24,7 +23,7 @@ import torch
 from torch import Tensor
 
 from scjepa.eval.visual_to_visual import evaluate_visual_to_visual
-from scjepa.losses import rollout_weights, weighted_rollout_mse
+from scjepa.losses import rollout_t2_endpoint_mse
 from scjepa.models.visual_to_visual import VisualToVisualModel, VisualToVisualOutput
 from scjepa.training.loop import Trainer
 
@@ -41,23 +40,19 @@ def collapse_metrics(states: Tensor, prefix: str) -> dict[str, float]:
     one direction scores ~1 and an isotropic one scores d_s. Those three go to
     their floor together under SCALE collapse.
 
-    ``temporal_var`` covers a mode the other three are jointly blind to: the
-    variance across TIME WITHIN an episode, averaged over episodes. The other
-    three pool episode and time, so a representation that is frozen in time but
-    still varies across episodes keeps all of them healthy — while making both
-    prediction branches trivially satisfiable by the identity map, which is also
-    the sparsest possible graph. That degenerate optimum exists under teacher
-    forcing alone; the K-step rollout raises its payoff (an honest model pays
-    L_TF + lambda_roll*L_roll, a frozen one pays about zero for both), so this
-    number is the one that separates "learned the dynamics" from "stopped
-    moving". Healthy: same order as ``content_var``. Degenerate: heads for zero
-    while ``content_var`` and ``effective_rank`` sit still.
+    ``temporal_var`` measures variation within each episode. Together with
+    per-row ``content_var`` it catches fixed slot identities and a representation
+    frozen in time despite variation between episodes. Effective rank pools
+    rows and is not sufficient evidence against either failure mode.
     """
     with torch.no_grad():
         flat = states.detach().flatten(0, 2).float()  # (episodes * time * tracks, d_s)
         centred = flat - flat.mean(dim=0, keepdim=True)
         covariance = centred.T @ centred / max(flat.shape[0] - 1, 1)
-        eigenvalues = torch.linalg.eigvalsh(covariance).clamp(min=0.0)
+        eigenvalues = cast(
+            Tensor,
+            torch.linalg.eigvalsh(covariance),  # pyright: ignore[reportUnknownMemberType]
+        ).clamp(min=0.0)
         total = eigenvalues.sum()
         if float(total) <= 0.0:
             effective_rank = 1.0
@@ -70,7 +65,9 @@ def collapse_metrics(states: Tensor, prefix: str) -> dict[str, float]:
         temporal_var = float(states.detach().float().var(dim=1, unbiased=False).mean())
         return {
             f"{prefix}/std": float(flat.std(dim=0).mean()),
-            f"{prefix}/content_var": float(centred.square().mean()),
+            f"{prefix}/content_var": float(
+                states.detach().float().flatten(0, 1).var(dim=0, unbiased=False).mean()
+            ),
             f"{prefix}/effective_rank": effective_rank,
             f"{prefix}/temporal_var": temporal_var,
         }
@@ -82,60 +79,21 @@ class VisualToVisualTrainer(Trainer):
     model: VisualToVisualModel
 
     def _forward(self, batch: dict[str, Tensor]) -> VisualToVisualOutput:  # type: ignore[override]
-        """Read frames; the true states in the batch are for evaluation only."""
+        """Read frames; simulator labels in the batch are evaluation-only."""
         frames = batch["frames"].to(self.device)
+        anchors = self.config.num_rollout_t2_anchors if self.config.lambda_rollout_t2 > 0 else 0
         return self.model(
             frames,
             context_len=self.config.context_len,
-            rollout_len=self.config.visual_rollout_len,
+            num_rollout_t2_anchors=anchors,
         )
 
     def _auxiliary_loss(self, output: VisualToVisualOutput) -> Tensor:  # type: ignore[override]
-        """Retain Experiment 3's separately declared fixed latent rollout."""
-        if output.rollout_prediction is None:
+        """Mean endpoint loss through two attached transitions, as in Experiment 1."""
+        if output.rollout_t2_prediction is None:
             return torch.zeros((), device=self.device)
-        assert output.rollout_target is not None
-        weights = rollout_weights(
-            output.rollout_prediction.shape[1], device=output.rollout_prediction.device
-        )
-        return weighted_rollout_mse(
-            output.rollout_prediction,
-            output.rollout_target,
-            weights,
-        )
-
-    def _auxiliary_weight(self) -> float:
-        """Return Experiment 3's visual-only rollout coefficient."""
-        return self.config.lambda_visual_rollout
-
-    def _predictive_metrics(
-        self,
-        teacher_forcing: Tensor,
-        raw_auxiliary: Tensor,
-        weighted_auxiliary: Tensor,
-        total: Tensor,
-    ) -> dict[str, float]:
-        """Keep Experiment 3 metrics distinct from state-to-state T=2 keys."""
-        return {
-            "loss/pred": teacher_forcing.item(),
-            "loss/visual_rollout_raw": raw_auxiliary.item(),
-            "loss/visual_rollout": weighted_auxiliary.item(),
-            "loss/total": total.item(),
-        }
-
-    def _branch_gradient_metrics(
-        self,
-        teacher_forcing: Tensor,
-        weighted_auxiliary: Tensor,
-        auxiliary_enabled: bool,
-    ) -> dict[str, float]:
-        """Use visual-specific names; never masquerade as state T=2 metrics."""
-        metrics = {"health/grad_norm_tf": self._branch_gradient_norm(teacher_forcing)}
-        if auxiliary_enabled:
-            metrics["health/grad_norm_visual_rollout"] = self._branch_gradient_norm(
-                weighted_auxiliary
-            )
-        return metrics
+        assert output.rollout_t2_target is not None
+        return rollout_t2_endpoint_mse(output.rollout_t2_prediction, output.rollout_t2_target)
 
     def _constraint(
         self,
@@ -147,14 +105,13 @@ class VisualToVisualTrainer(Trainer):
 
         The gradient objective (Eq. 121) keeps the raw latent MSE; dividing that
         by a moving denominator would change what is optimized. The floor
-        epsilon_var stops a collapsing target from making the constraint look
-        satisfiable by shrinking itself.
+        epsilon_var prevents division by zero. It does NOT prevent collapse:
+        a constant zero-error representation still satisfies this constraint.
 
-        Under the hybrid objective ``predictive_loss`` arrives as L_TF +
-        lambda_roll*L_roll (the caller scalarises §4.3's two bounds into one).
+        ``predictive_loss`` arrives as L_TF + lambda_rollout_t2 * L_AR2.
         Both are squared errors in the same target space, so both scale with the
-        representation exactly as ``target_variance`` does: the ratio stays
-        scale-free with the rollout term in it. What the normalization does NOT
+        representation exactly as ``target_variance`` does: above the variance
+        floor, their ratio is invariant to a shared rescaling. What it does NOT
         see is a target frozen in time — watch ``collapse/*/temporal_var``.
         """
         visual_output = cast(VisualToVisualOutput, output)
@@ -167,11 +124,27 @@ class VisualToVisualTrainer(Trainer):
         self.model.update_target()
 
     def _extra_metrics(self, output: VisualToVisualOutput) -> dict[str, float]:  # type: ignore[override]
-        """Eq. 124 collapse diagnostics plus the raw (unnormalized) predictor loss."""
+        """Predictive-suffix collapse diagnostics and context alignment changes."""
+        # Initialization transients in frames 0..C-2 can hide a frozen suffix.
+        # Report precisely the online anchors and EMA targets used by the loss.
+        transitions = output.target.shape[0] // output.causal_params.shape[0]
         return (
-            collapse_metrics(output.context_states, "collapse/online")
-            | collapse_metrics(output.target_states, "collapse/target")
-            | {"collapse/target_variance": float(output.target_variance)}
+            collapse_metrics(output.context_states[:, -transitions:], "collapse/online")
+            | collapse_metrics(output.target_states[:, -transitions:], "collapse/target")
+            | {
+                "collapse/target_variance": float(output.target_variance),
+                "alignment/context_target_nonidentity_fraction": float(
+                    (
+                        output.target_assignment
+                        != torch.arange(
+                            output.target_assignment.shape[1],
+                            device=output.target_assignment.device,
+                        )
+                    )
+                    .float()
+                    .mean()
+                ),
+            }
         )
 
     def _eval_step(self) -> dict[str, float]:
@@ -184,8 +157,11 @@ class VisualToVisualTrainer(Trainer):
             device=self.config.device,
             context_len=self.config.context_len,
             lambda_logit=self.config.lambda_logit,
-            rollout_len=self.config.visual_rollout_len,
-            lambda_roll=self.config.lambda_visual_rollout,
+            lambda_rollout_t2=self.config.lambda_rollout_t2,
+            num_rollout_t2_anchors=self.config.num_rollout_t2_anchors,
+            rollout_t2_horizon=self.config.rollout_t2_horizon,
+            oe_eval_horizon=self.config.oe_eval_horizon,
+            probe_dataset=self.dataset,
         )
         self.model.train()
         return {f"eval/{key}": value for key, value in report.metrics.items()}

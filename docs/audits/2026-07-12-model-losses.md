@@ -1,10 +1,16 @@
-# Fidelity audit: model/loss stack vs SPARTAN, Baumgartner, my_paper
+# Fidelity audit: model/loss stack vs SPARTAN, Baumgartner, manuscript
+
+> Historical audit of the July 12 implementation and then-current manuscript. Code line numbers,
+> equation references, joint-target training, and regularizer claims below describe that revision.
+> The current manuscript is `sources/SCJEPA.pdf`; current two-experiment behavior is defined by
+> `docs/decisions.md` D37–D39 and supersedes this audit's architecture recommendations.
+
 
 Date: 2026-07-12. Auditor scope: report-only, no code edits.
 Code state: git 55b5282 (the commit the v2 run qqye6ug1 ran at).
 Sources read equation-by-equation: `sources/SPARTAN.pdf` (Eqs. 3–6, App. A.1–A.2, Fig. 5),
 `sources/dynamical_system.pdf` (Eqs. 7–11, App. E bounce, F.1, F.4, F.5),
-`sources/my_paper.pdf` (Fig. 1, §4, §4.3), `docs/decisions.md` (D3–D15).
+`sources/SCJEPA.pdf` (Fig. 1, §4, §4.3), `docs/decisions.md` (D3–D15).
 
 **Headline verdict.** No sign error, no reversed dual update, no wrong-equation bug was found.
 The Lagrangian scheme is implemented faithfully to SPARTAN App. A.2 / Baumgartner Eqs. 9–10 —
@@ -56,7 +62,7 @@ mutually consistent with "all gates hard-closed, in train sampling as well as ev
 | Eq. 6/Baumgartner Eq. 8: \|Ā\| = L1 of path matrix | spartan.py:284 | Sum of (nonnegative) entries, batch mean = E‖Ā‖₁. Diagonal included (constant, zero gradient — documented D10.6). |
 | Eq. 11 normalization 1/(L·T²) | spartan.py:172 (per-layer mean over i,j), :290 (mean over layers) | mean∘mean = 1/(L·T²)·Σ, times λ_logit in loop.py:182. Matches Baumgartner Eq. 11 exactly up to the clamp (F-3). |
 | "adjacency disallows information flows" | spartan.py:131–160 | With mask-before-softmax, masked keys/values never enter h_i (row_max is over unmasked entries only; denominator over unmasked only). Ā_ij=0 ⇒ ∂pred_i/∂token_j=0 — pinned by test per D10.1. |
-| Token layout / prediction readout | spartan.py:259–267, 287 | [state 0..N−1 | param N..2N−1 | aux]; prediction from state positions only (`tokens[:, :num_slots]`), per my_paper Fig. 1. |
+| Token layout / prediction readout | spartan.py:259–267, 287 | [state 0..N−1 | param N..2N−1 | aux]; prediction from state positions only (`tokens[:, :num_slots]`), per manuscript Fig. 1. |
 | App. A.1 dims | Spartan ctor 185–233 | d→embed_dim in-projection, 3-Linear MLPs, single-head per layer. Run config uses layers=2, embed=128 vs A.1's 3/512 — a documented capacity knob, not an infidelity. |
 
 ### Findings (divergences / risks)
@@ -199,7 +205,7 @@ bug, but no code guard exists (none exists in the papers either).
 
 ---
 
-## 3. `channel_split.py` / `state_jepa.py` vs my_paper Fig. 1 / D4 / D14 / D15
+## 3. `channel_split.py` / `state_jepa.py` vs manuscript Fig. 1 / D4 / D14 / D15
 
 - **Param tokens are per-slot tokens:** Ŝ^ph (B, N, d) is concatenated as N separate tokens after
   the N state tokens (spartan.py:259–267) ⇒ T = 2N = 10 for 5 balls ✓ (matches |Ā| ≈ 11.6 ≈ T).
@@ -212,7 +218,7 @@ bug, but no code guard exists (none exists in the papers either).
   every param→(anything) gate is closed in every layer, the pooling head (`CrossSlotAttnPooling`,
   channel_split.py:115–168) and the param content receive **zero gradient from the predictive
   loss**. Moreover the regularizer is applied to `context_slots` and `target_slots` only
-  (loop.py:181) — **Ŝ^ph itself is NOT regularized** (faithful to my_paper Fig. 1, which draws
+  (loop.py:181) — **Ŝ^ph itself is NOT regularized** (faithful to manuscript Fig. 1, which draws
   SIGReg on the SAVi slot history and target slots, not on Ŝ^ph). Remaining gradient sources into
   the param branch after pruning: the logit penalty (shapes k_j magnitudes only, no task
   information) and rare Gumbel-open STE events (≈0.8%/sample at logit −4.8). **Architectural
@@ -222,9 +228,9 @@ bug, but no code guard exists (none exists in the papers either).
   gradient either) — so I classify it as faithful-but-load-bearing, not a divergence. It is the
   mechanism by which F-1/F-8/F-9/F-10 manifest as the observed signature.
 - **Channel split spec:** D14's CrossSlotAttnPooling is the default (last-step-anchored per-slot
-  queries over all Th·N tokens, temporal PE, no slot PE) — a *decided* departure from my_paper's
+  queries over all Th·N tokens, temporal PE, no slot PE) — a *decided* departure from manuscript's
   D4 text (manuscript update pending per D14). KinematicHead = linear on last-step slots ✓
-  (my_paper §4: "last time-step encoding … passed through a linear layer to disassociate it").
+  (manuscript §4: "last time-step encoding … passed through a linear layer to disassociate it").
 - **D15 sliding window:** Ŝ^ph pooled once from frames[:context_len], held fixed for K = L−Th
   transitions (state_jepa.py:70–80). Ordering check: `flatten(0,1)` on (B,K,…) vs
   `repeat_interleave(K, dim=0)` on (B,…) produce matching (b,k) order ✓. States regime windows
@@ -235,12 +241,12 @@ bug, but no code guard exists (none exists in the papers either).
 
 ---
 
-## 4. `losses/predictive.py`, `losses/regularizer.py`, `training/loop.py` vs my_paper loss assembly (D6, D12)
+## 4. `losses/predictive.py`, `losses/regularizer.py`, `training/loop.py` vs manuscript loss assembly (D6, D12)
 
 - **Hungarian MSE** (predictive.py:27–58): per-sample squared-Euclidean cost, exact
   `linear_sum_assignment`, assignment detached (piecewise-constant a.e. — correct), MSE over
   matched pairs. Permutation-invariant ✓; **no stop-gradient on target** ⇒ gradients reach BOTH
-  encoders (joint training, D7 / my_paper's deliberate departure from C-JEPA/SPARTAN) ✓.
+  encoders (joint training, D7 / manuscript's deliberate departure from C-JEPA/SPARTAN) ✓.
 - **Regularizer both branches** ✓ (loop.py:181: context_slots + target_slots, per Fig. 1).
   Vendored `visreg.py` matches VISReg Algorithm 1: center loss, scale loss (std−1)², sliced-
   Wasserstein shape loss against sorted Gaussian quantiles, **stop-gradient on std**
@@ -249,7 +255,7 @@ bug, but no code guard exists (none exists in the papers either).
   only (loop.py:186); `lagrangian.update(constraint_loss)` (loop.py:202) never sees reg. λ_reg
   stays 1.0 in the run config (D12) ✓. (The *min* player still sums all terms — that is what
   both papers do too; D12's requirement concerns the dual comparison, which is honored.)
-- **Loss assembly matches my_paper**: L(Ŝ_{t+1}, S_{t+1}) after Hungarian matching + regularizer
+- **Loss assembly matches manuscript**: L(Ŝ_{t+1}, S_{t+1}) after Hungarian matching + regularizer
   on both branches + SPARTAN sparsity (Lagrangian-weighted) + Eq. 11 logit term. ✓
 - **Metrics** (loop.py:204–221, harness.py): path_density counts thresholded entries incl. the
   residual diagonal — hence the 0.100 floor reads "identity-only", correctly. `constraint_loss`
@@ -297,14 +303,14 @@ so the "opening phase" that Fig. 5 shows never happened, exactly as observed (pr
 | 9 | Definition of the FC reference for τ | SPARTAN p.16 ("fully connected model") | Same gated model, sparsity off, 6k steps, ×2.0 | run script — see F-8 |
 | 10 | λ_logit value ("small") | Baumgartner p.7/F.4 | 1e-3 | bounce_baumgartner.yaml |
 | 11 | Eq. 11 numerical range | Baumgartner | clamp |logit| ≤ 30 + linear tail | spartan.py:169–172 |
-| 12 | Token roles / layout of (S_t, Ŝ^ph, U_t) | my_paper §4.1 (layout yes, roles no) | learned role embeddings; [state\|param\|aux] | spartan.py:222–233; D10.2–3 |
+| 12 | Token roles / layout of (S_t, Ŝ^ph, U_t) | manuscript §4.1 (layout yes, roles no) | learned role embeddings; [state\|param\|aux] | spartan.py:222–233; D10.2–3 |
 | 13 | Heads per layer | SPARTAN Eqs. 3–4 (one adjacency ⇒ single head) | 1 | D10.4 |
 | 14 | \|Ā\| diagonal inclusion | SPARTAN Eq. 6 literal | included (constant) | spartan.py:284; D10.6 |
 | 15 | Bounce per-object token content | Baumgartner App. E (never specified) | [x, y, vx, vy] | D13 (email-Anson item) |
 | 16 | Mass distribution, trajectory horizon | Baumgartner App. E | N(1.5, 0.5) clamp [0.5,3]; L=40, Th=10 | bounce_baumgartner.yaml; D13 |
-| 17 | Pooling architecture for Ŝ^ph | my_paper (attention pooling layer, unspecified) | CrossSlotAttnPooling (D14; supersedes D4 text) | channel_split.py:115–168 |
-| 18 | Regularizer placement on Ŝ^ph / S_t | my_paper Fig. 1 (drawn on S̃ and target slots only) | Not regularized (faithful to figure) — creates the dead-channel SPOF | loop.py:181; §3 above |
-| 19 | Regularizer identity | my_paper says SIGReg | VISReg (decided D3, manuscript update pending) | regularizer.py |
+| 17 | Pooling architecture for Ŝ^ph | manuscript (attention pooling layer, unspecified) | CrossSlotAttnPooling (D14; supersedes D4 text) | channel_split.py:115–168 |
+| 18 | Regularizer placement on Ŝ^ph / S_t | manuscript Fig. 1 (drawn on S̃ and target slots only) | Not regularized (faithful to figure) — creates the dead-channel SPOF | loop.py:181; §3 above |
+| 19 | Regularizer identity | manuscript says SIGReg | VISReg (decided D3, manuscript update pending) | regularizer.py |
 
 ---
 

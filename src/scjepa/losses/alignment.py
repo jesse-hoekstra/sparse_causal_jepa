@@ -1,28 +1,14 @@
-"""Trajectory-level alignment of visual tracks to simulator rows (experiments.pdf Eqs. 98-100).
+"""Fixed episode assignments and permutation utilities for anonymous visual tracks.
 
-The state-to-state regime needs none of this: true states arrive in simulator-row order, so
-parameter row ``i`` is attached to physical object ``i`` by construction and the
-evaluation alignment is the identity (Eq. 132). The visual regimes read anonymous
-recurrent visual tracks whose ordering may differ from the simulator's in every
-episode, so the predictions and the targets live in different orders and must be
-matched before any loss is taken.
+Experiment 1 has physical row identities by construction. Experiment 2 aligns its two visual
+branches from shared context slots, without physical supervision. Evaluation separately grounds
+visual tracks to physical objects using geometry. These helpers provide detached trajectory
+assignment and consistent gathering for states, parameters, and graph axes; no per-frame
+rematching is performed. Historical standardized physical-trajectory cost definitions come from
+``sources/outdated_experiments.pdf`` Eqs. 98-100 and remain useful as diagnostic utilities.
 
-The matching is deliberately constrained in three ways (S6.4, S6.5):
-
-1. **One assignment per episode, not per frame.** Eq. 98 sums the cost over the
-   whole prediction window before Eq. 99 solves it. Per-timestep rematching is
-   explicitly forbidden, because a mid-episode identity switch would then be
-   absorbed silently instead of showing up as loss.
-2. **Detached.** No gradient flows through the discrete assignment; gradients
-   reach the model only through the selected predictions.
-3. **Standardized only to choose the permutation.** Eq. 98 divides by frozen
-   training-split coordinate scales so position and velocity errors are
-   comparable while ranking permutations, but the loss itself (Eq. 101) is raw
-   unstandardized MSE.
-
-The same assignment is reused for the prediction loss, the parameter evaluation
-and every learned-graph axis in that episode, so those three never disagree
-about which visual track is which physical object.
+A single episode assignment cannot conceal a mid-trajectory identity switch. Coordinate scales
+only rank assignments; they do not silently normalize downstream predictive losses.
 """
 
 import torch

@@ -16,18 +16,19 @@ is a safety net that catches breakage in seconds and runs free on CPU in CI. Rea
 
 ## What you test (priority order — project-specific invariants included)
 1. **Shape & grad contracts.** Every module: forward on tiny random input gives documented shapes;
-   backward populates grads where expected. Project-critical: gradients reach **both** the context
-   and target SAVi encoders (joint training — a stop-gradient sneaking in via vendored JEPA code is
-   a likely bug); AttnPooling maps `(B, Th, N, d) → (B, N, d)` and its attention weights sum to 1
-   over the **time** axis; KinematicHead uses only the last timestep.
+   backward populates grads where expected. Project-critical: online SAVi/head receive gradients,
+   EMA target SAVi/head do not, and target updates occur only after accepted optimizer steps.
+   Parameter encoding applies relational attention then track-preserving temporal pooling; the
+   state head is row-wise and causal.
 2. **Method invariants.**
-   - Regularizer (VISReg or SIGReg): finite; a collapsed batch (identical embeddings) yields a
-     large penalty; a well-spread batch yields a small one.
+   - Collapse diagnostics distinguish content, temporal, and rank degeneracy. Neither active
+     experiment applies the optional vendored VISReg/SIGReg regularizers.
    - SPARTAN: sparsity penalty is monotone in attention density on constructed inputs; the exposed
      interaction graph has the documented shape and responds to the sparsity weight.
-   - Hungarian matching: permuting target slots leaves the matched loss unchanged (permutation
-     invariance); identity when prediction == target.
-   - AttnPooling is slot-local: perturbing slot j's history never changes ŝ^ph_i for i ≠ j.
+   - Hungarian branch matching: one detached assignment from context only; permuting the whole
+     target trajectory is corrected, while a mid-episode switch retains error.
+   - Shared T=2 windows: valid distinct per-episode sampling, one shared parameter estimate,
+     generated-state feedback with endpoint gradients through both calls, and mean loss scaling.
 3. **Wiring / smoke.** Tiny end-to-end run (synthetic dataset, tiny model, CPU, `WANDB_MODE=
    disabled`): completes, all loss terms finite and logged, checkpoint written, resume exact.
 4. **Data contracts.** One batch matches documented keys/shapes/dtypes/ranges; splits disjoint and

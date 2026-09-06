@@ -39,7 +39,7 @@ def test_slot_history_shape(tiny_encoder: SAViEncoder, tiny_clip: torch.Tensor) 
 
 
 def test_gradients_reach_all_submodules(tiny_encoder: SAViEncoder, tiny_clip: torch.Tensor) -> None:
-    """Joint training (no stop-gradient, D7): every trainable part must get grads."""
+    """The online encoder propagates gradients through each trainable component."""
     tiny_encoder(tiny_clip).square().mean().backward()
     impl = tiny_encoder._impl  # pyright: ignore[reportPrivateUsage]
     for part in ("encoder", "slot_attention", "predictor"):
@@ -109,7 +109,7 @@ def test_rejects_bad_input() -> None:
 
 @pytest.fixture
 def target_encoder() -> SAViEncoder:
-    """D9 target-branch encoder: single frame, no slot predictor."""
+    """D9 single-frame utility: not the recurrent Experiment-2 EMA target, no slot predictor."""
     torch.manual_seed(4)  # pyright: ignore[reportUnknownMemberType]
     return SAViEncoder(
         num_slots=N,

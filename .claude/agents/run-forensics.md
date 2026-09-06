@@ -20,19 +20,22 @@ follow-up experiments. Read `CLAUDE.md` (failure catalog, health signatures) and
 ## Method — evidence before hypotheses
 1. **Pull the trajectory, not the endpoint.** W&B API (`~/.netrc` creds), project
    `jesse-hoekstra-university-of-oxford/sparse-causal-jepa`, via `run.scan_history()`:
-   `loss/pred`, `loss/logit`, `loss/sparsity`, `sparsity/lambda`, `sparsity/path_density`,
-   `eval/*` (mcc, shd_state, shd_param, pred_loss, constraint_loss, path_density),
-   `health/grad_norm`, `health/target_slot_std_*`. Print a downsampled table. The single
-   end-of-run log line has been misleading in EVERY past failure.
-2. **Date the death.** Most failures happen in the first few % of steps and then flatline.
-   Find the last step where eval metrics still moved. A metric frozen at a suspicious constant
-   is a fingerprint: density = 1/T ⇒ identity-only path matrix; shd_param = 1.4595 ⇒ zero
-   param edges; lambda pinned at 1e6 ⇒ dual poisoned/never satisfiable.
-3. **Audit the constraint budget.** constraint = pred + lambda_logit·logit_penalty vs τ from
-   the resolved config. Who consumes the budget? Is the dual holding the system AT τ (healthy)
-   or is constraint ≪ τ (over-pruning headroom) / ≫ τ (infeasible)?
-4. **Check the reference is meaningful.** τ derives from the FC calibration run: was it
-   trained long enough that FC actually beats a self-loops-only model? If not, τ is noise.
+   `train/loss_teacher_forcing`, `train/loss_rollout_t2_raw`, `loss/logit`, `loss/sparsity`,
+   `sparsity/lambda`, `sparsity/path_density`, `eval/mcc`, `eval/shd`, `eval/constraint_loss`,
+   and gradient/skip health. For Experiment 2 include `collapse/*`, tracking, position/velocity
+   probes, and branch disagreement. Print a downsampled table; an endpoint alone can conceal
+   the failure time. Historical `mass_mcc` and split SHD keys are not current metrics.
+2. **Find when progress stopped.** Locate the last changing held-out metrics. Density = 1/T
+   indicates a token-local graph, but interpret it with MCC: low SHD can reward empty-graph
+   collapse. D30's successful four-phase trajectory is a historical qualitative comparison,
+   not a numerical target for the current objective or visual experiment.
+3. **Audit the exact constraint.** Both experiments use TF + weighted T=2 error and the logit
+   penalty; Experiment 2 normalizes only the predictive term by detached floored target content
+   variance. The path penalty is outside both constraints. Compare with the run's calibrated tau.
+4. **Check the reference.** Experiment 1 uses matched dense/identity feasibility selection (D38).
+   Experiment 2 uses its own normalized dense constraint (D39), with gross-collapse screening.
+   The latter remains exploratory because independently learned targets can have different
+   feature geometry; equal latent constraints do not establish equal physical fidelity.
 5. **Cross-run diffs.** `resolved_config.yaml` and `git_sha` between runs; runs execute on the
    NFS server — verify the sha matches the fix you think is deployed.
 6. **Cheap falsification runs** (CPU, minutes): 1500–6000 steps, `data.num_clips=200`, direct

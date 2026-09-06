@@ -1,4 +1,4 @@
-"""Datasets: the Bounce v2 simulator (experiments.pdf §6.1.1).
+"""Datasets: the Bounce v2 simulator (outdated_experiments.pdf §6.1.1).
 
 Every episode carries frames (optional), true states, masses, and the
 per-transition contact record from which the ground-truth local graphs

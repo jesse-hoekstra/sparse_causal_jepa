@@ -1,14 +1,16 @@
 # Architecture & engineering decisions
 
 Living record for the codebase implementing **"Causal Identification within JEPA Using a
-SPARTAN"** (`sources/my_paper.pdf`). Each entry states the decision and what would make us
-revisit it.
+SPARTAN"** (`sources/SCJEPA.pdf`). The current protocol has two experiments: true states (Experiment 1) and learned visual
+states with EMA targets (Experiment 2). D39 supersedes the retired three-experiment proposal.
+Equation references to `outdated_experiments.pdf` identify historical component definitions;
+the supplied manuscript and current implementation use the protocol described in D37–D39.
 
 **2026-07-25: D1-D26 were condensed to the rules below.** Experiment 1 is finished (D30) and
 the D29 refactor superseded most of the historical narrative, so the archaeology was removed
 rather than carried forward. The full original text (984 lines) is recoverable with
-`git show 3fbcdfd:docs/decisions.md`. D27-D30 are kept in full because they describe the code
-as it stands today.
+`git show 3fbcdfd:docs/decisions.md`. D27-D30 are retained as the metric definitions and historical successful baseline. Later
+entries state which objectives and launch settings supersede them.
 
 ## Condensed rules that still bind (from D1-D26)
 
@@ -89,7 +91,7 @@ transpose). (d) W&B/metrics key is `eval/mcc`; `mass_mcc`, `mass_mcc_linear` and
 It is SPARTAN's: Table 1 and §4.1 "Graph Learning" — "we evaluate the Structural Hamming
 Distance, a commonly used metric in graph structure learning, between the learned graphs and
 the ground-truth" — and App. D p.19 repeats the phrasing. Lower is better (their Table 1 and
-Table 7 captions state it). my_paper.pdf p.13 and the write-up §6.7 both require a graph-error
+Table 7 captions state it). SCJEPA.pdf p.13 and the write-up §6.7 both require a graph-error
 number, so it is kept.
 
 **The metric.** ONE number, `eval/shd`, matching that sentence literally: the learned graph
@@ -206,187 +208,71 @@ Retired by this result: failure modes #3-#5 (VISReg scale collapse, BPTT zombie 
 mid-density gradient detonation) are structurally unreachable post-D29 — no regularizer, no
 rollout, no gate-noise chaining. #1 (logit explosion) and #2 (empty-graph collapse) stay live.
 
-## D31 — Experiment-2 foundation: visual data condition + trajectory alignment (2026-07-25, Jesse)
+## D31 — Visual data condition and fixed trajectory alignment (2026-07-25, Jesse)
 
-Experiment 2 (experiments.pdf S6.5) starts from two prerequisites the write-up names itself.
-Both are implemented; the Experiment-2 MODEL is not yet.
+The visual condition renders the same simulator states with `render_radius_from_mass=False`
+and `uniform_appearance=True`: every object is drawn as the same white disc. Physical radii
+remain mass dependent; the rendering hides direct glyph-size and colour identifiers, not the
+physical evidence in collisions and occlusion. `mass_independent_init=True` is a separate
+optional control because it changes the state distribution. It is not enabled in the primary
+same-physics comparison.
 
-**1. Visual data condition (p.14: "physical and rendered radii must be separated").** The
-physics is untouched — same simulator, same Eq. 2 mass-proportional PHYSICAL radii, same
-`data/bounce_train_v2_100000.pt` preload — so mass stays identifiable exactly as in D30. Only
-the drawing changes, via three independent switches on `BounceDataset`:
-`render_radius_from_mass=False` (all discs drawn at the shared radius),
-`uniform_appearance=True` (one white glyph, no per-simulator-row colour), and
-`mass_independent_init=True` (the separate control that removes the mass-dependent
-initial-position support). Measured effect on the primary condition: correlation between total
-episode mass and white pixel area falls 0.96 -> 0.17, rendered-area std 137.5 px -> 4.6 px, and
-distinct frame colours 6 -> 2. The 0.17 residue is occlusion driven by physical contact
-geometry, which p.14 explicitly allows as legitimate evidence; it is not a glyph signature.
-Config: `configs/experiment/bounce_visual.yaml`.
+One stored physics file serves both active experiments. Render settings are excluded from
+`generation_meta`; controls that change states, including mass-independent initialization, are
+included. Frames render on demand rather than storing a roughly 294 GB frame tensor.
+The canonical seed-0 preload must not be regenerated on another machine: identical simulator
+settings gave different trajectories and contact graphs across machines. This is why the visual
+experiment requires the recorded Experiment-1 preload.
 
-Rendering settings are deliberately NOT part of `generation_meta`, because they cannot change
-states/params/contacts — one stored physics file therefore serves both experiments.
-`mass_independent_init` DOES change the states and so is in the identity, but only when
-enabled, so files written before the flag existed still compare equal. Frames are rendered ON
-THE FLY from preloaded states at ~6 ms/episode (170/s/worker); storing 100k x 60 frames would
-cost ~294 GB. Placement now restarts the whole layout on failure — greedy sequential sampling
-essentially never packs five balls at the worst-case radius r_max = 0.16.
+Anonymous visual tracks need one fixed assignment over an episode wherever rows are compared.
+Per-frame rematching could erase identity switches. The original supervised prediction-target
+assignment is retired with that experiment; the shared utilities remain useful for evaluation.
+Current training branch matching is context-only and is defined in D39. Evaluation matches slot
+allocation centroids to physical trajectories without using masses or parameter recovery.
 
-**2. Trajectory-level alignment (Eqs. 98-100), `src/scjepa/losses/alignment.py`.** One detached
-Hungarian assignment per EPISODE between anonymous visual tracks and simulator rows, ranked on
-frozen training-split coordinate scales, reused for the prediction loss, parameter evaluation
-and every graph axis. Targets are moved into visual-track order; nothing is permuted inside the
-predictor. Per-timestep rematching is forbidden (S6.4) and is regression-tested: an episode
-whose identity switches midway keeps a positive residual instead of being matched away.
+`python scripts/plot_bounce_episode.py --condition states|visual` shows the rendering conditions.
+The renderer's y coordinate increases downward; old y-up plots are vertically mirrored relative
+to the actual encoder input.
 
-**Experiment 1 is untouched and stays independently runnable.** Every new data knob defaults to
-the Experiment-1 behaviour, verified byte-identical against pre-change output; the two configs
-select the two conditions (`experiment=bounce_baumgartner` vs `experiment=bounce_visual`) and
-report the same `generation_meta`.
+## D32 — Experiment 2 foundation: visual context and EMA visual targets (2026-07-25, Jesse)
 
-**Still needed for a runnable Experiment 2** (none of it touches Experiment 1): the
-`VisualToStateModel` itself — SAVi Q_psi (S6.3; the existing wrapper already returns the Eq. 42
-(B,T,5,32) contract on these frames, verified) -> state head g_omega (Eq. 87) -> parameter
-encoder with the visual input map W_vis (Eq. 91) -> SPARTAN with W_S in R^{512x32} decoding to
-R^4 (Eqs. 93/95); episode-level permuted track keys from a fixed codebook (S6.4, which differ
-from Experiment 1's fixed per-index keys); the trainer hook that gathers targets through the
-assignment; the SEPARATE evaluation alignment zeta_e (Eqs. 137-138), which matches
-slot-attention mask centroids to true rendered centres rather than using prediction error; the
-S6.4 readiness checks as tests; and a freshly calibrated lambda_logit and tau_2 (Eq. 103).
+The visual-to-visual experiment reuses `Spartan`, `ParameterEncoder`, the training-loop
+safeguards, MCC, and SHD from Experiment 1. `models/visual.py` supplies the SAVi encoder and
+row-wise state head; both are copied into the EMA target. `models/visual_to_visual.py`,
+`training/visual_to_visual.py`, and `eval/visual_to_visual.py` hold regime-specific behavior.
+The preset is `configs/experiment/bounce_visual_to_visual.yaml`.
 
-**Addendum (2026-07-25): there is no separate v3 `.pt`, and the preload must never be
-regenerated.** v3 is a RENDERING condition, not a simulator version — the physics is unchanged,
-so a regenerated states file would be redundant. Worse, it would not even be the same data: the
-simulator is deterministic on one machine but NOT across machines. Regenerating the identical
-config locally instead of on the server diverges chaotically (n=200: 194/200 episodes differ,
-max |delta| 3.4, and 26% get a DIFFERENT contact graph, i.e. a different ground-truth causal
-graph for `eval/shd`). Masses are identical; only trajectories diverge. Experiment 2 therefore
-renders frames on the fly from the same `data/bounce_train_v2_100000.pt`, which guarantees it
-shares Experiment 1's exact physics. The only visual control that needs its own file is
-`mass_independent_init=True`, which genuinely changes the states.
+The optimized predictive error is raw latent MSE. The GECO scalar normalizes the predictive
+term by detached, floored target content variance and adds the weighted logit penalty. This
+keeps the controller sensitive to representation scale above the floor, but neither the floor
+nor EMA rules out a constant representation. A collapsed representation can still achieve
+zero predictive loss. Both spatial/content and temporal collapse diagnostics are necessary.
+The early dual trajectory is not expected to resemble Experiment 1's raw-state trajectory.
 
-Episode figures: `scripts/plot_bounce_episode.py --condition states|visual`. Rendered examples
-of the Experiment-2 input are `data/bounce_v3_visual_episode_00000.png` (with the physical
-collision radii annotated) and `data/bounce_v3_visual_clean_episode_00000.png` (raw encoder
-input). The renderer puts y DOWN, so both are vertically mirrored relative to the older
-`data/bounce_v2_episode_00000.png`, which was drawn y-up.
+The initial implementation compared same-index rows based on shared EMA ancestry. That was an
+assumption in `outdated_experiments.pdf` (PDF p.29), not a guarantee of physical tracking. D39
+replaces it with explicit fixed context-prefix branch matching, following the current
+manuscript's matching description. Source-PDF equation numbering also differs from older code
+comments; the normalized constraint appears as Eq.122 on PDF p.30 of the supplied old proposal.
 
-## D32 — Experiment 3 implemented: visual context, EMA visual target (2026-07-25, Jesse)
+Visual runs have not demonstrated full convergence. The starting logit coefficient `1e-5` is
+inherited from the true-state reference and remains to be screened for the visual architecture.
+Parameter interventions and EMA-speed controls remain future work.
 
-Experiment 3 (experiments.pdf §6.6) is written and runs end-to-end. It reuses the
-Experiment-1 pieces rather than forking them: the same `Spartan` (now with an `output_dim` and
-optional per-episode `track_keys`, both defaulting to Experiment-1 behaviour), the same
-`ParameterEncoder` (Eq. 91's visual input map is just a slot-width input), the same `Trainer`
-(three overridden seams), the same `nonlinear_mcc` and `structural_hamming_distance`.
-**Experiment 1 is byte-identical** — regression-verified, and it still trains from
-`experiment=bounce_baumgartner` with no code path in common beyond the shared modules.
+## D33 — Retired supervised visual-to-state bridge (2026-07-25; retired 2026-09-06)
 
-**What is new.** `models/visual.py` (`VisualStatePath` = Q_psi + g_omega, the object that has an
-EMA twin), `models/experiment3.py` (Eqs. 105-121), `training/experiment3.py` (Eq. 123 constraint,
-Eq. 111 EMA step, Eq. 124 collapse diagnostics), `eval/visual_alignment.py` (Eqs. 132-138),
-`eval/experiment3.py`, `scripts/eval_visual_to_visual.py`,
-`configs/experiment/bounce_visual_to_visual.yaml`, `scripts/isambard_visual_pipeline.sbatch`.
-
-**Three things differ from Experiment 1, and only three.** (a) Frames in, not true states.
-(b) The dual is fed Eq. 123's VARIANCE-NORMALIZED constraint — a learned target's scale drifts,
-so an unnormalized c would silently retune itself; the gradient objective (Eq. 121) keeps the
-raw latent MSE, and a floor epsilon_var stops a collapsing target from making the constraint
-satisfiable by shrinking. (c) The EMA target is stepped after every optimizer step.
-
-**No matching in training.** The EMA copy is initialized from the online encoder and updated
-component-wise, so it never permutes slot rows: predicted row i is compared with target row i
-(Eq. 116). §6.6 forbids matching here because it is unnecessary AND could conceal disagreement
-between the two recurrent trackers. The Hungarian machinery in `losses/alignment.py` belongs to
-Experiment 2's true-state target and to Experiment 3's EVALUATION only.
-
-**Getting metrics out required exposing slot allocations.** Experiment 3's tracks are anonymous,
-so `mcc` and `shd` are unreadable until each track is matched to a physical object. Eqs. 134-138
-do that on trajectory GEOMETRY — slot-attention mask centroids against true rendered centres —
-never on the learned parameters or the true masses, so it cannot be a permutation chosen to
-flatter the score. The vendored SAVi does not return its allocations, so `SAViEncoder.allocations`
-recovers them with a forward hook rather than patching `third_party` (D5 minimal diff), verified
-to satisfy Eq. 71 exactly and to recover a known permutation of true centres.
-
-**Known cold-start property.** At initialization the untrained encoder's slots are nearly
-constant, so V_tgt sits at its floor and Eq. 123's constraint starts in the hundreds. tau_3 is
-calibrated from the dense run in the same units, so it is self-consistent, but the early dual
-trajectory will look nothing like Experiment 1's — do not read D30's four phases onto it.
-
-**Practical warning: memory.** Two SAVi branches over 60 frames at 64x64 dominate; the context
-branch holds a full backward graph. `bounce_visual_to_visual.yaml` therefore sets `batch_size: 4`
-(Experiment 1 used 16). Raise only if it fits, and re-check the views-per-episode arithmetic
-(D12) if you do.
-
-**Not yet done.** lambda_logit is reused from Experiment 1 (1e-5) rather than swept — defensible
-because the logit penalty acts on SPARTAN's own attention logits, which the visual state
-interface does not change, but §6.1.3 asks for a fresh label-free dense sweep before the
-confirmatory seeds. Also absent: §6.7's parameter interventions, the multi-step latent rollout
-diagnostic, the faster/slower EMA controls, and Experiment 2 itself (the ladder puts it before
-this one; its foundations are D31).
-
-## D33 — Experiment 2 implemented; one pipeline script per experiment (2026-07-25, Jesse)
-
-Experiment 2 (experiments.pdf §6.5) is written and runs end-to-end, and the three experiments
-now have separate configs, trainers, evaluations and Isambard pipelines. Experiment 1 remains
-**bit-identical to commit 3fbcdfd** — re-verified after this change: same weight SHA-256 after a
-full CLI run, same resolved config, same metrics to full precision.
-
-| | Exp 1 | Exp 2 | Exp 3 |
-|---|---|---|---|
-| predictor input | true Z_{0:t} | frames X_{0:t} | frames X_{0:t} |
-| target | true Z_{t+1} | true Z_{t+1} | sg(EMA visual), Eq. 114 |
-| SPARTAN state / out | 4 / 4 | d_s=32 / 4 (Eq. 95) | d_s=32 / d_s=32 (Eq. 118) |
-| train alignment | none (zeta = id) | Hungarian, Eqs. 98-100 | none (EMA row ancestry, Eq. 116) |
-| constraint | Eq. 13 raw | Eq. 103 raw | Eq. 123 variance-normalized |
-| target encoder / EMA | no | **no** | yes |
-| collapse regularizer | no | **no** | no (monitored, Eq. 124) |
-| launch | `isambard_pipeline.sbatch` | `isambard_exp2_pipeline.sbatch` | `isambard_exp3_pipeline.sbatch` |
-
-**Experiment 2 is NOT just "Experiment 3 without the EMA".** Two further differences follow
-from the fixed target and are easy to get wrong:
-
-1. **SPARTAN decodes into the RAW 4-dim state** (Eq. 95) from a latent d_s input, so input and
-   output inhabit different spaces — which is exactly why §6.5 excludes open-loop rollout from
-   the primary protocol. Experiment 3's head is type-closed (Eq. 118).
-2. **A trajectory-level assignment is required** (Eqs. 98-100): predictions come out in
-   visual-track order, targets in simulator-row order. Experiment 3 needs none, because EMA row
-   ancestry aligns its branches by construction and §6.6 forbids matching there.
-
-Because the target is fixed raw data there is no target encoder, no EMA teacher, no learned
-target geometry and no representation-collapse regularizer (§6.5, verbatim): a constant context
-state cannot predict episode-varying future states, so collapse is not a trivial optimum.
-`health/latent_std` is logged as a cheap tell, not as an objective.
-
-**Two alignments in Experiment 2's evaluation, deliberately.** `pred_loss`/`constraint_loss` use
-the TRAINING assignment (Eq. 99), because tau_2 is the held-out constraint of the dense reference
-and must be the same quantity the dual sees. `mcc`/`shd` use the EVALUATION assignment
-(Eqs. 137-138, geometric slot-centroid matching), which is blind to learned parameters, true
-masses and prediction quality — the guarantee §6.7 demands and the prediction-error assignment
-cannot give. Their disagreement is logged as `assignment_disagreement`: a tracking tell, not a
-metric.
-
-**sigma_a lives on the model, not the trainer.** Eq. 98's frozen training-split scales are a
-buffer in `VisualToStateModel`, so they serialize into the checkpoint. A standalone evaluation that
-recomputed or defaulted them would select a different assignment and report a constraint tau was
-never calibrated against.
-
-**Track keys are resampled every forward** (§6.4: "an independently sampled episode-level
-permutation"), so two passes over identical input legitimately differ. Tests that need
-determinism seed the RNG; do not mistake this for nondeterminism in the encoder.
-
-**Still open for both visual experiments:** a fresh label-free lambda_logit sweep (1e-5 is
-inherited from D30, defensible because the logit penalty acts on SPARTAN's own attention logits,
-but not calibrated); §6.7's parameter interventions; the frozen held-out state probe (Eq. 104)
-and the "incremental information beyond the state branch" check; and the §6.4 readiness suite.
-The ladder's gating still applies — Experiment 2 must pass its continuation gate before
-Experiment 3 is interpreted.
+The old proposal included a middle experiment predicting a fixed raw four-dimensional physical
+state from visual latent inputs. The user has skipped that experiment. Its model, trainer,
+evaluation entry point, preset, dedicated tests, and launcher are removed. It is not an active
+regime or a prerequisite for interpreting Experiment 2. The two supported regimes are now
+`state_to_state` and `visual_to_visual`; the latter is Experiment 2 throughout active code,
+launchers, and documentation. Source PDFs are preserved as supplied.
 
 ## D34 — Experiment 1 objective is HYBRID: teacher forcing + a full-window autoregressive rollout, both inside the constraint (decided 2026-07-27, Jesse)
 
 > **SUPERSEDED for Experiment 1 by D37.** The text below is retained as the historical
 > motivation for adding an autoregressive branch. Experiment 1 no longer trains through a
-> K=30 rollout. D34b's separate fixed-K visual-to-visual Experiment-3 protocol remains active
-> and is not changed by D37.
+> K=30 rollout. D39 also supersedes the historical full-K visual objective in D34b.
 
 D29 made Experiment 1 a pure teacher-forced one-step objective and deleted the rollout. D34
 puts a rollout back, on a different footing: it is now a SECOND branch alongside teacher
@@ -456,54 +342,19 @@ forcing and predate the masked-softmax/denominator numerics fixes, so they do no
 under the pure-TF objective; the phase STRUCTURE should survive (it is a property of the GECO
 dual) but none of its numbers are comparable.
 
-### D34b — The rollout extends to Experiment 3 but NOT Experiment 2 (2026-07-27, Jesse)
+### D34b — Historical visual full-K rollout (2026-07-27; superseded by D39)
 
-Which regimes can carry the rollout branch is decided by a type, not by preference:
-Eq. 34's recursion needs `F_gamma` to map the representation space to ITSELF.
+The visual predictor maps its learned state width to itself, so it is composable. The former
+visual training objective used one full K=30 generated chain, anchored in the online branch,
+with one fixed parameter estimate and one set of episode keys. D39 replaces that training term
+with eight independent T=2 endpoint windows. The old visual-specific rollout configuration keys
+and any thresholds calibrated against that full-K objective are retired.
 
-* **Experiment 1** — raw true states in, raw true states out. Composable, but D37 now uses that
-  closure only for sampled T=2 windows during training; K=30 is evaluation-only.
-* **Experiment 3** — Eq. 118 gives the predictor `output_dim = state_dim`, so it maps the
-  learned latent width to itself. Composable. `visual_rollout_len: 30` and
-  `lambda_visual_rollout: 1.0` retain the geometry that Experiment 3 originally shared with
-  pre-D37 Experiment 1: anchor t = Tpar-1 = 29 on the ONLINE path, roll to t+K = 59 = T-1,
-  and supervise against the EMA target computed over every frame. The same theta-hat AND the
-  same per-episode track keys (§6.4) enter at every step; resampling keys mid-chain would give
-  each step a different episode-level permutation.
-* **Experiment 2 — structurally excluded.** Its predictor takes a 32-dim latent state
-  (Eq. 94) and decodes to a RAW 4-dim state (Eq. 95), so `f` cannot be composed with itself
-  and Assumption 4's closure `F_gamma(S, theta-hat) in S` fails BY TYPE, not by approximation
-  error. Making it composable would mean predicting the next latent and decoding only for the
-  loss — a rewrite of Eqs. 94/95 that invalidates tau_2. Not done.
-
-**Consequence for the write-up:** Experiment 1 now instantiates only D37's local T=2 training
-term and evaluates K=30 separately; Experiment 3 retains this fixed-K latent training term; and
-Experiment 2 has no composable rollout. The visual-to-state regime's identification argument
-rests on teacher forcing alone. The population trajectory assumption is not proved by any of
-these finite empirical objectives or diagnostics.
-
-**Eq. 123 needs no change.** L_TF and L_roll are both squared errors in the same target space,
-so both scale with the representation exactly as `target_variance` does: the variance-normalized
-constraint stays scale-free with the rollout term in it. The earlier worry that the rollout
-made scale collapse more profitable was wrong.
-
-**What the rollout DOES sharpen, and the new diagnostic.** `content_var` (Eq. 122) pools
-episode and time, and `effective_rank` is a spectrum statistic over the same pooled axis, so
-BOTH stay healthy for a representation that is frozen in time but varies across episodes.
-That representation makes every prediction satisfiable by the identity map — which is also the
-sparsest possible graph, i.e. empty-graph collapse (catalog failure #2) reached from a new
-direction. The optimum already exists under teacher forcing; the rollout raises its payoff,
-since an honest model pays L_TF + lambda_roll*L_roll (L_roll > L_TF, error compounds) while a
-frozen one pays about zero for both. `collapse/*/temporal_var` — variance across TIME within an
-episode, reduced over the time axis FIRST — is the one statistic that separates "learned the
-dynamics" from "stopped moving". Added for both branches; a test pins that the pooled metrics
-cannot distinguish the two cases and that this one can.
-
-**tau_3 must be recalibrated** for Experiment 3's own objective:
-`evaluate_visual_to_visual` computes its scalarised numerator, reading
-`visual_rollout_len`/`lambda_visual_rollout` from the run's resolved config. **Still
-unmeasured:** Experiment 3 has never been run at length (D32 records it as
-"written and runs end-to-end", no run IDs), so none of these diagnostics has faced a real run.
+The useful collapse lesson remains: content variance and effective rank pooled over episodes
+and time can look healthy when a representation varies across episodes but is frozen within
+each episode. Such a representation makes the identity transition sufficient. Temporal variance
+must therefore be reduced over time within each episode first. Neither the rollout nor the
+variance-normalized GECO scalar prevents this degenerate solution.
 
 ## D35 — Reach the exact K=30 objective through an accepted-update horizon curriculum (decided 2026-08-02, Jesse)
 
@@ -584,16 +435,15 @@ truncate the declared window, detach the recurrent state, change `lambda_roll`, 
 truth inside the chain, or weaken final full-rollout equivalence. Tau must be recalibrated from a
 fresh dense D35 run; the failed ramp run and every D34/pre-D34 tau remain invalid.
 
-D35 applied to Experiment 1's preset until D36 superseded it. Experiment 3 remained, and still
-remains, at its separately declared fixed K=30 protocol unless its own evidence motivates and
-explicitly configures a curriculum.
+D35 applied only to Experiment 1. Its historical curriculum is superseded by D37; the visual
+experiment now follows D39's independently anchored T=2 protocol.
 
 ## D36 — Cover the trajectory locally, then remove gradient cuts from one continuous K=30 rollout (decided 2026-08-07, Jesse)
 
 > **SUPERSEDED for Experiment 1 by D37.** This entry is retained to document the exact
 > multi-window/cut schedule that was tried and why it was abandoned. None of its stages,
-> accepted-update transitions, gradient cuts, or K=30 training loss remains active. Experiment
-> 3's separately declared fixed-K latent-space rollout is outside D37's state-to-state scope.
+> accepted-update transitions, gradient cuts, or K=30 training loss remains active. D39 also
+> replaces the visual full-K objective with T=2 endpoint windows.
 
 D35 increased one prefix from the fixed start, but that can leave the later trajectory regions
 untrained until a long recurrent graph reaches them. Three independently true-anchored windows
@@ -667,8 +517,7 @@ has completed zero no-cut updates and is not reportable; reportability requires
 `successful_updates > 115000`. The 355k attempted-batch budget yields the intended 240k terminal
 updates in a zero-skip run; provenance records the actual terminal accepted count otherwise.
 
-D36 applied only to Experiment 1. Experiment 3 retains its separately declared fixed K=30
-protocol unless its own evidence motivates an explicit change.
+D36 applied only to Experiment 1. The current visual objective is specified in D39.
 
 ## D37 — Experiment 1 returns to teacher forcing plus eight sampled two-step endpoints (decided 2026-09-02, Jesse)
 
@@ -763,8 +612,8 @@ The schedule-specific D34–D36 logging is removed. Experiment 1's predictive tr
 `train/loss_rollout_t2_weighted`, and `train/loss_total`; branch gradient norms may additionally
 use `train/grad_norm_teacher_forcing` and `train/grad_norm_rollout_t2_weighted`. Ordinary
 finite-gradient/skip safeguards, dual/sparsity diagnostics, MCC, and SHD remain. D37 changes
-only the state-to-state Experiment-1 objective: Experiment 2 remains teacher-forcing-only by
-type, and Experiment 3 retains its separately specified latent-space fixed-K rollout.
+the state-to-state Experiment-1 objective when it was recorded; D39 now extends the same
+T=2 sampling and endpoint supervision to the visual Experiment 2.
 
 ## D38 — Gate Experiment-1 tau with a freshly trained identity reference (decided 2026-09-03)
 
@@ -785,3 +634,89 @@ If no candidate satisfies the inequality, the pipeline stops before sparse train
 selected factor is a declared slack heuristic, not a value fixed by the identification theorem;
 the identity comparison ensures only empirical feasibility on the matched reference split.
 Terminal sparse evaluation remains on the disjoint seed-offset-29 split.
+
+
+## D39 — Two experiments, visual T=2 prediction, and explicit branch alignment (2026-09-06, Jesse)
+
+**Scope.** Keep Experiment 1 (true states). Skip the supervised visual-to-state bridge and name
+the fully visual extension Experiment 2. `sources/SCJEPA.pdf` is the current manuscript;
+`sources/outdated_experiments.pdf` preserves the old three-experiment proposal. Neither PDF is
+rewritten. The two presets are `bounce_baumgartner` and `bounce_visual_to_visual`.
+
+**Extend the stable local objective.** Both experiments train all 30 teacher-forced suffix
+transitions plus eight independently sampled T=2 windows, using D37's endpoint-only mean loss,
+`lambda_rollout_t2=1.0`, and no detached intermediate prediction. Experiment 2 anchors each
+window in its observed online visual state, supervises against its aligned EMA target two frames
+later, and shares one context-inferred `theta_hat` and one set of episode keys across every
+transition and window. No full-K rollout contributes training gradients. K=30 is evaluation-only.
+
+The visual optimized objective remains
+
+    L = L_TF + lambda_rollout_t2 * L_AR2 + lambda_logit * L_logit + lambda_s^-1 * L_path.
+
+Its GECO constraint is
+
+    c = (L_TF + lambda_rollout_t2 * L_AR2) / sg(max(V_target, epsilon_var))
+        + lambda_logit * L_logit <= tau.
+
+Only the predictive term is variance-normalized, and only in the scalar sent to GECO. The path
+penalty remains outside the constraint. Dense calibration and sparse training must share the
+same final T=2 objective, data, architecture, and optimization settings. Experiment 1 retains
+D38's dense/identity feasibility procedure; the initial visual pipeline uses its own dense
+normalized constraint as tau, subject to a gross-collapse rejection. Dense and sparse runs learn separate target feature spaces: equal normalized
+constraint values need not imply equal physical fidelity, even after passing that screen. This
+calibration remains exploratory; it does not establish visual convergence or a common recovered
+physical representation. Experiment-1 thresholds never transfer.
+
+**Causal visual inputs.** The online recurrence consumes source frames through time `t`; its
+parameter encoder consumes only frames 0–29. The independent target recurrence includes future
+target frames in the complete training sequence, but the target state at `t+1` is causal through
+that frame. The predictor never receives that future frame, target hidden state, or simulator
+truth. Training uses no physical-state, mass, segmentation, or reconstruction supervision.
+
+**EMA does not establish semantic slot identity.** The current manuscript describes Hungarian
+matching (SCJEPA PDF p.7, printed p.5). Its Assumption 2 and Remark 3 (PDF p.9, printed p.7)
+explicitly separate shared EMA ancestry from non-collapse, Markov sufficiency, and equality of
+limiting states. The old proposal's claim that component-wise EMA removes any need to align
+branches is therefore not used as an implementation guarantee.
+
+For each episode, compute one detached Hungarian assignment from the online and target pre-head
+slot trajectories over the shared context prefix. Apply that fixed permutation to the entire
+target sequence, including TF targets and T=2 endpoints. This context-prefix choice is our
+explicit implementation decision: it uses no future target slots, physical states, masses,
+prediction residuals, or per-frame rematching. The assignment changes row addresses, not the learned latent
+coordinate system; EMA still has to maintain comparable features. It can resolve a branch-wide
+permutation, but cannot conceal or repair within-episode tracking switches.
+
+Stochastic dropout in the SAVi recurrence is disabled for this deterministic matching protocol;
+the target remains in evaluation mode even while the online model trains. The target encoder
+and target state head update only through EMA after accepted optimizer steps. Rejected gradient
+updates must not update optimizer, dual, or target.
+
+**Representation learning remains an empirical requirement.** No new anti-collapse regularizer
+is introduced. EMA and a variance floor do not exclude constant states, background-only slots,
+duplicate object allocation, or states frozen over time. Dense calibration rejects gross
+collapse; full-run success still requires content/temporal variation, object tracking, state
+recovery, and useful parameter/graph results. Low latent MSE or a finite CPU smoke is not success.
+
+**Concise evaluation.** Keep MCC, SHD, path density, TF/T=2 losses, and dual/gradient health.
+Compare learned graphs with the matching physical contact graph at each predicted transition,
+not one final contact graph broadcast across time. Match anonymous visual tracks to physical
+objects geometrically for evaluation without using true masses to choose that permutation.
+Add a small slot-allocation panel and tracking/switch diagnostics. Frozen linear probes fit
+position and velocity on training episodes and score separate held-out episodes; state
+recoverability is evidence for the representation, not a claim that each latent coordinate is
+a true-state coordinate or a proof of the theoretical assumptions.
+
+The L40 entry point is `scripts/l40_exp2_pipeline.sbatch RUN_TAG LAMBDA_LOGIT [SEED] [STEPS]`;
+the corresponding Isambard entry point is `scripts/isambard_exp2_pipeline.sbatch`. Both require
+the recorded physics preload. The inherited logit coefficient and visual convergence remain
+exploratory until measured in full runs.
+
+**Local validation (2026-09-06).** The 189-test CPU suite passes, including causal/matching,
+T=2 gradient flow, probe isolation, per-transition graph, and mocked L40 pipeline checks.
+Repository Ruff lint/format and source/script Pyright checks pass. A five-update dense smoke
+used the production visual architecture and 60-frame clips (batch one): finite TF/T=2 losses,
+zero skipped updates, and a successful held-out evaluation/artifact pass. The short smoke
+showed diffuse slots and very low suffix target variance; it is execution validation, not
+evidence of state recovery or convergence. No L40 training run or live W&B upload was performed.

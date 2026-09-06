@@ -1,13 +1,14 @@
 # SCJEPA — "Causal Identification within JEPA Using a SPARTAN"
 
-PyTorch research codebase for Jesse's paper (`sources/my_paper.pdf`). SPARTAN predictor
+PyTorch research codebase for Jesse's paper (`sources/SCJEPA.pdf`). SPARTAN predictor
 (`sources/SPARTAN.pdf`, no public code) inside a JEPA, with the bounce identifiability
 experiment replicated from Baumgartner et al. (`sources/dynamical_system.pdf`).
-Settled design decisions live in `docs/decisions.md` (D1–D37) and BIND all work.
+Settled design decisions live in `docs/decisions.md` (D1–D39) and BIND all work.
 Subagent roster and shared conventions: `.claude/agents/README.md`.
 
-**STATUS: Experiment 1 has returned to its stable teacher-forcing foundation and now adds only
-eight sampled T=2 autoregressive endpoints (D37).**
+**STATUS: Two active experiments: Experiment 1 uses true states; Experiment 2 learns visual
+states and EMA targets. Both train teacher forcing plus eight sampled T=2 endpoints (D37/D39).
+The supervised visual-to-state bridge is retired.**
 Under the pure teacher-forced objective, sparsification pruned the graph AND recovered the
 masses (D30, run 7cq3h2ur): `mcc` 0.948, `shd` 4.81, `path_density` 0.223, L_path 12.3, zero
 skipped steps in 300k, at τ=0.02 (a TEST value, ~1.5–2× dense, not the §6.1.3 τ=1.0×dense).
@@ -163,11 +164,11 @@ byte-identical eval rows. That signature remains worth recognising even with the
 - **Working configuration: λ_logit=1e-5, λ_T2=1.0, eight T=2 anchors, K_eval=30,
   300k attempted batches, λ₀=1e4, α=2e-2.** τ is not a number to carry over. Let the
   dense pipeline calibrate the final TF+T=2+logit constraint.
-- Protocol τ = 1.0 × the held-out `constraint_loss` of ONE converged full-length dense run per
-  architecture/seed, computed with the IDENTICAL T=2 settings (never a short reference — v2
-  failure; never the gated model with sparsity off — F-8). The `--tau-max` token-local launch
-  gate was DELETED in D34: its floor (0.043645 + λ_logit·2.0, run ku244l5e) was measured under
-  the pure-TF constraint and is a different quantity now.
+- **Current Experiment-1 tau protocol (D38):** train matched dense and token-local identity
+  references with identical TF+T=2 settings and full training length. Select the first factor
+  in `[2.0,1.8,1.6,1.4]` satisfying `C_dense < tau = factor*C_dense < C_identity`; abort if none
+  is feasible. The old pure-TF token-local floor and the former 1.0×dense rule are superseded.
+  Experiment 2 calibrates its own normalized constraint separately (D39).
 - λ_logit comes from the label-free dense sweep (§6.1.3 rule, grid recentered to
   0…1e-3 low end): feasibility arithmetic (2026-07-25) says values above ~3e-5 make the
   gated constraint set EMPTY at raw scale — gate commitment costs λ_logit·(2cosh|l|−2)
@@ -207,20 +208,48 @@ byte-identical eval rows. That signature remains worth recognising even with the
   (a stricter Hungarian one-to-one score) and `eval/shd_param_aligned` — different
   quantities, do not plot them on the same axis as the current keys.
 
+## Experiment 2: learned visual states and EMA targets (D39)
+
+- Online SAVi and a row-wise state head encode each source frame causally. A frozen EMA copy
+  independently encodes the complete sequence, including future target frames. Only the initial
+  30-frame context supplies the episode's one `theta_hat`; future targets never enter the predictor.
+- Use the same TF+eight-T=2 endpoint objective as Experiment 1, anchored in online states and
+  supervised against aligned target states. Reuse one `theta_hat` and the same episode-local keys.
+  K=30 is evaluation-only; visual full-K training keys are retired.
+- EMA does not prove semantic row identity. Select one detached Hungarian permutation from
+  pre-head slot trajectories on the shared context prefix; reuse it for the whole target sequence.
+  No true states, masses, future slots, prediction residuals, or per-frame rematching select it.
+  It fixes a global branch permutation, not within-episode switches.
+- Disable recurrent SAVi dropout; target stays in eval mode and updates only by EMA after an
+  accepted optimizer step. A rejected update changes neither optimizer, dual, nor target.
+- The optimized prediction loss is raw latent MSE. The GECO scalar is
+  `(L_TF + lambda_rollout_t2*L_AR2)/sg(max(V_target, epsilon_var)) + lambda_logit*L_logit`.
+  The path penalty stays outside the constraint. Visual tau is freshly calibrated from its own
+  dense model; Experiment-1 thresholds and its raw-state loss scale cannot be reused.
+- EMA, stop-gradient, and the variance floor do not guarantee non-collapse or true-state recovery
+  (SCJEPA PDF p.9, Assumption 2 / Remark 3). No reconstruction or anti-collapse term has been added.
+  Low latent loss alone cannot establish success. Inspect temporal variance, rank, tracking,
+  frozen train-fit/test-eval position/velocity probes, and MCC/SHD together. Keep one slot panel.
+- Equal-radius white glyphs hide appearance identity and direct rendered mass; physical contact
+  radii remain mass dependent. Use the recorded physics preload. The separate
+  `mass_independent_init` control changes the distribution and needs its own data.
+- `sources/outdated_experiments.pdf` preserves the retired proposal. Its experiment numbering,
+  same-row EMA argument, and older objective do not override D39. `sources/SCJEPA.pdf` is the
+  current manuscript; match page/equation references to the actual supplied version.
+
 ## Commands
-- **One pipeline per experiment** (each does data -> dense/tau -> sparse -> eval):
+- **One pipeline per experiment** (recorded data -> matched references/tau -> sparse -> eval):
   - Exp 1 (true state): `sbatch --account=<P> scripts/isambard_exp1_pipeline.sbatch TAG LAMBDA_LOGIT [SEED]`
-  - Exp 2 (visual ctx, true target): `sbatch --account=<P> scripts/isambard_exp2_pipeline.sbatch TAG LAMBDA_LOGIT [SEED] [STEPS]`
-  - Exp 3 (visual ctx, EMA target): `sbatch --account=<P> scripts/isambard_exp3_pipeline.sbatch TAG LAMBDA_LOGIT [SEED] [STEPS]`
-  Configs: `bounce_baumgartner` / `bounce_visual_to_state` / `bounce_visual_to_visual`. All three share
-  the SAME physics preload; the visual ones render frames from it on the fly.
+  - Exp 2 (visual ctx, EMA target): `sbatch --account=<P> scripts/isambard_exp2_pipeline.sbatch TAG LAMBDA_LOGIT [SEED] [STEPS]`
+  - L40 Exp 2: `bash scripts/l40_exp2_pipeline.sbatch TAG LAMBDA_LOGIT [SEED] [STEPS]`
+  Configs: `bounce_baumgartner` / `bounce_visual_to_visual`. Both use the SAME physics preload;
+  Experiment 2 renders identical-looking balls from it on the fly.
 - **Reproduce the historical D30 pure-TF result** (~1.6 h on one GPU, 300k steps) only by
   explicitly setting `train.lambda_rollout_t2=0.0`; D37's default is TF+T=2. The historical
   `tau=0.02` is appropriate only to that exact reproduction, never to a D37 run.
-- Full pipeline: `bash scripts/run_bounce_example.sh --run-tag=X ...` (dense A≡1 same
-  length as main → τ = 1.0× its held-out constraint_loss → sparse run → 5000-episode eval;
-  NO identity stage since D29, NO `--tau-max` gate since D34; `--calib-steps` only for smokes;
-  other hydra overrides go to BOTH runs, D12).
+- Experiment-1 full pipeline: `bash scripts/run_bounce_example.sh --run-tag=X ...` (matched
+  dense and identity references -> D38 feasible tau selection -> sparse -> final evaluation).
+  `--calib-steps` is only for smokes; shared Hydra overrides go to every stage (D12).
 - Cheap stability smoke (~3–5 min, CPU): 1500–3000 steps via `Trainer` directly with
   `data.num_clips=200` at paper geometry (clip_len 60, context_len 30). D37's T=2 branch is active
   from the first update, so the smoke tests the actual fixed predictive objective. Healthy means

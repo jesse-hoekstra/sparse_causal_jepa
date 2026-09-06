@@ -61,7 +61,35 @@ use `train/grad_norm_teacher_forcing` and `train/grad_norm_rollout_t2_weighted`.
 fixed training-set coordinate standard deviations. These values estimate tolerance-based
 agreement on sampled trajectories; they do not prove population observational equivalence.
 
-Experiment 3's visual-to-visual fixed-K rollout is a separate latent-space protocol and remains
-unchanged.
+Experiment 2 uses the same TF+T=2 sampling and endpoint loss in learned visual state space.
+The L40 pipeline is:
+
+```bash
+bash scripts/l40_exp2_pipeline.sbatch visual_seed0 1e-5 0
+# Slurm uses the same arguments:
+sbatch scripts/l40_exp2_pipeline.sbatch visual_seed0 1e-5 0
+```
+
+Arguments are `RUN_TAG LAMBDA_LOGIT [SEED] [STEPS]` (default seed 0, 300,000 steps).
+The corresponding Isambard entry point is `isambard_exp2_pipeline.sbatch`. Both require the
+matching Experiment-1 physics preload and render equal-radius white balls on demand. Do not
+regenerate the canonical preload on another machine. Outputs are
+`outputs/bounce_exp2_<RUN_TAG>/{dense,main}`; an existing output root is rejected.
+
+The visual pipeline trains a dense model, evaluates 1,000 held-out episodes at seed offset 17,
+rejects a grossly collapsed reference, and sets tau to that model's normalized constraint. It then
+trains a sparse model with the identical TF+T=2 settings and evaluates 1,000 disjoint episodes at
+offset 29. Experiment 1's identity-reference slack selection is specific to its raw-state
+constraint and is not silently reused for visual calibration.
+
+`eval_visual_to_visual.py` additionally accepts `--probe-episodes` (default 128),
+`--require-noncollapsed`, and `--require-complete-protocol`. Final metrics and figures append
+to the original W&B training run automatically when W&B is enabled in its saved configuration. Probe coefficients are fitted on frozen features from
+training episodes; the scores use held-out episodes. Final W&B evaluation includes the core
+MCC/SHD/path-density results, concise tracking/state-recovery diagnostics, and a small slot panel.
+Dense and sparse models learn separate target feature spaces, so equal normalized constraints
+do not establish equal physical fidelity. The visual representation's latent coordinates need not literally equal true state coordinates;
+position/velocity decodability and consistent tracking are the relevant checks. EMA and target
+variance normalization alone do not establish successful representation learning.
 
 **Owner:** experiment-infra-engineer (`prepare_data.py` jointly with data-pipeline-engineer).

@@ -20,12 +20,11 @@ fail loudly rather than silently. Read `docs/decisions.md` first; it binds you.
 - **Start from le-wm's training loop** (MIT, vendored) — it already trains a JEPA end-to-end from
   pixels with a predictive loss + embedding regularizer. Adapt it to our modules rather than writing
   a loop from scratch.
-- **Regularizer (D3, resolved):** VISReg — code inspection showed le-wm's regularizer is one
-  swappable module call (`loss = pred_loss + lambd * self.sigreg(emb)`), so the SIGReg fallback
-  never triggered. Vendor `visreg/losses/` (has both `visreg.py` and `sigreg.py`) and keep the
-  regularizer config-selectable (`visreg` default, `sigreg` as ablation/safety hatch).
-- **Joint training:** ONE optimizer step updates encoders + pooling/linear heads + SPARTAN together.
-  No EMA schedule, no target-network machinery, no encoder freezing.
+- **Current experiments (D39):** true states and visual-to-visual EMA targets. The supervised
+  visual-to-state bridge is retired. No representation regularizer is active in either preset.
+- **Online training and EMA:** the optimizer updates online encoder/head, parameter encoder, and
+  SPARTAN. The target encoder/head are frozen to gradients and update by EMA only after accepted
+  optimizer steps. A skipped step updates neither optimizer, dual, nor target.
 - **Experiment-1 loss assembly (D37):** every batch teacher-forces all 30 suffix transitions and
   adds `lambda_rollout_t2 * L_AR2`, with `lambda_rollout_t2=1.0`. For each episode, uniformly
   sample exactly eight distinct valid T=2 offsets without replacement, independently across
@@ -41,8 +40,8 @@ fail loudly rather than silently. Read `docs/decisions.md` first; it binds you.
   activation, schedule checkpoint state, or full-rollout backpropagation. In a D37 sparse run,
   the path term and GECO are active from the start. Calibrate tau freshly for
   `L_TF + lambda_rollout_t2*L_AR2 + lambda_logit*L_logit`; never use the no-gradient K=30
-  diagnostic or an old threshold as the constraint. This restriction is state-to-state only;
-  preserve Experiment 3's separately configured visual-to-visual fixed-K objective.
+  diagnostic or an old threshold as the constraint. D39 applies the same local T=2 objective to
+  Experiment 2, whose predictive GECO term is normalized by detached target content variance.
 - **Experiment-1 logging:** keep `train/loss_teacher_forcing`, `train/loss_rollout_t2_raw`,
   `train/loss_rollout_t2_weighted`, and `train/loss_total`; branch norms may be
   `train/grad_norm_teacher_forcing` and `train/grad_norm_rollout_t2_weighted`. Do not log

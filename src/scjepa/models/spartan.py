@@ -1,4 +1,4 @@
-"""SPARTAN sparse transition predictor f_gamma — experiments.pdf §6.2, Eqs. 27-37.
+"""SPARTAN sparse transition predictor f_gamma — outdated_experiments.pdf §6.2, Eqs. 27-37.
 
 Implements the paper's token layout exactly: N current-state tokens and N
 track-attached scalar parameter tokens, M = 2N tokens total, L_sp single-head
@@ -201,8 +201,8 @@ class Spartan(nn.Module):
             identity: A ≡ 0 — the token-local reference. Mutually exclusive.
             output_dim: Width of the decoded head. ``None`` = ``state_dim``,
                 which covers state-to-state (Eq. 37, R^4 -> R^4) and visual-to-visual
-                (Eq. 118, R^d_s -> R^d_s). The visual-to-state regime is the asymmetric case:
-                a latent d_s input decoded into the raw R^4 target (Eq. 95).
+                (Eq. 118, R^d_s -> R^d_s). Both active experiments use an output
+                width equal to the state input width, enabling autoregression.
         """
         super().__init__()
         if dense and identity:

@@ -204,7 +204,7 @@ def render_bounce(
       own _PALETTE colour and, if ``radii`` is given, its own size. Both are
       dataset-global signatures tied to the simulator ROW INDEX, so a single
       frame reveals identity and (with ``radii``) mass.
-    * ``True`` (Experiments 2/3 primary condition, experiments.pdf p.14): every
+    * ``True`` (Experiment 2 primary condition, outdated_experiments.pdf p.14): every
       object is drawn with "the same mass-independent glyph and rendered
       radius". All discs are white and share ``radius``; ``radii`` is ignored
       for drawing. The frames then carry "no dataset-global visual signature
@@ -297,10 +297,10 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
         mass_range) instead of uniform, and ``radius_from_mass=True`` scales
         each ball's PHYSICAL radius ∝ its mass (mean radius = ``radius``): mass
         then acts through contact geometry too, which is what makes ABSOLUTE
-        mass (not just mass ratios) identifiable at all — experiments.pdf p.14
+        mass (not just mass ratios) identifiable at all — outdated_experiments.pdf p.14
         "Why absolute masses are observable".
 
-        Visual-experiment knobs (experiments.pdf p.14: "For the visual regimes,
+        Visual-experiment knobs (outdated_experiments.pdf p.14: "For the visual regimes,
         physical and rendered radii must be separated"):
 
         * ``render_radius_from_mass``: how large discs are DRAWN. ``None``
@@ -388,7 +388,7 @@ class BounceDataset(Dataset[dict[str, Tensor]]):
         return meta
 
     def physical_radii(self, masses: Float[Tensor, "n 1"]) -> Float[Tensor, " n"] | None:
-        """Collision radii r_i = radius * m_i / m_ref (experiments.pdf Eq. 2), or None.
+        """Collision radii r_i = radius * m_i / m_ref (outdated_experiments.pdf Eq. 2), or None.
 
         The reference mass is episode-INDEPENDENT (audit G2): normalising by the
         episode mean would make geometry reveal only m_i/mean(m), and since

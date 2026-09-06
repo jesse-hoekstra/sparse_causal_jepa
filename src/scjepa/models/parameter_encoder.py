@@ -1,4 +1,4 @@
-"""Parameter encoder P_η — experiments.pdf §6.2, Eqs. 16-26, implemented 1:1.
+"""Parameter encoder P_η — outdated_experiments.pdf §6.2, Eqs. 16-26, implemented 1:1.
 
 Maps the context window of tracked object states to one unconstrained scalar
 parameter coordinate per track:

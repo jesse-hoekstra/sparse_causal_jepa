@@ -1,30 +1,10 @@
 #!/bin/bash
-# Isambard-AI: the complete Experiment-2 pipeline (experiments.pdf §6.5) in one
-# job. Submit FROM THE REPO ROOT:
-#
+# Isambard: Experiment 2, visual states and EMA targets, with TF + sampled T=2 endpoints.
+# Submit from the repository root:
 #   sbatch --account=<PROJECT> scripts/isambard_exp2_pipeline.sbatch RUN_TAG LAMBDA_LOGIT [SEED] [STEPS]
-#
-# e.g.  sbatch --account=<PROJECT> scripts/isambard_exp2_pipeline.sbatch exp2_seed0 1e-5 0
-#
-# Three stages, in order:
-#   1. DATA   pregenerate the states preload (idempotent; skipped if present).
-#             The visual condition renders frames on the fly FROM these states,
-#             so this is the same physics Experiment 1 used and there is no
-#             separate frames file — 100k x 60 frames would be ~294 GB.
-#   2. DENSE  A = 1 everywhere, no path penalty. Its converged held-out
-#             constraint IS tau_2 (Eq. 103 units, raw).
-#   3. SPARSE the gated run at tau_2, then a final held-out evaluation.
-#
-# lambda_logit is chosen up front rather than swept: 1e-5 is the Experiment-1
-# value (D30) and is a defensible starting point because the logit penalty acts
-# on SPARTAN's own attention logits, which are unchanged by the switch to a
-# visual state interface. It is NOT a calibrated choice for this experiment —
-# §6.1.3 asks for a fresh label-free dense sweep, and the write-up requires
-# reporting one before the confirmatory seeds.
-#
-# Experiment 2 has NO target encoder and NO EMA: the target is the fixed true
-# state, so there is nothing whose scale can drift and nothing to collapse into.
-# The constraint is therefore raw (Eq. 103), like Experiment 1's.
+# Reuse the recorded Experiment-1 physics preload. Render identical-looking balls on demand.
+# Train a dense reference, reject gross collapse, calibrate the normalized visual constraint,
+# then train/evaluate the sparse model. The inherited 1e-5 logit value is exploratory.
 #SBATCH --job-name=scjepa-exp2
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
@@ -33,7 +13,7 @@
 #SBATCH --output=slurm-%x-%j.out
 
 set -euo pipefail
-if [ "$#" -lt 2 ]; then
+if [ "$#" -lt 2 ] || [ "$#" -gt 4 ]; then
   echo "usage: sbatch $0 RUN_TAG LAMBDA_LOGIT [SEED] [STEPS]" >&2
   exit 2
 fi
@@ -41,6 +21,11 @@ RUN_TAG=$1
 LAMBDA_LOGIT=$2
 SEED=${3:-0}
 STEPS=${4:-300000}
+if [[ ! "${RUN_TAG}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || \
+   [[ ! "${SEED}" =~ ^[0-9]+$ ]] || [[ ! "${STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "run tag must be a plain identifier, seed non-negative, and steps positive" >&2
+  exit 2
+fi
 ROOT="outputs/bounce_exp2_${RUN_TAG}"
 if [ -e "${ROOT}" ]; then
   echo "refusing to overwrite existing run: ${ROOT}" >&2
@@ -57,54 +42,53 @@ if [ "${SEED}" -eq 0 ]; then
 else
   PRELOAD="data/bounce_train_v2_${NUM_CLIPS}_seed${SEED}.pt"
 fi
+if [ ! -f "${PRELOAD}" ]; then
+  echo "missing recorded Experiment-1 physics preload: ${PRELOAD}; copy it from the Experiment-1 server" >&2
+  exit 2
+fi
 
 COMMON=(
-  experiment=bounce_visual_to_state
+  experiment=bounce_visual_to_visual
   wandb.enabled=true
   train.device=cuda
+  train.lambda_rollout_t2=1.0
+  train.num_rollout_t2_anchors=8
+  train.rollout_t2_horizon=2
+  train.oe_eval_horizon=30
   "train.lambda_logit=${LAMBDA_LOGIT}"
   "train.seed=${SEED}"
   "train.steps=${STEPS}"
   "data.seed=${SEED}"
   "data.num_clips=${NUM_CLIPS}"
   "data.preload=${PRELOAD}"
+  data.cache=false
+  data.render_radius_from_mass=false
+  data.uniform_appearance=true
 )
 
-# ---------------------------------------------------------------- 1. DATA ----
-# Idempotent. NOTE the physics is identical to Experiment 1's, so if the file
-# already exists it is REUSED rather than regenerated — deliberately: the
-# simulator is deterministic per machine but not across machines, and
-# regenerating would give Experiment 2 a different ground-truth contact graph
-# from the Experiment-1 result it is meant to build on.
-echo "== stage 1/3: data =="
-python scripts/pregenerate_bounce.py \
-  experiment=bounce_visual_to_state \
-  "data.num_clips=${NUM_CLIPS}" \
-  "data.seed=${SEED}"
-
-# --------------------------------------------------------------- 2. DENSE ----
-echo "== stage 2/3: dense reference (tau_2 calibration) =="
+echo "== recorded physics: ${PRELOAD} =="
+echo "== dense reference: TF + T=2 =="
 DENSE_DIR="${ROOT}/dense"
 python scripts/train.py "${COMMON[@]}" \
   model.spartan_dense=true \
   train.sparsity_enabled=false \
   "wandb.run_tag=${RUN_TAG}-dense" \
   "hydra.run.dir=${DENSE_DIR}"
-python scripts/eval_visual_to_state.py "${DENSE_DIR}" \
-  --episodes 1000 --seed-offset 17 --device cuda
+python scripts/eval_visual_to_visual.py "${DENSE_DIR}" \
+  --episodes 1000 --seed-offset 17 --device cuda \
+  --require-complete-protocol --require-noncollapsed
 
-TAU=$(python -c "import json,sys; print(json.load(open('${DENSE_DIR}/metrics.json'))['constraint_loss'])")
-echo "calibrated tau_2 = ${TAU} (1.0x the dense held-out constraint, Eq. 103 units)"
+TAU=$(python -c 'import json,math,sys; v=float(json.load(open(sys.argv[1]))["constraint_loss"]); assert math.isfinite(v) and v > 0, "invalid dense constraint"; print(v)' "${DENSE_DIR}/metrics.json")
+echo "calibrated visual tau = ${TAU} (1.0x dense normalized held-out TF+T=2 constraint)"
+echo "Tau is exploratory: different learned target spaces need not imply equal physical fidelity."
 
-# -------------------------------------------------------------- 3. SPARSE ----
-echo "== stage 3/3: sparse run at tau_2 = ${TAU} =="
+echo "== sparse run =="
 MAIN_DIR="${ROOT}/main"
 python scripts/train.py "${COMMON[@]}" \
   "train.sparsity_tau=${TAU}" \
   "wandb.run_tag=${RUN_TAG}-sparse" \
   "hydra.run.dir=${MAIN_DIR}"
-
-echo "== final held-out evaluation (disjoint split) =="
-python scripts/eval_visual_to_state.py "${MAIN_DIR}" \
-  --episodes 1000 --seed-offset 29 --device cuda
-echo "artifacts in ${ROOT} (dense/, main/, metrics.json in each)"
+python scripts/eval_visual_to_visual.py "${MAIN_DIR}" \
+  --episodes 1000 --seed-offset 29 --device cuda \
+  --require-complete-protocol --require-noncollapsed
+echo "artifacts in ${ROOT}: dense/, main/, metrics.json in each"

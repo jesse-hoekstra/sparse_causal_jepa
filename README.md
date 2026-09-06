@@ -1,214 +1,141 @@
 # sparse_causal_jepa
 
-Codebase for **"Causal Identification within JEPA Using a SPARTAN"** (Jesse Hoekstra, Oxford
-Statistics; manuscript in `sources/my_paper.pdf`). It combines a temporal parameter encoder with
-a SPARTAN-style sparse transition model and evaluates causal-graph and parameter recovery with SHD
-and MCC. Experiment 1 operates directly on object states; Experiments 2 and 3 introduce visual
-encoders and their regime-specific representation losses.
+Code accompanying **"Causal Identification within JEPA Using a SPARTAN"**
+([manuscript](sources/SCJEPA.pdf)). There are two active experiments:
 
-**Decision log:** [`docs/decisions.md`](docs/decisions.md) is the source of truth for settled
-design decisions: a short list of standing rules (framework, vendoring, tooling, SPARTAN
-interpretations, simulator contract, pipeline consistency, grad-skip guard) followed by
-D27–D37, which define the metrics, Experiment-1 architecture, verified result, and current
-teacher-forcing-plus-T=2 protocol.
-Read it before changing anything it covers.
+| | Experiment 1 | Experiment 2 |
+|---|---|---|
+| Observations | True object states | Frame sequences of identical-looking balls |
+| Context state | Simulator state | Recurrent SAVi slots and a learned state head |
+| Prediction target | True next state | Stop-gradient EMA visual state |
+| Parameter estimate | One per episode from the true-state context | One per episode from context slots |
+| Training | Teacher forcing + eight sampled T=2 endpoints | Same local objective in learned state space |
+| Preset | `bounce_baumgartner` | `bounce_visual_to_visual` |
 
-> **NOTE:** the historical architecture/ladder discussion below still contains pre-D29 material.
-> Its removed `--identity-check`, `train.lambda_reg`, `health/target_slot_std_*`, and `mass_mcc`
-> names are not current APIs. D34–D36's K=30 state-to-state training curriculum is also
-> superseded. See `CLAUDE.md` and D37 in `docs/decisions.md` for the active protocol.
+The supervised visual-to-true-state bridge has been retired. The old three-experiment proposal
+in [outdated_experiments.pdf](sources/outdated_experiments.pdf) is historical: its equation
+references explain existing components, but its numbering and same-row EMA assumption are not
+the current protocol. [Decisions D37–D39](docs/decisions.md) record the active design.
 
-## Repo map
-
-```
-pyproject.toml            # packaging + ruff/pyright/pytest config in one place
-.pre-commit-config.yaml   # hygiene + ruff + pyright (strict) gates
-docs/decisions.md         # decision log — source of truth
-sources/                  # papers (my_paper, SPARTAN, SAVi++, VISReg, ...)
-src/scjepa/
-  third_party/            # vendored reference code + PROVENANCE.md convention (see its README)
-  models/                 # SAVi, channel split, SPARTAN           (model-architecture-engineer)
-  losses/                 # predictive loss, VISReg/SIGReg, sparsity (paper-to-code-translator)
-  data/                   # CLEVRER, Push-T, synthetic systems     (data-pipeline-engineer)
-  training/               # loop, optim, logging                   (experiment-infra-engineer)
-  eval/                   # SHD/MCC, probes, rollouts              (experiment-infra-engineer)
-configs/                  # Hydra configs                          (experiment-infra-engineer)
-scripts/                  # train.py, eval.py, prepare_data.py     (experiment-infra-engineer)
-tests/                    # fast CPU pytest suite                  (test-and-ci-engineer)
-```
-
-`data/`, `checkpoints/`, `wandb/`, and `outputs/` are gitignored and never committed.
-
-## Quickstart
-
-Requires Python 3.12 (pinned in `pyproject.toml`).
+## Setup
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 pre-commit install
+python -m pytest tests/ -q
 ```
 
-Sanity checks:
+The project uses PyTorch, Hydra, W&B, scipy, and jaxtyping. Source code lives under
+`src/scjepa/{data,models,losses,training,eval}`; runnable entry points are in `scripts/`,
+Hydra presets in `configs/experiment/`, and implementation decisions in `docs/decisions.md`.
+Data, model checkpoints, W&B files, and run outputs are not committed.
 
-```bash
-python -c "import scjepa; print(scjepa.__version__)"
-ruff check .
-pyright
-pytest
-```
+## Shared teacher-forcing and T=2 objective
 
-Stack: PyTorch · Hydra · Weights & Biases · einops · scipy · jaxtyping — exact pins and their
-rationale in `pyproject.toml`.
-
-## Current Experiment-1 predictive objective
-
-Experiment 1 has returned to the stable 30-transition teacher-forcing foundation and adds one
-fixed local-composition term:
+Both experiments use 60-frame episodes and a 30-frame parameter-inference context. Infer one
+attached `theta_hat` from times 0–29 and reuse it for all 30 teacher-forced transitions and all
+auxiliary windows:
 
 ```text
 L_pred = L_TF + lambda_rollout_t2 * L_AR2
 ```
 
-One `theta_hat` is inferred from `S_0,...,S_29` and reused for all 30 teacher-forced suffix
-transitions and all auxiliary windows. For each episode, training samples exactly eight distinct
-valid two-step offsets uniformly without replacement, independently of the other episodes in the
-batch. With context length 30 and sequence length 60, the offsets are `0,...,28`; offset `r`
-launches from the true anchor `S_(29+r)`, predicts `Shat_(30+r)`, feeds that generated state back,
-and predicts `Shat_(31+r)`. Only the second prediction is supervised by `L_AR2`, because the first
-transition is already covered by teacher forcing. The intermediate prediction is not detached.
-The loss is averaged over episodes, eight windows, objects, and coordinates.
+For each episode, sample eight distinct offsets uniformly from 0–28. An offset `r` launches from
+the observed state at `29+r` (a true state in Experiment 1, an online visual state in Experiment
+2), generates the next state, feeds it back without detaching, and predicts the second state.
+Only that second endpoint contributes to `L_AR2`; average the loss over batch, windows, objects,
+and coordinates. `lambda_rollout_t2=0` bypasses the auxiliary branch and its random sampling.
+There is no K=30 training loss or rollout curriculum. K=30 remains an evaluation diagnostic.
 
-There is no K=30 training loss, horizon curriculum, warmup, gradient-cut schedule, or
-full-rollout backpropagation. A deterministic K=30 chain remains only as a fixed-held-out,
-no-gradient observational-equivalence diagnostic. It reports the fraction of episodes whose
-worst-step coordinate-normalized NRMSE is at most `oe_tolerance_nrmse`, plus p50 and p95 of that
-worst-step error. Training horizon 2 and evaluation horizon 30 intentionally differ: T=2 targets
-local composition and exposure bias; the held-out K=30 diagnostic measures approximate trajectory
-agreement. Neither establishes the population observational-equivalence assumption, and T=2 does
-not claim to identify every physical parameter by itself.
+Experiment 1 uses the raw predictive error in its GECO constraint. Experiment 2 divides the
+predictive error by detached, floored target content variance before adding the weighted logit
+penalty to the constraint; the optimized predictive loss remains raw latent MSE. The path penalty
+is outside the constraint in both experiments. Tau must be calibrated for each experiment's
+actual objective and representation scale. Never reuse Experiment 1's historical `tau=0.02`
+for the current TF+T=2 setup or for Experiment 2.
 
-## Worked example: identifiability on bounce (CPU)
+## Experiment 1: true states
 
-The **bounce** system (D11) is 5 balls with per-episode sampled masses colliding elastically;
-every episode carries full ground truth (frames, states, masses, time-indexed contact graph).
-The GT-embedding diagnostic regime (`model.type: states`) runs the channel split + SPARTAN on
-ground-truth object states — slot i ≡ ball i by construction — so the identifiability metrics
-are directly meaningful.
-
-**One command runs the current procedure** — dense and identity reference runs, held-out
-feasibility selection of τ, the main sparsity run, and terminal identifiability evaluation.
-Supply the `lambda_logit` selected by the dense sweep:
+The successful historical teacher-forcing run reached MCC 0.948 and SHD 4.81 (D30). Those values
+predate the T=2 objective and are a reference, not a measured result for the new objective.
+The full single-seed pipeline trains dense and identity references, selects a feasible tau, then
+trains and evaluates the sparse model:
 
 ```bash
-LAMBDA_LOGIT=YOUR_SELECTED_VALUE
-bash scripts/run_bounce_example.sh --run-tag=seed0 \
-  "train.lambda_logit=${LAMBDA_LOGIT}"
-#    -> prints both reference losses and the selected tau, then TF/T=2 losses,
-#       OE diagnostics, SHD, MCC, path_density
-#    -> saves recovery_grid.png with all mass/latent pairs and the global assignment
+bash scripts/run_bounce_example.sh --run-tag=seed0 train.lambda_logit=1e-5
 ```
 
-Hydra overrides are passed to every run, so the references and main run cannot diverge
-in config (the D12 rule). The script tries tau factors `2.0`, `1.8`, `1.6`, then `1.4`,
-selecting the first whose tau lies strictly between the held-out dense and identity losses;
-it aborts before sparse training if none is feasible. Knobs are script flags —
-`--calib-steps`, `--main-steps` (main run only), and `--run-tag` (required for parallel
-launches) — and a mistyped flag errors loudly; the equivalent env vars still work as a fallback.
-
-**What to watch:**
-
-1. *Branch stability.* `train/loss_teacher_forcing` and `train/loss_rollout_t2_raw` should remain
-   finite, as should the corresponding branch gradients when logged. The D18 skip guard remains
-   active; a sustained rejected-update sequence is a failure, not a curriculum phase.
-2. *Stale tau.* Tau is objective- and scale-dependent. Changing the T=2 coefficient, anchor
-   count, logit coefficient, data geometry, or model invalidates the old calibration. If the
-   achievable constraint remains above tau, the dual can grow without pruning. Recalibrate from
-   a matching dense run.
-3. *Trajectory agreement.* Watch all three fixed-held-out OE metrics together. Satisfaction is
-   thresholded, so interpret it with the continuous worst-step NRMSE p50/p95 curves. They are
-   diagnostics, not training losses or a population guarantee.
-
-Healthy sparse training still shows the SPARTAN dual dynamics: `sparsity/constraint` crosses tau,
-then `sparsity/lambda` reverses and decoded-state `sparsity/path_density` shrinks while the
-constraint stays near tau. A short smoke run establishes finite computation and gradients only;
-it does not establish convergence, parameter recovery, or observational equivalence.
-
-## The experiment ladder (bounce) — STALE, superseded by D29
-
-Every rung uses the same one-command runner (τ auto-calibrated per rung; overrides apply to both
-runs); repeat with `train.seed=0..7` for seeded statistics. Periodic W&B evaluation contains only
-the core curves: `pred_loss`, `constraint_loss`, `mean_abs_logit`, `gate_entropy`, `mass_mcc`,
-`shd_state`, `shd_param_aligned`, and `path_density`. The final report also saves the full
-permutation-aware recovery matrix and assignment in `recovery_grid.png` and
-`recovery_alignment.json`. Healthy training always shows: `loss/logit` falls early (when enabled),
-`sparsity/constraint` drops below τ, then `sparsity/lambda` falls and the decoded-state-row
-`sparsity/path_density` shrinks. In learned-target runs, monitor
-`health/target_slot_std_*` for collapse; in the raw-state rung it is a fixed data statistic.
+With an already selected fixed tau, the existing L40 launcher runs eight matched dense/sparse
+seeds on two GPUs:
 
 ```bash
-# Use the coefficient selected by the dense sweep described below.
-LAMBDA_LOGIT=YOUR_SELECTED_VALUE
-
-# Rung 1 — Baumgartner-aligned environment with a true-state JEPA (radius∝mass,
-# logit loss). Their Fig. 3 MCC ≈ 0.9+ is context, not a like-for-like target:
-# the encoder/objective differ. Successful recovery still gives sharp marginals.
-bash scripts/run_bounce_example.sh \
-  experiment=bounce_baumgartner "train.lambda_logit=${LAMBDA_LOGIT}"
-
-# Rung 1-ablation — ±sparsity (their MLP/Transformer comparison; note their own
-# finding: on bounce even an unregularised Transformer disentangles, so expect a
-# smaller gap here than on dual particle). This stale ablation must be launched
-# separately: the current pipeline deliberately enforces a sparse main stage.
-
-# Rung 2 — invisible mass (equal radii, uniform masses): identical otherwise, so
-# any MCC drop vs rung 1 isolates the weaker sufficient-variability (mass acts
-# only through collision impulses). MCC ≈ rung 1 -> method robust; MCC ≈ 0 -> edge found.
-bash scripts/run_bounce_example.sh \
-  experiment=bounce_baumgartner \
-  "train.lambda_logit=${LAMBDA_LOGIT}" \
-  data.radius_from_mass=false data.mass_normal=null
-
-# The resolved Stage-1 config already uses 60-step trajectories with a
-# 30-step inference context. Rung 2.5 — a recurrent per-object encoder that
-# isolates representation learning — remains planned.
-
-# Rung 3 — pixels, invisible mass (the paper's claim; SAVi from pixels):
-python scripts/train.py data.name=bounce data.clip_len=10 train.steps=...   # vision regime
-#   NOTE: MCC/SHD eval for learned slots awaits the slot<->object alignment probe;
-#   until then only training health (pred loss, collapse metrics) is reportable.
-
-# Negative control — pixels + VISIBLE mass (radius rendered): expect prediction to
-# stay good while param->state edges prune away and MCC on θ̂ collapses — the
-# parameter migrates into the state channel (D13 scope condition), motivating the
-# observability assumption in the manuscript.
-python scripts/train.py data.name=bounce data.radius_from_mass=true ...
+SCJEPA_BATCH_ID=exp1_8seed CUDA_VISIBLE_DEVICES=4,5 \
+  bash scripts/l40_exp1_8seed_pipeline.sbatch TAU
 ```
 
-Scale: Baumgartner's setting is ~300k steps × 8 seeds (their Fig. 17/3); the D37
-state-to-state preset uses the last stable 300k-step budget. The historical successful
-teacher-forcing run used `lambda_logit=1e-5` and `sparsity_lambda_init=1e4`. Its `tau=0.02`
-must not be reused: the dense stage must calibrate tau for
-`L_TF + lambda_rollout_t2*L_AR2 + lambda_logit*L_logit`. Baumgartner does not specify the
-numerical `lambda_logit`, so first run the controlled
-dense-model sweep on Isambard:
+See [scripts/README.md](scripts/README.md) for outputs and Slurm usage.
+
+## Experiment 2: learn states from pixels
+
+Both experiments reuse the same stored physics. The visual renderer draws equal-radius white
+balls, so neither glyph size nor colour supplies an object identifier or a direct mass label.
+Physical collision radii still depend on mass; occlusion and collision geometry may reveal
+physical information. `mass_independent_init` is a separate optional control that changes the
+physics distribution and needs its own preload. The canonical Experiment-1 preload must not be
+regenerated on another machine.
+
+The online branch encodes each source frame causally. The target branch is a frozen EMA copy of
+the visual encoder and state head, and encodes the full sequence, including future target frames.
+Its recurrent state at time `t` depends only on frames through `t`. The predictor receives the
+online current state and the single parameter estimate from the initial context. During T=2
+windows, its second call receives its own prediction.
+
+**EMA does not guarantee that slot `i` tracks the same ball in both branches.** Each episode
+therefore gets one detached Hungarian assignment between the branches' pre-head slot trajectories
+on the shared context prefix. That permutation is fixed for the entire target sequence and every
+training term. It uses no future frames, physical states, or masses. It can correct a branch-wide
+permutation; it cannot repair an identity switch midway through a trajectory. Slot numbering is
+local to an episode, and tracking still has to be measured. This matching is an implementation
+choice consistent with the current manuscript's Hungarian matching description; the outdated
+proposal's stronger same-row assumption is not used.
+
+EMA and stop-gradient also do not prove non-collapse or recovery of a sufficient Markov state
+(SCJEPA, PDF p.9, Assumption 2 and Remark 3). No reconstruction loss or anti-collapse regularizer
+has been added. Low latent prediction error alone is insufficient: inspect temporal variation,
+effective rank, object tracking, and held-out state probes before interpreting MCC/SHD.
+
+Run the complete dense-calibration and sparse pipeline on one L40:
 
 ```bash
-sbatch --account=<PROJECT> scripts/isambard_logit_sweep.sbatch logit_seed0 0
-# The job prints selected_lambda_logit and writes it to sweep_summary.json.
-SWEEP=outputs/lambda_logit_sweep_logit_seed0/sweep_summary.json
-LAMBDA_LOGIT=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["selected_lambda_logit"])' "$SWEEP")
-sbatch --account=<PROJECT> scripts/isambard_exp1_pipeline.sbatch full_seed0 "$LAMBDA_LOGIT" 0
+bash scripts/l40_exp2_pipeline.sbatch visual_seed0 1e-5 0
+# Or on Slurm:
+sbatch scripts/l40_exp2_pipeline.sbatch visual_seed0 1e-5 0
 ```
 
-The sweep compares prediction against the `lambda_logit=0` control, rejects values degrading it
-by more than 5%, and selects the smallest Pareto coefficient that obtains 90% of the best
-admissible reduction in the excess logit penalty above its theoretical floor of 2. Mass recovery
-is displayed as a validation diagnostic, not used by that rule. Dense attention can only screen
-the coefficient; the gated pipeline must still reach τ, move λ away from its ceiling, reduce path
-density/SHD, and retain `mcc`.
+The first argument is a unique run tag; the remaining arguments are `LAMBDA_LOGIT [SEED] [STEPS]`
+(default seed 0 and 300,000 steps). Outputs go to `outputs/bounce_exp2_visual_seed0/{dense,main}`.
+The launcher requires the corresponding physics preload, calibrates tau from the dense model's
+held-out normalized constraint, rejects grossly collapsed dense references, and evaluates the
+sparse model on a disjoint split. Dense and sparse models learn separate target feature spaces;
+equal normalized errors therefore need not imply equal physical fidelity. This is an exploratory
+experiment: the inherited `1e-5` logit coefficient and visual convergence have not been
+established by full runs.
 
-If compute nodes have no internet, add `wandb.mode=offline` and sync afterwards. Every final eval
-writes `metrics.json`; aggregate seeded runs with
-`python scripts/aggregate_runs.py 'outputs/bounce_example_rung1_seed*/main'`.
+## Concise results to inspect
+
+Use the existing `eval/mcc`, `eval/shd`, and `eval/path_density` together with TF/T=2 losses and
+constraint/dual health. A low SHD with low MCC can be empty-graph collapse. Experiment 2 adds
+`slot_centroid_rmse`, `slot_switch_rate`, and `branch_slot_disagreement`, frozen linear probes
+(`position_probe_r2`, `velocity_probe_r2`), and one small `slot_tracks.png` panel.
+The probes fit on training episodes and score separate held-out episodes, using the prediction
+window in both cases. They test whether true states are linearly recoverable from the learned
+representation, not whether individual latent coordinates
+literally equal `(x,y,vx,vy)`. The slot panel shows allocations over frames and should make merged
+objects, background slots, and switching visible without adding a large gallery of plots.
+Its shared color scale is relative to uniform attention, so diffuse slots cannot look sharply
+localized through independent contrast stretching.
+
+A finite CPU smoke confirms that the implementation runs; successful identification still needs
+the L40 run and inspection of these held-out results.

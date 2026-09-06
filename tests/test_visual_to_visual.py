@@ -1,14 +1,16 @@
-"""Visual-to-visual regime: frames in, EMA-encoded next frame out (experiments.pdf §6.6)."""
+"""Visual-to-visual regime: frames in, EMA-encoded next frame out (Experiment 2)."""
 
 import copy
 
 import pytest
 import torch
+from torch import Tensor, nn
 
 from scjepa.data.bounce import BounceDataset
 from scjepa.eval.visual_alignment import physical_assignment, slot_centroids
 from scjepa.eval.visual_to_visual import evaluate_visual_to_visual
-from scjepa.models.visual_to_visual import build_visual_to_visual
+from scjepa.models.spartan import SpartanOutput
+from scjepa.models.visual_to_visual import build_visual_to_visual, context_target_assignment
 from scjepa.training.loop import TrainConfig
 from scjepa.training.visual_to_visual import VisualToVisualTrainer, collapse_metrics
 
@@ -45,7 +47,7 @@ def _dataset(episodes: int = 4, clip_len: int = 6) -> BounceDataset:
 
 
 def test_target_is_initialized_from_the_online_path() -> None:
-    """Eq. 110: shared row ancestry is what makes matching unnecessary."""
+    """EMA starts in a shared feature basis; object tracking still needs testing."""
     model = _model()
     for online, target in zip(model.online.parameters(), model.target.parameters(), strict=True):
         assert torch.equal(online, target)
@@ -133,8 +135,6 @@ def test_constraint_is_variance_normalized() -> None:
         batch_size=2,
         context_len=3,
         lambda_rollout_t2=0.0,
-        visual_rollout_len=3,
-        lambda_visual_rollout=1.0,
         lambda_logit=0.0,
     )
     trainer = VisualToVisualTrainer(model, _dataset(), config, eval_dataset=None)
@@ -146,15 +146,13 @@ def test_constraint_is_variance_normalized() -> None:
 
 
 def test_variance_floor_bounds_the_constraint() -> None:
-    """A collapsing target must not make the constraint look satisfiable."""
+    """The variance floor bounds division; it is not an anti-collapse objective."""
     model = _model(variance_floor=1e-2)
     config = TrainConfig(
         steps=1,
         batch_size=2,
         context_len=3,
         lambda_rollout_t2=0.0,
-        visual_rollout_len=3,
-        lambda_visual_rollout=1.0,
     )
     trainer = VisualToVisualTrainer(model, _dataset(), config, eval_dataset=None)
     output = model(torch.rand(2, 5, 3, 64, 64), context_len=3)._replace(
@@ -172,10 +170,8 @@ def test_training_step_runs_and_steps_the_ema() -> None:
         batch_size=2,
         context_len=3,
         lambda_rollout_t2=0.0,
-        visual_rollout_len=3,
-        lambda_visual_rollout=1.0,
         device="cpu",
-        out_dir="/tmp/e3",
+        out_dir="/tmp/e2",
     )
     trainer = VisualToVisualTrainer(model, _dataset(), config, eval_dataset=None)
     before = copy.deepcopy([t.clone() for t in model.target.parameters()])
@@ -204,7 +200,12 @@ def test_collapse_metrics_detect_a_constant_representation() -> None:
 def test_evaluation_reports_the_shared_metric_keys() -> None:
     """This regime must land on the same mcc/shd axis as state-to-state."""
     report = evaluate_visual_to_visual(
-        _model(), _dataset(episodes=4), batch_size=2, max_batches=2, context_len=3
+        _model(),
+        _dataset(episodes=4),
+        batch_size=2,
+        max_batches=2,
+        context_len=3,
+        num_rollout_t2_anchors=2,
     )
     for key in ("pred_loss", "constraint_loss", "path_density", "shd", "mcc"):
         assert key in report.metrics
@@ -232,42 +233,25 @@ def test_slot_centroids_match_the_renderer_axis_convention() -> None:
     assert float(centroid[1]) == pytest.approx((10 + 0.5) / 64)
 
 
-def test_rollout_is_autoregressive_and_anchored_on_the_online_path() -> None:
-    """Eqs. 33-34 in the learned latent space.
-
-    The anchor must be the ONLINE state at Tpar-1 and each later step must
-    consume the previous PREDICTION. A rollout that silently re-read the online
-    path every step would be K teacher-forced predictions wearing a chain's
-    clothing, and would train and log identically.
-    """
-    torch.manual_seed(0)
-    model = _model()
-    model.eval()
-    frames = _dataset()[0]["frames"].unsqueeze(0).repeat(2, 1, 1, 1, 1)
-    tpar, horizon = 3, 3
+def test_evaluation_rollout_targets_and_guards() -> None:
+    model = _model().eval()
     with torch.no_grad():
-        out = model(frames, context_len=tpar, rollout_len=horizon)
-        anchor = out.context_states[:, tpar - 1]
-        assert out.rollout_prediction is not None
-        torch.testing.assert_close(out.rollout_prediction[:, 0].shape, anchor.shape)
-        # k=2 must differ from what a fresh online encoding would have produced.
-        teacher_forced_k2 = out.context_states[:, tpar]
-        assert not torch.allclose(out.rollout_prediction[:, 1], teacher_forced_k2)
-
-
-def test_rollout_targets_come_from_the_ema_branch() -> None:
-    """Eq. 114: targets are the EMA path's states, detached, at t+1..t+K."""
-    torch.manual_seed(0)
-    model = _model()
-    model.eval()
-    frames = _dataset()[0]["frames"].unsqueeze(0).repeat(2, 1, 1, 1, 1)
-    tpar, horizon = 3, 3
-    with torch.no_grad():
-        out = model(frames, context_len=tpar, rollout_len=horizon)
-    assert out.rollout_target is not None
-    assert not out.rollout_target.requires_grad
-    for k in range(1, horizon + 1):
-        torch.testing.assert_close(out.rollout_target[:, k - 1], out.target_states[:, tpar - 1 + k])
+        out = model(torch.rand(2, 6, 3, 64, 64), context_len=3)
+        prediction, target = model.rollout_for_evaluation(
+            out.context_states, out.target_states, 3, 3, out.causal_params, out.episode_keys
+        )
+    assert prediction.shape == (2, 3, 5, 8)
+    torch.testing.assert_close(target, out.target_states[:, 3:])
+    assert not prediction.requires_grad
+    with pytest.raises(RuntimeError, match="no_grad"):
+        model.rollout_for_evaluation(
+            out.context_states, out.target_states, 3, 3, out.causal_params, out.episode_keys
+        )
+    model.train()
+    with torch.no_grad(), pytest.raises(RuntimeError, match="model.eval"):
+        model.rollout_for_evaluation(
+            out.context_states, out.target_states, 3, 3, out.causal_params, out.episode_keys
+        )
 
 
 def test_temporal_var_catches_a_time_frozen_representation() -> None:
@@ -291,3 +275,223 @@ def test_temporal_var_catches_a_time_frozen_representation() -> None:
     # ...but the temporal one does, unambiguously.
     assert degenerate["x/temporal_var"] == pytest.approx(0.0, abs=1e-9)
     assert healthy["x/temporal_var"] > 0.1
+
+
+def test_matching_recovers_one_per_episode_slot_permutation() -> None:
+    torch.manual_seed(9)
+    online = torch.randn(3, 4, 5, 8, requires_grad=True)
+    permutations = torch.stack([torch.randperm(5) for _ in range(3)])
+    target = online.detach().gather(2, permutations[:, None, :, None].expand_as(online))
+    assignment = context_target_assignment(online, target)
+    torch.testing.assert_close(assignment, permutations.argsort(dim=1))
+    assert not assignment.requires_grad
+    torch.testing.assert_close(
+        target.gather(2, assignment[:, None, :, None].expand_as(target)), online
+    )
+
+
+def test_matching_does_not_depend_on_other_episodes_in_the_batch() -> None:
+    torch.manual_seed(1)
+    online = torch.randn(1, 4, 5, 8)
+    target = torch.randn_like(online)
+    alone = context_target_assignment(online, target)
+    unrelated_online = torch.randn_like(online) * torch.logspace(-4, 6, 8)
+    unrelated_target = torch.randn_like(online) * torch.logspace(-4, 6, 8)
+    batched = context_target_assignment(
+        torch.cat((online, unrelated_online)), torch.cat((target, unrelated_target))
+    )
+    torch.testing.assert_close(alone[0], batched[0])
+
+
+def test_identical_ema_prefixes_remain_deterministic_during_training() -> None:
+    model = _model().train()
+    frames = torch.rand(2, 6, 3, 64, 64)
+    out = model(frames, context_len=3)
+    assert not model.target.training
+    torch.testing.assert_close(out.context_states, out.target_states[:, :-1], rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(out.target_assignment, torch.arange(5)[None].expand(2, -1))
+
+
+def test_future_frames_do_not_change_assignment_parameters_or_past_states() -> None:
+    model = _model().eval()
+    frames = torch.rand(2, 6, 3, 64, 64)
+    baseline = model(frames, context_len=3)
+    changed = frames.clone()
+    changed[:, 3:] = torch.rand_like(changed[:, 3:])
+    altered = model(changed, context_len=3)
+    torch.testing.assert_close(baseline.target_assignment, altered.target_assignment)
+    torch.testing.assert_close(baseline.causal_params, altered.causal_params)
+    torch.testing.assert_close(baseline.context_states[:, :3], altered.context_states[:, :3])
+    torch.testing.assert_close(baseline.target_states[:, :3], altered.target_states[:, :3])
+
+
+def test_allocations_are_optional_detached_and_reuse_the_encoder_pass() -> None:
+    model = _model()
+    frames = torch.rand(2, 5, 3, 64, 64)
+    calls: list[int] = []
+    handle = model.online.encoder._impl.slot_attention.register_forward_hook(
+        lambda *_: calls.append(1)
+    )
+    try:
+        output = model(frames, context_len=3, capture_allocations=True)
+    finally:
+        handle.remove()
+    assert len(calls) == 4  # exactly one correction pass per online frame
+    assert output.context_allocations is not None
+    assert output.target_allocations is not None
+    assert output.context_allocations.shape == (2, 4, 5, 64 * 64)
+    assert output.target_allocations.shape == (2, 5, 5, 64 * 64)
+    assert not output.context_allocations.requires_grad
+    torch.testing.assert_close(output.context_allocations.sum(-1), torch.ones(2, 4, 5))
+    assert model(frames, context_len=3).context_allocations is None
+
+
+def test_t2_reuses_one_parameter_inference_and_episode_keys() -> None:
+    model = _model()
+    parameter_calls: list[int] = []
+    predictor_calls: list[tuple[tuple[Tensor, ...], dict[str, Tensor], SpartanOutput]] = []
+    encoder_hook = model.parameter_encoder.register_forward_hook(
+        lambda *_: parameter_calls.append(1)
+    )
+
+    def record_call(
+        _module: nn.Module,
+        args: tuple[Tensor, ...],
+        kwargs: dict[str, Tensor],
+        output: SpartanOutput,
+    ) -> None:
+        predictor_calls.append((args, kwargs, output))
+
+    predictor_hook = model.predictor.register_forward_hook(record_call, with_kwargs=True)
+    try:
+        out = model(torch.rand(2, 6, 3, 64, 64), context_len=3, num_rollout_t2_anchors=2)
+    finally:
+        encoder_hook.remove()
+        predictor_hook.remove()
+    assert len(parameter_calls) == 1
+    assert len(predictor_calls) == 3  # TF, generated first step, generated second step
+    assert out.rollout_t2_offsets is not None
+    assert out.rollout_t2_offsets.shape == (2, 2)
+    assert out.rollout_t2_prediction is not None
+    assert out.rollout_t2_target is not None
+    assert out.rollout_t2_intermediate is not None
+    torch.testing.assert_close(predictor_calls[2][0][0], out.rollout_t2_intermediate.flatten(0, 1))
+    for args, kwargs, _ in predictor_calls[1:]:
+        torch.testing.assert_close(args[1], out.causal_params.repeat_interleave(2, dim=0))
+        torch.testing.assert_close(
+            kwargs["track_keys"], out.episode_keys.repeat_interleave(2, dim=0)
+        )
+    indices = 4 + out.rollout_t2_offsets
+    torch.testing.assert_close(
+        out.rollout_t2_target, out.target_states[torch.arange(2)[:, None], indices]
+    )
+    assert not out.rollout_t2_target.requires_grad
+
+
+def test_t2_endpoint_gradient_reaches_both_predictions_and_online_anchor() -> None:
+    model = _model()
+    online_states = torch.randn(2, 5, 5, 8, requires_grad=True)
+    target_states = torch.randn(2, 6, 5, 8, requires_grad=True)
+    theta = torch.randn(2, 5, 1, requires_grad=True)
+    generated: list[Tensor] = []
+
+    def retain(_module: nn.Module, _args: tuple[Tensor, ...], output: SpartanOutput) -> None:
+        output.prediction.retain_grad()
+        generated.append(output.prediction)
+
+    handle = model.predictor.register_forward_hook(retain)
+    try:
+        endpoint, target, _ = model.rollout_t2_from_offsets(
+            online_states,
+            target_states,
+            3,
+            theta,
+            torch.tensor([[0, 1], [1, 0]]),
+            model.predictor.sample_track_keys(2),
+        )
+        (endpoint - target).square().mean().backward()
+    finally:
+        handle.remove()
+    assert len(generated) == 2
+    assert generated[0].grad is not None
+    assert float(generated[0].grad.abs().sum()) > 0
+    assert generated[1].grad is not None
+    assert float(generated[1].grad.abs().sum()) > 0
+    assert online_states.grad is not None
+    assert float(online_states.grad.abs().sum()) > 0
+    assert theta.grad is not None
+    assert float(theta.grad.abs().sum()) > 0
+    assert target_states.grad is None
+
+
+def test_t2_disabled_preserves_teacher_forcing_rng_and_calls() -> None:
+    model = _model()
+    frames = torch.rand(2, 6, 3, 64, 64)
+    rng = torch.get_rng_state()
+    baseline = model(frames, context_len=3)
+    baseline_after = torch.get_rng_state()
+    torch.set_rng_state(rng)
+    disabled = model(frames, context_len=3, num_rollout_t2_anchors=0)
+    torch.testing.assert_close(baseline.prediction, disabled.prediction)
+    torch.testing.assert_close(torch.get_rng_state(), baseline_after)
+    assert disabled.rollout_t2_prediction is None
+
+
+def test_trainer_uses_only_frames_and_shared_t2_metric_names() -> None:
+    model = _model()
+    config = TrainConfig(steps=1, batch_size=2, context_len=3, num_rollout_t2_anchors=2)
+    trainer = VisualToVisualTrainer(model, _dataset(), config)
+    # Supplying no state, mass, or contact fields also rules out accidental
+    # simulator supervision in either the model or the training objective.
+    metrics = trainer._train_step({"frames": torch.rand(2, 6, 3, 64, 64)})
+    assert metrics["health/skipped_steps"] == 0.0
+    assert metrics["train/loss_rollout_t2_raw"] > 0
+    for key in ("train/loss_teacher_forcing", "train/loss_rollout_t2_weighted", "train/loss_total"):
+        assert key in metrics
+
+
+def test_static_slot_identities_do_not_count_as_content_variance() -> None:
+    fixed_slots = torch.randn(1, 1, 5, 8).expand(3, 4, -1, -1)
+    metrics = collapse_metrics(fixed_slots, "x")
+    assert metrics["x/content_var"] == 0.0
+    assert metrics["x/temporal_var"] == 0.0
+
+
+def test_collapse_metrics_exclude_context_initialization_transients() -> None:
+    model = _model()
+    trainer = VisualToVisualTrainer(
+        model, _dataset(), TrainConfig(steps=1, batch_size=2, context_len=3)
+    )
+    out = model(torch.rand(2, 6, 3, 64, 64), context_len=3)
+    online = torch.zeros_like(out.context_states)
+    target = torch.zeros_like(out.target_states)
+    online[:, :2] = torch.randn_like(online[:, :2])
+    target[:, :3] = torch.randn_like(target[:, :3])
+    metrics = trainer._extra_metrics(out._replace(context_states=online, target_states=target))
+    assert metrics["collapse/online/temporal_var"] == 0.0
+    assert metrics["collapse/target/temporal_var"] == 0.0
+    assert metrics["collapse/online/content_var"] == 0.0
+    assert metrics["collapse/target/content_var"] == 0.0
+
+
+def test_fixed_context_mapping_does_not_rematch_a_future_identity_switch() -> None:
+    model = _model().eval()
+    permutation = torch.tensor([4, 1, 2, 3, 0])
+
+    def swap_future(_module: nn.Module, _args: tuple[Tensor, ...], output):  # noqa: ANN001, ANN202
+        slots, states = output.slots.clone(), output.states.clone()
+        slots[:, 3:] = slots[:, 3:, permutation]
+        states[:, 3:] = states[:, 3:, permutation]
+        return output._replace(slots=slots, states=states)
+
+    frames = torch.rand(2, 6, 3, 64, 64)
+    baseline = model(frames, context_len=3)
+    handle = model.target.register_forward_hook(swap_future)
+    try:
+        switched = model(frames, context_len=3)
+    finally:
+        handle.remove()
+    torch.testing.assert_close(switched.target_assignment, baseline.target_assignment)
+    torch.testing.assert_close(
+        switched.target_states[:, 3:], baseline.target_states[:, 3:, permutation]
+    )

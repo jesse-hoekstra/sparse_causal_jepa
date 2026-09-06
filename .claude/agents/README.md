@@ -1,7 +1,7 @@
 # Project subagents
 
 Specialized Claude Code subagents for building the codebase of **"Causal Identification within JEPA
-Using a SPARTAN"** (`sources/my_paper.pdf`). Each agent owns one area and hands off to the next.
+Using a SPARTAN"** (`sources/SCJEPA.pdf`). Each agent owns one area and hands off to the next.
 Claude routes automatically on the `description` field, or call one explicitly.
 
 **Source of truth for settled decisions: [`docs/decisions.md`](../../docs/decisions.md).**
@@ -10,7 +10,7 @@ Framework is **PyTorch** (D1); reuse-first via vendored `third_party/` code (D5)
 ## Stack & reference codebases
 - PyTorch · Hydra · W&B · einops · scipy (Hungarian) · ruff · pyright strict · pytest · jaxtyping
 - [le-wm](https://github.com/lucas-maes/le-wm) (MIT) — JEPA training loop + SIGReg-style regularizer
-- [visreg](https://github.com/HaiyuWu/visreg) (CC BY-NC 4.0) — VISReg anti-collapse (D3 resolved: VISReg; SIGReg kept only as config ablation)
+- [visreg](https://github.com/HaiyuWu/visreg) (CC BY-NC 4.0) — vendored regularizers (not active in either current experiment)
 - PyTorch SAVi (e.g. SlotFormer's), validated against
   [official JAX SAVi](https://github.com/google-research/slot-attention-video) (Apache 2.0) — D2: SAVi, not SAVi++
 - SPARTAN: **no public code** — implemented from the paper (`sources/SPARTAN.pdf`, arXiv:2411.06890)
@@ -27,15 +27,20 @@ Framework is **PyTorch** (D1); reuse-first via vendored `third_party/` code (D5)
 | 6 | `test-and-ci-engineer` | `tests/`, `.github/workflows/` | fast CPU tests + CI |
 | 7 | `run-forensics` | W&B/run diagnosis, failure-mode naming | a run failed or looks wrong — BEFORE editing code |
 
-## Architecture facts every agent must respect (from the paper)
-- Context & target SAVi encoders **jointly trained** — **no EMA target, no frozen encoder, no
-  stop-gradient asymmetry**. Collapse prevention = VISReg/SIGReg loss term only.
-- Channel split (D4): per-slot temporal attention pooling collapses the time axis
-  `(B, Th, N, d) → (B, N, d)` = θ̂; linear head on last-step slots = S_t.
-- SPARTAN predicts Ŝ_{t+1} from (S_t, θ̂, optional U_t) and must **expose its interaction
-  graph** for SHD/MCC eval.
-- Loss: Hungarian-matched predictive loss + regularizer (both branches) + SPARTAN sparsity penalty.
-- Auxiliary variables (actions) strictly optional — Push-T uses them, CLEVRER doesn't.
+## Architecture facts every agent must respect
+
+- Two experiments: true-state `state_to_state`, and pixel-based `visual_to_visual` with a
+  stop-gradient EMA target. The supervised visual-to-state bridge is retired.
+- Both train teacher forcing plus eight sampled T=2 endpoints with one shared `theta_hat`;
+  K=30 is evaluation-only. See D37/D39 for sampling and gradient contracts.
+- Visual parameter encoding applies relational attention across tracks before per-track temporal
+  pooling. A shared row-wise head produces the dynamic state; SPARTAN predicts the next state.
+- Experiment 2 matches online/target context-prefix slot trajectories once per episode and holds
+  the permutation for all targets. Physical-object matching is an evaluation-only operation.
+- Target encoder/head update only by EMA after accepted steps. No reconstruction or anti-collapse
+  regularizer is active; track non-collapse and state-recovery empirically.
+- Report MCC, SHD, and density together. Visual slot diagnostics and frozen state probes determine
+  whether representation learning supports interpretation of those identification metrics.
 
 ## Conventions shared by all agents
 - Reuse first: adapt vendored code over rewriting; record provenance (URL + SHA + changes).

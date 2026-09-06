@@ -2,8 +2,8 @@
 
 Wraps ``scjepa.third_party.slotformer.StoSAVi`` in **deterministic, encoder-only**
 mode as the context/target encoder of the JEPA (D2): no decoder is built and no
-reconstruction/KLD objective exists (D7) — training signal comes solely from the
-predictive loss and the VISReg regularizer (D3), applied outside this module.
+reconstruction/KLD objective exists — Experiment 2 trains this path through the
+latent prediction objective and keeps an EMA copy for stopped-gradient targets.
 
 Symbol table (paper ↔ code):
     frames  x_{1:T}   (B, T, 3, H, W)  input video clip
@@ -34,11 +34,10 @@ class SAViEncoder(nn.Module):
 
     Recurrent over time: slots at t are predicted from slots at t-1 (transformer
     +LSTM slot predictor) and corrected against frame-t features (slot attention).
-    Weights are NOT shared between the context and target encoders — instantiate
-    one ``SAViEncoder`` per branch (joint training, no EMA; see decisions D6/D7).
-    The target branch consumes a single future frame (D9): build it with
-    ``single_frame=True``, which skips the never-invoked slot predictor and
-    reduces the encoder to per-image Slot Attention.
+    Experiment 2 initializes the target as a deep copy of the online encoder
+    and updates it by EMA. Both branches are causal recurrent trackers; the
+    target also processes future frames. ``single_frame`` remains a standalone
+    encoder option and is not the Experiment 2 target architecture.
     """
 
     def __init__(
@@ -75,7 +74,7 @@ class SAViEncoder(nn.Module):
             pred_ffn_dim: Feed-forward dim in the slot predictor.
             pred_rnn: Wrap the predictor in an LSTM (SlotFormer default).
             single_frame: Accept exactly one frame per clip and build no slot
-                predictor (D9 target encoder). The ``pred_*`` args are ignored.
+                predictor. The ``pred_*`` args are ignored.
         """
         super().__init__()
         if resolution[0] != resolution[1] or resolution[0] not in (64, 128):
@@ -120,6 +119,16 @@ class SAViEncoder(nn.Module):
             },
         )
 
+        # The upstream transformer otherwise inherits PyTorch's dropout=0.1.
+        # Independent dropout would make two identical EMA branches disagree
+        # before either has learned anything. Keep the documented deterministic
+        # encoder without modifying the vendored implementation.
+        for module in self._impl.modules():
+            if isinstance(module, nn.Dropout):
+                module.p = 0.0
+            elif isinstance(module, nn.MultiheadAttention):
+                module.dropout = 0.0
+
     def forward(self, frames: Float[Tensor, "b t c h w"]) -> Float[Tensor, "b t n d"]:
         """Encode a video clip into its slot history.
 
@@ -160,29 +169,42 @@ class SAViEncoder(nn.Module):
         from those features and the slots the call returned, i.e. the attention
         of the FINAL slots. Evaluation-only, so the extra projections are cheap.
         """
+        return self.forward_with_allocations(frames)[1]
+
+    def forward_with_allocations(
+        self, frames: Float[Tensor, "b t c h w"]
+    ) -> tuple[Float[Tensor, "b t n d"], Float[Tensor, "b t n p"]]:
+        """Encode once and capture detached final-slot maps for diagnostics.
+
+        Slots retain their ordinary gradient path; the optional maps retain no
+        graph. Capturing them in the existing pass avoids a second full CNN and
+        recurrent tracker evaluation when reporting object grounding.
+        """
         module = self._impl.slot_attention  # pyright: ignore[reportUnknownMemberType]
         captured: list[Tensor] = []
 
+        @torch.no_grad()
         def hook(_module: object, args: tuple[Tensor, ...], output: Tensor) -> None:
             features, slots = args[0], output
             normed = module.norm_inputs(features)  # pyright: ignore[reportUnknownMemberType]
             k = module.project_k(normed)  # pyright: ignore[reportUnknownMemberType]
             q = module.project_q(slots)  # pyright: ignore[reportUnknownMemberType]
-            logits = module.attn_scale * torch.einsum("bpc,bnc->bpn", k, q)
+            scale = cast(float, module.attn_scale)  # pyright: ignore[reportUnknownMemberType]
+            logits = scale * torch.einsum("bpc,bnc->bpn", k, q)
             attention = torch.softmax(logits, dim=-1) + module.eps
             attention = attention / attention.sum(dim=1, keepdim=True)  # Eq. 70
             captured.append(attention.permute(0, 2, 1))  # (B, N, P)
 
         handle = module.register_forward_hook(hook)  # pyright: ignore[reportUnknownMemberType]
         try:
-            self.forward(frames)
+            slots = self(frames)
         finally:
             handle.remove()
         if len(captured) != frames.shape[1]:
             raise AssertionError(
                 f"captured {len(captured)} allocations for {frames.shape[1]} frames"
             )
-        return torch.stack(captured, dim=1)
+        return slots, torch.stack(captured, dim=1)
 
 
 __all__ = ["SAViEncoder"]

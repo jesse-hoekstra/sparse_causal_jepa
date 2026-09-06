@@ -7,7 +7,7 @@ Two conditions, matching the two experiment configs:
     per-track palette colour. This illustrates the data-generating process; it is
     not what any model sees in the state-to-state regime, which reads [px, py, vx, vy] rows.
 
-``--condition visual`` (the visual-to-state regime, ``experiment=bounce_visual``)
+``--condition visual`` (Experiment 2, ``experiment=bounce_visual_to_visual``)
     The ACTUAL rendered frames, pixel for pixel, as the SAVi encoder receives
     them: identical white glyphs at one shared rendered radius, no persistent
     colour identity. Physical collision radii stay mass-dependent (Eq. 2), so
@@ -26,11 +26,13 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.patches import Circle
 
-from scjepa.data.bounce import _PALETTE, BounceDataset
+# The physics illustration deliberately reuses the renderer's established palette.
+from scjepa.data.bounce import _PALETTE, BounceDataset  # pyright: ignore[reportPrivateUsage]
 
-# The configured Bounce v2 physics (experiments.pdf S6.1.1). Identical in both
+# The configured Bounce v2 physics (outdated_experiments.pdf S6.1.1). Identical in both
 # conditions -- only the appearance arguments below it differ.
 PHYSICS = dict(
     clip_len=60,
@@ -96,7 +98,11 @@ def main() -> None:
                     Circle(
                         centre,
                         float(radii[ball]),
-                        facecolor=tuple(_PALETTE[ball].tolist()),
+                        facecolor=(
+                            float(_PALETTE[ball, 0]),
+                            float(_PALETTE[ball, 1]),
+                            float(_PALETTE[ball, 2]),
+                        ),
                         edgecolor="black",
                         linewidth=0.6,
                     )
@@ -117,50 +123,85 @@ def main() -> None:
 
     if args.condition == "visual":
         handles = [
-            plt.Line2D([], [], marker="o", color="none", markerfacecolor="white",
-                       markeredgecolor="black", markersize=11,
-                       label="every object: identical glyph, rendered r = 0.080"),
+            Line2D(
+                [],
+                [],
+                marker="o",
+                color="none",
+                markerfacecolor="white",
+                markeredgecolor="black",
+                markersize=11,
+                label="every object: identical glyph, rendered r = 0.080",
+            ),
         ]
         if args.show_collision_radii:
             handles.append(
-                plt.Line2D([], [], color="#ff3b30", linestyle=(0, (3, 2)), linewidth=1.4,
-                           label="physical collision radius (annotation; NOT in the data)")
+                Line2D(
+                    [],
+                    [],
+                    color="#ff3b30",
+                    linestyle=(0, (3, 2)),
+                    linewidth=1.4,
+                    label="physical collision radius (annotation; NOT in the data)",
+                )
             )
         caption = (
             "Visual-regime input: exactly the 64x64 frames the encoder receives. "
             "All objects share "
             "one mass-independent glyph and rendered radius,\nand carry no persistent colour "
-            "identity, so a single frame cannot reveal mass. The physical collision radii below "
+            "identity. Collision geometry and occlusion can still reveal physical information. "
+            "The collision radii below "
             "remain mass-dependent,\nwhich is why most bounces occur with a visible gap between "
             "the discs -- the 'hidden contact geometry' a sequence can reveal."
         )
     else:
         handles = [
-            plt.Line2D([], [], marker="o", color="none",
-                       markerfacecolor=tuple(_PALETTE[b].tolist()), markeredgecolor="black",
-                       markersize=11, label=f"object {b + 1}: m = {float(masses[b]):.2f}")
+            Line2D(
+                [],
+                [],
+                marker="o",
+                color="none",
+                markerfacecolor=(
+                    float(_PALETTE[b, 0]),
+                    float(_PALETTE[b, 1]),
+                    float(_PALETTE[b, 2]),
+                ),
+                markeredgecolor="black",
+                markersize=11,
+                label=f"object {b + 1}: m = {float(masses[b]):.2f}",
+            )
             for b in range(states.shape[1])
         ]
         caption = (
-            "Circle radii are the physical collision radii; "
-            "colours distinguish simulator tracks."
+            "Circle radii are the physical collision radii; colours distinguish simulator tracks."
         )
 
-    figure.legend(handles=handles, loc="lower center", ncol=min(len(handles), 5),
-                  frameon=False, bbox_to_anchor=(0.5, 0.085), fontsize=11)
+    # Matplotlib's dynamic keyword stubs leave these rendering methods partially unknown.
+    figure.legend(  # pyright: ignore[reportUnknownMemberType]
+        handles=handles,
+        loc="lower center",
+        ncol=min(len(handles), 5),
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.085),
+        fontsize=11,
+    )
     masses_text = "   ".join(
         f"object {b + 1}: m = {float(masses[b]):.2f} (r_phys = {float(radii[b]):.3f})"
         for b in range(states.shape[1])
     )
     if args.condition == "visual":
-        figure.text(0.5, 0.058, masses_text, ha="center", va="bottom", fontsize=9, color="#333333")
-    figure.text(0.5, 0.008, caption, ha="center", va="bottom", fontsize=9, color="#555555")
+        figure.text(  # pyright: ignore[reportUnknownMemberType]
+            0.5, 0.058, masses_text, ha="center", va="bottom", fontsize=9, color="#333333"
+        )
+    figure.text(  # pyright: ignore[reportUnknownMemberType]
+        0.5, 0.008, caption, ha="center", va="bottom", fontsize=9, color="#555555"
+    )
     figure.tight_layout(rect=(0, 0.115, 1, 1))
 
     tag = "v3_visual" if args.condition == "visual" else "v2"
     out = args.out or f"data/bounce_{tag}_episode_{args.episode:05d}.png"
     Path(out).parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(out, dpi=110)
+    figure.savefig(out, dpi=110)  # pyright: ignore[reportUnknownMemberType]
     print(f"wrote {out}")
 
 

@@ -1,9 +1,8 @@
 # @package _global_
-# Experiment 1 at paper scale (experiments.pdf §6.1–6.2): true-state context,
+# Experiment 1 at paper scale (sources/outdated_experiments.pdf): true-state context,
 # true-state target, 5-ball Bounce v2 with mass-proportional physical radii.
-# tau and lambda_logit are NOT set here: lambda_logit comes from the label-free
-# dense sweep (§6.1.3; scripts/isambard_logit_sweep.sbatch + summarize). The
-# pipeline selects tau from [2.0, 1.8, 1.6, 1.4] x the held-out dense loss,
+# lambda_logit retains the successful reference value below. Tau is freshly
+# calibrated: the pipeline selects [2.0, 1.8, 1.6, 1.4] x the held-out dense loss,
 # requiring it to remain strictly below the matched identity-reference loss.
 
 data:

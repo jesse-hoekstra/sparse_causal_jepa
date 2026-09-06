@@ -10,7 +10,8 @@
 ## Role: REFERENCE, not imported
 
 These files are vendored as the stable in-repo reference for adapting the JEPA training
-process (loss assembly, EMA-free joint training) into `scjepa.training`. Nothing in
+process into `scjepa.training`. The initial adaptation used EMA-free joint training;
+that historical architecture is superseded by D39's Experiment-2 EMA target. Nothing in
 `src/scjepa` imports them.
 
 **Why `train.py` was NOT vendored (finding, 2026-07-09):** upstream's training loop is
@@ -19,11 +20,11 @@ not plain PyTorch — it sits on `lightning`, `stable_pretraining`, and
 project for ~145 lines whose JEPA-specific content is small. The loop *pattern* it
 implements — one optimizer step over encoder+predictor jointly, loss assembled as
 `loss = pred_loss + lambd * regularizer(emb)` — is what `scjepa.training` re-expresses
-in the project's own plain-PyTorch/Hydra stack (module 5). The D3 evidence (regularizer
-is one swappable module call) is from this file and still holds.
+in the project's own plain-PyTorch/Hydra stack. The D3 regularizer observation is
+historical; neither active experiment currently applies that regularizer.
 
 `module.py` contains upstream's own `SIGReg` implementation; we do NOT use it — the
-regularizers come from `third_party/visreg/` (official implementation, D3). It is kept
+optional regularizer utilities live in `third_party/visreg/` (official implementation). It is kept
 here so the adaptation can be diffed against what le-wm actually does.
 
 ## Local changes
