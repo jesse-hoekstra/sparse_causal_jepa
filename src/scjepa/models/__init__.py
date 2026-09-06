@@ -1,8 +1,8 @@
-"""Model modules for the experiment ladder (experiments.pdf §6).
+"""Model modules for the two active experiments (outdated_experiments.pdf §6).
 
 State-to-state: ``ParameterEncoder`` (P_η, §6.2 Eqs. 16-26) + ``Spartan``
 (f_gamma, Eqs. 27-37) composed by ``StateToStateModel`` (Eq. 38). ``SAViEncoder``
-is the shared causal visual substrate for Experiments 2 and 3 (§6.3).
+is the causal encoder for Experiment 2, with online and EMA target branches (§6.3).
 """
 
 from scjepa.models.parameter_encoder import ParameterEncoder

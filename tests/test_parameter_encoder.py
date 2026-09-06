@@ -1,4 +1,4 @@
-"""Tests for the parameter encoder P_eta (experiments.pdf Eqs. 16-26)."""
+"""Tests for the parameter encoder P_eta (outdated_experiments.pdf Eqs. 16-26)."""
 
 import pytest
 import torch

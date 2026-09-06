@@ -1,11 +1,10 @@
 # configs/
 
-Hydra configuration tree for the three bounce regimes. `config.yaml` holds shared defaults and
-`experiment/bounce_baumgartner.yaml` is the paper-scale state-to-state Experiment-1 preset.
+Hydra configuration tree for two bounce experiments. `config.yaml` holds shared defaults;
+`experiment/bounce_baumgartner.yaml` is Experiment 1 (true states), and
+`experiment/bounce_visual_to_visual.yaml` is Experiment 2 (online visual states and EMA targets).
 
-## Experiment 1: fixed teacher forcing plus T=2
-
-The active predictive settings are:
+Both presets use the following predictive settings:
 
 ```yaml
 train:
@@ -13,35 +12,22 @@ train:
   num_rollout_t2_anchors: 8
   rollout_t2_horizon: 2
   oe_eval_horizon: 30
-  oe_tolerance_nrmse: 0.10
 ```
 
-`rollout_t2_horizon` is validated as exactly two; it is not a schedule. For every episode,
-exactly eight distinct valid relative offsets are sampled uniformly without replacement and
-independently of the other episodes. A window starts at true state `S_(C-1+r)`, feeds its first
-generated prediction into the second transition without detaching it, and supervises only the
-second prediction. All windows share the one `theta_hat` inferred from the episode's context.
-The endpoint error is averaged over batch, window, object, and coordinate dimensions.
+For each episode, eight distinct valid T=2 offsets are sampled independently without replacement.
+Each window starts from its observed anchor, feeds the first generated prediction back without
+detaching, and supervises only the second endpoint. All transitions and windows share the one
+context-inferred `theta_hat` (and Experiment 2's episode-level track keys). The endpoint error is
+averaged over batch, window, object, and coordinate dimensions. The horizon is validated as two;
+there is no training curriculum. Setting `lambda_rollout_t2: 0` bypasses sampling and both
+auxiliary calls. K=30 is evaluation-only.
 
-Setting `lambda_rollout_t2: 0` disables the auxiliary branch completely, including its random
-sampling, and recovers the teacher-forcing-only computation. The dense tau-calibration run and
-the sparse run must resolve identical T=2 settings. Never reuse D30's `tau=0.02` or a D34–D36
-K=30 threshold; calibrate tau for the final teacher-forcing-plus-T=2 constraint.
+Experiment 2 renders identical-looking balls from the same physics preload. Its target encoder
+and state head update by EMA after accepted optimizer steps. A context-only branch assignment
+fixes the target slot order once per episode; physical truth is used only in evaluation.
+Its GECO constraint normalizes the predictive term by detached target content variance, while
+Experiment 1's constraint uses raw state error. Calibrate tau separately with matching objective,
+data, architecture, and seed. Neither old pure-TF nor full-K rollout thresholds transfer.
 
-The K=30 value belongs only to evaluation. The fixed held-out diagnostic uses a no-gradient
-autoregressive chain from `S_29` to `Shat_59`, fixed training-set coordinate standard deviations,
-and the configured NRMSE tolerance. The different horizons are intentional: H=2 trains local
-composition and exposure bias, while K=30 measures sampled long-trajectory agreement.
-
-There is no state-to-state rollout curriculum, rollout-length warmup, gradient-cut schedule, or
-schedule-dependent checkpoint state. D34–D36 document that superseded experiment in
-`docs/decisions.md`.
-
-## Other regimes
-
-Experiment 2 (`bounce_visual_to_state`) remains teacher-forcing-only because its latent input and
-raw-state output cannot be composed by type. Experiment 3 (`bounce_visual_to_visual`) retains its
-separately specified latent-space fixed-K objective; D37 does not change that protocol. Keep its
-visual-only rollout keys distinct from Experiment 1's `lambda_rollout_t2` settings.
-
-**Owner:** experiment-infra-engineer.
+The supervised visual-to-state preset and visual-only K-rollout configuration keys are retired.
+See `docs/decisions.md` D37–D39 for active settings and historical rationale.

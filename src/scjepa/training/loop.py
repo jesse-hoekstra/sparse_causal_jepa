@@ -27,7 +27,6 @@ from torch.utils.data import DataLoader, Dataset
 from scjepa.eval.harness import evaluate_identifiability
 from scjepa.losses import aligned_mse, rollout_t2_endpoint_mse
 from scjepa.models.state_to_state import StateToStateModel, TransitionOutput
-from scjepa.models.visual_to_state import VisualToStateModel
 from scjepa.models.visual_to_visual import VisualToVisualModel
 from scjepa.training.lagrangian import SparsityLagrangian
 
@@ -68,7 +67,7 @@ class TrainConfig:
     sparsity_lambda_init: float = 1e4
     sparsity_momentum: float = 0.99
     lambda_logit: float = 0.0
-    # Fixed state-to-state auxiliary: no warmup and no schedule.
+    # Both experiments use endpoint-only T=2 windows, without a schedule.
     lambda_rollout_t2: float = 1.0
     num_rollout_t2_anchors: int = 8
     rollout_t2_horizon: int = 2
@@ -76,10 +75,6 @@ class TrainConfig:
     oe_eval_horizon: int = 30
     oe_tolerance_nrmse: float = 0.10
     oe_coordinate_std: tuple[float, ...] | None = None
-    # Experiment 3 has a separate latent-space objective. Keeping its fixed
-    # horizon explicitly visual avoids reintroducing state-training K=30 knobs.
-    visual_rollout_len: int | None = None
-    lambda_visual_rollout: float = 0.0
     seed: int = 0
     device: str = "cpu"
     context_len: int | None = None
@@ -99,7 +94,7 @@ class Trainer:
 
     def __init__(
         self,
-        model: StateToStateModel | VisualToStateModel | VisualToVisualModel,
+        model: StateToStateModel | VisualToVisualModel,
         dataset: Dataset[dict[str, Tensor]],
         config: TrainConfig,
         logger: MetricLogger | None = None,
@@ -138,30 +133,22 @@ class Trainer:
     def _validate_fixed_protocol(self) -> None:
         """Reject invalid fixed T=2/OE settings before the first batch."""
         config = self.config
-        if isinstance(self.model, StateToStateModel):
-            if config.rollout_t2_horizon != 2:
-                raise ValueError(
-                    f"rollout_t2_horizon must equal 2, got {config.rollout_t2_horizon}"
-                )
-            if not math.isfinite(config.lambda_rollout_t2) or config.lambda_rollout_t2 < 0:
-                raise ValueError("lambda_rollout_t2 must be finite and non-negative")
-            if config.num_rollout_t2_anchors < 1:
-                raise ValueError("num_rollout_t2_anchors must be positive")
-            if config.oe_eval_horizon < 1:
-                raise ValueError("oe_eval_horizon must be positive")
-            if not math.isfinite(config.oe_tolerance_nrmse) or config.oe_tolerance_nrmse < 0:
-                raise ValueError("oe_tolerance_nrmse must be finite and non-negative")
-            if config.eval_every is not None:
-                scales = config.oe_coordinate_std
-                if scales is None or not scales:
-                    raise ValueError("state-to-state evaluation requires fixed oe_coordinate_std")
-                if any(not math.isfinite(value) or value <= 0 for value in scales):
-                    raise ValueError("oe_coordinate_std must contain finite positive values")
-        if isinstance(self.model, VisualToVisualModel):
-            if config.visual_rollout_len is not None and config.visual_rollout_len < 2:
-                raise ValueError("visual_rollout_len must be at least 2 when enabled")
-            if not math.isfinite(config.lambda_visual_rollout) or config.lambda_visual_rollout < 0:
-                raise ValueError("lambda_visual_rollout must be finite and non-negative")
+        if config.rollout_t2_horizon != 2:
+            raise ValueError(f"rollout_t2_horizon must equal 2, got {config.rollout_t2_horizon}")
+        if not math.isfinite(config.lambda_rollout_t2) or config.lambda_rollout_t2 < 0:
+            raise ValueError("lambda_rollout_t2 must be finite and non-negative")
+        if config.num_rollout_t2_anchors < 1:
+            raise ValueError("num_rollout_t2_anchors must be positive")
+        if config.oe_eval_horizon < 1:
+            raise ValueError("oe_eval_horizon must be positive")
+        if not math.isfinite(config.oe_tolerance_nrmse) or config.oe_tolerance_nrmse < 0:
+            raise ValueError("oe_tolerance_nrmse must be finite and non-negative")
+        if config.eval_every is not None and isinstance(self.model, StateToStateModel):
+            scales = config.oe_coordinate_std
+            if scales is None or not scales:
+                raise ValueError("state-to-state evaluation requires fixed oe_coordinate_std")
+            if any(not math.isfinite(value) or value <= 0 for value in scales):
+                raise ValueError("oe_coordinate_std must contain finite positive values")
 
     # ------------------------------------------------------------- data ----
     def _epoch_loader(self, epoch: int) -> DataLoader[dict[str, Tensor]]:
@@ -319,11 +306,7 @@ class Trainer:
             branch_grad_metrics = self._branch_gradient_metrics(
                 teacher_forcing,
                 weighted_auxiliary,
-                getattr(output, "rollout_t2_prediction", None) is not None
-                or (
-                    getattr(output, "rollout_prediction", None) is not None
-                    and self._auxiliary_weight() > 0
-                ),
+                getattr(output, "rollout_t2_prediction", None) is not None,
             )
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -349,9 +332,8 @@ class Trainer:
             if sparsity_active:
                 self.lagrangian.update(constraint)
 
-        # ``prediction`` is flattened (B*K,N,D) for state-to-state but keeps
-        # (B,K,N,D) in Experiment 3. The episode-level parameter width is N in
-        # every regime and therefore names the decoded state-token rows safely.
+        # The episode-level parameter width names the decoded state-token rows
+        # in both experiments, independently of flattened transition axes.
         num_decoded = output.causal_params.shape[1]
         return (
             self._extra_metrics(output)

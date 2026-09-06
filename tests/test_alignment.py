@@ -1,4 +1,4 @@
-"""Trajectory-level visual-track alignment (experiments.pdf Eqs. 98-100)."""
+"""Trajectory-level visual-track alignment (outdated_experiments.pdf Eqs. 98-100)."""
 
 import pytest
 import torch

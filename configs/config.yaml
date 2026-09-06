@@ -17,11 +17,12 @@
 # made to refuse the run instead of picking for you:
 #   * `train.lambda_logit` — a default of 0 would disable the attention-logit
 #     penalty in BOTH the objective and the dual constraint. Choose it from the
-#     label-free dense sweep (scripts/isambard_logit_sweep.sbatch); pass 0.0
+#     label-free dense sweep; pass 0.0
 #     explicitly to run the no-penalty ablation deliberately.
 #   * `train.sparsity_tau` — supplied by the relevant experiment pipeline from
-#     matched held-out references. Experiment 1 uses a fixed multiplier ladder
-#     with dense and identity references. It is read
+#     references with the same TF + T=2 objective. Experiment 1 uses D38's
+#     dense/identity feasibility ladder; Experiment 2 uses its own normalized
+#     dense reference as an exploratory threshold. It is read
 #     ONLY when `sparsity_enabled=true`, so dense/token-local reference stages
 #     run without supplying it.
 # Every run prints a RUN CONFIGURATION banner naming the source of each
@@ -74,10 +75,11 @@ train:
   sparsity_momentum: 0.99 # moving average of c - tau
   lambda_logit: ??? # MANDATORY: from the label-free dense sweep (§6.1.3).
   # No default: 0.0 would silently disable the penalty in objective AND bound.
-  # Fixed state-to-state predictive objective:
+  # Both experiments use the fixed predictive objective:
   #   L_pred = L_TF + lambda_rollout_t2 * L_AR2.
   # Eight distinct valid offsets are sampled independently per episode. Each
-  # window starts at a true state, feeds back one generated prediction, and
+  # window starts at an observed state (true or image-derived), feeds back one
+  # generated prediction, and
   # supervises only its second prediction. There is no horizon schedule.
   lambda_rollout_t2: 1.0
   num_rollout_t2_anchors: 8
@@ -88,10 +90,6 @@ train:
   oe_eval_horizon: 30
   oe_tolerance_nrmse: 0.10
   oe_coordinate_std: null
-  # Experiment 3's independently specified latent-space objective uses these
-  # visual-only fields. They remain disabled in the state-to-state regime.
-  visual_rollout_len: null
-  lambda_visual_rollout: 0.0
   seed: 0
   device: cpu
   context_len: 30 # Tpar (Eq. 17)

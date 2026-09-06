@@ -12,6 +12,7 @@ import scjepa.training.loop as training_loop
 from scjepa.data import BounceDataset
 from scjepa.models import StateToStateModel, build_state_to_state
 from scjepa.training import SparsityLagrangian, TrainConfig, Trainer
+from scjepa.training.factory import REGIMES, build_dataset, build_model
 
 N = 3
 
@@ -125,6 +126,35 @@ def test_shipped_state_protocol_is_fixed_and_has_no_obsolete_schema() -> None:
     obsolete = {"rollout_curriculum", "rollout_len", "lambda_roll"}
     assert obsolete.isdisjoint(preset.train.keys())
     assert obsolete.isdisjoint(field.name for field in fields(TrainConfig))
+
+
+def test_two_experiment_configuration_and_retired_regime() -> None:
+    root = Path(__file__).parents[1] / "configs"
+    base = OmegaConf.load(root / "config.yaml")
+    visual = OmegaConf.merge(base, OmegaConf.load(root / "experiment/bounce_visual_to_visual.yaml"))
+    assert isinstance(visual, DictConfig)
+    assert REGIMES == ("state_to_state", "visual_to_visual")
+    assert set(path.stem for path in (root / "experiment").glob("*.yaml")) == {
+        "bounce_baumgartner",
+        "bounce_visual_to_visual",
+    }
+    assert visual.model.regime == "visual_to_visual"
+    assert visual.data.uniform_appearance
+    assert not visual.data.render_radius_from_mass
+    assert visual.train.lambda_rollout_t2 == 1.0
+    assert visual.train.num_rollout_t2_anchors == 8
+    assert visual.train.rollout_t2_horizon == 2
+    assert {"visual_rollout_len", "lambda_visual_rollout"}.isdisjoint(
+        field.name for field in fields(TrainConfig)
+    )
+    with pytest.raises(ValueError, match="model.regime"):
+        build_model(OmegaConf.create({"regime": "visual_to_state"}))
+    visual.data.num_clips = 2
+    visual.data.cache = True
+    held_out = build_dataset(visual.data, seed_offset=29)
+    assert isinstance(held_out, BounceDataset)
+    assert not held_out.cache
+    assert held_out._preloaded is None  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.parametrize(

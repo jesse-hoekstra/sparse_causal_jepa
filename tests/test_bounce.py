@@ -226,8 +226,9 @@ def test_baumgartner_variant_radius_from_mass() -> None:
 
 
 def test_radius_from_mass_uses_fixed_reference() -> None:
-    """G2: r_i ∝ m_i with an episode-independent constant, so absolute mass
-    is geometrically identifiable (episode-mean normalization capped MCC at ~0.77).
+    """G2: r_i ∝ m_i uses an episode-independent constant.
+
+    Absolute mass is geometrically identifiable; episode-mean normalization capped MCC at ~0.77.
     """
     dataset = BounceDataset(
         num_episodes=2,
@@ -250,8 +251,9 @@ def test_radius_from_mass_uses_fixed_reference() -> None:
 
 
 def test_wall_bounce_recorded_on_diagonal_only_with_radii() -> None:
-    """G1: wall bounces are mass-relevant iff radius ∝ mass; the contacts
-    diagonal records them only then.
+    """G1: wall bounces are mass-relevant iff radius ∝ mass.
+
+    The contacts diagonal records them only then.
     """
     masses = torch.tensor([[2.0]])
     positions = torch.tensor([[0.15, 0.5]])
@@ -281,7 +283,8 @@ def test_initial_placement_respects_per_ball_radii() -> None:
         masses = dataset[index]["params"].squeeze(-1)
         radii = 0.08 * masses / 1.5
         pos = states[0, :, :2]
-        assert (pos > radii.unsqueeze(-1)).all() and (pos < 1 - radii.unsqueeze(-1)).all()
+        assert (pos > radii.unsqueeze(-1)).all()
+        assert (pos < 1 - radii.unsqueeze(-1)).all()
         diff = (pos.unsqueeze(1) - pos.unsqueeze(0)).square().sum(-1).sqrt()
         min_sep = radii.unsqueeze(0) + radii.unsqueeze(1)
         off_diag = ~torch.eye(5, dtype=torch.bool)

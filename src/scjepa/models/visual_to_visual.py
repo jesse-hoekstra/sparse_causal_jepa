@@ -1,55 +1,48 @@
-"""Visual-to-visual regime: frames in, EMA-encoded next frame out (fully self-supervised).
+"""Experiment 2: anonymous video frames, online states and stopped-gradient EMA targets.
 
-The controlled change from the visual-to-state regime is the TARGET, and only the target. The
-predictor-side construction is unchanged (Eq. 107): a causal SAVi encoder and a
-shared state head produce S^ctx_t from X_{0:t}, the parameter encoder produces one
-scalar per track from the first Tpar frames, and SPARTAN predicts one step ahead.
-What changes is that the prediction is compared against a stopped-gradient
-representation of X_{0:t+1} produced by an exponential-moving-average copy of the
-online state path (Eqs. 108-114), instead of against the true physical state.
+This extends Experiment 1's teacher forcing plus sampled T=2 endpoints to learned
+states. One parameter vector per episode and one set of track keys are reused
+by every transition. Full-horizon autoregression is evaluation-only.
 
-Consequences that shape this module:
+EMA keeps feature coordinates close, but does not guarantee that recurrent slot
+row i tracks the same object in both branches. We therefore match pre-head slot
+trajectories over the observed context only, detach the assignment and keep it
+fixed for every target frame in that episode. This is an implementation change
+from the row-identity assumption in the outdated experiment proposal. It uses
+neither simulator labels nor future frames; it cannot repair a mid-episode swap
+or establish that slots represent objects in the first place.
 
-* **No matching, anywhere in training.** The EMA copy is initialized from the
-  online encoder and updated component-wise, so it never permutes slot rows:
-  predicted row i is compared directly with target row i (Eq. 116). §6.6 forbids
-  per-frame Hungarian matching or a learned context-to-target assignment here,
-  because under EMA row correspondence it is unnecessary AND it could conceal a
-  disagreement between the two recurrent trackers. The Hungarian machinery in
-  ``scjepa.losses.alignment`` belongs to the visual-to-state regime's true-state target and to
-  The visual-to-visual regime's EVALUATION only.
-* **Only the state path has an EMA twin.** The parameter encoder, SPARTAN, the
-  track keys and the gates are predictor-side and have no EMA copy (§6.6).
-* **The dual sees a normalized scalar.** Because the learned target's scale can
-  drift, the GECO controller is fed L_pred divided by the detached target content
-  variance (Eqs. 122/123), while the gradient objective (Eq. 121) keeps the raw
-  latent MSE. This normalization exists ONLY for the constraint.
-* **Collapse is an empirical requirement.** The EMA asymmetry does not make a
-  constant-representation fixed point impossible, so Eq. 124's diagnostics are
-  computed every step and a run with vanishing content variance or degenerate
-  effective rank is rejected as collapsed rather than reported.
-
-During training, true states, masses and contact graphs are excluded from the
-model, the objective and every selection decision; they are used only for
-held-out evaluation.
+Only the online visual path is copied to the target. Parameter inference and
+SPARTAN remain predictor-side. Latent MSE is the gradient objective; the GECO
+constraint normalizes it by detached target variance. Neither EMA nor a
+variance denominator rules out representation collapse; held-out grounding,
+state probes and collapse diagnostics must accompany prediction loss.
 """
 
 import copy
-from typing import NamedTuple
+from typing import NamedTuple, Self
 
 import torch
-from jaxtyping import Float
+from jaxtyping import Float, Int
+from scipy.optimize import linear_sum_assignment
 from torch import Tensor, nn
 
+from scjepa.losses.alignment import align_to_assignment
 from scjepa.models.parameter_encoder import ParameterEncoder
 from scjepa.models.spartan import Spartan
+from scjepa.models.state_to_state import num_valid_rollout_t2_offsets, sample_rollout_t2_offsets
 from scjepa.models.visual import VisualStatePath
 
-__all__ = ["VisualToVisualModel", "VisualToVisualOutput", "build_visual_to_visual"]
+__all__ = [
+    "VisualToVisualModel",
+    "VisualToVisualOutput",
+    "build_visual_to_visual",
+    "context_target_assignment",
+]
 
 
 class VisualToVisualOutput(NamedTuple):
-    """One forward pass over an episode batch, flattened to (B*K, ...) rows."""
+    """Teacher forcing, optional local endpoints and detached target alignment."""
 
     prediction: Float[Tensor, "bk n s"]
     target: Float[Tensor, "bk n s"]
@@ -61,24 +54,51 @@ class VisualToVisualOutput(NamedTuple):
     mean_gate_probability: Float[Tensor, ""]
     gate_entropy: Float[Tensor, ""]
     target_variance: Float[Tensor, ""]
-    """V_tgt (Eq. 122): mean per-coordinate variance of the EMA target."""
     context_states: Float[Tensor, "b t n s"]
-    """Online latent states, kept for the Eq. 124 collapse diagnostics."""
     target_states: Float[Tensor, "b t n s"]
-    """EMA latent states, kept for the Eq. 124 collapse diagnostics."""
-    rollout_prediction: Float[Tensor, "b j n s"] | None = None
-    """Hybrid Eqs. 33-34: the K autoregressive prefixes. None when disabled."""
-    rollout_target: Float[Tensor, "b j n s"] | None = None
-    """EMA targets S^tgt_{t+1..t+K} for those prefixes (stop-gradient)."""
+    """EMA states in online row order under the fixed context assignment."""
+    target_assignment: Int[Tensor, "b n"]
+    """assignment[b, i] is the EMA row matched to online row i."""
+    episode_keys: Float[Tensor, "b n d"]
+    rollout_t2_prediction: Float[Tensor, "b w n s"] | None = None
+    rollout_t2_target: Float[Tensor, "b w n s"] | None = None
+    rollout_t2_offsets: Int[Tensor, "b w"] | None = None
+    rollout_t2_intermediate: Float[Tensor, "b w n s"] | None = None
+    context_allocations: Float[Tensor, "b t n p"] | None = None
+    target_allocations: Float[Tensor, "b t n p"] | None = None
 
 
 def _content_variance(states: Tensor) -> Tensor:
-    """Eq. 122: mean over tracks and coordinates of the variance across (episode, time).
-
-    A collapsed representation drives this to zero, which is exactly why it also
-    guards the constraint denominator.
-    """
+    """Mean per-row, per-coordinate variance across episodes and timesteps."""
     return states.flatten(0, 1).var(dim=0, unbiased=False).mean()
+
+
+@torch.no_grad()
+def context_target_assignment(
+    context_slots: Float[Tensor, "b c n d"],
+    target_slots: Float[Tensor, "b c n d"],
+) -> Int[Tensor, "b n"]:
+    """Match two observed slot histories once, without supervision or future data.
+
+    Cost is mean squared distance in pre-head feature coordinates. A shared
+    detached coordinate scale estimated from both context histories prevents a
+    high-amplitude feature from arbitrarily dominating the permutation. EMA
+    makes comparison in this shared feature basis reasonable, not infallible.
+    Assignment is discrete and detached. Identical histories resolve to row
+    identity; degenerate slots still require explicit collapse diagnostics.
+    """
+    if context_slots.ndim != 4 or context_slots.shape != target_slots.shape:
+        raise ValueError("context and target slot histories must share shape (B, C, N, D)")
+    online = context_slots.detach().float()
+    target = target_slots.detach().float()
+    pooled = torch.cat((online.flatten(1, 2), target.flatten(1, 2)), dim=1)
+    scales = pooled.var(dim=1, unbiased=False).clamp_min(1e-6).sqrt()
+    difference = (online.unsqueeze(3) - target.unsqueeze(2)) / scales[:, None, None, None, :]
+    cost = difference.square().mean(dim=(1, 4))
+    # One small B x N x N transfer, not one device synchronization per episode.
+    cost_cpu = cost.cpu().numpy()
+    assignments = [linear_sum_assignment(episode)[1].tolist() for episode in cost_cpu]
+    return torch.tensor(assignments, dtype=torch.long, device=context_slots.device)
 
 
 class VisualToVisualModel(nn.Module):
@@ -92,40 +112,30 @@ class VisualToVisualModel(nn.Module):
         ema_decay: float = 0.996,
         variance_floor: float = 1e-4,
     ) -> None:
-        """Compose §6.6's model; the target path is cloned from ``online``.
-
-        Args:
-            online: The trainable visual state path chi = (psi, omega).
-            parameter_encoder: P_eta over the CONTEXT slots (Eq. 106).
-            predictor: SPARTAN with a d_s state interface and a d_s output head.
-            ema_decay: tau_EMA of Eq. 111. Fixed before the confirmatory runs;
-                §6.6 requires reporting a faster and a slower control.
-            variance_floor: epsilon_var of Eq. 123.
-        """
+        """Compose the learned-state model and initialize its frozen target."""
         super().__init__()
         if not 0.0 <= ema_decay < 1.0:
             raise ValueError(f"ema_decay must be in [0, 1), got {ema_decay}")
         if variance_floor <= 0:
             raise ValueError("variance_floor must be positive")
         self.online = online
-        # Eq. 110: the target is INITIALIZED FROM the online parameters, which is
-        # what makes row ancestry shared and matching unnecessary (Eq. 116).
         self.target = copy.deepcopy(online)
-        for parameter in self.target.parameters():
-            parameter.requires_grad_(False)
+        self.target.requires_grad_(False)
+        self.target.eval()
         self.parameter_encoder = parameter_encoder
         self.predictor = predictor
         self.ema_decay = ema_decay
         self.variance_floor = variance_floor
 
+    def train(self, mode: bool = True) -> Self:
+        """Keep targets deterministic even while the online model trains."""
+        super().train(mode)
+        self.target.eval()
+        return self
+
     @torch.no_grad()
     def update_target(self) -> None:
-        """Eq. 111, applied after each optimizer step on the online parameters.
-
-        Buffers are copied outright rather than averaged: they carry no learned
-        content here, and averaging them would desynchronize the two branches'
-        architectures instead of their weights.
-        """
+        """Advance the EMA only after an accepted optimizer update."""
         for target, online in zip(self.target.parameters(), self.online.parameters(), strict=True):
             target.mul_(self.ema_decay).add_(online.detach(), alpha=1.0 - self.ema_decay)
         for target_buffer, online_buffer in zip(
@@ -137,52 +147,67 @@ class VisualToVisualModel(nn.Module):
         self,
         frames: Float[Tensor, "b t c h w"],
         context_len: int | None = None,
-        rollout_len: int | None = None,
+        num_rollout_t2_anchors: int = 0,
+        rollout_t2_offsets: Int[Tensor, "b w"] | None = None,
+        capture_allocations: bool = False,
     ) -> VisualToVisualOutput:
-        """Run both branches once, then make the |I| one-step latent predictions.
+        """Encode causal histories once and compute TF plus optional T=2 endpoints.
 
-        Args:
-            frames: (B, T, 3, H, W) episode batch.
-            context_len: Tpar (the visual-to-visual regime: 30). None -> T-1, giving K = 1.
-            rollout_len: K for the hybrid autoregressive branch (Eqs. 33-35).
-                None disables it. Unlike the visual-to-state regime this is
-                well-typed: the predictor maps the learned state width to
-                itself (Eq. 118), so f can be composed with itself.
+        Parameter inference and the target assignment use only frames 0..C-1.
+        Teacher-forced online anchors at later t see frames 0..t; their EMA
+        targets see frames 0..t+1. No online prediction sees its future image.
+        A zero anchor count bypasses auxiliary sampling and predictor calls.
         """
         if frames.ndim != 5 or frames.shape[1] < 2:
             raise ValueError(f"expected (B, T>=2, C, H, W), got {tuple(frames.shape)}")
-        batch, length = frames.shape[0], frames.shape[1]
+        batch, length = frames.shape[:2]
         tpar = context_len if context_len is not None else length - 1
         if not 1 <= tpar < length:
             raise ValueError(f"context_len={tpar} must be in [1, T-1={length - 1}]")
-        transitions = length - tpar  # K
-
-        # Eq. 115: each recurrence is run ONCE over the episode. The context
-        # branch never sees the final frame; the target branch does, and its
-        # prefix notation only expresses causal dependence.
-        context = self.online(frames[:, : length - 1])
+        if num_rollout_t2_anchors < 0:
+            raise ValueError("num_rollout_t2_anchors must be non-negative")
+        transitions = length - tpar
+        context = self.online(frames[:, :-1], capture_allocations=capture_allocations)
         with torch.no_grad():
-            target = self.target(frames)
+            target = self.target(frames, capture_allocations=capture_allocations)
+        assignment = context_target_assignment(context.slots[:, :tpar], target.slots[:, :tpar])
+        target_states = align_to_assignment(target.states, assignment, track_dim=2).detach()
+        target_allocations = (
+            None
+            if target.allocations is None
+            else align_to_assignment(target.allocations, assignment, track_dim=2)
+        )
 
-        # Eq. 106: theta-hat comes from the CONTEXT SLOTS (pre-state-head) over
-        # the parameter window only. Frames after Tpar-1 must not affect it.
+        # Infer theta exactly once and preserve its attached path in all calls.
         causal_params = self.parameter_encoder(context.slots[:, :tpar])
-
-        # I = {Tpar-1, ..., T-2}: source states S^ctx_t, targets S^tgt_{t+1}.
         sources = context.states[:, tpar - 1 :].flatten(0, 1)
-        targets = target.states[:, tpar:].flatten(0, 1).detach()  # Eq. 114 stop-gradient
+        targets = target_states[:, tpar:].flatten(0, 1)
         params = causal_params.repeat_interleave(transitions, dim=0)
-        # §6.4: one key per episode, reused for every transition of that episode
-        # — and, below, for every step of that episode's rollout. Resampling
-        # mid-chain would give each step a different episode-level permutation.
         episode_keys = self.predictor.sample_track_keys(batch)
         keys = episode_keys.repeat_interleave(transitions, dim=0)
         out = self.predictor(sources, params, track_keys=keys)
 
-        rollout_prediction = rollout_target = None
-        if rollout_len is not None:
-            rollout_prediction, rollout_target = self._rollout(
-                context.states, target.states, tpar, rollout_len, causal_params, episode_keys
+        endpoint = endpoint_target = sampled_offsets = intermediate = None
+        if rollout_t2_offsets is not None:
+            if rollout_t2_offsets.ndim != 2 or rollout_t2_offsets.shape[0] != batch:
+                raise ValueError("rollout_t2_offsets must have shape (B, W)")
+            if rollout_t2_offsets.dtype == torch.bool or rollout_t2_offsets.is_floating_point():
+                raise ValueError("rollout offsets must be integer indices")
+            if num_rollout_t2_anchors not in (0, rollout_t2_offsets.shape[1]):
+                raise ValueError(
+                    "num_rollout_t2_anchors must be zero or match explicit offset width"
+                )
+            sampled_offsets = rollout_t2_offsets.to(device=frames.device, dtype=torch.long)
+        elif num_rollout_t2_anchors > 0:
+            sampled_offsets = sample_rollout_t2_offsets(
+                batch,
+                num_valid_rollout_t2_offsets(length, tpar),
+                num_rollout_t2_anchors,
+                device=frames.device,
+            )
+        if sampled_offsets is not None:
+            endpoint, endpoint_target, intermediate = self.rollout_t2_from_offsets(
+                context.states, target_states, tpar, causal_params, sampled_offsets, episode_keys
             )
 
         return VisualToVisualOutput(
@@ -195,55 +220,87 @@ class VisualToVisualModel(nn.Module):
             mean_abs_logit=out.mean_abs_logit,
             mean_gate_probability=out.mean_gate_probability,
             gate_entropy=out.gate_entropy,
-            target_variance=_content_variance(target.states[:, tpar:]).detach(),
+            target_variance=_content_variance(target_states[:, tpar:]).detach(),
             context_states=context.states,
-            target_states=target.states,
-            rollout_prediction=rollout_prediction,
-            rollout_target=rollout_target,
+            target_states=target_states,
+            target_assignment=assignment,
+            episode_keys=episode_keys,
+            rollout_t2_prediction=endpoint,
+            rollout_t2_target=endpoint_target,
+            rollout_t2_offsets=sampled_offsets,
+            rollout_t2_intermediate=intermediate,
+            context_allocations=context.allocations,
+            target_allocations=target_allocations,
         )
 
-    def _rollout(
+    def rollout_t2_from_offsets(
         self,
         context_states: Float[Tensor, "b t n s"],
         target_states: Float[Tensor, "b t n s"],
-        tpar: int,
+        context_len: int,
+        causal_params: Float[Tensor, "b n 1"],
+        offsets: Int[Tensor, "b w"],
+        episode_keys: Float[Tensor, "b n d"],
+    ) -> tuple[Float[Tensor, "b w n s"], Float[Tensor, "b w n s"], Float[Tensor, "b w n s"]]:
+        """Two attached transition calls from each observed online anchor.
+
+        The target endpoint is the already aligned, detached EMA state. Path
+        and logit penalties remain those of the teacher-forced call alone.
+        """
+        batch = context_states.shape[0]
+        valid = num_valid_rollout_t2_offsets(target_states.shape[1], context_len)
+        if offsets.ndim != 2 or offsets.shape[0] != batch or offsets.shape[1] < 1:
+            raise ValueError(f"offsets must be non-empty (B, W), got {tuple(offsets.shape)}")
+        if offsets.dtype == torch.bool or offsets.is_floating_point():
+            raise ValueError("rollout offsets must be integer indices")
+        offsets = offsets.to(device=context_states.device, dtype=torch.long)
+        if bool((offsets < 0).any()) or bool((offsets >= valid).any()):
+            raise ValueError(f"rollout offsets must lie in [0, {valid - 1}]")
+        sorted_offsets = offsets.sort(dim=1).values
+        if sorted_offsets.shape[1] > 1 and bool(
+            (sorted_offsets[:, 1:] == sorted_offsets[:, :-1]).any()
+        ):
+            raise ValueError("rollout offsets must be distinct within every episode")
+        windows = offsets.shape[1]
+        episode_index = torch.arange(batch, device=context_states.device)[:, None]
+        anchor_indices = context_len - 1 + offsets
+        anchors = context_states[episode_index, anchor_indices].flatten(0, 1)
+        params = causal_params.repeat_interleave(windows, dim=0)
+        keys = episode_keys.repeat_interleave(windows, dim=0)
+        first = self.predictor(anchors, params, track_keys=keys).prediction
+        second = self.predictor(first, params, track_keys=keys).prediction
+        target = target_states[episode_index, anchor_indices + 2].detach()
+        shape = (batch, windows, *context_states.shape[2:])
+        return second.reshape(shape), target, first.reshape(shape)
+
+    def rollout_for_evaluation(
+        self,
+        context_states: Float[Tensor, "b t n s"],
+        target_states: Float[Tensor, "b t n s"],
+        context_len: int,
         horizon: int,
         causal_params: Float[Tensor, "b n 1"],
         episode_keys: Float[Tensor, "b n d"],
     ) -> tuple[Float[Tensor, "b j n s"], Float[Tensor, "b j n s"]]:
-        """Hybrid Eqs. 33-34 in the learned latent space.
-
-            Ŝ^[0]_t := S^on_t,   Ŝ^[k]_{t+k} := f_gamma(Ŝ^[k-1]_{t+k-1}, θ̂)
-
-        The chain is anchored at t = Tpar-1 on the ONLINE path — Eq. 33's
-        S^on_t — and supervised against the EMA target path, which has already
-        been run over every frame, so no extra encoder pass is needed. The same
-        θ̂ AND the same episode track keys enter at every step.
-
-        Well-typed only because Eq. 118 gives the predictor ``output_dim =
-        state_dim``: f maps the learned state width to itself. The
-        visual-to-state regime decodes to the raw 4-dim state instead
-        (Eq. 95), so it has no composable f and no rollout branch.
-        """
-        length = context_states.shape[1]
-        # The online path never sees the final frame, so its states run to T-2;
-        # the anchor and every fed-back state come from that branch.
-        if tpar + horizon > target_states.shape[1]:
-            raise ValueError(
-                f"rollout_len={horizon} runs past the episode: need Tpar-1+K <= T-1, "
-                f"got {tpar - 1}+{horizon} > {target_states.shape[1] - 1} (Tpar={tpar})"
-            )
-        if tpar - 1 >= length:
-            raise ValueError(f"context_len={tpar} leaves no online anchor (T-1={length})")
-
-        state = context_states[:, tpar - 1]  # Ŝ^[0] := S^on_t (Eq. 33)
+        """Recursively predict from the last context state, without gradients."""
+        if self.training:
+            raise RuntimeError("evaluation rollout requires model.eval()")
+        if torch.is_grad_enabled():
+            raise RuntimeError("evaluation rollout requires torch.no_grad()")
+        if horizon < 1:
+            raise ValueError("evaluation horizon must be positive")
+        if not 1 <= context_len <= context_states.shape[1]:
+            raise ValueError("context_len leaves no online anchor")
+        if context_len + horizon > target_states.shape[1]:
+            raise ValueError("evaluation horizon runs past the episode")
+        state = context_states[:, context_len - 1]
         predictions: list[Tensor] = []
         for _ in range(horizon):
             state = self.predictor(state, causal_params, track_keys=episode_keys).prediction
             predictions.append(state)
-        # Eq. 114 stop-gradient, exactly as the teacher-forced targets carry it.
-        target = target_states[:, tpar : tpar + horizon].detach()
-        return torch.stack(predictions, dim=1), target
+        return torch.stack(predictions, dim=1), target_states[
+            :, context_len : context_len + horizon
+        ]
 
 
 def build_visual_to_visual(

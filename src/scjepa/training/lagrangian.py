@@ -1,4 +1,4 @@
-"""GECO-style dual controller for the path-objective weight (experiments.pdf §6.1.3).
+"""GECO-style dual controller for the path-objective weight (outdated_experiments.pdf §6.1.3).
 
 The sparse regime solves  min L_path  s.t.  c = L_pred + λ_logit·L_logit ≤ τ
 via the objective  L = L_pred + λ_logit·L_logit + λ⁻¹·L_path  (Eq. 40), with

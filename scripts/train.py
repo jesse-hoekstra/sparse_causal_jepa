@@ -16,7 +16,6 @@ from omegaconf import DictConfig, OmegaConf
 from scjepa.eval.observational_equivalence import training_coordinate_std
 from scjepa.training import MetricLogger, NoopLogger, TrainConfig, Trainer, seed_everything
 from scjepa.training.factory import build_dataset, build_model
-from scjepa.training.visual_to_state import VisualToStateTrainer
 from scjepa.training.visual_to_visual import VisualToVisualTrainer
 
 
@@ -112,7 +111,7 @@ def _print_run_banner(cfg: DictConfig, experiment: str, phase: str, git_sha: str
         ("data.preload", str(cfg.data.preload), _source_of("data.preload", overrides, preset)),
         ("git_sha", git_sha, "-"),
     ]
-    if regime == "state_to_state":
+    if regime in ("state_to_state", "visual_to_visual"):
         rows[4:4] = [
             (
                 "train.lambda_rollout_t2",
@@ -138,19 +137,6 @@ def _print_run_banner(cfg: DictConfig, experiment: str, phase: str, git_sha: str
                 "train.oe_tolerance_nrmse",
                 f"{float(cfg.train.oe_tolerance_nrmse):g}",
                 _source_of("train.oe_tolerance_nrmse", overrides, preset),
-            ),
-        ]
-    elif regime == "visual_to_visual":
-        rows[4:4] = [
-            (
-                "train.visual_rollout_len",
-                str(cfg.train.visual_rollout_len),
-                _source_of("train.visual_rollout_len", overrides, preset),
-            ),
-            (
-                "train.lambda_visual_rollout",
-                f"{float(cfg.train.lambda_visual_rollout):g}",
-                _source_of("train.lambda_visual_rollout", overrides, preset),
             ),
         ]
     width = max(len(name) for name, _, _ in rows)
@@ -243,8 +229,6 @@ def main(cfg: DictConfig) -> None:
             if cfg.train.get("oe_coordinate_std") is not None
             else None
         ),
-        visual_rollout_len=cfg.train.get("visual_rollout_len", None),
-        lambda_visual_rollout=float(cfg.train.get("lambda_visual_rollout", 0.0)),
         seed=cfg.train.seed,
         device=cfg.train.device,
         context_len=cfg.train.get("context_len", None),
@@ -277,7 +261,6 @@ def main(cfg: DictConfig) -> None:
     # state-to-state path is untouched by this dispatch.
     trainers = {
         "state_to_state": Trainer,
-        "visual_to_state": VisualToStateTrainer,
         "visual_to_visual": VisualToVisualTrainer,
     }
     trainer_class = trainers[str(cfg.model.get("regime", "state_to_state"))]

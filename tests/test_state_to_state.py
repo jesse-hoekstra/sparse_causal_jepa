@@ -1,4 +1,4 @@
-"""Tests for the state-to-state model (experiments.pdf §6.2, Eqs. 15/38-40)."""
+"""Tests for the state-to-state model (outdated_experiments.pdf §6.2, Eqs. 15/38-40)."""
 
 import pytest
 import torch

@@ -1,4 +1,4 @@
-"""Evaluation-only alignment of visual tracks to physical objects (experiments.pdf Eqs. 132-140).
+"""Evaluation-only alignment of visual tracks to physical objects.
 
 The state-to-state regime needs nothing here: true states arrive in physical-object order, so
 zeta = id (Eq. 132). In the visual experiments the recurrent tracks are anonymous
@@ -14,7 +14,7 @@ This matching is deliberately DIFFERENT from the training-time assignment in
   cannot be gamed by a model that predicts well for the wrong reason;
 * it never sees the learned parameter values or the true masses, so it cannot be
   a permutation chosen to flatter the recovery score;
-* it is computed once from the complete held-out trajectory and sends no
+* it is computed once from the context prefix of a held-out trajectory and sends no
   gradient anywhere.
 
 The visual-to-visual regime has no true-state prediction to match on at all, which is precisely
@@ -26,7 +26,7 @@ from jaxtyping import Float, Int
 from scipy.optimize import linear_sum_assignment
 from torch import Tensor
 
-__all__ = ["physical_assignment", "slot_centroids", "spatial_grid"]
+__all__ = ["physical_assignment", "slot_centroids", "spatial_grid", "tracking_metrics"]
 
 
 def spatial_grid(resolution: int, device: torch.device | None = None) -> Float[Tensor, "p 2"]:
@@ -86,3 +86,30 @@ def physical_assignment(
     return torch.as_tensor(
         [row.tolist() for row in rows], dtype=torch.long, device=centroids.device
     )
+
+
+@torch.no_grad()
+def tracking_metrics(
+    centroids: Tensor, true_centres: Tensor, assignment: Tensor
+) -> dict[str, float]:
+    """Score localization and frame-to-frame assignment changes without rematching labels.
+
+    RMSE uses one context-derived assignment for the entire sequence. The switch
+    rate compares consecutive per-frame Hungarian assignments and is a diagnostic
+    of unstable tracking; diffuse allocations can also make it large.
+    """
+    from scjepa.losses.alignment import align_to_assignment
+
+    truth = align_to_assignment(true_centres, assignment, track_dim=2)
+    rmse = (centroids - truth).square().mean().sqrt()
+    batch, length, slots, _ = centroids.shape
+    frame_assignment = physical_assignment(
+        centroids.reshape(batch * length, 1, slots, 2),
+        true_centres.reshape(batch * length, 1, slots, 2),
+    ).reshape(batch, length, slots)
+    switches = (
+        (frame_assignment[:, 1:] != frame_assignment[:, :-1]).float().mean()
+        if length > 1
+        else torch.zeros((), device=centroids.device)
+    )
+    return {"slot_centroid_rmse": float(rmse), "slot_switch_rate": float(switches)}

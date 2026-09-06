@@ -1,4 +1,4 @@
-"""Tests for the Experiment-1 prediction loss (experiments.pdf Eq. 39)."""
+"""Tests for the Experiment-1 prediction loss (outdated_experiments.pdf Eq. 39)."""
 
 import pytest
 import torch

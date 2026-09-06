@@ -1,6 +1,6 @@
-"""Visual (Experiment 2/3) data condition: separated physical and rendered radii.
+"""Visual (Experiment 2) data condition: separated physical and rendered radii.
 
-experiments.pdf p.14 requires that for the visual experiments the simulator keeps
+outdated_experiments.pdf p.14 requires that for the visual experiments the simulator keeps
 Eq. 2's mass-proportional PHYSICAL radii — that is what makes absolute mass
 identifiable at all — while every object is drawn with the same mass-independent
 glyph and rendered radius, and the frames carry no dataset-global signature tied
@@ -9,7 +9,7 @@ to the simulator row index.
 
 import torch
 
-from scjepa.data.bounce import BounceDataset
+from scjepa.data.bounce import BounceDataset, render_bounce
 
 PHYSICS = dict(
     clip_len=16,
@@ -55,6 +55,17 @@ def test_uniform_appearance_removes_the_per_row_colour_signature() -> None:
 
     palette = _frames_dataset()[0]["frames"]
     assert torch.unique(palette[0].reshape(3, -1), dim=1).shape[1] > 2
+
+
+def test_anonymous_frames_are_invariant_to_simulator_identity() -> None:
+    """Row permutation and physical radius changes cannot change visible glyphs."""
+    states = _states_dataset()[0]["states"]
+    permutation = torch.tensor([3, 0, 4, 1, 2])
+    first = render_bounce(
+        states, radii=torch.tensor([0.03, 0.06, 0.09, 0.12, 0.15]), uniform_appearance=True
+    )
+    second = render_bounce(states[:, permutation], radii=torch.ones(5), uniform_appearance=True)
+    assert torch.equal(first, second)
 
 
 def test_drawn_size_stops_tracking_mass() -> None:
