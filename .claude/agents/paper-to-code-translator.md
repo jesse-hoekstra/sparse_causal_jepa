@@ -37,11 +37,14 @@ bind you.
    - **Visual target:** Experiment 2's target encoder/state head are a stop-gradient EMA copy of
      the online path. No physical-state grounding or reconstruction loss is active.
    - **Loss assembly:** teacher forcing plus eight sampled T=2 endpoint losses, weighted logit
-     penalty, and sparse path penalty. The visual GECO scalar normalizes predictive error by
-     detached floored target content variance; the gradient objective retains raw latent MSE.
-   - **Branch alignment:** one detached Hungarian permutation from shared context-prefix
+     penalty, and sparse path penalty. Both experiments' GECO scalar is the same raw
+     TF+weighted-T=2+logit sum optimized by the gradient objective; the path term is outside the
+     constraint. D42 removes predictive variance division; variance remains diagnostic only.
+     Visual configs/checkpoints require `visual_constraint_version=raw_tf_t2_v1`.
+   - **Branch alignment:** one detached minimum-cost permutation from shared context-prefix
      pre-head slots, held fixed across the target sequence. This explicit implementation choice
      avoids assuming semantic row identity from EMA and does not fix tracking switches.
+     D41 solves the five-slot assignment exactly on-device by enumeration, with lexicographic ties.
 2. **Build a symbol table.** Map every paper symbol to a named tensor with shape/dtype
    (S_t, θ̂, U_t, S̃_k, N, d, Th, Tp …). Keep it as a docstring next to the implementation.
 3. **Implement incrementally** with shape asserts and small sanity checks (`torch.testing`):

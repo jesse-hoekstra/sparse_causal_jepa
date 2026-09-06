@@ -1,20 +1,20 @@
-"""Training loop for the visual-to-visual regime: three overrides on the shared Trainer.
+"""Training loop for learned visual states and EMA targets.
 
 Everything that makes a run survivable — the D18 grad-spike skip guard, rolling
 checkpoints, exact resume, deterministic epoch order, the GECO dual — is
 inherited unchanged from :class:`scjepa.training.loop.Trainer`, because none of
-it depends on where the target comes from. Exactly three things differ:
+it depends on where the target comes from. The visual-specific behavior is:
 
 1. the model reads FRAMES, not true states;
-2. the dual is fed Eq. 123's variance-normalized constraint rather than Eq. 13's
-   raw one, because a learned target's scale drifts during training and an
-   unnormalized c would silently retune itself;
-3. the EMA target is stepped after every optimizer step (Eq. 111).
+2. the EMA target is stepped after every accepted optimizer step;
+3. representation variation is monitored on the predictive suffix.
 
-The predictive objective and metrics match Experiment 1: teacher forcing plus
-sampled T=2 endpoint loss. Collapse diagnostics are monitoring, not an
-anti-collapse objective. A low latent loss alone is insufficient evidence of
-success; object grounding and held-out state probes must also improve.
+The predictive objective and raw GECO constraint match Experiment 1: teacher
+forcing plus sampled T=2 endpoint loss, with the logit term in the constraint.
+The path term stays outside the constraint. Collapse diagnostics are monitoring,
+not normalization or an anti-collapse objective. A low latent loss alone is
+insufficient evidence of success; object grounding and held-out state probes
+must also improve.
 """
 
 from typing import cast
@@ -25,17 +25,18 @@ from torch import Tensor
 from scjepa.eval.visual_to_visual import evaluate_visual_to_visual
 from scjepa.losses import rollout_t2_endpoint_mse
 from scjepa.models.visual_to_visual import VisualToVisualModel, VisualToVisualOutput
+from scjepa.training.distributed import gather_batch_tensor
 from scjepa.training.loop import Trainer
 
 __all__ = ["VisualToVisualTrainer", "collapse_metrics"]
 
 
 def collapse_metrics(states: Tensor, prefix: str) -> dict[str, float]:
-    """Eq. 124's representation diagnostics for one branch.
+    """Representation diagnostics for one branch, independent of the constraint.
 
     ``std``: mean per-coordinate standard deviation. ``content_var``: variance
-    across (episode, time) averaged over tracks and coordinates — the quantity
-    Eq. 122 feeds to the constraint. ``effective_rank``: the exponential of the
+    across (episode, time) averaged over tracks and coordinates.
+    ``effective_rank``: the exponential of the
     entropy of the normalized covariance eigenvalues, so a representation using
     one direction scores ~1 and an isotropic one scores d_s. Those three go to
     their floor together under SCALE collapse.
@@ -80,12 +81,15 @@ class VisualToVisualTrainer(Trainer):
 
     def _forward(self, batch: dict[str, Tensor]) -> VisualToVisualOutput:  # type: ignore[override]
         """Read frames; simulator labels in the batch are evaluation-only."""
-        frames = batch["frames"].to(self.device)
+        frames = batch["frames"].to(self.device, non_blocking=self.device.type == "cuda")
         anchors = self.config.num_rollout_t2_anchors if self.config.lambda_rollout_t2 > 0 else 0
-        return self.model(
-            frames,
-            context_len=self.config.context_len,
-            num_rollout_t2_anchors=anchors,
+        return cast(
+            VisualToVisualOutput,
+            self._forward_model(
+                frames,
+                context_len=self.config.context_len,
+                num_rollout_t2_anchors=anchors,
+            ),
         )
 
     def _auxiliary_loss(self, output: VisualToVisualOutput) -> Tensor:  # type: ignore[override]
@@ -94,29 +98,6 @@ class VisualToVisualTrainer(Trainer):
             return torch.zeros((), device=self.device)
         assert output.rollout_t2_target is not None
         return rollout_t2_endpoint_mse(output.rollout_t2_prediction, output.rollout_t2_target)
-
-    def _constraint(
-        self,
-        predictive_loss: Tensor,
-        logit_loss: Tensor,
-        output: object,
-    ) -> Tensor:
-        """Eq. 123: normalize ONLY the scalar handed to the dual controller.
-
-        The gradient objective (Eq. 121) keeps the raw latent MSE; dividing that
-        by a moving denominator would change what is optimized. The floor
-        epsilon_var prevents division by zero. It does NOT prevent collapse:
-        a constant zero-error representation still satisfies this constraint.
-
-        ``predictive_loss`` arrives as L_TF + lambda_rollout_t2 * L_AR2.
-        Both are squared errors in the same target space, so both scale with the
-        representation exactly as ``target_variance`` does: above the variance
-        floor, their ratio is invariant to a shared rescaling. What it does NOT
-        see is a target frozen in time — watch ``collapse/*/temporal_var``.
-        """
-        visual_output = cast(VisualToVisualOutput, output)
-        denominator = torch.clamp(visual_output.target_variance, min=self.model.variance_floor)
-        return (predictive_loss.detach() / denominator + logit_loss.detach()).detach()
 
     def _after_optimizer_step(self, output: VisualToVisualOutput) -> None:  # type: ignore[override]
         """Eq. 111: the target moves only through the EMA, never by gradient."""
@@ -128,11 +109,19 @@ class VisualToVisualTrainer(Trainer):
         # Initialization transients in frames 0..C-2 can hide a frozen suffix.
         # Report precisely the online anchors and EMA targets used by the loss.
         transitions = output.target.shape[0] // output.causal_params.shape[0]
+        online_metrics = collapse_metrics(
+            gather_batch_tensor(output.context_states[:, -transitions:]), "collapse/online"
+        )
+        target_metrics = collapse_metrics(
+            gather_batch_tensor(output.target_states[:, -transitions:]), "collapse/target"
+        )
         return (
-            collapse_metrics(output.context_states[:, -transitions:], "collapse/online")
-            | collapse_metrics(output.target_states[:, -transitions:], "collapse/target")
+            online_metrics
+            | target_metrics
             | {
-                "collapse/target_variance": float(output.target_variance),
+                # Reuse the gathered predictive-suffix statistic. Rank-local
+                # variances omit variation between ranks' episode means.
+                "collapse/target_variance": target_metrics["collapse/target/content_var"],
                 "alignment/context_target_nonidentity_fraction": float(
                     (
                         output.target_assignment

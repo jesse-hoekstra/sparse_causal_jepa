@@ -32,7 +32,9 @@ Framework is **PyTorch** (D1); reuse-first via vendored `third_party/` code (D5)
 - Two experiments: true-state `state_to_state`, and pixel-based `visual_to_visual` with a
   stop-gradient EMA target. The supervised visual-to-state bridge is retired.
 - Both train teacher forcing plus eight sampled T=2 endpoints with one shared `theta_hat`;
-  K=30 is evaluation-only. See D37/D39 for sampling and gradient contracts.
+  K=30 is evaluation-only. See D37/D39 for sampling and gradient contracts. D42 uses the same
+  raw TF+weighted-T=2+logit constraint in both experiments, with the path penalty outside and
+  target variance confined to diagnostics. Visual runs require `raw_tf_t2_v1` provenance.
 - Visual parameter encoding applies relational attention across tracks before per-track temporal
   pooling. A shared row-wise head produces the dynamic state; SPARTAN predicts the next state.
 - Experiment 2 matches online/target context-prefix slot trajectories once per episode and holds

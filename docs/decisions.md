@@ -4,7 +4,9 @@ Living record for the codebase implementing **"Causal Identification within JEPA
 SPARTAN"** (`sources/SCJEPA.pdf`). The current protocol has two experiments: true states (Experiment 1) and learned visual
 states with EMA targets (Experiment 2). D39 supersedes the retired three-experiment proposal.
 Equation references to `outdated_experiments.pdf` identify historical component definitions;
-the supplied manuscript and current implementation use the protocol described in D37–D39.
+the supplied manuscript and current implementation use the protocol described in D37–D42.
+D42 supersedes the historical visual variance-normalized constraint in D17/D32/D39 and its
+DDP reduction details in D40/D41; branch matching and EMA remain unchanged.
 
 **2026-07-25: D1-D26 were condensed to the rules below.** Experiment 1 is finished (D30) and
 the D29 refactor superseded most of the historical narrative, so the archaeology was removed
@@ -52,7 +54,8 @@ entries state which objectives and launch settings supersede them.
 **Deleted as superseded** (full text in git): D2/D3 (SAVi choice, VISReg — no regularizer in
 Experiment 1), D4/D14 (pooling variants), D6/D9 (Hungarian single-step loss, target branch),
 D7 (from-scratch encoders), D13 (experiment ladder), D15/D16 (sliding-window and autoregressive
-rollout objectives), D17 (variance-normalized constraint), D19 (per-chain gate noise), D20/D21
+rollout objectives), D17 (historical variance-normalized constraint; D42 now removes its
+later visual reintroduction), D19 (per-chain gate noise), D20/D21
 (gt-state ruler, teacher-forced one-step — now the write-up's own spec), D22/D23 (dual
 schedules and the lambda clamp), D24/D25/D26 (parameter-slot architectures). All were replaced
 by D29's refactor to the write-up's Experiment-1 specification.
@@ -147,7 +150,8 @@ decoded-rows path objective) composed by `StateToStateModel` (Eq. 38: same θ̂ 
 transitions, every prediction anchored at the true Z_t). Trainer objective is exactly Eq. 40;
 dual constraint exactly Eq. 13; dual update log λ += α·MA[c−τ] with λ₀=1e6, no clamp. Deleted:
 SCJepa, rollout machinery, all four pooling variants, kinematic head, Hungarian matching,
-VISReg/SlotRegularizer, target-variance constraint normalization (returns with Exp 3's Eq. 123),
+VISReg/SlotRegularizer, target-variance constraint normalization (historically reintroduced for visual targets in D39,
+then superseded by the raw constraint in D42),
 aux-token pathway, gate-noise chaining, sparsity warm-up, λ clamps, the synthetic smoke dataset.
 Verified fidelity anchor: the dense model's path objective is EXACTLY 6655 and token-local 5
 (§6.1.3's stated endpoints; regression-tested).
@@ -235,6 +239,9 @@ The renderer's y coordinate increases downward; old y-up plots are vertically mi
 to the actual encoder input.
 
 ## D32 — Experiment 2 foundation: visual context and EMA visual targets (2026-07-25, Jesse)
+
+> The variance-normalized constraint below is historical and superseded by D42. EMA and visual
+> state learning remain active; target variance is now only a diagnostic.
 
 The visual-to-visual experiment reuses `Spartan`, `ParameterEncoder`, the training-loop
 safeguards, MCC, and SHD from Experiment 1. `models/visual.py` supplies the SAVi encoder and
@@ -638,6 +645,10 @@ Terminal sparse evaluation remains on the disjoint seed-offset-29 split.
 
 ## D39 — Two experiments, visual T=2 prediction, and explicit branch alignment (2026-09-06, Jesse)
 
+> D42 supersedes this entry's variance-normalized GECO formula and its normalized-tau calibration.
+> The formula below records the protocol as originally implemented. The two-experiment setup,
+> EMA target, causal inputs, fixed context assignment, and T=2 supervision remain active.
+
 **Scope.** Keep Experiment 1 (true states). Skip the supervised visual-to-state bridge and name
 the fully visual extension Experiment 2. `sources/SCJEPA.pdf` is the current manuscript;
 `sources/outdated_experiments.pdf` preserves the old three-experiment proposal. Neither PDF is
@@ -654,7 +665,7 @@ The visual optimized objective remains
 
     L = L_TF + lambda_rollout_t2 * L_AR2 + lambda_logit * L_logit + lambda_s^-1 * L_path.
 
-Its GECO constraint is
+Its historical GECO constraint (superseded by D42) is
 
     c = (L_TF + lambda_rollout_t2 * L_AR2) / sg(max(V_target, epsilon_var))
         + lambda_logit * L_logit <= tau.
@@ -708,7 +719,8 @@ position and velocity on training episodes and score separate held-out episodes;
 recoverability is evidence for the representation, not a claim that each latent coordinate is
 a true-state coordinate or a proof of the theoretical assumptions.
 
-The L40 entry point is `scripts/l40_exp2_pipeline.sbatch RUN_TAG LAMBDA_LOGIT [SEED] [STEPS]`;
+The L40 entry point is
+`scripts/l40_exp2_pipeline.sbatch RUN_TAG LAMBDA_LOGIT [SEED] [STEPS] [GPUS]` (two GPUs by default);
 the corresponding Isambard entry point is `scripts/isambard_exp2_pipeline.sbatch`. Both require
 the recorded physics preload. The inherited logit coefficient and visual convergence remain
 exploratory until measured in full runs.
@@ -720,3 +732,143 @@ used the production visual architecture and 60-frame clips (batch one): finite T
 zero skipped updates, and a successful held-out evaluation/artifact pass. The short smoke
 showed diffuse slots and very low suffix target variance; it is execution validation, not
 evidence of state recovery or convergence. No L40 training run or live W&B upload was performed.
+
+## D40 — Two-L40 training with a fixed global batch (2026-09-06, Jesse)
+
+> D42 replaces the normalized constraint and every-update target-variance moments below with
+> the global mean raw constraint. Target statistics are gathered only for logged diagnostics.
+
+Experiment 2 can train one model across the user's two L40s using PyTorch
+DistributedDataParallel and one torchrun process per GPU. The L40 launcher now requests two
+GPUs by default. It trains dense and sparse stages in sequence, because the latter requires
+the dense calibration result. Evaluation stays on one GPU with the original global batch.
+
+`train.batch_size=4` means the total batch, hence two episodes per GPU. The deterministic
+sampler splits each original shuffled batch without adding or dropping episodes beyond the
+original incomplete final batch. Learning rate, update count, T=2 windows, EMA decay per update,
+and objective weights remain unchanged. Independent rank RNG streams preserve independent
+stochastic samples; one-GPU and two-GPU runs need not follow identical numerical trajectories.
+
+DDP averages local gradients. The GECO bound uses the global predictive mean and a target
+variance reconstructed from global moments, including differences between rank means; averaging
+locally normalized losses would change the experiment. Logged collapse statistics likewise use
+gathered latent states. All ranks agree on finite-loss and gradient-skip decisions, and update
+optimizer, EMA, and dual together. Only rank zero logs to W&B, evaluates, and writes checkpoints.
+Checkpoint files retain an unwrapped model and each rank's RNG; writing is atomic and all ranks
+wait for completion. Exact training resume requires the same world size and global batch.
+
+DDP omits the separate branch gradient diagnostics because PyTorch DDP does not support the
+extra `autograd.grad` traversals used there; total synchronized gradient norm remains logged.
+Expensive collapse spectra/gathers run only at logging points. NCCL data workers use spawn;
+Hydra output logging is disabled in torchrun workers to avoid competing artifact writes.
+
+`train/seconds_per_step` and `train/episodes_per_second` report throughput between logging
+points. D41 refines their timing to exclude evaluation/checkpoint/logger overhead; first-interval
+worker warmup remains included. Two-GPU speedup must be measured on the L40s; CPU correctness
+tests do not establish a speedup, and the 72-hour scheduler allowance remains provisional.
+
+Validation: the 217-test suite passes, including real two-process Gloo tests for full-batch
+DDP gradient/Adam equivalence and visual EMA/GECO/skip/RNG behavior. The actual torchrun
+entrypoint also completed two CPU updates with periodic held-out evaluation and one shared
+checkpoint. No L40 training or live W&B upload was performed during implementation.
+
+## D41 — Remove avoidable training stalls before increasing the batch (2026-09-06)
+
+> D42 removes the target-variance collective described below from ordinary training updates.
+> Target-state gathering remains at logging points only; the other throughput changes remain.
+
+The user requested faster training through higher GPU utilization. Preserve global batch four,
+learning rate, update count, precision, TF+T=2 losses, gradient guards, EMA and GECO. Raising the
+batch at fixed update count would process more episodes and change the optimization trajectory;
+it is not a guaranteed wall-clock reduction for the same experiment.
+
+CUDA data loaders pin prefetched batches, and state/frame transfers use `non_blocking=True`.
+This removes the immediate host synchronization on each transfer; there is no separate CUDA
+copy stream, so it does not claim overlap between a transfer and compute on the same stream.
+Only logged/final updates materialize metric scalars and monitoring reductions. Every update
+still checks finite loss and pre-clip gradient health, makes unanimous DDP rejection decisions,
+and updates optimizer/EMA/dual together when accepted. Device rejection flags reach their DDP
+reduction before one host decision. Global target variance packs count and both moments into
+one collective instead of two. These follow the
+[PyTorch performance guide](https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html).
+
+For at most six slots on CPU/CUDA, context branch alignment now exhaustively scores permutations
+on-device (120 for the active five-slot setup). It solves the same minimum-cost assignment as
+Hungarian matching, using the same detached, normalized, context-only cost and one fixed
+permutation per episode. Sums use double precision to preserve near-tied optimal costs. Exact
+ties select the lexicographically first permutation, which can differ from SciPy's tie choice;
+identical histories select identity. Thus exact historical trajectories are not promised in
+degenerate tie cases. Larger slot sets and other backends retain SciPy. Nonfinite costs on the
+tensor path yield a valid arbitrary permutation so the training loss/gradient guards can reject
+the nonfinite model outputs; they do not force another host synchronization to raise in matching.
+
+Throughput measures training and loader time, excludes evaluation/checkpoint/logger calls, and
+synchronizes CUDA at interval boundaries for valid elapsed times. Logged-step diagnostic
+computation is still included. The first interval includes worker startup; compare later
+intervals. Whole-pipeline elapsed time remains longer because it includes all serial stages.
+
+`scripts/l40_exp2_benchmark.sbatch TAG [STEPS=400]` requests two L40s, runs the production dense
+visual model first on one GPU and then two, and reports final-interval seconds per update and
+scaling in `benchmark.json`. Steps must be a multiple of 100, at least 200, to time a complete
+100-update interval after warm-up. Both use global batch four, eight total data workers, recorded
+seed-zero physics and fixed CPU thread limits. It omits W&B, evaluation and periodic checkpoints
+and refuses a speed report if any update was skipped. Short dense timing estimates hardware
+scaling, not sparse-stage speed, object learning, convergence, or time to successful recovery.
+The normal single-GPU branch-gradient logging is included; DDP omits it per D40, so this is a
+comparison of practical training throughput with each mode's actual diagnostics.
+
+CPU regression checks cover exact assignment cost, unchanged updates/RNG without metric
+collection, retained numerical guards, distributed behavior, timing exclusions and benchmark
+protocol. The full CPU suite passed, with the CUDA parity test skipped; final benchmark and
+test-typing adjustments also passed their 38-test regression subset. Ruff and source/script
+Pyright pass. Full-project Pyright still reports 129 existing test-typing diagnostics, verified
+against unchanged files and the original `test_training.py`; none come from the new tests.
+L40 speedup and CUDA-path performance remain unmeasured locally.
+
+
+## D42 — Use raw predictive loss in the visual GECO constraint (2026-09-06, Jesse)
+
+The user requested removal of predictive variance division from Experiment 2. Both experiments
+now constrain the same raw predictive and logit terms that enter their gradient objective:
+
+    L_pred = L_TF + lambda_rollout_t2 * L_AR2
+    L = L_pred + lambda_logit * L_logit + lambda_s^-1 * L_path
+    c = L_pred + lambda_logit * L_logit <= tau.
+
+No target variance divides either predictive loss or constraint. The path penalty stays outside
+the constraint. This supersedes D17's historical normalization and its visual reintroduction in
+D32/D39; it is an explicit protocol change, not a claim that the older normalization never
+existed. The supplied PDFs and past audit results remain historical sources.
+
+EMA/stop-gradient, causal frame inputs, one fixed context-derived slot permutation per episode,
+and the TF+eight-T=2 endpoint objective remain unchanged. No replacement LayerNorm or
+anti-collapse regularizer is introduced. The model's `variance_floor` is removed. Content
+variance, temporal variance, rank, tracking, and frozen state probes remain diagnostics;
+evaluation-only `min_target_variance=1e-4` continues to screen gross collapse and never appears
+as a loss denominator. Low raw latent error alone does not establish representation learning.
+
+The visual pipeline must train a fresh matching dense model and set tau to 1.0 times its held-out
+raw TF+weighted-T=2+logit constraint after the existing collapse screen. No earlier normalized
+tau transfers. Dense and sparse models still learn separate target feature spaces, so equal
+raw latent MSE or constraint values do not establish equal physical fidelity. Experiment 1's
+D38 dense/identity feasibility procedure remains unchanged.
+
+Under DDP, local raw gradients are averaged and GECO uses the global mean raw constraint.
+Target variance no longer requires an every-update moments all-reduce; global target-state
+statistics are gathered only for logging diagnostics. Unanimous gradient rejection,
+optimizer/EMA/dual synchronization, fixed global batch, and rank-specific checkpoint RNG
+behavior remain as specified in D40/D41.
+
+Resolved visual configurations and checkpoints record
+`visual_constraint_version=raw_tf_t2_v1`. Legacy normalized runs cannot resume into this
+protocol or provide its calibration merely because their tensor shapes still load. Fresh dense
+and sparse runs and evaluation must agree on this stamp and the unchanged TF+T=2 settings.
+
+Validation: 299 tests passed; the CUDA-only assignment check was skipped locally. Tests verify
+variance-independent raw constraint arithmetic, global DDP means and diagnostics, preserved
+EMA/skip/RNG behavior, and rejection of old config/checkpoint stamps. Ruff and source/script
+Pyright pass. The actual training entrypoint completed two accepted CPU updates with 60-frame
+clips and eight T=2 anchors using a small model; its evaluation entrypoint passed protocol
+validation and reported a raw constraint equal to the sum of its three loss components.
+Target variance remained very small in that short smoke, so this verifies execution rather than
+representation learning. No L40 run or live W&B upload was performed.

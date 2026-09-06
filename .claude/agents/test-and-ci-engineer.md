@@ -21,12 +21,15 @@ is a safety net that catches breakage in seconds and runs free on CPU in CI. Rea
    Parameter encoding applies relational attention then track-preserving temporal pooling; the
    state head is row-wise and causal.
 2. **Method invariants.**
-   - Collapse diagnostics distinguish content, temporal, and rank degeneracy. Neither active
-     experiment applies the optional vendored VISReg/SIGReg regularizers.
+   - Collapse diagnostics distinguish content, temporal, and rank degeneracy. Variance does
+     not divide the raw TF+T=2+logit constraint (D42), and `min_target_variance` is evaluation-only.
+     Visual provenance rejects legacy normalized checkpoints. Neither active experiment applies
+     a replacement LayerNorm or the optional vendored VISReg/SIGReg regularizers.
    - SPARTAN: sparsity penalty is monotone in attention density on constructed inputs; the exposed
      interaction graph has the documented shape and responds to the sparsity weight.
-   - Hungarian branch matching: one detached assignment from context only; permuting the whole
+   - Minimum-cost branch matching: one detached assignment from context only; permuting the whole
      target trajectory is corrected, while a mid-episode switch retains error.
+     Compare the bounded device enumeration with SciPy optimal costs, including near ties (D41).
    - Shared T=2 windows: valid distinct per-episode sampling, one shared parameter estimate,
      generated-state feedback with endpoint gradients through both calls, and mean loss scaling.
 3. **Wiring / smoke.** Tiny end-to-end run (synthetic dataset, tiny model, CPU, `WANDB_MODE=

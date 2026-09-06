@@ -29,13 +29,14 @@ follow-up experiments. Read `CLAUDE.md` (failure catalog, health signatures) and
    indicates a token-local graph, but interpret it with MCC: low SHD can reward empty-graph
    collapse. D30's successful four-phase trajectory is a historical qualitative comparison,
    not a numerical target for the current objective or visual experiment.
-3. **Audit the exact constraint.** Both experiments use TF + weighted T=2 error and the logit
-   penalty; Experiment 2 normalizes only the predictive term by detached floored target content
-   variance. The path penalty is outside both constraints. Compare with the run's calibrated tau.
+3. **Audit the exact constraint.** Both experiments use raw TF + weighted T=2 error and the
+   logit penalty (D42). Target variance does not divide prediction error; the path penalty is
+   outside both constraints. Compare with the run's calibrated tau. For Experiment 2 require
+   `visual_constraint_version=raw_tf_t2_v1`; older normalized thresholds are incompatible.
 4. **Check the reference.** Experiment 1 uses matched dense/identity feasibility selection (D38).
-   Experiment 2 uses its own normalized dense constraint (D39), with gross-collapse screening.
-   The latter remains exploratory because independently learned targets can have different
-   feature geometry; equal latent constraints do not establish equal physical fidelity.
+   Experiment 2 uses a fresh raw dense constraint (D42), with evaluation-only gross-collapse
+   screening. The latter remains exploratory because independently learned targets can have
+   different feature geometry; equal raw latent errors do not establish equal physical fidelity.
 5. **Cross-run diffs.** `resolved_config.yaml` and `git_sha` between runs; runs execute on the
    NFS server — verify the sha matches the fix you think is deployed.
 6. **Cheap falsification runs** (CPU, minutes): 1500–6000 steps, `data.num_clips=200`, direct

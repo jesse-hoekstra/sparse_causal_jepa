@@ -25,9 +25,21 @@ auxiliary calls. K=30 is evaluation-only.
 Experiment 2 renders identical-looking balls from the same physics preload. Its target encoder
 and state head update by EMA after accepted optimizer steps. A context-only branch assignment
 fixes the target slot order once per episode; physical truth is used only in evaluation.
-Its GECO constraint normalizes the predictive term by detached target content variance, while
-Experiment 1's constraint uses raw state error. Calibrate tau separately with matching objective,
-data, architecture, and seed. Neither old pure-TF nor full-K rollout thresholds transfer.
+Both experiments use the raw constraint
+`L_TF + lambda_rollout_t2*L_AR2 + lambda_logit*L_logit <= tau`, with the path penalty outside.
+Experiment 2 records `visual_constraint_version: raw_tf_t2_v1` in its config and checkpoint;
+legacy normalized checkpoints and tau values cannot be reused. Calibrate a fresh visual tau
+from the matching dense raw constraint. `variance_floor` is removed from the model: variance
+remains a diagnostic, and evaluation's `min_target_variance=1e-4` is only a collapse-screening
+threshold. No replacement LayerNorm or anti-collapse regularizer is introduced.
+
+`train.batch_size` is the global training batch, including under torchrun. The L40 Experiment-2
+launcher keeps it at four and defaults to two GPUs (two episodes per GPU); one and four GPUs
+are also supported. The learning rate and step count stay fixed. `resolved_config.yaml` records
+the worker count and local/global batch sizes in `distributed`. DDP uses the global mean raw
+constraint; target variance is gathered only when logging diagnostics. Evaluation remains single GPU.
+CUDA pinned-memory loading and deferred monitoring apply automatically, without changing any
+training hyperparameters. See `scripts/l40_exp2_benchmark.sbatch` for a short hardware comparison.
 
 The supervised visual-to-state preset and visual-only K-rollout configuration keys are retired.
-See `docs/decisions.md` D37–D39 for active settings and historical rationale.
+See `docs/decisions.md` D37–D42 for active settings and historical rationale.

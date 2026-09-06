@@ -33,6 +33,11 @@ def build_model(
     if regime not in REGIMES:
         raise ValueError(f"model.regime must be one of {REGIMES}, got {regime!r}")
     if regime == "visual_to_visual":
+        if "variance_floor" in model_cfg:
+            raise ValueError(
+                "model.variance_floor belongs to the retired normalized visual constraint; "
+                "use the current preset and freshly calibrate raw tau (D42)"
+            )
         return build_visual_to_visual(
             num_slots=model_cfg.num_slots,
             slot_size=model_cfg.slot_size,
@@ -49,7 +54,6 @@ def build_model(
             spartan_dense=bool(model_cfg.get("spartan_dense", False)),
             spartan_identity=bool(model_cfg.get("spartan_identity", False)),
             ema_decay=float(model_cfg.get("ema_decay", 0.996)),
-            variance_floor=float(model_cfg.get("variance_floor", 1e-4)),
         )
     return build_state_to_state(
         state_dim=model_cfg.state_dim,

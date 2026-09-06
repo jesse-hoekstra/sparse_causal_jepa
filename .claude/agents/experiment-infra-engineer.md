@@ -41,7 +41,10 @@ fail loudly rather than silently. Read `docs/decisions.md` first; it binds you.
   the path term and GECO are active from the start. Calibrate tau freshly for
   `L_TF + lambda_rollout_t2*L_AR2 + lambda_logit*L_logit`; never use the no-gradient K=30
   diagnostic or an old threshold as the constraint. D39 applies the same local T=2 objective to
-  Experiment 2, whose predictive GECO term is normalized by detached target content variance.
+  Experiment 2. D42 makes its GECO term the same raw TF+weighted-T=2+logit sum; no predictive
+  variance division remains. Under DDP use the global mean raw constraint and gather target
+  variance only for logging. Require `visual_constraint_version=raw_tf_t2_v1`; recalibrate
+  visual tau from a fresh raw dense reference. Evaluation collapse screening remains separate.
 - **Experiment-1 logging:** keep `train/loss_teacher_forcing`, `train/loss_rollout_t2_raw`,
   `train/loss_rollout_t2_weighted`, and `train/loss_total`; branch norms may be
   `train/grad_norm_teacher_forcing` and `train/grad_norm_rollout_t2_weighted`. Do not log

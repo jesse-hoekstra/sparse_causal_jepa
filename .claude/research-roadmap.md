@@ -1,6 +1,6 @@
 # Research roadmap: two experiments
 
-Updated 2026-09-06. Read [decisions D37–D39](../docs/decisions.md) and
+Updated 2026-09-06. Read [decisions D37–D42](../docs/decisions.md) and
 [README.md](../README.md) for the active protocol. Historical run failures and objective changes
 remain in the decision log. The supervised visual-to-state bridge is retired.
 
@@ -21,16 +21,20 @@ EMA visual branch. Both training branches use causal recurrence; only the target
 contains future target frames. Render equal-radius white glyphs from the same physics preload.
 The online branch cannot receive true states or masses for training.
 
-Use one detached context-prefix Hungarian branch assignment per episode and keep it for all
+Use one detached context-prefix minimum-cost branch assignment per episode and keep it for all
 future targets and TF/T=2 windows. The matching inputs are pre-head slot histories, never true
 states, masses, future slots, or prediction residuals. It corrects global branch permutation,
 not within-episode identity switches. EMA ancestry does not prove physical identity, state
 sufficiency, or non-collapse. These are empirical requirements and explicit assumptions in
 SCJEPA.pdf (PDF p.9, Assumption 2 / Remark 3).
 
-The dense run calibrates this experiment's normalized TF+T=2 constraint; sparse training uses
-that tau. Reject a grossly collapsed reference before interpreting a calibrated threshold.
-There is no reconstruction/grounding loss or new anti-collapse regularizer. The inherited
+The dense run freshly calibrates this experiment's raw TF+T=2+logit constraint (D42); sparse
+training uses that tau. Target variance does not divide the loss. Require the
+`visual_constraint_version=raw_tf_t2_v1` config/checkpoint stamp; old normalized thresholds do
+not transfer. Reject gross collapse using evaluation diagnostics, including
+`min_target_variance=1e-4`. Equal raw MSE across independently learned target spaces does not
+establish equal physical fidelity. There is no replacement LayerNorm, reconstruction/grounding
+loss, or new anti-collapse regularizer. The inherited
 lambda_logit=1e-5 is an exploratory default, not a completed visual sweep.
 
 ## Evidence required

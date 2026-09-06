@@ -2,9 +2,9 @@
 
 Simulator truth is used exclusively for these diagnostics. One geometric
 assignment, inferred from the context prefix, is held fixed across the episode.
-The predictive constraint mirrors training's per-batch normalized TF + T=2
-objective. Its scale is specific to the current learned target representation;
-normalization alone does not establish equal physical fidelity across models.
+The predictive constraint mirrors training's raw TF + T=2 + logit objective.
+Its scale is specific to the current learned target representation; matching
+loss values does not establish equal physical fidelity across models.
 """
 
 from collections import defaultdict
@@ -224,7 +224,6 @@ def _evaluate(
         if output.rollout_t2_prediction is not None:
             assert output.rollout_t2_target is not None
             t2 = (output.rollout_t2_prediction - output.rollout_t2_target).square().mean()
-        denominator = output.target_variance.clamp(min=model.variance_floor)
         learned = read_learned_graph(output.path_matrix, output.causal_params.shape[1])
         truth = graph_in_slot_order(batch["contacts"][:, tpar - 1 :].bool().to(device), order)
         metrics = {
@@ -232,8 +231,9 @@ def _evaluate(
             "loss_teacher_forcing": float(tf),
             "loss_rollout_t2_raw": float(t2),
             "loss_rollout_t2_weighted": float(lambda_rollout_t2 * t2),
+            "loss_logit_weighted": float(lambda_logit * output.logit_penalty),
             "constraint_loss": float(
-                (tf + lambda_rollout_t2 * t2) / denominator + lambda_logit * output.logit_penalty
+                tf + lambda_rollout_t2 * t2 + lambda_logit * output.logit_penalty
             ),
             "target_variance": float(output.target_variance),
             "mean_abs_logit": float(output.mean_abs_logit),
@@ -265,6 +265,9 @@ def _evaluate(
                 output.causal_params,
                 output.episode_keys,
             )
+            # Preserve the evaluation-only rollout ruler. This numerical floor
+            # and normalization never enter the training loss or GECO bound.
+            denominator = output.target_variance.clamp(min=1e-4)
             metrics[f"latent_rollout_k{oe_eval_horizon}_nrmse"] = float(
                 ((prediction - target).square().mean() / denominator).sqrt()
             )

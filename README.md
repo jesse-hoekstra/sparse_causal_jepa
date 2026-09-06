@@ -15,7 +15,7 @@ Code accompanying **"Causal Identification within JEPA Using a SPARTAN"**
 The supervised visual-to-true-state bridge has been retired. The old three-experiment proposal
 in [outdated_experiments.pdf](sources/outdated_experiments.pdf) is historical: its equation
 references explain existing components, but its numbering and same-row EMA assumption are not
-the current protocol. [Decisions D37–D39](docs/decisions.md) record the active design.
+the current protocol. [Decisions D37–D42](docs/decisions.md) record the active design.
 
 ## Setup
 
@@ -49,12 +49,18 @@ Only that second endpoint contributes to `L_AR2`; average the loss over batch, w
 and coordinates. `lambda_rollout_t2=0` bypasses the auxiliary branch and its random sampling.
 There is no K=30 training loss or rollout curriculum. K=30 remains an evaluation diagnostic.
 
-Experiment 1 uses the raw predictive error in its GECO constraint. Experiment 2 divides the
-predictive error by detached, floored target content variance before adding the weighted logit
-penalty to the constraint; the optimized predictive loss remains raw latent MSE. The path penalty
-is outside the constraint in both experiments. Tau must be calibrated for each experiment's
-actual objective and representation scale. Never reuse Experiment 1's historical `tau=0.02`
-for the current TF+T=2 setup or for Experiment 2.
+Both experiments use the same raw predictive terms in the gradient objective and GECO constraint:
+
+```text
+c = L_TF + lambda_rollout_t2 * L_AR2 + lambda_logit * L_logit <= tau
+```
+
+The path penalty stays outside the constraint. Experiment 2 no longer divides prediction error
+by target variance (D42). Variance, rank, and temporal statistics remain diagnostics; no new
+LayerNorm or anti-collapse loss is introduced. Visual runs record
+`visual_constraint_version=raw_tf_t2_v1` in their configuration and checkpoints. Calibrate a fresh
+visual tau from the raw dense constraint: neither earlier variance-normalized thresholds nor
+Experiment 1's historical `tau=0.02` transfers.
 
 ## Experiment 1: true states
 
@@ -93,33 +99,53 @@ online current state and the single parameter estimate from the initial context.
 windows, its second call receives its own prediction.
 
 **EMA does not guarantee that slot `i` tracks the same ball in both branches.** Each episode
-therefore gets one detached Hungarian assignment between the branches' pre-head slot trajectories
+therefore gets one detached minimum-cost assignment between the branches' pre-head slot trajectories
 on the shared context prefix. That permutation is fixed for the entire target sequence and every
 training term. It uses no future frames, physical states, or masses. It can correct a branch-wide
 permutation; it cannot repair an identity switch midway through a trajectory. Slot numbering is
 local to an episode, and tracking still has to be measured. This matching is an implementation
 choice consistent with the current manuscript's Hungarian matching description; the outdated
 proposal's stronger same-row assumption is not used.
+For five slots, all 120 permutations are scored directly on the GPU, solving the same assignment
+problem without a CPU round trip. Equal-cost ties select the first lexicographic permutation.
 
 EMA and stop-gradient also do not prove non-collapse or recovery of a sufficient Markov state
 (SCJEPA, PDF p.9, Assumption 2 and Remark 3). No reconstruction loss or anti-collapse regularizer
 has been added. Low latent prediction error alone is insufficient: inspect temporal variation,
 effective rank, object tracking, and held-out state probes before interpreting MCC/SHD.
 
-Run the complete dense-calibration and sparse pipeline on one L40:
+Run the complete dense-calibration and sparse pipeline on two L40s in one machine:
 
 ```bash
 bash scripts/l40_exp2_pipeline.sbatch visual_seed0 1e-5 0
 # Or on Slurm:
 sbatch scripts/l40_exp2_pipeline.sbatch visual_seed0 1e-5 0
+# One GPU or four GPUs: match the allocation to the fifth argument.
+sbatch --gres=gpu:1 scripts/l40_exp2_pipeline.sbatch visual_one 1e-5 0 300000 1
+sbatch --gres=gpu:4 scripts/l40_exp2_pipeline.sbatch visual_four 1e-5 0 300000 4
 ```
 
-The first argument is a unique run tag; the remaining arguments are `LAMBDA_LOGIT [SEED] [STEPS]`
-(default seed 0 and 300,000 steps). Outputs go to `outputs/bounce_exp2_visual_seed0/{dense,main}`.
+The first argument is a unique run tag; the remaining arguments are
+`LAMBDA_LOGIT [SEED] [STEPS] [GPUS]` (defaults: seed 0, 300,000 steps, two GPUs).
+Training uses one synchronized process per GPU and divides the global batch of four across
+them: two episodes per GPU on two L40s. The learning rate and number of optimizer/EMA updates
+stay the same. A single W&B run and checkpoint stream record the combined training run.
+Dense training, calibration, sparse training, and final evaluation remain sequential; evaluation
+uses one GPU. GPU communication and those serial stages limit speedup, which must be measured.
+Outputs go to `outputs/bounce_exp2_visual_seed0/{dense,main}`.
+
+Before a full run, compare one- and two-GPU training throughput with
+`sbatch scripts/l40_exp2_benchmark.sbatch speed_check`. It runs 400 dense updates per GPU count
+with the same global batch and reports the final 100-step interval after warm-up in
+`outputs/bounce_exp2_benchmark_speed_check/benchmark.json`. It tests hardware scaling, not
+convergence. Training uses pinned image batches, nonblocking CUDA transfers, and computes
+monitoring metrics only at logging points. W&B throughput includes data loading and excludes
+evaluation, checkpoint writes, and logger calls; first-interval startup still counts.
+
 The launcher requires the corresponding physics preload, calibrates tau from the dense model's
-held-out normalized constraint, rejects grossly collapsed dense references, and evaluates the
+held-out raw constraint, rejects grossly collapsed dense references, and evaluates the
 sparse model on a disjoint split. Dense and sparse models learn separate target feature spaces;
-equal normalized errors therefore need not imply equal physical fidelity. This is an exploratory
+equal raw latent errors therefore need not imply equal physical fidelity. This is an exploratory
 experiment: the inherited `1e-5` logit coefficient and visual convergence have not been
 established by full runs.
 

@@ -2,7 +2,7 @@
 
 Updated 2026-09-06. This file formerly proposed three scientific gates and a jointly optimized
 single-frame target. That proposal is superseded by the user's two-experiment setup and
-[decisions D37–D39](../docs/decisions.md).
+[decisions D37–D42](../docs/decisions.md).
 
 1. **Experiment 1:** infer parameters from true-state histories; train all teacher-forced suffix
    transitions plus eight sampled T=2 endpoints. Keep the successful historical baseline and
@@ -25,7 +25,12 @@ density. Preserve train/test episode separation for probes and use physical labe
 evaluation. A concise slot panel and recovery plot accompany scalar curves. A representation may
 linearly encode physical state without its latent coordinates literally being that state.
 
-Visual tau is calibrated from its own dense normalized TF+T=2 constraint after gross-collapse
-screening. Dense and sparse targets can still have different feature geometry, so equal latent
+Both experiments use the raw constraint
+`L_TF + lambda_rollout_t2*L_AR2 + lambda_logit*L_logit <= tau`, with the path penalty outside.
+Visual tau is freshly calibrated from its dense raw constraint after gross-collapse screening.
+D42 removes predictive division by variance; the evaluation-only `min_target_variance=1e-4`
+threshold remains a diagnostic screen. Visual configs/checkpoints carry
+`visual_constraint_version=raw_tf_t2_v1`; older normalized thresholds/checkpoints do not transfer.
+Dense and sparse targets can still have different feature geometry, so equal raw latent
 constraints do not establish equal physical fidelity. Full visual convergence and confirmatory
 seeds remain to be demonstrated. See [research-roadmap.md](research-roadmap.md).

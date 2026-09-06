@@ -14,7 +14,14 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from scjepa.eval.observational_equivalence import training_coordinate_std
+from scjepa.models.visual_to_visual import VISUAL_CONSTRAINT_VERSION
 from scjepa.training import MetricLogger, NoopLogger, TrainConfig, Trainer, seed_everything
+from scjepa.training.distributed import (
+    destroy_distributed,
+    initialize_distributed,
+    is_main_process,
+    world_size,
+)
 from scjepa.training.factory import build_dataset, build_model
 from scjepa.training.visual_to_visual import VisualToVisualTrainer
 
@@ -98,6 +105,13 @@ def _print_run_banner(cfg: DictConfig, experiment: str, phase: str, git_sha: str
         ),
         ("train.steps", str(cfg.train.steps), _source_of("train.steps", overrides, preset)),
         (
+            "train.batch_size (global)",
+            str(cfg.train.batch_size),
+            _source_of("train.batch_size", overrides, preset),
+        ),
+        ("distributed.world_size", str(world_size()), "torchrun environment"),
+        ("distributed.local_batch_size", str(int(cfg.train.batch_size) // world_size()), "derived"),
+        (
             "train.context_len",
             str(cfg.train.get("context_len", None)),
             _source_of("train.context_len", overrides, preset),
@@ -163,7 +177,18 @@ def _git_sha() -> str:
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig) -> None:
-    """Build model + data + trainer from the config and run."""
+    """Bind each torchrun worker to its GPU and clean up the process group."""
+    cfg.train.device = str(initialize_distributed(str(cfg.train.device)))
+    try:
+        _train(cfg)
+    finally:
+        destroy_distributed()
+
+
+def _train(cfg: DictConfig) -> None:
+    """Build one replica per worker and let rank zero own run artifacts."""
+    if int(cfg.train.batch_size) < world_size() or int(cfg.train.batch_size) % world_size():
+        raise ValueError("train.batch_size is global and must be divisible by the worker count")
     # Trainer.__init__ seeds the training stream, but that is too late for
     # reproducible dataset/model construction. Seed before either is built.
     seed_everything(int(cfg.train.seed))
@@ -182,7 +207,8 @@ def main(cfg: DictConfig) -> None:
     # directory, a checkpoint and a W&B entry already exist. NOTE: never read
     # these with DictConfig.get(key, default) — it returns the default for a
     # MISSING value and would silently reinstate the footgun this replaces.
-    _print_run_banner(cfg, experiment, phase, git_sha)
+    if is_main_process():
+        _print_run_banner(cfg, experiment, phase, git_sha)
 
     out_dir = Path(str(HydraConfig.get().runtime.output_dir))
     dataset = build_dataset(cfg.data)
@@ -196,7 +222,18 @@ def main(cfg: DictConfig) -> None:
 
     resolved: dict[str, Any] = OmegaConf.to_container(cfg, resolve=True)  # pyright: ignore[reportAssignmentType]
     resolved["git_sha"] = git_sha
-    OmegaConf.save(config=OmegaConf.create(resolved), f=out_dir / "resolved_config.yaml")
+    if regime == "visual_to_visual":
+        resolved["visual_constraint_version"] = VISUAL_CONSTRAINT_VERSION
+    resolved["distributed"] = {
+        "world_size": world_size(),
+        "global_batch_size": int(cfg.train.batch_size),
+        "local_batch_size": int(cfg.train.batch_size) // world_size(),
+    }
+    if world_size() > 1 and str(cfg.train.device).startswith("cuda"):
+        # Rank-local CUDA indices belong to execution, not the portable protocol.
+        resolved["train"]["device"] = "cuda"
+    if is_main_process():
+        OmegaConf.save(config=OmegaConf.create(resolved), f=out_dir / "resolved_config.yaml")
 
     eval_dataset = None
     if cfg.train.get("eval_every") is not None:
@@ -248,7 +285,7 @@ def main(cfg: DictConfig) -> None:
         run_name = f"{run_name}-{cfg.wandb.run_tag}"
     logger: MetricLogger = (
         WandbLogger(project=cfg.wandb.project, mode=cfg.wandb.mode, config=resolved, name=run_name)
-        if cfg.wandb.enabled
+        if cfg.wandb.enabled and is_main_process()
         else NoopLogger()
     )
     # Record the run id so scripts/eval_identifiability.py can attach the final
@@ -267,9 +304,11 @@ def main(cfg: DictConfig) -> None:
     final = trainer_class(
         cast(Any, model), dataset, train_config, logger, eval_dataset=eval_dataset
     ).train()
-    print(
-        f"done at step {train_config.steps}: " + ", ".join(f"{k}={v:.4g}" for k, v in final.items())
-    )
+    if is_main_process():
+        print(
+            f"done at step {train_config.steps}: "
+            + ", ".join(f"{k}={v:.4g}" for k, v in final.items())
+        )
 
 
 if __name__ == "__main__":
