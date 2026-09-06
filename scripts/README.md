@@ -137,6 +137,26 @@ the direct GPU communication path is implicated. Treat the setting as a diagnost
 re-measure throughput before using it for the full run. See
 [NVIDIA's GPU communication troubleshooting](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/gpu_troubleshooting.html).
 
+If the small communication checks pass but training stops at `Initializing DDP`, check the
+actual dense visual model's DDP constructor. Its parameter verification and roughly 24 MiB
+coalesced parameter broadcast are not covered by the scalar/1 MiB checks. This mode also uses
+the training launcher's lazy NCCL initialization, whereas the small checks initialize eagerly:
+
+```bash
+timeout -k 10s 90s env -u NCCL_P2P_DISABLE CUDA_VISIBLE_DEVICES=4,5 \
+  OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NCCL_DEBUG=INFO \
+  .venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  --local-addr=127.0.0.1 scripts/check_nccl.py --visual-ddp \
+  2>&1 | tee logs/nccl_visual_ddp.log
+```
+
+The model check prints a Python traceback after 30 seconds if DDP construction has not
+returned, then relies on the process-group and outer timeouts to abort. It constructs the real
+model without loading data or training. `PASS` covers initialization only. If it hangs, repeat
+with `NCCL_P2P_DISABLE=1` added after `env -u NCCL_P2P_DISABLE` and use a separate log;
+passing the smaller P2P checks does not settle this larger initialization path. Preserve the
+traceback and timeout error so shape verification can be distinguished from parameter broadcast.
+
 CUDA training now pins batches in the data loader and submits input copies without a host wait.
 The five-slot context assignment is solved exactly on-device, and scalar monitoring metrics are
 only materialized on logged updates. Numerical rejection guards still run on every update.

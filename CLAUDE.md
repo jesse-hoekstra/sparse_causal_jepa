@@ -95,6 +95,16 @@ finite ~1e30 loss that passed `isfinite`, overflowed the backward pass to grad_n
 let clipping multiply every gradient by zero — a run that "finished" 230k frozen steps with
 byte-identical eval rows. That signature remains worth recognising even with the short T=2 path.
 
+Infrastructure investigation (2026-09-06): the two-L40 visual benchmark reaches
+`Initializing DDP` on both ranks and NCCL `Init COMPLETE`/`Connected all rings`, but neither
+rank reports `DDP ready`. Dataset loading and model construction have completed; data workers
+and training have not started. Scalar/1 MiB NCCL checks passed with default transport and with
+P2P disabled. This localizes a DDP-constructor stall without establishing its root cause.
+`scripts/check_nccl.py --visual-ddp` now isolates the actual dense model's initialization
+(including shape verification and roughly 24 MiB parameter synchronization), using the same
+lazy NCCL setup as training, a short timeout, and a delayed Python traceback. Missing optional
+IB/plugin messages followed by successful Socket fallback are not evidence of the cause.
+
 ## Key mechanics (Experiment 1, fixed TF + T=2 objective — D37)
 - **The objective has two predictive branches sharing one θ̂.** Pool θ̂ exactly once per
   episode from states 0..29 and reuse the same attached tensor for every teacher-forcing
