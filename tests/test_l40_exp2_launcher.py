@@ -20,17 +20,24 @@ def _environment(tmp_path: Path) -> dict[str, str]:
     python = tmp_path / ".venv/bin/python"
     python.write_text(
         "#!/usr/bin/env python3\n"
-        "import json,os,pathlib,sys\n"
+        "import json,os,pathlib,sys,types\n"
         "args=sys.argv[1:]\n"
         "with open(os.environ['CALLS'], 'a') as out: out.write(json.dumps(args)+'\\n')\n"
         "if args[0]=='-c':\n"
         "    if 'constraint_loss' in args[1]: print(0.25)\n"
-        "elif args[0]=='scripts/train.py':\n"
+        "    else:\n"
+        "        visible_count=int(os.environ.get('MOCK_VISIBLE_GPUS', '4'))\n"
+        "        sys.modules['torch']=types.SimpleNamespace(cuda=types.SimpleNamespace(\n"
+        "            is_available=lambda:visible_count>0, device_count=lambda:visible_count,\n"
+        "            get_device_name=lambda index:'Mock L40'))\n"
+        "        sys.argv=['-c', *args[2:]]\n"
+        "        exec(args[1])\n"
+        "elif 'scripts/train.py' in args:\n"
         "    directory=next(x.split('=',1)[1] for x in args if x.startswith('hydra.run.dir='))\n"
         "    pathlib.Path(directory).mkdir(parents=True)\n"
         "elif args[0]=='scripts/eval_visual_to_visual.py':\n"
         "    if args[1].endswith('/dense') and os.environ.get('DENSE_COLLAPSED')=='1':\n"
-        "        print('dense target variance is at the normalization floor', file=sys.stderr)\n"
+        "        print('dense target variance is below the screening threshold', file=sys.stderr)\n"
         "        sys.exit(23)\n"
     )
     python.chmod(0o755)
@@ -39,8 +46,10 @@ def _environment(tmp_path: Path) -> dict[str, str]:
     return environment
 
 
+@pytest.mark.parametrize("gpu_argument", [None, "1", "2", "4"])
 def test_l40_exp2_runs_matched_dense_sparse_objectives_with_separate_eval_splits(
     tmp_path: Path,
+    gpu_argument: str | None,
 ) -> None:
     subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
     environment = _environment(tmp_path)
@@ -48,7 +57,8 @@ def test_l40_exp2_runs_matched_dense_sparse_objectives_with_separate_eval_splits
     # Nonzero seed exercises preload selection without substituting the seed-0 checksum.
     (tmp_path / "data/bounce_train_v2_100000_seed3.pt").touch()
     subprocess.run(
-        ["bash", str(SCRIPT), "test", "1e-5", "3", "1500"],
+        ["bash", str(SCRIPT), "test", "1e-5", "3", "1500"]
+        + ([] if gpu_argument is None else [gpu_argument]),
         env=environment,
         cwd=tmp_path,
         check=True,
@@ -56,9 +66,21 @@ def test_l40_exp2_runs_matched_dense_sparse_objectives_with_separate_eval_splits
         text=True,
     )
     calls = [json.loads(row) for row in (tmp_path / "calls.jsonl").read_text().splitlines()]
-    train = [call for call in calls if call[0] == "scripts/train.py"]
+    train = [call for call in calls if "scripts/train.py" in call]
     assert len(train) == 2
     for call in train:
+        gpu_count = int(gpu_argument or "2")
+        assert call[:4] == [
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            f"--nproc_per_node={gpu_count}",
+        ]
+        assert "train.batch_size=4" in call
+        assert "--local-addr=127.0.0.1" in call
+        assert f"train.num_workers={8 // gpu_count}" in call
+        assert "hydra.output_subdir=null" in call
+        assert "hydra/job_logging=disabled" in call
         assert "experiment=bounce_visual_to_visual" in call
         assert "train.steps=1500" in call
         assert "train.lambda_rollout_t2=1.0" in call
@@ -126,7 +148,7 @@ def test_l40_exp2_requires_recorded_seed_zero_checksum(tmp_path: Path, checksum:
         text=True,
     )
     calls = [json.loads(row) for row in (tmp_path / "calls.jsonl").read_text().splitlines()]
-    training = [call for call in calls if call[0] == "scripts/train.py"]
+    training = [call for call in calls if "scripts/train.py" in call]
     if checksum == PHYSICS_SHA256:
         assert result.returncode == 0, result.stderr
         assert len(training) == 2
@@ -151,7 +173,7 @@ def test_l40_exp2_dense_collapse_stops_before_tau_or_sparse_training(tmp_path: P
         text=True,
     )
     calls = [json.loads(row) for row in (tmp_path / "calls.jsonl").read_text().splitlines()]
-    training = [call for call in calls if call[0] == "scripts/train.py"]
+    training = [call for call in calls if "scripts/train.py" in call]
     evaluations = [call for call in calls if call[0] == "scripts/eval_visual_to_visual.py"]
     assert result.returncode == 23
     assert "dense target variance" in result.stderr
@@ -180,3 +202,33 @@ def test_l40_exp2_preserves_existing_run_directory(tmp_path: Path) -> None:
     assert "refusing to overwrite" in result.stderr
     assert checkpoint.read_bytes() == b"keep this run"
     assert not (tmp_path / "calls.jsonl").exists()
+
+
+@pytest.mark.parametrize("gpu_argument", ["0", "-1", "3", "8", "two"])
+def test_l40_exp2_rejects_invalid_gpu_counts(tmp_path: Path, gpu_argument: str) -> None:
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "test", "1e-5", "3", "1500", gpu_argument],
+        env=_environment(tmp_path),
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "GPUS must be 1, 2, or 4" in result.stderr
+    assert not (tmp_path / "calls.jsonl").exists()
+
+
+def test_l40_exp2_rejects_insufficient_visible_gpus(tmp_path: Path) -> None:
+    environment = _environment(tmp_path)
+    environment["MOCK_VISIBLE_GPUS"] = "1"
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "test", "1e-5", "3", "1500"],
+        env=environment,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "requested 2 workers but only 1 CUDA GPUs visible" in result.stderr
+    calls = [json.loads(row) for row in (tmp_path / "calls.jsonl").read_text().splitlines()]
+    assert all("scripts/train.py" not in call for call in calls)

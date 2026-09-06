@@ -3,7 +3,7 @@
 # Submit from the repository root:
 #   sbatch --account=<PROJECT> scripts/isambard_exp2_pipeline.sbatch RUN_TAG LAMBDA_LOGIT [SEED] [STEPS]
 # Reuse the recorded Experiment-1 physics preload. Render identical-looking balls on demand.
-# Train a dense reference, reject gross collapse, calibrate the normalized visual constraint,
+# Train a dense reference, reject gross collapse, calibrate the raw visual constraint,
 # then train/evaluate the sparse model. The inherited 1e-5 logit value is exploratory.
 #SBATCH --job-name=scjepa-exp2
 #SBATCH --partition=workq
@@ -79,7 +79,7 @@ python scripts/eval_visual_to_visual.py "${DENSE_DIR}" \
   --require-complete-protocol --require-noncollapsed
 
 TAU=$(python -c 'import json,math,sys; v=float(json.load(open(sys.argv[1]))["constraint_loss"]); assert math.isfinite(v) and v > 0, "invalid dense constraint"; print(v)' "${DENSE_DIR}/metrics.json")
-echo "calibrated visual tau = ${TAU} (1.0x dense normalized held-out TF+T=2 constraint)"
+echo "calibrated visual tau = ${TAU} (1.0x dense raw held-out TF+T=2+logit constraint)"
 echo "Tau is exploratory: different learned target spaces need not imply equal physical fidelity."
 
 echo "== sparse run =="

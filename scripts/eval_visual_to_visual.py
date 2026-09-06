@@ -2,7 +2,7 @@
 
 The state probe is fitted on TRAINING episodes and scored on held-out episodes.
 True states, identities, and masses never affect encoder training or tau
-selection. The normalized latent constraint is specific to a learned target
+selection. The raw latent constraint is specific to a learned target
 space; a calibrated tau is exploratory until physical recovery and tracking
 also succeed. Existing W&B runs receive the two images and final metrics.
 """
@@ -19,16 +19,18 @@ from torch.utils.data import Subset
 
 from scjepa.eval.visual_artifacts import save_visual_artifacts
 from scjepa.eval.visual_to_visual import evaluate_visual_to_visual
-from scjepa.models.visual_to_visual import VisualToVisualModel
+from scjepa.models.visual_to_visual import VISUAL_CONSTRAINT_VERSION, VisualToVisualModel
 from scjepa.training.factory import build_dataset, build_model
 
 
-def require_noncollapsed(metrics: dict[str, float], variance_floor: float) -> None:
+def require_noncollapsed(metrics: dict[str, float], min_target_variance: float = 1e-4) -> None:
     """Reject only obvious label-free degeneracy before dense tau calibration.
 
-    These are numerical screening thresholds, not evidence of object discovery.
+    These are evaluation-only thresholds, not evidence of object discovery.
     No simulator-labelled recovery or tracking metric is used to accept tau.
     """
+    if not math.isfinite(min_target_variance) or min_target_variance <= 0:
+        raise ValueError("minimum target variance must be finite and positive")
     keys = (
         "constraint_loss",
         "target_variance",
@@ -37,14 +39,30 @@ def require_noncollapsed(metrics: dict[str, float], variance_floor: float) -> No
     )
     if any(not math.isfinite(metrics[key]) for key in keys):
         raise ValueError("non-finite dense predictive/collapse diagnostics; cannot calibrate tau")
-    if metrics["constraint_loss"] <= 0 or metrics["target_variance"] <= variance_floor:
+    if metrics["constraint_loss"] <= 0:
+        raise ValueError("dense raw predictive constraint must be positive; cannot calibrate tau")
+    if metrics["target_variance"] <= min_target_variance:
         raise ValueError(
-            "dense target variance is at the normalization floor; cannot calibrate tau"
+            "dense target variance does not exceed the evaluation minimum; cannot calibrate tau"
         )
     if metrics["target_temporal_variance"] <= 1e-10:
         raise ValueError("dense target is effectively frozen in time; cannot calibrate tau")
     if metrics["target_effective_rank"] <= 1.01:
         raise ValueError("dense target is effectively rank one; cannot calibrate tau")
+
+
+def require_current_constraint(cfg: DictConfig, payload: dict[str, Any]) -> None:
+    """Reject obsolete or unstamped runs before reporting raw-constraint results."""
+    for source, version in (
+        ("resolved config", cfg.get("visual_constraint_version")),
+        ("checkpoint", payload.get("visual_constraint_version")),
+    ):
+        if version != VISUAL_CONSTRAINT_VERSION:
+            raise ValueError(
+                f"{source} has visual_constraint_version={version!r}; "
+                f"expected {VISUAL_CONSTRAINT_VERSION!r}. Start a new raw-constraint run; "
+                "normalized or unversioned checkpoints cannot be reused."
+            )
 
 
 def _log_to_wandb(
@@ -96,22 +114,31 @@ def main() -> None:
         help="screen gross label-free collapse before tau calibration",
     )
     parser.add_argument(
+        "--min-target-variance",
+        type=float,
+        default=1e-4,
+        help="evaluation-only collapse-screen threshold; never a training denominator",
+    )
+    parser.add_argument(
         "--require-complete-protocol",
         action="store_true",
-        help="require completed checkpoint and eight-anchor T=2 objective",
+        help="require completed raw-constraint checkpoint and eight-anchor T=2 objective",
     )
     args = parser.parse_args()
     if args.seed_offset == 0 or args.episodes < 2 or args.probe_episodes < 2:
         parser.error("use a held-out nonzero seed offset and at least two test/probe episodes")
+    if not math.isfinite(args.min_target_variance) or args.min_target_variance <= 0:
+        parser.error("minimum target variance must be finite and positive")
     cfg = OmegaConf.load(args.run_dir / "resolved_config.yaml")
     if not isinstance(cfg, DictConfig):
         raise ValueError("resolved_config.yaml must contain a mapping")
-    model = build_model(cfg.model)
-    if not isinstance(model, VisualToVisualModel):
-        raise ValueError("checkpoint must use the visual_to_visual regime")
     payload = cast(
         dict[str, Any], torch.load(args.run_dir / "last.pt", map_location="cpu", weights_only=False)
     )
+    require_current_constraint(cfg, payload)
+    model = build_model(cfg.model)
+    if not isinstance(model, VisualToVisualModel):
+        raise ValueError("checkpoint must use the visual_to_visual regime")
     model.load_state_dict(payload["model"])
     batch_size = int(cfg.train.batch_size) if args.batch_size is None else args.batch_size
     if batch_size < 1:
@@ -169,7 +196,9 @@ def main() -> None:
         oe_eval_horizon=int(cfg.train.oe_eval_horizon),
         probe_fit_episodes=probe_count,
         target_matching="detached_context_slot_trajectory",
-        objective_version="visual_tf_t2_v1",
+        objective_version="visual_tf_t2_v2",
+        visual_constraint_version=VISUAL_CONSTRAINT_VERSION,
+        min_target_variance=args.min_target_variance,
         constraint_interpretation=(
             "per-model latent scale; does not establish shared physical fidelity"
         ),
@@ -191,7 +220,7 @@ def main() -> None:
         f"wrote metrics.json, mcc_matrix.json, slot_tracks.png, recovery_grid.png in {args.run_dir}"
     )
     if args.require_noncollapsed:
-        require_noncollapsed(report.metrics, model.variance_floor)
+        require_noncollapsed(report.metrics, min_target_variance=args.min_target_variance)
 
 
 if __name__ == "__main__":

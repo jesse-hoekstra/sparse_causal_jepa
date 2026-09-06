@@ -1,5 +1,8 @@
 """End-to-end tests for the fixed teacher-forcing-plus-T=2 trainer."""
 
+# These tests intentionally exercise protected training hooks and loader methods.
+# pyright: reportPrivateUsage=false
+
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
@@ -290,8 +293,13 @@ def test_checkpoint_rejects_a_different_oe_ruler(tmp_path: Path) -> None:
         incompatible.load_checkpoint(tmp_path / "last.pt")
 
 
+@pytest.mark.parametrize("collect_metrics", [False, True])
+@pytest.mark.parametrize("reported_norm", [11.0, float("inf"), float("nan")])
 def test_gradient_spike_rejects_primal_and_dual_update(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    collect_metrics: bool,
+    reported_norm: float,
 ) -> None:
     trainer = Trainer(
         tiny_model(),
@@ -302,14 +310,125 @@ def test_gradient_spike_rejects_primal_and_dual_update(
     before_dual = trainer.lagrangian.log_lambda.clone()
 
     def oversized_norm(*_args: object, **_kwargs: object) -> torch.Tensor:
-        return torch.tensor(11.0)
+        return torch.tensor(reported_norm)
 
     monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", oversized_norm)
-    trainer._train_step(next(trainer._batches()))
+    trainer._train_step(next(trainer._batches()), collect_metrics=collect_metrics)
     assert trainer.total_skips == 1
     assert torch.equal(trainer.lagrangian.log_lambda, before_dual)
     for key, value in trainer.model.state_dict().items():
         torch.testing.assert_close(value, before_model[key])
+
+
+def test_unlogged_update_preserves_model_dual_optimizer_and_rng(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference = Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path, log_every=100))
+    unlogged = Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path, log_every=100))
+    batch = next(reference._batches())
+    rng = torch.get_rng_state().clone()
+    reference_metrics = reference._train_step(batch)
+    assert reference_metrics["health/skipped_steps"] == 0.0
+    expected_rng = torch.get_rng_state().clone()
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("unlogged steps must not collect monitoring statistics")
+
+    monkeypatch.setattr(unlogged, "_predictive_metrics", forbidden)
+    monkeypatch.setattr(unlogged, "_extra_metrics", forbidden)
+    monkeypatch.setattr(unlogged, "_branch_gradient_metrics", forbidden)
+    torch.set_rng_state(rng)
+    assert unlogged._train_step(batch, collect_metrics=False) == {}
+    torch.testing.assert_close(
+        unlogged.model.state_dict(), reference.model.state_dict(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        unlogged.optimizer.state_dict(), reference.optimizer.state_dict(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        unlogged.lagrangian.state_dict(), reference.lagrangian.state_dict(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(torch.get_rng_state(), expected_rng, rtol=0, atol=0)
+
+
+def test_unlogged_nonfinite_loss_still_aborts_before_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path))
+    before = {key: value.clone() for key, value in trainer.model.state_dict().items()}
+
+    def nonfinite_loss(_output: object) -> torch.Tensor:
+        return torch.tensor(float("nan"))
+
+    monkeypatch.setattr(trainer, "_teacher_forcing_loss", nonfinite_loss)
+    with pytest.raises(RuntimeError, match="non-finite loss"):
+        trainer._train_step(next(trainer._batches()), collect_metrics=False)
+    torch.testing.assert_close(trainer.model.state_dict(), before, rtol=0, atol=0)
+    assert not trainer.optimizer.state_dict()["state"]
+
+
+def test_training_timing_excludes_evaluation_checkpoint_and_logging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = Trainer(
+        tiny_model(),
+        tiny_dataset(),
+        tiny_config(tmp_path, steps=5, log_every=3, eval_every=2, checkpoint_every=2),
+        eval_dataset=tiny_dataset(6),
+    )
+    now = 0.0
+    collected: list[bool] = []
+    logged_training: list[dict[str, float]] = []
+    original_step = trainer._train_step
+
+    def timed_step(
+        batch: dict[str, torch.Tensor], *, collect_metrics: bool = True
+    ) -> dict[str, float]:
+        nonlocal now
+        collected.append(collect_metrics)
+        metrics = original_step(batch, collect_metrics=collect_metrics)
+        now += 2.0
+        return metrics
+
+    def slow_eval() -> dict[str, float]:
+        nonlocal now
+        now += 100.0
+        return {"eval/constraint_loss": 0.25}
+
+    def slow_checkpoint(_path: Path) -> None:
+        nonlocal now
+        now += 40.0
+
+    def slow_log(_step: int, metrics: dict[str, float]) -> None:
+        nonlocal now
+        now += 20.0
+        if "train/seconds_per_step" in metrics:
+            logged_training.append(dict(metrics))
+
+    monkeypatch.setattr(training_loop.time, "perf_counter", lambda: now)
+    monkeypatch.setattr(trainer, "_train_step", timed_step)
+    monkeypatch.setattr(trainer, "_eval_step", slow_eval)
+    monkeypatch.setattr(trainer, "save_checkpoint", slow_checkpoint)
+    monkeypatch.setattr(trainer.logger, "log", slow_log)
+    final = trainer.train()
+    assert collected == [False, False, True, False, True]
+    assert len(logged_training) == 2
+    assert all(metrics["train/seconds_per_step"] == 2.0 for metrics in logged_training)
+    assert all(metrics["train/episodes_per_second"] == 2.0 for metrics in logged_training)
+    assert final == logged_training[-1]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda:0"])
+@pytest.mark.parametrize("distributed", [False, True])
+def test_loader_pins_memory_only_for_cuda(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, device: str, distributed: bool
+) -> None:
+    trainer = Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path))
+    # Inspect loader configuration without allocating a CUDA tensor or starting
+    # a process group, so the configuration is covered on CPU development hosts.
+    trainer.device = torch.device(device)
+    monkeypatch.setattr(training_loop, "world_size", lambda: 2 if distributed else 1)
+    assert trainer._epoch_loader(0).pin_memory == (device == "cuda:0")
 
 
 def test_sparsity_ablation_removes_path_term_and_freezes_dual(tmp_path: Path) -> None:

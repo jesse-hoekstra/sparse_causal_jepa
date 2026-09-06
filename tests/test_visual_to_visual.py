@@ -1,16 +1,25 @@
 """Visual-to-visual regime: frames in, EMA-encoded next frame out (Experiment 2)."""
 
 import copy
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from torch import Tensor, nn
 
 from scjepa.data.bounce import BounceDataset
 from scjepa.eval.visual_alignment import physical_assignment, slot_centroids
 from scjepa.eval.visual_to_visual import evaluate_visual_to_visual
 from scjepa.models.spartan import SpartanOutput
-from scjepa.models.visual_to_visual import build_visual_to_visual, context_target_assignment
+from scjepa.models.visual_to_visual import (
+    VISUAL_CONSTRAINT_VERSION,
+    build_visual_to_visual,
+    context_target_assignment,
+)
+from scjepa.training.factory import build_model
 from scjepa.training.loop import TrainConfig
 from scjepa.training.visual_to_visual import VisualToVisualTrainer, collapse_metrics
 
@@ -127,8 +136,9 @@ def test_track_keys_are_permuted_per_episode() -> None:
     assert not all(torch.equal(episode, codebook) for episode in keys)
 
 
-def test_constraint_is_variance_normalized() -> None:
-    """Eq. 123 divides by the target variance; Eq. 121's gradient objective does not."""
+@pytest.mark.parametrize("variance", [0.0, 1e-12, 0.1, 100.0])
+def test_raw_constraint_is_independent_of_target_variance(variance: float) -> None:
+    """The controller receives the raw predictive sum, with variance diagnostic only."""
     model = _model()
     config = TrainConfig(
         steps=1,
@@ -138,16 +148,18 @@ def test_constraint_is_variance_normalized() -> None:
         lambda_logit=0.0,
     )
     trainer = VisualToVisualTrainer(model, _dataset(), config, eval_dataset=None)
-    output = model(torch.rand(2, 5, 3, 64, 64), context_len=3)
-    pred = torch.tensor(0.5)
-    constraint = trainer._constraint(pred, torch.tensor(0.0), output)
-    expected = 0.5 / max(float(output.target_variance), model.variance_floor)
-    assert float(constraint) == pytest.approx(expected, rel=1e-5)
+    output = SimpleNamespace(target_variance=torch.tensor(variance))
+    pred = torch.tensor(0.5, requires_grad=True)
+    logit = torch.tensor(0.125, requires_grad=True)
+    constraint = trainer._constraint(pred, logit, output)  # pyright: ignore[reportPrivateUsage]
+    torch.testing.assert_close(constraint, torch.tensor(0.625), rtol=0, atol=0)
+    assert not constraint.requires_grad
 
 
-def test_variance_floor_bounds_the_constraint() -> None:
-    """The variance floor bounds division; it is not an anti-collapse objective."""
-    model = _model(variance_floor=1e-2)
+@pytest.mark.parametrize("scale", [0.0, 0.01, 1.0, 10.0])
+def test_raw_constraint_preserves_prediction_units_under_rescaling(scale: float) -> None:
+    """Rescaling latent prediction errors changes raw GECO; it cannot cancel against variance."""
+    model = _model()
     config = TrainConfig(
         steps=1,
         batch_size=2,
@@ -155,11 +167,49 @@ def test_variance_floor_bounds_the_constraint() -> None:
         lambda_rollout_t2=0.0,
     )
     trainer = VisualToVisualTrainer(model, _dataset(), config, eval_dataset=None)
-    output = model(torch.rand(2, 5, 3, 64, 64), context_len=3)._replace(
-        target_variance=torch.tensor(0.0)
+    output = SimpleNamespace(target_variance=torch.tensor(0.1 * scale**2))
+    constraint = trainer._constraint(  # pyright: ignore[reportPrivateUsage]
+        torch.tensor(scale**2), torch.tensor(0.25), output
     )
-    constraint = trainer._constraint(torch.tensor(1.0), torch.tensor(0.0), output)
-    assert float(constraint) == pytest.approx(100.0, rel=1e-5)
+    torch.testing.assert_close(constraint, torch.tensor(scale**2 + 0.25))
+
+
+def test_retired_variance_floor_configuration_is_rejected() -> None:
+    with pytest.raises(ValueError, match="retired normalized visual constraint"):
+        build_model(OmegaConf.create({"regime": "visual_to_visual", "variance_floor": 1e-4}))
+
+
+def test_visual_checkpoint_records_raw_constraint_for_resume(tmp_path: Path) -> None:
+    trainer = VisualToVisualTrainer(
+        _model(), _dataset(), TrainConfig(steps=1, batch_size=2, context_len=3)
+    )
+    checkpoint = tmp_path / "raw.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, weights_only=False)
+    assert payload["visual_constraint_version"] == VISUAL_CONSTRAINT_VERSION
+    resumed = VisualToVisualTrainer(
+        _model(), _dataset(), TrainConfig(steps=1, batch_size=2, context_len=3)
+    )
+    resumed.load_checkpoint(checkpoint)
+    torch.testing.assert_close(resumed.model.state_dict(), trainer.model.state_dict())
+    torch.testing.assert_close(resumed.lagrangian.state_dict(), trainer.lagrangian.state_dict())
+
+
+@pytest.mark.parametrize("version", [None, "normalized_tf_t2_v1", "unknown"])
+def test_visual_resume_rejects_legacy_constraint(tmp_path: Path, version: str | None) -> None:
+    trainer = VisualToVisualTrainer(
+        _model(), _dataset(), TrainConfig(steps=1, batch_size=2, context_len=3)
+    )
+    checkpoint = tmp_path / "legacy.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = cast(dict[str, Any], torch.load(checkpoint, weights_only=False))
+    if version is None:
+        del payload["visual_constraint_version"]
+    else:
+        payload["visual_constraint_version"] = version
+    torch.save(payload, checkpoint)
+    with pytest.raises(ValueError, match="fresh raw-constraint run"):
+        trainer.load_checkpoint(checkpoint)
 
 
 def test_training_step_runs_and_steps_the_ema() -> None:

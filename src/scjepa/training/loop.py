@@ -14,20 +14,33 @@ no-gradient harness.
 
 import math
 import random
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 import numpy as np
 import torch
-from torch import Tensor
+from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 
 from scjepa.eval.harness import evaluate_identifiability
 from scjepa.losses import aligned_mse, rollout_t2_endpoint_mse
 from scjepa.models.state_to_state import StateToStateModel, TransitionOutput
-from scjepa.models.visual_to_visual import VisualToVisualModel
+from scjepa.models.visual_to_visual import VISUAL_CONSTRAINT_VERSION, VisualToVisualModel
+from scjepa.training.distributed import (
+    GlobalBatchSampler,
+    any_rank,
+    distributed_barrier,
+    gather_rank_objects,
+    is_main_process,
+    mean_metrics,
+    mean_tensor,
+    rank,
+    world_size,
+)
 from scjepa.training.lagrangian import SparsityLagrangian
 
 
@@ -90,7 +103,7 @@ class TrainConfig:
 
 
 class Trainer:
-    """Explicit single-device training loop; fails loudly and resumes exactly."""
+    """Train on one device or synchronized replicas, with a fixed global batch."""
 
     def __init__(
         self,
@@ -101,7 +114,9 @@ class Trainer:
         eval_dataset: Dataset[dict[str, Tensor]] | None = None,
     ) -> None:
         """Build the optimizer and dual controller around a fixed objective."""
-        seed_everything(config.seed)
+        # Model construction uses one common seed; stochastic episodes, gates,
+        # and T=2 anchors then receive an independent stream on each rank.
+        seed_everything(config.seed + rank() * 1_000_003)
         if config.eval_every is not None and eval_dataset is None:
             raise ValueError("eval_every set but no eval_dataset provided")
         self.config = config
@@ -111,6 +126,18 @@ class Trainer:
         self.dataset = dataset
         self.logger: MetricLogger = logger if logger is not None else NoopLogger()
         self._validate_fixed_protocol()
+        self._forward_model: nn.Module = self.model
+        if world_size() > 1:
+            self._forward_model = DistributedDataParallel(
+                self.model,
+                device_ids=[self.device.index] if self.device.type == "cuda" else None,
+                # Buffers are fixed architecture/codebooks. EMA updates follow
+                # synchronized optimizer updates; no forward broadcast needed.
+                broadcast_buffers=False,
+                # SAVi retains unused upstream prior parameters, and reference
+                # predictors can bypass gates. Detect these rather than hang.
+                find_unused_parameters=True,
+            )
         self.lagrangian = SparsityLagrangian(
             tau=config.sparsity_tau,
             step_size=config.sparsity_step_size,
@@ -156,6 +183,23 @@ class Trainer:
         generator = torch.Generator()
         generator.manual_seed(self.config.seed * 100_003 + epoch)
         workers = self.config.num_workers
+        if world_size() > 1:
+            return DataLoader(
+                self.dataset,
+                batch_sampler=GlobalBatchSampler(
+                    dataset_size=len(self.dataset),  # pyright: ignore[reportArgumentType]
+                    batch_size=self.config.batch_size,
+                    seed=self.config.seed,
+                    epoch=epoch,
+                ),
+                generator=generator,
+                num_workers=workers,
+                pin_memory=self.device.type == "cuda",
+                persistent_workers=workers > 0,
+                prefetch_factor=self.config.prefetch_factor if workers > 0 else None,
+                # NCCL is not fork-safe after group initialization.
+                multiprocessing_context="spawn" if workers > 0 else None,
+            )
         return DataLoader(
             self.dataset,
             batch_size=self.config.batch_size,
@@ -163,6 +207,7 @@ class Trainer:
             generator=generator,
             drop_last=True,
             num_workers=workers,
+            pin_memory=self.device.type == "cuda",
             persistent_workers=workers > 0,
             prefetch_factor=self.config.prefetch_factor if workers > 0 else None,
         )
@@ -188,15 +233,17 @@ class Trainer:
 
     def _forward(self, batch: dict[str, Tensor]) -> TransitionOutput:
         """Run teacher forcing and, when weighted, exactly eight T=2 windows."""
-        states = batch["states"].to(self.device)
+        states = batch["states"].to(self.device, non_blocking=self.device.type == "cuda")
         # A zero coefficient bypasses sampling and both auxiliary predictor
         # calls. This preserves TF tensors and the post-forward RNG state.
         anchors = self.config.num_rollout_t2_anchors if self.config.lambda_rollout_t2 > 0 else 0
-        model = cast(StateToStateModel, self.model)
-        return model(
-            states,
-            context_len=self.config.context_len,
-            num_rollout_t2_anchors=anchors,
+        return cast(
+            TransitionOutput,
+            self._forward_model(
+                states,
+                context_len=self.config.context_len,
+                num_rollout_t2_anchors=anchors,
+            ),
         )
 
     def _teacher_forcing_loss(self, output: TransitionOutput) -> Tensor:
@@ -217,7 +264,7 @@ class Trainer:
     def _constraint(self, predictive_loss: Tensor, logit_loss: Tensor, output: object) -> Tensor:
         """GECO bound: predictive sum plus logit term, excluding path/OE."""
         del output
-        return (predictive_loss + logit_loss).detach()
+        return mean_tensor(predictive_loss + logit_loss)
 
     def _after_optimizer_step(self, output: TransitionOutput) -> None:
         """Hook for the visual-to-visual EMA update."""
@@ -279,8 +326,15 @@ class Trainer:
         return 0.0 if squared_norm is None else float(squared_norm.sqrt())
 
     # ------------------------------------------------------------- steps ----
-    def _train_step(self, batch: dict[str, Tensor]) -> dict[str, float]:
-        """Execute one fixed-objective optimizer attempt."""
+    def _train_step(
+        self, batch: dict[str, Tensor], *, collect_metrics: bool = True
+    ) -> dict[str, float]:
+        """Execute one optimizer attempt; materialize metrics only when requested.
+
+        Loss/gradient rejection and optimizer, EMA, and GECO updates always run.
+        Direct callers retain scalar results by default; the main loop avoids
+        monitoring reductions and device-to-host copies on unlogged steps.
+        """
         output = self._forward(batch)
         teacher_forcing = self._teacher_forcing_loss(output)
         raw_auxiliary = self._auxiliary_loss(output)
@@ -293,16 +347,23 @@ class Trainer:
             total = total + self.lagrangian.penalty_weight * output.sparsity
         constraint = self._constraint(predictive_loss, logit_loss, output)
 
-        if not torch.isfinite(total):
+        if any_rank(~torch.isfinite(total), self.device):
             raise RuntimeError(
-                f"non-finite loss at step {self.step}: tf={teacher_forcing.item():.4g} "
+                f"non-finite loss on at least one rank at step {self.step}: "
+                f"local tf={teacher_forcing.item():.4g} "
                 f"rollout_t2={weighted_auxiliary.item():.4g} "
                 f"sparsity={output.sparsity.item():.4g}"
             )
 
         branch_grad_metrics: dict[str, float] = {}
         diagnostic_step = self.step + 1
-        if diagnostic_step % self.config.log_every == 0 or diagnostic_step == self.config.steps:
+        log_step = (
+            diagnostic_step % self.config.log_every == 0 or diagnostic_step == self.config.steps
+        )
+        if collect_metrics and world_size() == 1 and log_step:
+            # DDP requires .backward() accumulation and does not support these
+            # extra autograd.grad traversals. Global total gradient norm is
+            # still logged in every distributed run.
             branch_grad_metrics = self._branch_gradient_metrics(
                 teacher_forcing,
                 weighted_auxiliary,
@@ -312,8 +373,9 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         total.backward()  # pyright: ignore[reportUnknownMemberType]
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-        skip = (not bool(torch.isfinite(grad_norm))) or (
-            float(grad_norm) > self.config.grad_skip_threshold
+        skip = any_rank(
+            ~torch.isfinite(grad_norm) | (grad_norm > self.config.grad_skip_threshold),
+            self.device,
         )
         if skip:
             self.optimizer.zero_grad(set_to_none=True)
@@ -332,11 +394,16 @@ class Trainer:
             if sparsity_active:
                 self.lagrangian.update(constraint)
 
+        if not collect_metrics:
+            return {}
+
         # The episode-level parameter width names the decoded state-token rows
         # in both experiments, independently of flattened transition axes.
         num_decoded = output.causal_params.shape[1]
         return (
-            self._extra_metrics(output)
+            # Collapse spectra and distributed gathers are monitoring only;
+            # calculate them when their values will actually be logged.
+            (self._extra_metrics(output) if log_step else {})
             | self._predictive_metrics(
                 teacher_forcing,
                 raw_auxiliary,
@@ -370,26 +437,64 @@ class Trainer:
         out_dir.mkdir(parents=True, exist_ok=True)
         metrics: dict[str, float] = {}
         batches = self._batches()
+        self._synchronize_device()
+        interval_started = time.perf_counter()
+        interval_step = self.step
+        interval_training_seconds = 0.0
         while self.step < self.config.steps:
-            metrics = self._train_step(next(batches))
+            upcoming_step = self.step + 1
+            log_step = (
+                upcoming_step % self.config.log_every == 0 or upcoming_step == self.config.steps
+            )
+            metrics = self._train_step(next(batches), collect_metrics=log_step)
             self.step += 1
-            if self.step % self.config.log_every == 0 or self.step == self.config.steps:
-                self.logger.log(self.step, metrics)
-            if (
+            eval_step = (
                 self.config.eval_every is not None
                 and self.eval_dataset is not None
                 and (self.step % self.config.eval_every == 0 or self.step == self.config.steps)
-            ):
-                self.logger.log(self.step, self._eval_step())
-            if self.step % self.config.checkpoint_every == 0:
-                self.save_checkpoint(out_dir / "last.pt")
-            if (
+            )
+            rolling_checkpoint = self.step % self.config.checkpoint_every == 0
+            kept_checkpoint = (
                 self.config.checkpoint_keep_every is not None
                 and self.step % self.config.checkpoint_keep_every == 0
-            ):
+            )
+            pause_training_timer = log_step or eval_step or rolling_checkpoint or kept_checkpoint
+            if pause_training_timer:
+                # CUDA launches are asynchronous. Finish the measured training
+                # work before pausing, without imposing a new per-step sync.
+                self._synchronize_device()
+                interval_training_seconds += time.perf_counter() - interval_started
+            if log_step:
+                metrics = mean_metrics(metrics, self.device)
+                seconds_per_step = interval_training_seconds / (self.step - interval_step)
+                metrics["train/seconds_per_step"] = seconds_per_step
+                metrics["train/episodes_per_second"] = self.config.batch_size / seconds_per_step
+                if is_main_process():
+                    self.logger.log(self.step, metrics)
+                interval_training_seconds, interval_step = 0.0, self.step
+            if eval_step:
+                # Evaluation uses the unwrapped model and the original global
+                # batch size, preserving dense calibration's variance ruler.
+                distributed_barrier()
+                if is_main_process():
+                    self.logger.log(self.step, self._eval_step())
+                distributed_barrier()
+            if rolling_checkpoint:
+                self.save_checkpoint(out_dir / "last.pt")
+            if kept_checkpoint:
                 self.save_checkpoint(out_dir / f"step_{self.step}.pt")
+            if pause_training_timer:
+                # Evaluation/checkpoint/logging time is excluded, including any
+                # queued CUDA work from those operations. Data loading stays in.
+                self._synchronize_device()
+                interval_started = time.perf_counter()
         self.save_checkpoint(out_dir / "last.pt")
         return metrics
+
+    def _synchronize_device(self) -> None:
+        """Finish pending CUDA work only when starting or pausing a timed interval."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
 
     def _eval_step(self) -> dict[str, float]:
         """Run deterministic held-out identifiability and K=30 OE evaluation."""
@@ -413,30 +518,64 @@ class Trainer:
 
     # ------------------------------------------------------- checkpoints ----
     def save_checkpoint(self, path: Path) -> None:
-        """Save model, optimizer, controller, step, fixed scales, and RNG state."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "model": self.model.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "lagrangian": self.lagrangian.state_dict(),
-                "step": self.step,
-                "total_skips": self.total_skips,
-                "consecutive_skips": self.consecutive_skips,
-                "oe_coordinate_std": self.config.oe_coordinate_std,
-                "rng_python": random.getstate(),
-                "rng_numpy": np.random.get_state(),  # noqa: NPY002
-                "rng_torch": torch.get_rng_state(),
-                "rng_cuda": (
-                    torch.cuda.get_rng_state(self.device) if self.device.type == "cuda" else None
-                ),
-            },
-            path,
-        )
+        """Collect each rank's RNG and write one portable checkpoint on rank zero.
+
+        All ranks must call this method together in distributed training.
+        The model is saved unwrapped so ordinary single-device evaluation can
+        load it directly. Resuming training requires the same world/global batch.
+        """
+        local_rng = {
+            "rng_python": random.getstate(),
+            "rng_numpy": np.random.get_state(),  # noqa: NPY002
+            "rng_torch": torch.get_rng_state(),
+            "rng_cuda": (
+                torch.cuda.get_rng_state(self.device) if self.device.type == "cuda" else None
+            ),
+        }
+        rank_rng = gather_rank_objects(local_rng)
+        if is_main_process():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            torch.save(
+                {
+                    "model": self.model.state_dict(),
+                    "optimizer": self.optimizer.state_dict(),
+                    "lagrangian": self.lagrangian.state_dict(),
+                    "step": self.step,
+                    "total_skips": self.total_skips,
+                    "consecutive_skips": self.consecutive_skips,
+                    "oe_coordinate_std": self.config.oe_coordinate_std,
+                    **local_rng,
+                    "rank_rng": rank_rng,
+                    "world_size": world_size(),
+                    "global_batch_size": self.config.batch_size,
+                    **(
+                        {"visual_constraint_version": VISUAL_CONSTRAINT_VERSION}
+                        if isinstance(self.model, VisualToVisualModel)
+                        else {}
+                    ),
+                },
+                temporary,
+            )
+            temporary.replace(path)
+        # Returning means all ranks can immediately load the complete file.
+        distributed_barrier()
 
     def load_checkpoint(self, path: Path) -> None:
         """Restore everything written by :meth:`save_checkpoint`."""
-        payload = torch.load(path, weights_only=False)
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if (
+            isinstance(self.model, VisualToVisualModel)
+            and payload.get("visual_constraint_version") != VISUAL_CONSTRAINT_VERSION
+        ):
+            raise ValueError(
+                "visual checkpoint uses a legacy or unknown constraint; "
+                "start a fresh raw-constraint run and recalibrate tau (D42)"
+            )
+        if int(payload.get("world_size", 1)) != world_size():
+            raise ValueError("exact training resume requires the checkpoint's world_size")
+        if int(payload.get("global_batch_size", self.config.batch_size)) != self.config.batch_size:
+            raise ValueError("exact training resume requires the checkpoint's global_batch_size")
         checkpoint_scales = payload.get("oe_coordinate_std")
         configured_scales = self.config.oe_coordinate_std
         if checkpoint_scales is not None:
@@ -465,10 +604,13 @@ class Trainer:
         self.step = int(payload["step"])
         self.total_skips = int(payload.get("total_skips", 0))
         self.consecutive_skips = int(payload.get("consecutive_skips", 0))
-        random.setstate(payload["rng_python"])
-        np.random.set_state(payload["rng_numpy"])  # noqa: NPY002
-        torch.set_rng_state(payload["rng_torch"])
-        cuda_rng = payload.get("rng_cuda")
+        rng_state = cast(
+            dict[str, Any], payload["rank_rng"][rank()] if "rank_rng" in payload else payload
+        )
+        random.setstate(rng_state["rng_python"])
+        np.random.set_state(rng_state["rng_numpy"])  # noqa: NPY002
+        torch.set_rng_state(rng_state["rng_torch"])
+        cuda_rng = rng_state.get("rng_cuda")
         if cuda_rng is not None and self.device.type == "cuda":
             torch.cuda.set_rng_state(cuda_rng, self.device)
 

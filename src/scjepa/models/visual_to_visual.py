@@ -13,13 +13,15 @@ neither simulator labels nor future frames; it cannot repair a mid-episode swap
 or establish that slots represent objects in the first place.
 
 Only the online visual path is copied to the target. Parameter inference and
-SPARTAN remain predictor-side. Latent MSE is the gradient objective; the GECO
-constraint normalizes it by detached target variance. Neither EMA nor a
-variance denominator rules out representation collapse; held-out grounding,
-state probes and collapse diagnostics must accompany prediction loss.
+SPARTAN remain predictor-side. Both the gradient objective and GECO use raw
+latent prediction error (D42). Variance is diagnostic only. EMA does not rule
+out representation collapse; held-out grounding, state probes and collapse
+diagnostics must accompany prediction loss.
 """
 
 import copy
+from functools import lru_cache
+from itertools import permutations
 from typing import NamedTuple, Self
 
 import torch
@@ -34,11 +36,15 @@ from scjepa.models.state_to_state import num_valid_rollout_t2_offsets, sample_ro
 from scjepa.models.visual import VisualStatePath
 
 __all__ = [
+    "VISUAL_CONSTRAINT_VERSION",
     "VisualToVisualModel",
     "VisualToVisualOutput",
     "build_visual_to_visual",
     "context_target_assignment",
 ]
+
+VISUAL_CONSTRAINT_VERSION = "raw_tf_t2_v1"
+"""Checkpoint/config marker separating raw GECO from legacy variance-normalized runs."""
 
 
 class VisualToVisualOutput(NamedTuple):
@@ -54,6 +60,7 @@ class VisualToVisualOutput(NamedTuple):
     mean_gate_probability: Float[Tensor, ""]
     gate_entropy: Float[Tensor, ""]
     target_variance: Float[Tensor, ""]
+    """Target content variance for monitoring only; never a prediction-loss denominator."""
     context_states: Float[Tensor, "b t n s"]
     target_states: Float[Tensor, "b t n s"]
     """EMA states in online row order under the fixed context assignment."""
@@ -73,6 +80,14 @@ def _content_variance(states: Tensor) -> Tensor:
     return states.flatten(0, 1).var(dim=0, unbiased=False).mean()
 
 
+@lru_cache(maxsize=16)
+def _assignment_permutations(num_slots: int, device: torch.device) -> tuple[Tensor, Tensor]:
+    """Cache bounded lexicographic permutations and their flattened cost indices."""
+    candidates = torch.tensor(list(permutations(range(num_slots))), device=device)
+    entries = candidates + num_slots * torch.arange(num_slots, device=device)
+    return candidates, entries
+
+
 @torch.no_grad()
 def context_target_assignment(
     context_slots: Float[Tensor, "b c n d"],
@@ -84,17 +99,37 @@ def context_target_assignment(
     detached coordinate scale estimated from both context histories prevents a
     high-amplitude feature from arbitrarily dominating the permutation. EMA
     makes comparison in this shared feature basis reasonable, not infallible.
-    Assignment is discrete and detached. Identical histories resolve to row
-    identity; degenerate slots still require explicit collapse diagnostics.
+    Assignment is discrete and detached. For at most six slots on CPU/CUDA,
+    exhaustive tensor scoring finds the same minimum-cost matching without a
+    CUDA-to-CPU transfer; larger problems use SciPy. Equal-cost optima choose
+    the lexicographically first permutation on the tensor path, which can
+    differ from SciPy's tie choice. Identical histories resolve to row identity;
+    degenerate slots still require explicit collapse diagnostics. Nonfinite
+    costs on the tensor path yield an arbitrary valid permutation, leaving
+    the trainer's numerical guards to reject the nonfinite model outputs.
+    The SciPy fallback retains its nonfinite-cost exceptions.
     """
     if context_slots.ndim != 4 or context_slots.shape != target_slots.shape:
         raise ValueError("context and target slot histories must share shape (B, C, N, D)")
+    if any(size == 0 for size in context_slots.shape):
+        raise ValueError("slot histories must have nonempty batch, context, slots and features")
+    if context_slots.device != target_slots.device:
+        raise ValueError("context and target slot histories must share a device")
+    if not context_slots.is_floating_point() or not target_slots.is_floating_point():
+        raise ValueError("slot histories must have floating-point coordinates")
     online = context_slots.detach().float()
     target = target_slots.detach().float()
     pooled = torch.cat((online.flatten(1, 2), target.flatten(1, 2)), dim=1)
     scales = pooled.var(dim=1, unbiased=False).clamp_min(1e-6).sqrt()
     difference = (online.unsqueeze(3) - target.unsqueeze(2)) / scales[:, None, None, None, :]
     cost = difference.square().mean(dim=(1, 4))
+    num_slots = context_slots.shape[2]
+    if num_slots <= 6 and cost.device.type in ("cpu", "cuda"):
+        candidates, entries = _assignment_permutations(num_slots, cost.device)
+        # SciPy accumulates these float32 entries in double precision. Match that
+        # precision so rounding a near-tied sum to float32 cannot change the optimum.
+        totals = cost.flatten(1)[:, entries].sum(dim=-1, dtype=torch.float64)
+        return candidates[totals.argmin(dim=1)]
     # One small B x N x N transfer, not one device synchronization per episode.
     cost_cpu = cost.cpu().numpy()
     assignments = [linear_sum_assignment(episode)[1].tolist() for episode in cost_cpu]
@@ -110,14 +145,11 @@ class VisualToVisualModel(nn.Module):
         parameter_encoder: ParameterEncoder,
         predictor: Spartan,
         ema_decay: float = 0.996,
-        variance_floor: float = 1e-4,
     ) -> None:
         """Compose the learned-state model and initialize its frozen target."""
         super().__init__()
         if not 0.0 <= ema_decay < 1.0:
             raise ValueError(f"ema_decay must be in [0, 1), got {ema_decay}")
-        if variance_floor <= 0:
-            raise ValueError("variance_floor must be positive")
         self.online = online
         self.target = copy.deepcopy(online)
         self.target.requires_grad_(False)
@@ -125,7 +157,6 @@ class VisualToVisualModel(nn.Module):
         self.parameter_encoder = parameter_encoder
         self.predictor = predictor
         self.ema_decay = ema_decay
-        self.variance_floor = variance_floor
 
     def train(self, mode: bool = True) -> Self:
         """Keep targets deterministic even while the online model trains."""
@@ -319,7 +350,6 @@ def build_visual_to_visual(
     spartan_dense: bool = False,
     spartan_identity: bool = False,
     ema_decay: float = 0.996,
-    variance_floor: float = 1e-4,
 ) -> VisualToVisualModel:
     """Build the visual-to-visual model from plain config values (Hydra-friendly)."""
     return VisualToVisualModel(
@@ -351,5 +381,4 @@ def build_visual_to_visual(
             output_dim=state_dim,  # Eq. 118: decode into the learned state width
         ),
         ema_decay=ema_decay,
-        variance_floor=variance_floor,
     )

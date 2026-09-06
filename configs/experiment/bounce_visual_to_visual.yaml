@@ -2,7 +2,7 @@
 # Experiment 2: learn object states from anonymous frames, with an EMA target.
 # Extension of Experiment 1 using the same physics and TF + endpoint-only T=2
 # objective. True states, masses, contacts and identities are evaluation-only.
-# See docs/decisions.md D39 for departures from the historical experiments PDF.
+# See docs/decisions.md D39/D42 for departures from the historical experiments PDF.
 
 data:
   num_clips: 100000
@@ -22,11 +22,10 @@ model:
   latent_state_dim: 32
   resolution: 64
   ema_decay: 0.996
-  variance_floor: 1.0e-4 # numerical floor, not an anti-collapse guarantee
 
 train:
   steps: 300000
-  batch_size: 4 # two recurrent SAVi passes; raise only after checking GPU memory
+  batch_size: 4 # global batch; torchrun divides it across GPUs (two per GPU on two L40s)
   context_len: 30
   lambda_logit: 1.0e-5 # Experiment-1 starting value, not a visual sweep result
   sparsity_lambda_init: 1.0e4
@@ -34,7 +33,8 @@ train:
   num_rollout_t2_anchors: 8
   rollout_t2_horizon: 2
   oe_eval_horizon: 30 # open-loop latent diagnostic only; no long BPTT
-  # tau must be freshly calibrated on the normalized TF + T=2 dense constraint.
+  # Raw TF + T=2 + logit constraint, as in Experiment 1; variance is diagnostic.
+  # Freshly calibrate tau: old variance-normalized thresholds cannot be reused.
   num_workers: 8
   prefetch_factor: 2
   eval_every: 5000
