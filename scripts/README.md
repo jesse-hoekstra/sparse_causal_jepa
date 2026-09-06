@@ -83,7 +83,8 @@ rejected updates, and EMA updates are synchronized. Target variance is gathered 
 diagnostics; it no longer requires an every-update collective for the loss. Rank zero owns W&B, checkpoints, and evaluation.
 Dense and sparse stages still run sequentially because sparse training requires the calibrated
 dense threshold. Final evaluation remains single GPU, so total pipeline speedup will be lower
-than training speedup. No L40 scaling measurement has been made yet.
+than training speedup. The measured `speed_shm_v1` comparison below showed no useful two-GPU
+benefit at global batch four; prefer one GPU for the next learning checks on that server.
 
 For custom distributed launches, `train.batch_size` always means the global batch and must be
 divisible by the process count. Use `hydra.output_subdir=null hydra/job_logging=disabled` when
@@ -116,6 +117,54 @@ so it compares practical training throughput. Repeat with unique tags if the tim
 The benchmark prints progress every 100 updates even with W&B disabled. Startup messages
 identify dataset loading, DDP initialization, the first batch, and the first update. Older
 versions only printed the configuration and the final result, so silence did not establish a hang.
+
+On `omi-rapid-octagpu`, GPUs 4/5 with PyTorch 2.13.0+cu130 and NCCL 2.29.7 require a
+transport workaround for the observed DDP startup failure. The real-model probe hangs using
+`P2P/CUMEM` and passes on both ranks with `NCCL_P2P_DISABLE=1`, which selects
+`SHM/direct/direct`. Scope the setting to launches on this server:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5 NCCL_P2P_DISABLE=1 \
+  bash scripts/l40_exp2_benchmark.sbatch speed_shm_v1 400
+```
+
+The user-supplied `speed_shm_v1` log completed 400 updates in both configurations with zero
+skips. The final 100-update interval measured 0.6722 s/update on one GPU and 0.6676 on two:
+1.0069x throughput, or only 0.68% time saved. This is not a demonstrated practical reason to
+use twice the GPUs. One dense 300k-update stage extrapolates to about 56 hours before
+evaluation/checkpoint overhead; sparse training was not timed. Repeated timing would be needed
+to resolve such a small difference. Use a fresh tag to repeat an existing benchmark.
+
+Both runs also have very small final-batch target variance (about 1e-7), with the logit term
+contributing about 99% of total loss. A short log cannot distinguish early learning from
+persistent information collapse. The saved single-GPU model can provide an early baseline:
+
+```bash
+CUDA_VISIBLE_DEVICES=4 .venv/bin/python scripts/eval_visual_to_visual.py \
+  outputs/bounce_exp2_benchmark_speed_shm_v1/gpu1 \
+  --device cuda --episodes 64 --probe-episodes 64 --batch-size 4 \
+  --require-complete-protocol
+```
+
+This evaluates the existing checkpoint and writes `metrics.json`, `slot_tracks.png`, and
+`recovery_grid.png`. Inspect held-out position/velocity probe R2 and slot grounding. The
+complete-protocol flag checks completion of the configured 400 updates and the objective
+settings; it does not mean this short run is a completed scientific experiment.
+
+The supplied 64-episode evaluation of this checkpoint returned position/velocity probe R2
+0.144/0.044 and nearly uniform slot maps. Local initialization checks show that the recurrent
+encoder already loses slot distinctions before frame 30, but the recurrent weights are
+trainable. At only 400 of 300,000 planned updates, these observations do not justify changing
+the architecture or declaring failure. Continue the planned run with the current encoder and
+raw objective, monitoring the existing evaluations every 5,000 updates. The
+[slot-initialization audit](../docs/audits/2026-09-06-exp2-slot-initialization.md) records the
+early baseline and its limits; learning must be judged over a longer trajectory.
+
+The transport workaround is verified through these 400 training updates. The smaller
+communication checks passed in both transport modes. The driver/NCCL/topology cause has not
+been established, and no global NCCL
+defaults or training objectives are changed by these launch commands. Revisit the workaround
+if the server's software or topology changes.
 
 If two GPUs stall during startup, stop that benchmark before checking communication alone.
 On a manually managed Linux server, from the repository root with your two GPU IDs:

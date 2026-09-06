@@ -95,15 +95,40 @@ finite ~1e30 loss that passed `isfinite`, overflowed the backward pass to grad_n
 let clipping multiply every gradient by zero — a run that "finished" 230k frozen steps with
 byte-identical eval rows. That signature remains worth recognising even with the short T=2 path.
 
-Infrastructure investigation (2026-09-06): the two-L40 visual benchmark reaches
-`Initializing DDP` on both ranks and NCCL `Init COMPLETE`/`Connected all rings`, but neither
-rank reports `DDP ready`. Dataset loading and model construction have completed; data workers
-and training have not started. Scalar/1 MiB NCCL checks passed with default transport and with
-P2P disabled. This localizes a DDP-constructor stall without establishing its root cause.
-`scripts/check_nccl.py --visual-ddp` now isolates the actual dense model's initialization
-(including shape verification and roughly 24 MiB parameter synchronization), using the same
-lazy NCCL setup as training, a short timeout, and a delayed Python traceback. Missing optional
-IB/plugin messages followed by successful Socket fallback are not evidence of the cause.
+Infrastructure workaround (2026-09-06): on `omi-rapid-octagpu`, L40 GPUs 4/5 with PyTorch
+2.13.0+cu130 and NCCL 2.29.7 stall in DDP initialization using `P2P/CUMEM`. The actual-model
+probe `scripts/check_nccl.py --visual-ddp` reproduces it: rank 1 times out on parameter-shape
+broadcast (458 elements, sequence 2), while rank 0 waits on model-parameter broadcast
+(6,302,785 elements, sequence 3). With `NCCL_P2P_DISABLE=1`, NCCL selects `SHM/direct/direct`
+and both ranks finish DDP construction and report `PASS`. Use this environment setting for
+the next benchmark on this server, and the main run if training and throughput checks pass.
+The smaller scalar/1 MiB checks had passed in both modes, so they were insufficient to diagnose
+this initialization path. The comparison establishes a transport-dependent startup failure;
+the underlying driver/NCCL/topology cause remains unknown. Missing optional IB/plugin warnings
+also occur in the passing run.
+
+Follow-up `speed_shm_v1`: both GPU counts completed 400 updates with zero skips. Final-interval
+time was 0.6722 s/update on one L40 and 0.6676 on two (1.0069x, only 0.68% time saved).
+This short benchmark demonstrates working training with the transport workaround but no useful
+two-GPU benefit at global batch four. Prefer one GPU for the next learning diagnostic. At this
+rate, 300k dense updates alone extrapolate to about 56 hours before evaluation/checkpoints;
+sparse-stage throughput has not been measured. Both checkpoints have very small final-batch
+target content variance (9.763e-8 / 8.141e-8), and the logit term is about 99% of total loss.
+These are early representation-scale observations, not proof of lost state information or a
+collapse trajectory. Use held-out position/velocity probes and slot maps to monitor learning
+during the planned run; keep the raw objective unchanged (D42).
+
+That checkpoint's subsequent 64-episode evaluation found nearly uniform allocations,
+position/velocity probe R2 of 0.144/0.044, and target variance 9.07e-8. A local untrained
+full-model check already produces uniform predictive-window maps and variance 9.19e-8.
+A one-clip stage trace localizes strong initial slot contraction to the LSTM/projector,
+with corrected slot differences falling from 0.217 at frame 0 to 8.55e-8 at frame 29.
+400 updates are only 0.13% of the planned dense run. Initial contraction does not establish
+that trainable recurrent weights will retain this behavior, and the early checkpoint does not
+justify changing the architecture or stopping the planned run. Continue with the existing
+5,000-update evaluations and assess the learning trajectory. These observations are not
+evidence that loss normalization removal caused the behavior. Full evidence and limits:
+`docs/audits/2026-09-06-exp2-slot-initialization.md`.
 
 ## Key mechanics (Experiment 1, fixed TF + T=2 objective — D37)
 - **The objective has two predictive branches sharing one θ̂.** Pool θ̂ exactly once per
