@@ -1,0 +1,132 @@
+"""Paired-seed summaries for completed controlled-vector runs."""
+
+import csv
+import io
+import math
+import statistics
+from pathlib import Path
+from typing import cast
+
+from scjepa.experiments.config import ExperimentConfig
+from scjepa.experiments.storage import file_lock, read_json, write_json
+
+
+def _statistics(values: list[float]) -> dict[str, float | int | None]:
+    return {
+        "n": len(values),
+        "mean": statistics.mean(values),
+        "std": statistics.stdev(values) if len(values) > 1 else None,
+        "standard_error": statistics.stdev(values) / math.sqrt(len(values))
+        if len(values) > 1
+        else None,
+    }
+
+
+def aggregate_results(config: ExperimentConfig) -> dict[str, object]:
+    """Summarize actual finished pairs, explicitly retaining missing-run counts."""
+    root = Path(config.output_dir)
+    rows: list[dict[str, object]] = []
+    missing: list[str] = []
+    missing_pairs: list[str] = []
+    execution_path = root / "execution.json"
+    expected_world_size = (
+        read_json(execution_path).get("world_size") if execution_path.exists() else None
+    )
+    completed: dict[tuple[str, int, str], tuple[dict[str, object], dict[str, float]]] = {}
+    with file_lock(root / ".report.lock", blocking=True):
+        for graph in config.graphs:
+            for seed in config.seeds:
+                for condition in ("baseline", "full"):
+                    slug = f"{graph}/seed-{seed}/{condition}"
+                    directory = root / slug
+                    status_path = directory / "status.json"
+                    if (
+                        not status_path.exists()
+                        or read_json(status_path).get("status") != "completed"
+                    ):
+                        missing.append(slug)
+                        continue
+                    record = read_json(directory / "run_config.json")
+                    processes = record.get("world_size")
+                    if (
+                        not isinstance(processes, int)
+                        or isinstance(processes, bool)
+                        or processes < 1
+                        or (expected_world_size is not None and processes != expected_world_size)
+                    ):
+                        raise ValueError(f"unmatched or invalid world_size in {slug}")
+                    expected_world_size = processes
+                    values = read_json(directory / "evaluation" / "metrics.json")
+                    if any(
+                        not isinstance(v, int | float) or not math.isfinite(v)
+                        for v in values.values()
+                    ):
+                        raise ValueError(f"nonfinite or nonscalar evaluation results in {slug}")
+                    metrics = {
+                        key: float(value) for key, value in cast(dict[str, float], values).items()
+                    }
+                    completed[(graph, seed, condition)] = (record, metrics)
+                    rows.append({"graph": graph, "seed": seed, "condition": condition, **metrics})
+        summaries: dict[str, object] = {}
+        differences: dict[str, object] = {}
+        for graph in config.graphs:
+            for condition in ("baseline", "full"):
+                group = [
+                    metrics
+                    for (g, _, c), (_, metrics) in completed.items()
+                    if g == graph and c == condition
+                ]
+                if group:
+                    keys = set[str].intersection(*(set(metrics) for metrics in group))
+                    summaries[f"{graph}/{condition}"] = {
+                        key: _statistics([metrics[key] for metrics in group])
+                        for key in sorted(keys)
+                    }
+            pairs: list[tuple[dict[str, float], dict[str, float]]] = []
+            for seed in config.seeds:
+                baseline, full = (
+                    completed.get((graph, seed, "baseline")),
+                    completed.get((graph, seed, "full")),
+                )
+                if baseline is None or full is None:
+                    missing_pairs.append(f"{graph}/seed-{seed}")
+                    continue
+                for key in ("initial_state_fingerprint", "dataset_identity", "experiment_identity"):
+                    value = baseline[0].get(key)
+                    if not isinstance(value, str) or not value or value != full[0].get(key):
+                        raise ValueError(f"unmatched {key} for {graph}, seed {seed}")
+                pairs.append((baseline[1], full[1]))
+            if pairs:
+                keys = set[str].intersection(*(set(a) & set(b) for a, b in pairs))
+                differences[graph] = {
+                    key: _statistics([full[key] - baseline[key] for baseline, full in pairs])
+                    for key in sorted(keys)
+                }
+        result: dict[str, object] = {
+            "format_version": 1,
+            "complete": not missing,
+            "missing_runs": missing,
+            "missing_pairs": missing_pairs,
+            "completed_runs": len(rows),
+            "expected_runs": 2 * len(config.graphs) * len(config.seeds),
+            "per_condition": summaries,
+            "paired_full_minus_baseline": differences,
+        }
+        write_json(root / "summary.json", result)
+        if rows:
+            fields = [
+                "graph",
+                "seed",
+                "condition",
+                *sorted(
+                    set[str].union(*(set(row) for row in rows)) - {"graph", "seed", "condition"}
+                ),
+            ]
+            stream = io.StringIO()
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+            temporary = root / ".results.csv.tmp"
+            temporary.write_text(stream.getvalue())
+            temporary.replace(root / "results.csv")
+        return result

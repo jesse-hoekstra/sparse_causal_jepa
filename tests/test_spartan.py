@@ -1,19 +1,29 @@
-"""Tests for the SPARTAN sparse transition predictor (outdated_experiments.pdf Eqs. 27-37)."""
+"""Finite-lag coordinate graphs and sparse information-flow contracts."""
 
 import pytest
 import torch
+from torch import Tensor
 
-from scjepa.models import Spartan
+import scjepa.models.spartan as spartan_module
+from scjepa.models.spartan import Spartan, SpartanLayer
 
-N, K, DIM = 3, 4, 32
+DZ, DP, DA, DIM = 3, 5, 2, 16
 
 
-def tiny(dense: bool = False, identity: bool = False, layers: int = 2) -> Spartan:
+def tiny(
+    history: int = 1,
+    actions: int = 0,
+    dense: bool = False,
+    identity: bool = False,
+    layers: int = 2,
+) -> Spartan:
+    """Construct a small model with independently chosen coordinate dimensions."""
     torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
     return Spartan(
-        state_dim=K,
-        param_dim=1,
-        num_slots=N,
+        state_dim=DZ,
+        param_dim=DP,
+        action_dim=actions,
+        history_len=history,
         num_layers=layers,
         embed_dim=DIM,
         mlp_hidden_size=DIM,
@@ -23,162 +33,279 @@ def tiny(dense: bool = False, identity: bool = False, layers: int = 2) -> Sparta
     )
 
 
-@pytest.fixture
-def inputs() -> tuple[torch.Tensor, torch.Tensor]:
-    torch.manual_seed(1)  # pyright: ignore[reportUnknownMemberType]
-    return torch.randn(2, N, K), torch.randn(2, N, 1)
+@pytest.mark.parametrize("history", [1, 3])
+@pytest.mark.parametrize("action_dim", [0, DA])
+def test_output_shapes_and_independent_dimensions(history: int, action_dim: int) -> None:
+    model = tiny(history=history, actions=action_dim)
+    states, parameters = torch.randn(2, history, DZ), torch.randn(2, DP)
+    actions = torch.randn(2, history, action_dim) if action_dim else None
+    output = model(states, parameters, actions)
+    tokens = history * (DZ + action_dim) + DP
+    assert output.prediction.shape == (2, DZ)
+    assert output.path_matrix.shape == (2, tokens, tokens)
+    assert output.graphs.state.shape == (2, DZ, history, DZ)
+    assert output.graphs.action.shape == (2, DZ, history, action_dim)
+    assert output.graphs.parameter.shape == (2, DZ, DP)
+    assert all(penalty.ndim == 0 for penalty in output.sparsity)
+    assert all(torch.isfinite(penalty) for penalty in output.sparsity)
+    if not action_dim:
+        assert output.sparsity.action.item() == 0.0
 
 
-def test_output_shapes(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
-    out = tiny()(*inputs)
-    assert out.prediction.shape == (2, N, K)  # Eq. 37: decoded into R^4
-    assert out.path_matrix.shape == (2, 2 * N, 2 * N)  # M = 2N tokens
-    assert out.sparsity.ndim == 0
+def test_graph_extraction_uses_lag_major_sources_and_latest_state_receivers() -> None:
+    model = tiny(history=3, actions=DA)
+    paths = torch.arange(2 * model.num_tokens**2).reshape(2, model.num_tokens, model.num_tokens)
+    graphs = model.extract_graphs(paths)
+    for coordinate in range(DZ):
+        row = 2 * DZ + coordinate
+        for lag in range(3):
+            torch.testing.assert_close(
+                graphs.state[:, coordinate, lag], paths[:, row, lag * DZ : (lag + 1) * DZ]
+            )
+            start = 3 * DZ + lag * DA
+            torch.testing.assert_close(
+                graphs.action[:, coordinate, lag], paths[:, row, start : start + DA]
+            )
+        torch.testing.assert_close(graphs.parameter[:, coordinate], paths[:, row, -DP:])
+    aggregate = graphs.aggregate_lags()
+    torch.testing.assert_close(aggregate.state, graphs.state.amax(dim=2))
+    torch.testing.assert_close(aggregate.action, graphs.action.amax(dim=2))
+    torch.testing.assert_close(aggregate.parameter, graphs.parameter)
 
 
-def test_path_matrix_is_integer_valued(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
-    """Eq. 10: entries of (A^L+I)...(A^1+I) are path COUNTS."""
-    out = tiny()(*inputs)
-    torch.testing.assert_close(out.path_matrix, out.path_matrix.round())
-    assert (out.path_matrix.diagonal(dim1=-2, dim2=-1) >= 1).all()  # residual self-paths
+def test_no_action_graph_aggregation_keeps_empty_block() -> None:
+    model = tiny(history=3)
+    output = model(torch.randn(2, 3, DZ), torch.randn(2, DP))
+    assert output.graphs.aggregate_lags().action.shape == (2, DZ, 0)
 
 
-def test_sparsity_covers_only_decoded_state_rows(
-    inputs: tuple[torch.Tensor, torch.Tensor],
+def test_path_counts_include_every_residual() -> None:
+    model = tiny(history=3, actions=DA, dense=True, layers=3)
+    output = model(torch.randn(2, 3, DZ), torch.randn(2, DP), torch.randn(2, 3, DA))
+    single_layer = torch.ones(model.num_tokens, model.num_tokens) + torch.eye(model.num_tokens)
+    expected = (single_layer @ single_layer @ single_layer).expand(2, -1, -1)
+    torch.testing.assert_close(output.path_matrix, expected)
+    torch.testing.assert_close(output.sparsity.state, output.graphs.state.mean())
+    torch.testing.assert_close(output.sparsity.action, output.graphs.action.mean())
+    torch.testing.assert_close(output.sparsity.parameter, output.graphs.parameter.mean())
+
+
+def test_path_counts_keep_float32_under_autocast() -> None:
+    model = tiny(history=3, actions=DA, dense=True, layers=4)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = model(torch.randn(2, 3, DZ), torch.randn(2, DP), torch.randn(2, 3, DA))
+    assert output.path_matrix.dtype == torch.float32
+    assert torch.isfinite(output.path_matrix).all()
+    single = torch.ones(model.num_tokens, model.num_tokens) + torch.eye(model.num_tokens)
+    torch.testing.assert_close(
+        output.path_matrix, (single @ single @ single @ single).expand(2, -1, -1)
+    )
+
+
+def test_identity_mode_depends_only_on_same_latest_state_coordinate() -> None:
+    model = tiny(history=3, actions=DA, identity=True).eval()
+    states = torch.randn(2, 3, DZ)
+    parameters, actions = torch.randn(2, DP), torch.randn(2, 3, DA)
+    original = model(states, parameters, actions)
+    torch.testing.assert_close(original.path_matrix, torch.eye(model.num_tokens).expand(2, -1, -1))
+    assert torch.count_nonzero(original.graphs.action).item() == 0
+    assert torch.count_nonzero(original.graphs.parameter).item() == 0
+    assert torch.count_nonzero(original.graphs.state[:, :, :-1]).item() == 0
+    torch.testing.assert_close(original.graphs.state[:, :, -1], torch.eye(DZ).expand(2, -1, -1))
+    changed = states.clone()
+    changed[:, :-1] += 10
+    changed[:, -1, 1:] -= 10
+    perturbed = model(changed, parameters + 5, actions - 7)
+    torch.testing.assert_close(original.prediction[:, 0], perturbed.prediction[:, 0])
+
+
+def test_sparse_path_products_account_for_indirect_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Eq. 11: the path objective sums the N decoded rows only."""
-    out = tiny()(*inputs)
-    expected = out.path_matrix[:, :N].sum(dim=(1, 2)).mean()
-    torch.testing.assert_close(out.sparsity, expected)
+    model = tiny(history=2, actions=DA, layers=2).eval()
+    first = torch.zeros(1, model.num_tokens, model.num_tokens)
+    second = first.clone()
+    # Latest state 0 receives old action 1, which receives parameter 2 in the
+    # preceding layer. The graph must include the resulting indirect path.
+    receiver, intermediary, source = DZ, 2 * DZ + 1, model.num_tokens - DP + 2
+    first[0, intermediary, source] = 1
+    second[0, receiver, intermediary] = 1
+    prescribed = iter([first, second])
+
+    def fixed_adjacency(logits: Tensor, _temperature: float, _training: bool) -> Tensor:
+        return next(prescribed).to(logits).expand_as(logits)
+
+    monkeypatch.setattr(spartan_module, "_sample_hard_adjacency", fixed_adjacency)
+    output = model(torch.randn(1, 2, DZ), torch.randn(1, DP), torch.randn(1, 2, DA))
+    eye = torch.eye(model.num_tokens)
+    torch.testing.assert_close(output.path_matrix, (second + eye) @ (first + eye))
+    assert output.graphs.parameter[0, 0, 2].item() == 1
+    assert output.graphs.action[0, 0, 0, 1].item() == 1
 
 
-def test_identity_mode_is_token_local(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
-    """A≡0: path matrix exactly I — only each token's residual-MLP path remains."""
-    model = tiny(identity=True).eval()
-    out = model(*inputs)
-    eye = torch.eye(2 * N).expand(2, -1, -1)
-    torch.testing.assert_close(out.path_matrix, eye)
-    # Parameter values cannot influence predictions.
-    state, params = inputs
-    out_other = model(state, params + 5.0)
-    torch.testing.assert_close(out.prediction, out_other.prediction)
+def test_closed_edges_have_no_attention_control_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = tiny(history=2, actions=DA, layers=1).eval()
+    prescribed = torch.zeros(1, model.num_tokens, model.num_tokens)
+    prescribed[0, DZ, 1] = 1  # latest output 0 may read oldest state 1
+
+    def fixed_adjacency(logits: Tensor, _temperature: float, _training: bool) -> Tensor:
+        return prescribed.to(logits).expand_as(logits)
+
+    monkeypatch.setattr(spartan_module, "_sample_hard_adjacency", fixed_adjacency)
+    states = torch.randn(1, 2, DZ, requires_grad=True)
+    parameters = torch.randn(1, DP, requires_grad=True)
+    actions = torch.randn(1, 2, DA, requires_grad=True)
+    output = model(states, parameters, actions)
+    state_grad, parameter_grad, action_grad = torch.autograd.grad(
+        output.prediction[0, 0], (states, parameters, actions)
+    )
+    allowed = output.graphs.state[0, 0].bool()
+    assert torch.count_nonzero(state_grad[0][~allowed]).item() == 0
+    assert torch.count_nonzero(parameter_grad).item() == 0
+    assert torch.count_nonzero(action_grad).item() == 0
+    changed_states = states.detach().clone()
+    changed_states[0][~allowed] += 100
+    changed = model(changed_states, parameters.detach() - 100, actions.detach() + 100)
+    torch.testing.assert_close(output.prediction[:, 0], changed.prediction[:, 0])
 
 
-def test_dense_mode_is_fully_connected_and_deterministic(
-    inputs: tuple[torch.Tensor, torch.Tensor],
-) -> None:
-    """A≡1 with no gate sampling: rho_path = 1, repeat calls agree in train mode."""
+def test_graph_and_attention_logits_are_independent_of_input_values() -> None:
+    model = tiny(history=2, actions=DA).eval()
+    first = model(torch.randn(2, 2, DZ), torch.randn(2, DP), torch.randn(2, 2, DA))
+    changed = model(100 * torch.randn(2, 2, DZ), torch.randn(2, DP), torch.randn(2, 2, DA))
+    torch.testing.assert_close(first.path_matrix, changed.path_matrix)
+    torch.testing.assert_close(first.logit_penalty, changed.logit_penalty)
+    torch.testing.assert_close(first.mean_abs_logit, changed.mean_abs_logit)
+
+
+def test_sparsity_blocks_can_be_weighted_independently() -> None:
+    model = tiny(history=2, actions=DA)
+    paths = torch.rand(2, model.num_tokens, model.num_tokens, requires_grad=True)
+    penalties = model.extract_graphs(paths).penalties()
+    loss = 2 * penalties.state + 3 * penalties.action + 0 * penalties.parameter
+    loss.backward()  # pyright: ignore[reportUnknownMemberType]
+    assert paths.grad is not None
+    gradient = model.extract_graphs(paths.grad)
+    assert torch.all(gradient.state > 0)
+    assert torch.all(gradient.action > 0)
+    assert torch.count_nonzero(gradient.parameter).item() == 0
+
+
+def test_dense_mode_deterministic_without_gate_sampling() -> None:
     model = tiny(dense=True)
-    out1, out2 = model(*inputs), model(*inputs)
-    torch.testing.assert_close(out1.prediction, out2.prediction)
-    assert bool((out1.path_matrix >= 1).all())
+    states, parameters = torch.randn(2, 1, DZ), torch.randn(2, DP)
+    first, second = model(states, parameters), model(states, parameters)
+    torch.testing.assert_close(first.prediction, second.prediction)
+    assert torch.all(first.path_matrix > 0)
 
 
-def test_paper_stated_path_objective_endpoints() -> None:
-    """§6.1.3: with ten tokens, dense L_path = 6655 and token-local = 5."""
-    state, params = torch.randn(1, 5, K), torch.randn(1, 5, 1)
-    dense = Spartan(num_slots=5, num_layers=3, embed_dim=DIM, mlp_hidden_size=DIM, dense=True)
-    assert dense(state, params).sparsity.item() == 6655.0
-    local = Spartan(num_slots=5, num_layers=3, embed_dim=DIM, mlp_hidden_size=DIM, identity=True)
-    assert local(state, params).sparsity.item() == 5.0
-
-
-def test_eval_gates_are_deterministic(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
-    """Eq. 34: eval-mode adjacency is the noiseless threshold 1{g > 0}."""
-    model = tiny().eval()
-    out1, out2 = model(*inputs), model(*inputs)
-    torch.testing.assert_close(out1.prediction, out2.prediction)
-    torch.testing.assert_close(out1.path_matrix, out2.path_matrix)
-
-
-def test_train_gates_resample_fresh_noise(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
-    """Eq. 33: every training forward draws fresh Gumbel noise."""
+def test_sparse_evaluation_deterministic_training_resamples() -> None:
     model = tiny()
-    torch.manual_seed(2)  # pyright: ignore[reportUnknownMemberType]
-    out1 = model(*inputs)
-    out2 = model(*inputs)
-    assert not torch.equal(out1.path_matrix, out2.path_matrix)
+    states, parameters = torch.randn(2, 1, DZ), torch.randn(2, DP)
+    model.eval()
+    first, second = model(states, parameters), model(states, parameters)
+    torch.testing.assert_close(first.prediction, second.prediction)
+    torch.testing.assert_close(first.path_matrix, second.path_matrix)
+    model.train()
+    first, second = model(states, parameters), model(states, parameters)
+    assert not torch.equal(first.path_matrix, second.path_matrix)
+    torch.testing.assert_close(first.path_matrix, first.path_matrix.round())
 
 
-def test_track_keys_fixed_shared_and_distinct() -> None:
-    """Eq. 27: one fixed non-trainable codebook shared by all three modes."""
-    sparse, dense, identity = tiny(), tiny(dense=True), tiny(identity=True)
-    keys = sparse.track_keys
-    assert keys.shape == (1, N, DIM)
-    assert not keys.requires_grad
-    assert all("track_keys" not in name for name, _ in sparse.named_parameters())
-    dists = torch.cdist(keys[0], keys[0]) + torch.eye(N)
-    assert bool((dists > 0).all())  # rows pairwise distinct
-    torch.testing.assert_close(dense.track_keys, keys)
-    torch.testing.assert_close(identity.track_keys, keys)
+def test_gradients_reach_states_actions_parameters_and_structural_logits() -> None:
+    model = tiny(history=2, actions=DA, dense=True)
+    states = torch.randn(2, 2, DZ, requires_grad=True)
+    parameters = torch.randn(2, DP, requires_grad=True)
+    actions = torch.randn(2, 2, DA, requires_grad=True)
+    output = model(states, parameters, actions)
+    (output.prediction.square().mean() + 1e-3 * output.logit_penalty).backward()  # pyright: ignore[reportUnknownMemberType]
+    for value in (states, parameters, actions):
+        assert value.grad is not None
+        assert value.grad.abs().sum() > 0
+    layer = model.layers[0]
+    assert isinstance(layer, SpartanLayer)
+    gradient = layer.project_q.weight.grad
+    assert gradient is not None
+    assert gradient.abs().sum() > 0
 
 
-def test_track_keys_give_tokens_addresses(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
-    """Identical-content rows get different outputs: kappa_i is an address."""
-    model = tiny(dense=True).eval()
-    state, params = inputs
-    state = state.clone()
-    state[:, 1] = state[:, 0]  # rows 0 and 1 identical in content
-    params = params.clone()
-    params[:, 1] = params[:, 0]
-    out = model(state, params)
-    # If keys carried no information the two rows would be exchangeable and
-    # their predictions identical; the distinct kappa breaks the tie.
-    assert not torch.allclose(out.prediction[:, 0], out.prediction[:, 1])
+def test_sparse_path_penalty_trains_straight_through_gates() -> None:
+    model = tiny(history=2, actions=DA)
+    output = model(torch.randn(2, 2, DZ), torch.randn(2, DP), torch.randn(2, 2, DA))
+    (output.sparsity.state + output.sparsity.action + output.sparsity.parameter).backward()  # pyright: ignore[reportUnknownMemberType]
+    for layer in model.layers:
+        assert isinstance(layer, SpartanLayer)
+        for projection in (layer.project_q, layer.project_k):
+            gradient = projection.weight.grad
+            assert gradient is not None
+            assert torch.isfinite(gradient).all()
+            assert gradient.abs().sum() > 0
 
 
-def test_gates_block_information_flow() -> None:
-    """A masked edge admits no information (Eq. 35 masks BEFORE normalizing)."""
-    model = tiny(identity=True).eval()  # extreme case: everything masked
-    state = torch.randn(1, N, K)
-    params = torch.randn(1, N, 1)
-    out1 = model(state, params)
-    state2 = state.clone()
-    state2[:, 2] += 10.0  # perturb another token
-    out2 = model(state2, params)
-    torch.testing.assert_close(out1.prediction[:, 0], out2.prediction[:, 0])
+def test_fully_closed_rows_remain_finite_in_forward_and_backward() -> None:
+    model = tiny(identity=True)
+    states, parameters = torch.randn(2, 1, DZ, requires_grad=True), torch.randn(2, DP)
+    output = model(states, parameters)
+    output.prediction.square().mean().backward()  # pyright: ignore[reportUnknownMemberType]
+    assert torch.isfinite(output.prediction).all()
+    assert states.grad is not None
+    assert torch.isfinite(states.grad).all()
+    for parameter in model.parameters():
+        if parameter.grad is not None:
+            assert torch.isfinite(parameter.grad).all()
 
 
-def test_logit_penalty_minimum_and_growth(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
-    """exp(a)+exp(-a): minimum 2 at a=0, grows with |a|, finite at extremes."""
-    out = tiny()(*inputs)
-    assert out.logit_penalty.item() >= 2.0
-    assert torch.isfinite(out.logit_penalty)
-    # The linear continuation keeps huge logits finite.
+def test_logit_penalty_and_diagnostics_finite_at_large_logits() -> None:
     model = tiny(dense=True)
+    states, parameters = torch.randn(2, 1, DZ), torch.randn(2, DP)
+    regular = model(states, parameters)
+    assert regular.logit_penalty.item() >= 2
+    assert 0 <= regular.mean_gate_probability.item() <= 1
+    assert 0 <= regular.gate_entropy.item() <= 0.6932
+    assert regular.mean_abs_logit.item() >= 0
     with torch.no_grad():
-        model.state_project.weight.mul_(1e4)
-    big = model(*inputs)
-    assert torch.isfinite(big.logit_penalty)
-    assert big.logit_penalty > out.logit_penalty
+        for layer in model.layers:
+            assert isinstance(layer, SpartanLayer)
+            layer.project_q.weight.mul_(1e4)
+    large = model(states, parameters)
+    assert torch.isfinite(large.prediction).all()
+    assert torch.isfinite(large.logit_penalty)
+    assert large.logit_penalty > regular.logit_penalty
 
 
-def test_diagnostics_bounded(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
-    out = tiny()(*inputs)
-    assert 0 <= out.mean_gate_probability.item() <= 1
-    assert 0 <= out.gate_entropy.item() <= 0.6932
-    assert out.mean_abs_logit.item() >= 0
+@pytest.mark.parametrize(
+    ("keyword", "value"),
+    [("state_dim", 0), ("param_dim", 0), ("history_len", 0), ("action_dim", -1), ("num_layers", 0)],
+)
+def test_invalid_dimensions(keyword: str, value: int) -> None:
+    config = {"state_dim": DZ, "param_dim": DP, keyword: value}
+    with pytest.raises(ValueError, match="positive|nonnegative"):
+        Spartan(
+            state_dim=config["state_dim"],
+            param_dim=config["param_dim"],
+            history_len=config.get("history_len", 1),
+            action_dim=config.get("action_dim", 0),
+            num_layers=config.get("num_layers", 2),
+        )
 
 
-def test_gradients_reach_gates_and_params(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
-    """Straight-through (Eq. 33): prediction + path losses reach q/k and theta."""
-    model = tiny()
-    state, params = inputs
-    params = params.clone().requires_grad_(True)
-    out = model(state, params)
-    (out.prediction.square().mean() + 1e-6 * out.sparsity).backward()  # pyright: ignore[reportUnknownMemberType]
-    assert params.grad is not None
-    q_grad = model.layers[0].project_q.weight.grad
-    assert q_grad is not None
-    assert q_grad.abs().sum() > 0
-
-
-def test_input_guards(inputs: tuple[torch.Tensor, torch.Tensor]) -> None:
-    model = tiny()
-    state, params = inputs
-    with pytest.raises(ValueError, match="expected state"):
-        model(state[:, :2], params)
-    with pytest.raises(ValueError, match="expected state"):
-        model(state, params.squeeze(-1))
+def test_input_guards() -> None:
+    states, parameters = torch.randn(2, 1, DZ), torch.randn(2, DP)
+    with pytest.raises(ValueError, match="expected states"):
+        tiny()(states[:, 0], parameters)
+    with pytest.raises(ValueError, match="expected parameters"):
+        tiny()(states, parameters[:, :2])
+    with pytest.raises(ValueError, match="expected actions"):
+        tiny(actions=DA)(states, parameters)
+    with pytest.raises(ValueError, match="expected actions"):
+        tiny(actions=DA)(states, parameters, torch.randn(2, 2, DA))
+    with pytest.raises(ValueError, match="actions must be None"):
+        tiny()(states, parameters, torch.randn(2, 1, 0))
+    with pytest.raises(ValueError, match="nonempty"):
+        tiny()(states[:0], parameters[:0])
     with pytest.raises(ValueError, match="mutually exclusive"):
-        Spartan(num_slots=N, dense=True, identity=True)
+        tiny(dense=True, identity=True)
+    with pytest.raises(ValueError, match="temperature"):
+        Spartan(state_dim=DZ, param_dim=DP, temperature=0)
+    with pytest.raises(ValueError, match="path_matrix"):
+        tiny().extract_graphs(torch.ones(2, 3, 3))

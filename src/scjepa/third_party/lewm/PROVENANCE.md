@@ -1,32 +1,10 @@
-# Provenance: lewm (LeJEPA world-model reference)
+# Training-pattern attribution: le-wm
 
-## Upstream
+- Upstream: <https://github.com/lucas-maes/le-wm>
+- Commit: `8edfeb336732b5f3ce7b8b210d0ba370a09e2cac`
+- License: MIT (Lucas Maes, 2026), retained verbatim in `LICENSE`.
 
-- **URL:** <https://github.com/lucas-maes/le-wm>
-- **Commit SHA:** `8edfeb336732b5f3ce7b8b210d0ba370a09e2cac`
-- **License:** MIT (Lucas Maes, 2026) — copied verbatim as `LICENSE`.
-- **Files taken:** `jepa.py`, `module.py`.
-
-## Role: REFERENCE, not imported
-
-These files are vendored as the stable in-repo reference for adapting the JEPA training
-process into `scjepa.training`. The initial adaptation used EMA-free joint training;
-that historical architecture is superseded by D39's Experiment-2 EMA target. Nothing in
-`src/scjepa` imports them.
-
-**Why `train.py` was NOT vendored (finding, 2026-07-09):** upstream's training loop is
-not plain PyTorch — it sits on `lightning`, `stable_pretraining`, and
-`stable_worldmodel`. Vendoring it would drag three framework dependencies into the
-project for ~145 lines whose JEPA-specific content is small. The loop *pattern* it
-implements — one optimizer step over encoder+predictor jointly, loss assembled as
-`loss = pred_loss + lambd * regularizer(emb)` — is what `scjepa.training` re-expresses
-in the project's own plain-PyTorch/Hydra stack. The D3 regularizer observation is
-historical; neither active experiment currently applies that regularizer.
-
-`module.py` contains upstream's own `SIGReg` implementation; we do NOT use it — the
-optional regularizer utilities live in `third_party/visreg/` (official implementation). It is kept
-here so the adaptation can be diffed against what le-wm actually does.
-
-## Local changes
-
-1. `jepa.py`, `module.py` — **verbatim, no changes**.
+The project's plain-PyTorch training loop re-expresses the upstream pattern of
+jointly optimizing encoder and predictor with predictive and representation
+regularization losses. The unused reference `jepa.py` and `module.py` networks
+are no longer shipped. No upstream training framework is required at runtime.

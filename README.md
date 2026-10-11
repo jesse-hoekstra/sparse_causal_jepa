@@ -1,167 +1,152 @@
-# sparse_causal_jepa
+# Sparse causal JEPA
 
-Code accompanying **"Causal Identification within JEPA Using a SPARTAN"**
-([manuscript](sources/SCJEPA.pdf)). There are two active experiments:
+An experiment-independent PyTorch implementation of framewise state encoding,
+context-based parameter inference, and sparse finite-memory latent dynamics.
+The motivating manuscript is `sources/Parameter_and_State_Identifiability.pdf`
+(local source PDFs are ignored by Git).
 
-| | Experiment 1 | Experiment 2 |
-|---|---|---|
-| Observations | True object states | Frame sequences of identical-looking balls |
-| Context state | Simulator state | Recurrent SAVi slots and a learned state head |
-| Prediction target | True next state | Stop-gradient EMA visual state |
-| Parameter estimate | One per episode from the true-state context | One per episode from context slots |
-| Training | Teacher forcing + eight sampled T=2 endpoints | Same local objective in learned state space |
-| Preset | `bounce_baumgartner` | `bounce_visual_to_visual` |
+The package supplies architecture, training infrastructure, the paper's data
+generators, and a complete paired controlled-vector experiment runner. See
+[the first experiment](docs/controlled_experiment.md) for the comparison,
+tmux/W&B server commands, validation, recovery metrics, and resume. The scientific
+protocol lives separately from the reusable model/trainer. See
+[data generation](docs/data_generation.md) for equations and storage.
 
-The supervised visual-to-true-state bridge has been retired. The old three-experiment proposal
-in [outdated_experiments.pdf](sources/outdated_experiments.pdf) is historical: its equation
-references explain existing components, but its numbering and same-row EMA assumption are not
-the current protocol. [Decisions D37–D42](docs/decisions.md) record the active design.
+## Model and batch interface
 
-## Setup
+```python
+import torch
+from scjepa.training.factory import ModelConfig, build_model
+
+model = build_model(ModelConfig(
+    observation_dim=8, state_dim=5, param_dim=3, action_dim=2,
+    context_len=4, history_len=2,
+))
+x = torch.randn(3, 8, 8)       # episodes, frames, observation coordinates
+a = torch.randn(3, 7, 2)       # a[:, t] advances x[:, t] to x[:, t + 1]
+out = model(x, a)
+assert out.predictions.shape == (3, 4, 5)
+assert out.parameters.shape == (3, 3)
+loss = (out.predictions - out.targets).square().mean()
+loss.backward()
+```
+
+- Vector observations: `(B,T,d_x)`; images: `(B,T,C,H,W)`, floating point.
+- Actions: `(B,T-1,d_a)`; use `None` with `action_dim=0`.
+- Each frame independently produces `(B,T,d_z)` through an MLP or CNN and its
+  vector head. Normalization never spans frames or episodes.
+- Parameter inference consumes the first `K=context_len` online states and the
+  first `K-1` actions, producing **one attached `(B,d_theta)` tensor**.
+- Prediction consumes `L=history_len` states and aligned actions. Source indices
+  start at `s=max(K,L)-1` by default, with targets `s+1 ... T-1`. The result is
+  `(B,T-1-s,d_z)`. `K`, `L`, `d_z`, `d_theta`, and `d_a` are independent.
+- `out.targets` is a stopped-gradient representation from the separate complete
+  EMA encoder, including its output head. There is no decoder or matching step.
+
+See [architecture and choices](docs/architecture.md) for graph semantics, rollout,
+EMA, and loss details.
+
+## Training integration
+
+`Trainer(model, TrainConfig(...), dataset=None)` exposes `train_step(batch)`.
+A batch is a mapping with `observations`, optional `actions`, and `episode_ids`
+(int64 `(B,)`) when parameter regularization is enabled. IDs identify original
+episodes; separate clips from one episode must share an ID.
+
+The basic loss is latent prediction MSE. `ObjectiveConfig` exposes independent
+state/action/parameter sparsity weights, attention-logit weight, and independent
+state/parameter `none` or `sigreg` selections and weights. All auxiliary
+weights default to zero. Setting only `parameter_sparsity_weight=0` retains the
+parameter encoder, conditioning, optimizer, and all other architecture choices.
+
+`TensorEpisodes` is a tensor adapter, not a scientific data generator. To use the
+saved-tensor CLI route, supply a `torch.save` mapping of episode-major `observations`,
+optional `actions`, and optional `episode_ids`:
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-pre-commit install
-python -m pytest tests/ -q
+python scripts/train.py data_path=/absolute/path/episodes.pt train.steps=10
+# Exact resume requires matching model config, batch size, world size, and data.
+python scripts/train.py data_path=/absolute/path/episodes.pt \
+  resume=/absolute/path/outputs/generic/last.pt train.steps=20
 ```
 
-The project uses PyTorch, Hydra, W&B, scipy, and jaxtyping. Source code lives under
-`src/scjepa/{data,models,losses,training,eval}`; runnable entry points are in `scripts/`,
-Hydra presets in `configs/experiment/`, and implementation decisions in `docs/decisions.md`.
-Data, model checkpoints, W&B files, and run outputs are not committed.
+Alternatively select `data=controlled_vector` or `data=coupled_springs`, or pass
+a versioned bundle directory as `data_path`. Model/data compatibility is checked
+before training and checkpoints validate dataset identity.
 
-## Shared teacher-forcing and T=2 objective
+These commands illustrate the interface; they prescribe no scientific schedule.
+`steps` counts microbatches, `batch_size` is global across ranks, and
+`accumulation_steps` controls microbatches per optimizer update. A final partial
+accumulation group is explicitly discarded; checkpoints require a boundary.
+EMA advances only after accepted optimizer updates. Both single-process and
+`torchrun` execution are supported. CLI training logs to W&B and prints JSON;
+direct `Trainer` use stays local unless a logger is supplied.
 
-Both experiments use 60-frame episodes and a 30-frame parameter-inference context. Infer one
-attached `theta_hat` from times 0–29 and reuse it for all 30 teacher-forced transitions and all
-auxiliary windows:
+## Weights & Biases
 
-```text
-L_pred = L_TF + lambda_rollout_t2 * L_AR2
-```
-
-For each episode, sample eight distinct offsets uniformly from 0–28. An offset `r` launches from
-the observed state at `29+r` (a true state in Experiment 1, an online visual state in Experiment
-2), generates the next state, feeds it back without detaching, and predicts the second state.
-Only that second endpoint contributes to `L_AR2`; average the loss over batch, windows, objects,
-and coordinates. `lambda_rollout_t2=0` bypasses the auxiliary branch and its random sampling.
-There is no K=30 training loss or rollout curriculum. K=30 remains an evaluation diagnostic.
-
-Both experiments use the same raw predictive terms in the gradient objective and GECO constraint:
-
-```text
-c = L_TF + lambda_rollout_t2 * L_AR2 + lambda_logit * L_logit <= tau
-```
-
-The path penalty stays outside the constraint. Experiment 2 no longer divides prediction error
-by target variance (D42). Variance, rank, and temporal statistics remain diagnostics; no new
-LayerNorm or anti-collapse loss is introduced. Visual runs record
-`visual_constraint_version=raw_tf_t2_v1` in their configuration and checkpoints. Calibrate a fresh
-visual tau from the raw dense constraint: neither earlier variance-normalized thresholds nor
-Experiment 1's historical `tau=0.02` transfers.
-
-## Experiment 1: true states
-
-The successful historical teacher-forcing run reached MCC 0.948 and SHD 4.81 (D30). Those values
-predate the T=2 objective and are a reference, not a measured result for the new objective.
-The full single-seed pipeline trains dense and identity references, selects a feasible tau, then
-trains and evaluates the sparse model:
+Install the logging extra and authenticate once on the training machine:
 
 ```bash
-bash scripts/run_bounce_example.sh --run-tag=seed0 train.lambda_logit=1e-5
+python -m pip install -e '.[logging]'
+wandb login
 ```
 
-With an already selected fixed tau, the existing L40 launcher runs eight matched dense/sparse
-seeds on two GPUs:
+W&B is enabled by default in `scripts/train.py`. The project defaults to
+`sparse_causal_jepa`; the entity defaults to your authenticated W&B settings.
+Use `WANDB_PROJECT` / `WANDB_ENTITY`, or explicit Hydra settings:
 
 ```bash
-SCJEPA_BATCH_ID=exp1_8seed CUDA_VISIBLE_DEVICES=4,5 \
-  bash scripts/l40_exp1_8seed_pipeline.sbatch TAU
+python scripts/train.py data=controlled_vector \
+  wandb.entity=YOUR_ENTITY wandb.project=sparse_causal_jepa \
+  wandb.name=vector-check train.out_dir=outputs/vector-check
 ```
 
-See [scripts/README.md](scripts/README.md) for outputs and Slurm usage.
+Set `wandb.mode=offline` to keep W&B records locally, or `wandb.mode=disabled`
+for terminal logging only. `WANDB_MODE` supplies the default when set.
+`wandb.group`, `wandb.tags`, and `wandb.job_type` are also configurable.
+Missing dependencies or online initialization failures stop the run instead of
+silently dropping tracking. Keep API keys in W&B's credential store or environment,
+never in YAML or command-line configuration.
 
-## Experiment 2: learn states from pixels
+Only rank zero creates the W&B run and logs the reduced metrics. It records the
+resolved model/data/training configuration, dataset identity, loss components,
+gradient health, optimizer/skip counts and per-microbatch timing. Charts use
+`train/microbatch` as their training axis. Logging preserves training RNG state;
+datasets and checkpoint weights are not uploaded automatically.
 
-Both experiments reuse the same stored physics. The visual renderer draws equal-radius white
-balls, so neither glyph size nor colour supplies an object identifier or a direct mass label.
-Physical collision radii still depend on mass; occlusion and collision geometry may reveal
-physical information. `mass_independent_init` is a separate optional control that changes the
-physics distribution and needs its own preload. The canonical Experiment-1 preload must not be
-regenerated on another machine.
+`run_metadata.json` and checkpoints retain the run ID, entity and project.
+Resuming an online checkpoint reconnects to that same W&B run, even with a new
+output directory; conflicting entity/project overrides are rejected. A checkpoint
+without W&B metadata starts a new tracking run. W&B's internal event index remains
+monotonic when replaying an older checkpoint; the custom training axis can repeat.
+Offline continuation writes separate local segments with the retained ID, without
+claiming online resume or merging them automatically. Sync offline segments explicitly
+using the [W&B CLI](https://docs.wandb.ai/ref/cli/wandb-sync).
 
-The online branch encodes each source frame causally. The target branch is a frozen EMA copy of
-the visual encoder and state head, and encodes the full sequence, including future target frames.
-Its recurrent state at time `t` depends only on frames through `t`. The predictor receives the
-online current state and the single parameter estimate from the initial context. During T=2
-windows, its second call receives its own prediction.
+## Development and verification
 
-**EMA does not guarantee that slot `i` tracks the same ball in both branches.** Each episode
-therefore gets one detached minimum-cost assignment between the branches' pre-head slot trajectories
-on the shared context prefix. That permutation is fixed for the entire target sequence and every
-training term. It uses no future frames, physical states, or masses. It can correct a branch-wide
-permutation; it cannot repair an identity switch midway through a trajectory. Slot numbering is
-local to an episode, and tracking still has to be measured. This matching is an implementation
-choice consistent with the current manuscript's Hungarian matching description; the outdated
-proposal's stronger same-row assumption is not used.
-For five slots, all 120 permutations are scored directly on the GPU, solving the same assignment
-problem without a CPU round trip. Equal-cost ties select the first lexicographic permutation.
-
-EMA and stop-gradient also do not prove non-collapse or recovery of a sufficient Markov state
-(SCJEPA, PDF p.9, Assumption 2 and Remark 3). No reconstruction loss or anti-collapse regularizer
-has been added. Low latent prediction error alone is insufficient: inspect temporal variation,
-effective rank, object tracking, and held-out state probes before interpreting MCC/SHD.
-
-Run the complete dense-calibration and sparse pipeline on two L40s in one machine:
+Python 3.12, with the project virtual environment activated:
 
 ```bash
-bash scripts/l40_exp2_pipeline.sbatch visual_seed0 1e-5 0
-# Or on Slurm:
-sbatch scripts/l40_exp2_pipeline.sbatch visual_seed0 1e-5 0
-# One GPU or four GPUs: match the allocation to the fifth argument.
-sbatch --gres=gpu:1 scripts/l40_exp2_pipeline.sbatch visual_one 1e-5 0 300000 1
-sbatch --gres=gpu:4 scripts/l40_exp2_pipeline.sbatch visual_four 1e-5 0 300000 4
+python -m pip install -e '.[dev,logging]'
+OMP_NUM_THREADS=1 pytest
+ruff format --check .
+ruff check .
+pyright
+python scripts/smoke.py
 ```
 
-The first argument is a unique run tag; the remaining arguments are
-`LAMBDA_LOGIT [SEED] [STEPS] [GPUS]` (defaults: seed 0, 300,000 steps, two GPUs).
-Training uses one synchronized process per GPU and divides the global batch of four across
-them: two episodes per GPU on two L40s. The learning rate and number of optimizer/EMA updates
-stay the same. A single W&B run and checkpoint stream record the combined training run.
-Dense training, calibration, sparse training, and final evaluation remain sequential; evaluation
-uses one GPU. GPU communication and those serial stages limit speedup, which must be measured.
-Outputs go to `outputs/bounce_exp2_visual_seed0/{dense,main}`.
+The smoke uses random CPU tensors only, exercises image/vector forward/backward,
+regularizers, accumulation, and an EMA update, and writes no training artifacts.
+Tests also exercise two CPU Gloo processes. No GPU run is required.
 
-Before a full run, compare one- and two-GPU training throughput with
-`sbatch scripts/l40_exp2_benchmark.sbatch speed_check`. It runs 400 dense updates per GPU count
-with the same global batch and reports the final 100-step interval after warm-up in
-`outputs/bounce_exp2_benchmark_speed_check/benchmark.json`. It tests hardware scaling, not
-convergence. Training uses pinned image batches, nonblocking CUDA transfers, and computes
-monitoring metrics only at logging points. W&B throughput includes data loading and excludes
-evaluation, checkpoint writes, and logger calls; first-interval startup still counts.
+Reusable evaluation helpers cover ridge probes, nonlinear coordinate recovery,
+structural Hamming distance, and trajectory-error summaries. Callers supply
+reference coordinates, alignment, independent splits, and tolerances. Graph
+reachability, low loss, EMA, and representation regularization **do not prove
+injectivity or identifiability**.
 
-The launcher requires the corresponding physics preload, calibrates tau from the dense model's
-held-out raw constraint, rejects grossly collapsed dense references, and evaluates the
-sparse model on a disjoint split. Dense and sparse models learn separate target feature spaces;
-equal raw latent errors therefore need not imply equal physical fidelity. This is an exploratory
-experiment: the inherited `1e-5` logit coefficient and visual convergence have not been
-established by full runs.
-
-## Concise results to inspect
-
-Use the existing `eval/mcc`, `eval/shd`, and `eval/path_density` together with TF/T=2 losses and
-constraint/dual health. A low SHD with low MCC can be empty-graph collapse. Experiment 2 adds
-`slot_centroid_rmse`, `slot_switch_rate`, and `branch_slot_disagreement`, frozen linear probes
-(`position_probe_r2`, `velocity_probe_r2`), and one small `slot_tracks.png` panel.
-The probes fit on training episodes and score separate held-out episodes, using the prediction
-window in both cases. They test whether true states are linearly recoverable from the learned
-representation, not whether individual latent coordinates
-literally equal `(x,y,vx,vy)`. The slot panel shows allocations over frames and should make merged
-objects, background slots, and switching visible without adding a large gallery of plots.
-Its shared color scale is relative to uniform attention, so diffuse slots cannot look sharply
-localized through independent contrast stretching.
-
-A finite CPU smoke confirms that the implementation runs; successful identification still needs
-the L40 run and inspection of these held-out results.
+SIGReg is the only enabled representation regularizer. Upstream attribution
+and licensing are retained under
+[src/scjepa/third_party](src/scjepa/third_party/README.md). Local data, checkpoints,
+run outputs, logs, and unrelated notes are outside refactor cleanup.

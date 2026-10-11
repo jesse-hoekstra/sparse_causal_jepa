@@ -1,0 +1,115 @@
+{
+  "os": "Linux-6.8.0-136-generic-x86_64-with-glibc2.39",
+  "python": "CPython 3.12.9",
+  "startedAt": "2026-09-06T12:23:27.911086Z",
+  "args": [
+    "experiment=bounce_visual_to_visual",
+    "wandb.enabled=true",
+    "train.device=cuda",
+    "train.batch_size=4",
+    "train.num_workers=8",
+    "hydra.output_subdir=null",
+    "hydra/job_logging=disabled",
+    "train.lambda_logit=1e-5",
+    "train.seed=0",
+    "train.steps=300000",
+    "train.lambda_rollout_t2=1.0",
+    "train.num_rollout_t2_anchors=8",
+    "train.rollout_t2_horizon=2",
+    "train.oe_eval_horizon=30",
+    "data.seed=0",
+    "data.num_clips=100000",
+    "data.preload=data/bounce_train_v2_100000.pt",
+    "data.cache=false",
+    "data.render_radius_from_mass=false",
+    "data.uniform_appearance=true",
+    "model.spartan_dense=true",
+    "train.sparsity_enabled=false",
+    "wandb.run_tag=full_seed0_v1-dense",
+    "hydra.run.dir=outputs/bounce_exp2_full_seed0_v1/dense"
+  ],
+  "program": "/nfs/home/jesseh/sparse_causal_jepa/scripts/train.py",
+  "codePath": "scripts/train.py",
+  "codePathLocal": "scripts/train.py",
+  "git": {
+    "remote": "git@github.com:jesse-hoekstra/sparse_causal_jepa.git",
+    "commit": "691cf24f24696a6e51c833ee762ad0485d2f1384"
+  },
+  "email": "jesse.hoekstra@nuffield.ox.ac.uk",
+  "root": "/nfs/home/jesseh/sparse_causal_jepa",
+  "host": "omi-rapid-octagpu.omirapid.oxford-man.ox.ac.uk",
+  "executable": "/nfs/home/jesseh/sparse_causal_jepa/.venv/bin/python",
+  "cpu_count": 128,
+  "cpu_count_logical": 256,
+  "gpu": "NVIDIA L40",
+  "gpu_count": 8,
+  "disk": {
+    "/": {
+      "total": "529089576960",
+      "used": "28521091072"
+    }
+  },
+  "memory": {
+    "total": "1081945485312"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA L40",
+      "memoryTotal": "48305799168",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-808a88f1-8da9-785c-e556-938761217a75"
+    },
+    {
+      "name": "NVIDIA L40",
+      "memoryTotal": "48305799168",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-aaf2ac86-3a02-0cff-281c-2fed0793a3d0"
+    },
+    {
+      "name": "NVIDIA L40",
+      "memoryTotal": "48305799168",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-8c0c8929-a388-c495-64ff-426f4c357c72"
+    },
+    {
+      "name": "NVIDIA L40",
+      "memoryTotal": "48305799168",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-151055fe-e844-be71-f389-a200bb777bf2"
+    },
+    {
+      "name": "NVIDIA L40",
+      "memoryTotal": "48305799168",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-fdc67d25-8f82-6e80-88e7-ad450ef61434"
+    },
+    {
+      "name": "NVIDIA L40",
+      "memoryTotal": "48305799168",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-9d2d94d9-9c41-c9be-668a-6037a2e832f3"
+    },
+    {
+      "name": "NVIDIA L40",
+      "memoryTotal": "48305799168",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-49897f62-1ba4-ae91-e3f6-dcb0e933aa4e"
+    },
+    {
+      "name": "NVIDIA L40",
+      "memoryTotal": "48305799168",
+      "cudaCores": 18176,
+      "architecture": "Ada",
+      "uuid": "GPU-72003117-fed5-d4c2-a79a-b0b9bdbdeef1"
+    }
+  ],
+  "cudaVersion": "13.3",
+  "writerId": "g7c9lmbb6088s3vd1dgogqi3nw5k1kta"
+}

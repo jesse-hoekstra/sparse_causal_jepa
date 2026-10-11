@@ -1,22 +1,10 @@
-"""Training loop for the state-to-state SCJEPA regime.
-
-The fixed predictive objective is::
-
-    L_pred = L_TF + lambda_rollout_t2 * L_AR2
-
-where ``L_TF`` uses every true suffix transition and ``L_AR2`` is the mean
-endpoint error from independently sampled, true-anchored two-step windows. The
-GECO constraint sees that same predictive sum plus the existing logit term. No
-rollout curriculum, horizon schedule, recurrent gradient cut, or full-rollout
-backpropagation exists in this loop. K=30 is evaluated only by the held-out,
-no-gradient harness.
-"""
+"""Generic latent-prediction training, accumulation, EMA, and portable checkpoints."""
 
 import math
 import random
 import time
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping, Sized
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -26,22 +14,22 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 
-from scjepa.eval.harness import evaluate_identifiability
-from scjepa.losses import aligned_mse, rollout_t2_endpoint_mse
-from scjepa.models.state_to_state import StateToStateModel, TransitionOutput
-from scjepa.models.visual_to_visual import VISUAL_CONSTRAINT_VERSION, VisualToVisualModel
+from scjepa.data.compatibility import validate_model_dataset
+from scjepa.data.identity import dataset_fingerprint
+from scjepa.losses import RegularizerKind, RepresentationRegularizer, prediction_mse
+from scjepa.models.model import SCJEPA, ModelOutput
 from scjepa.training.distributed import (
     GlobalBatchSampler,
     any_rank,
     distributed_barrier,
+    gather_batch_tensor,
     gather_rank_objects,
     is_main_process,
     mean_metrics,
-    mean_tensor,
     rank,
     world_size,
 )
-from scjepa.training.lagrangian import SparsityLagrangian
+from scjepa.training.rng import preserve_rng
 
 
 def seed_everything(seed: int) -> None:
@@ -52,578 +40,685 @@ def seed_everything(seed: int) -> None:
 
 
 class MetricLogger(Protocol):
-    """Minimal logging interface so W&B never blocks tests or CI."""
+    """Small optional logging interface."""
 
     def log(self, step: int, metrics: dict[str, float]) -> None:
-        """Record one step's scalar metrics."""
+        """Record scalar metrics."""
         ...
 
 
 class NoopLogger:
-    """Logger that drops everything."""
+    """Logger that drops metrics."""
 
     def log(self, step: int, metrics: dict[str, float]) -> None:
-        """Drop the metrics."""
+        """Drop metrics."""
+
+
+@dataclass
+class ObjectiveConfig:
+    """Explicit additive loss weights; all auxiliary terms are opt-in."""
+
+    state_sparsity_weight: float = 0.0
+    action_sparsity_weight: float = 0.0
+    parameter_sparsity_weight: float = 0.0
+    logit_weight: float = 0.0
+    state_regularizer: str = "none"
+    parameter_regularizer: str = "none"
+    state_regularizer_weight: float = 0.0
+    parameter_regularizer_weight: float = 0.0
+    regularizer_num_projections: int = 256
+
+    def __post_init__(self) -> None:
+        """Reject invalid weights and silently ineffective regularization settings."""
+        for name, value in asdict(self).items():
+            if name.endswith("_weight") and (not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and non-negative")
+        for kind, weight in (
+            (self.state_regularizer, self.state_regularizer_weight),
+            (self.parameter_regularizer, self.parameter_regularizer_weight),
+        ):
+            if kind not in {"none", "sigreg"}:
+                raise ValueError("regularizer must be none or sigreg")
+            if kind == "none" and weight != 0:
+                raise ValueError("a nonzero regularizer weight requires sigreg")
+        if self.regularizer_num_projections < 1:
+            raise ValueError("regularizer_num_projections must be positive")
+
+
+class TrainingObjective(nn.Module):
+    """Prediction MSE plus independent graph, logit, and representation terms.
+
+    Representation statistics use the local batch on each distributed rank.
+    State samples have shape ``(T, B, d_z)``; parameter samples ``(1, B, d_theta)``.
+    Parameter regularization requires unique episode IDs, validated by Trainer
+    across all ranks. It never counts repeated times as new parameter samples.
+    """
+
+    def __init__(self, config: ObjectiveConfig) -> None:
+        """Construct optional upstream regularizers."""
+        super().__init__()
+        self.config = config
+        self.state_regularizer = RepresentationRegularizer(
+            cast(RegularizerKind, config.state_regularizer), config.regularizer_num_projections
+        )
+        self.parameter_regularizer = RepresentationRegularizer(
+            cast(RegularizerKind, config.parameter_regularizer), config.regularizer_num_projections
+        )
+
+    def forward(self, output: ModelOutput) -> tuple[Tensor, dict[str, Tensor]]:
+        """Compute scalar terms without a rollout or experiment-specific schedule."""
+        config = self.config
+        terms = {
+            "prediction": prediction_mse(output.predictions, output.targets),
+            "state_sparsity": torch.stack([item.sparsity.state for item in output.dynamics]).mean(),
+            "action_sparsity": torch.stack(
+                [item.sparsity.action for item in output.dynamics]
+            ).mean(),
+            "parameter_sparsity": torch.stack(
+                [item.sparsity.parameter for item in output.dynamics]
+            ).mean(),
+            "logit": torch.stack([item.logit_penalty for item in output.dynamics]).mean(),
+        }
+        total = terms["prediction"]
+        for name, weight in (
+            ("state_sparsity", config.state_sparsity_weight),
+            ("action_sparsity", config.action_sparsity_weight),
+            ("parameter_sparsity", config.parameter_sparsity_weight),
+            ("logit", config.logit_weight),
+        ):
+            if weight:
+                total = total + weight * terms[name]
+        if config.state_regularizer_weight:
+            terms["state_regularizer"] = self.state_regularizer(
+                output.online_states.transpose(0, 1)
+            )
+            total = total + config.state_regularizer_weight * terms["state_regularizer"]
+        if config.parameter_regularizer_weight:
+            terms["parameter_regularizer"] = self.parameter_regularizer(
+                output.parameters.unsqueeze(0)
+            )
+            total = total + config.parameter_regularizer_weight * terms["parameter_regularizer"]
+        return total, terms
+
+
+class _LossForward(nn.Module):
+    """Expose only the optimized graph to DDP's unused-parameter discovery."""
+
+    def __init__(self, model: SCJEPA, objective: TrainingObjective) -> None:
+        super().__init__()
+        self.model = model
+        self.objective = objective
+
+    def forward(
+        self, observations: Tensor, actions: Tensor | None
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        output = cast(ModelOutput, self.model(observations, actions))
+        total, terms = self.objective.forward(output)
+        return total, {name: value.detach() for name, value in terms.items()}
 
 
 @dataclass
 class TrainConfig:
-    """Fixed training protocol and ordinary run-health configuration."""
+    """Optimizer and run-health settings, independent of scientific protocols.
 
-    steps: int
-    batch_size: int
-    lr: float = 5e-5
+    ``steps`` counts consumed microbatches. ``batch_size`` is the total number
+    of episodes per microbatch over all distributed ranks. Updates average
+    ``accumulation_steps`` equal-sized microbatches.
+    """
+
+    steps: int = 1
+    batch_size: int = 8
+    lr: float = 1e-3
+    weight_decay: float = 0.0
     grad_clip: float = 1.0
-    sparsity_enabled: bool = True
-    sparsity_tau: float = 0.1
-    sparsity_step_size: float = 2e-2
-    sparsity_lambda_init: float = 1e4
-    sparsity_momentum: float = 0.99
-    lambda_logit: float = 0.0
-    # Both experiments use endpoint-only T=2 windows, without a schedule.
-    lambda_rollout_t2: float = 1.0
-    num_rollout_t2_anchors: int = 8
-    rollout_t2_horizon: int = 2
-    # No-gradient held-out trajectory diagnostic.
-    oe_eval_horizon: int = 30
-    oe_tolerance_nrmse: float = 0.10
-    oe_coordinate_std: tuple[float, ...] | None = None
+    grad_skip_threshold: float = math.inf
+    grad_skip_max_consecutive: int = 100
+    accumulation_steps: int = 1
     seed: int = 0
     device: str = "cpu"
-    context_len: int | None = None
-    eval_every: int | None = None
-    grad_skip_threshold: float = 1e3
-    grad_skip_max_consecutive: int = 2000
     num_workers: int = 0
-    prefetch_factor: int = 4
-    log_every: int = 10
-    checkpoint_every: int = 200
-    checkpoint_keep_every: int | None = None
+    prefetch_factor: int = 2
+    log_every: int = 1
+    checkpoint_every: int | None = None
     out_dir: str = "outputs"
+    objective: ObjectiveConfig = field(default_factory=ObjectiveConfig)
+
+    def __post_init__(self) -> None:
+        """Validate numerical and batching controls."""
+        for name in (
+            "steps",
+            "batch_size",
+            "accumulation_steps",
+            "grad_skip_max_consecutive",
+            "prefetch_factor",
+            "log_every",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be positive")
+        if self.num_workers < 0 or (
+            self.checkpoint_every is not None and self.checkpoint_every < 1
+        ):
+            raise ValueError("num_workers must be non-negative and checkpoint_every positive")
+        for name in ("lr", "grad_clip"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not math.isfinite(self.weight_decay) or self.weight_decay < 0:
+            raise ValueError("weight_decay must be finite and non-negative")
+        if math.isnan(self.grad_skip_threshold) or self.grad_skip_threshold < 0:
+            raise ValueError("grad_skip_threshold must be non-negative")
 
 
 class Trainer:
-    """Train on one device or synchronized replicas, with a fixed global batch."""
+    """Train an SCJEPA with synchronized skip decisions and one EMA per update."""
 
     def __init__(
         self,
-        model: StateToStateModel | VisualToVisualModel,
-        dataset: Dataset[dict[str, Tensor]],
+        model: SCJEPA,
         config: TrainConfig,
+        dataset: Dataset[dict[str, Tensor]] | None = None,
         logger: MetricLogger | None = None,
-        eval_dataset: Dataset[dict[str, Tensor]] | None = None,
+        model_config: Mapping[str, object] | None = None,
+        dataset_identity: str | None = None,
     ) -> None:
-        """Build the optimizer and dual controller around a fixed objective."""
-        # Model construction uses one common seed; stochastic episodes, gates,
-        # and T=2 anchors then receive an independent stream on each rank.
+        """Validate inputs and bind dataset identity before constructing the optimizer.
+
+        Built-in datasets declare their provenance fingerprint. Other deterministic
+        datasets receive a streamed content fingerprint. An explicit identity may
+        describe caller-managed ``train_step`` data when ``dataset`` is absent;
+        it cannot replace or bypass the identity of a supplied dataset.
+        """
+        if dataset_identity is not None and not dataset_identity:
+            raise ValueError("dataset_identity must be a nonempty string when supplied")
+        if dataset is not None:
+            validate_model_dataset(model, dataset)
+            inferred_identity = dataset_fingerprint(dataset)
+            if dataset_identity is not None and dataset_identity != inferred_identity:
+                raise ValueError("dataset_identity differs from the supplied dataset fingerprint")
+            dataset_identity = inferred_identity
+        self.dataset_identity = dataset_identity
+        # Generic tracking metadata is independent of model/data/optimizer state.
+        # The CLI fills this after resuming and initializing its rank-zero logger.
+        self.run_metadata: dict[str, object] = {}
+        self.validation_state: dict[str, str | float | int | None] = {}
+        self.interrupted = False
         seed_everything(config.seed + rank() * 1_000_003)
-        if config.eval_every is not None and eval_dataset is None:
-            raise ValueError("eval_every set but no eval_dataset provided")
         self.config = config
-        self.eval_dataset = eval_dataset
         self.device = torch.device(config.device)
         self.model = model.to(self.device)
+        self.model_config = dict(model_config) if model_config is not None else None
         self.dataset = dataset
         self.logger: MetricLogger = logger if logger is not None else NoopLogger()
-        self._validate_fixed_protocol()
-        self._forward_model: nn.Module = self.model
+        if config.batch_size % world_size():
+            raise ValueError("batch_size must be divisible by world_size")
+        self.objective = TrainingObjective(config.objective).to(self.device)
+        self._loss_model = _LossForward(self.model, self.objective)
+        self._forward_model: nn.Module = self._loss_model
         if world_size() > 1:
-            print(f"[rank {rank()}] Initializing DDP on {self.device}...", flush=True)
             self._forward_model = DistributedDataParallel(
-                self.model,
+                self._loss_model,
                 device_ids=[self.device.index] if self.device.type == "cuda" else None,
-                # Buffers are fixed architecture/codebooks. EMA updates follow
-                # synchronized optimizer updates; no forward broadcast needed.
                 broadcast_buffers=False,
-                # SAVi retains unused upstream prior parameters, and reference
-                # predictors can bypass gates. Detect these rather than hang.
                 find_unused_parameters=True,
             )
-            print(f"[rank {rank()}] DDP ready.", flush=True)
-        self.lagrangian = SparsityLagrangian(
-            tau=config.sparsity_tau,
-            step_size=config.sparsity_step_size,
-            lambda_init=config.sparsity_lambda_init,
-            momentum=config.sparsity_momentum,
-        ).to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr)
-
-        batches_per_epoch = len(self._epoch_loader(0))
-        if batches_per_epoch == 0:
-            raise ValueError(
-                f"dataset yields no batches: {len(self._epoch_loader(0).dataset)} episodes "  # pyright: ignore[reportArgumentType]
-                f"with batch_size={config.batch_size} and drop_last=True. Raise "
-                "data.num_clips to at least the batch size, or lower train.batch_size."
-            )
+        self._parameters = tuple(
+            parameter for parameter in self.model.parameters() if parameter.requires_grad
+        )
+        target_ids = {id(parameter) for parameter in self.model.target_encoder.parameters()}
+        if any(id(parameter) in target_ids for parameter in self._parameters):
+            raise ValueError("target encoder parameters must be frozen")
+        self.optimizer = torch.optim.AdamW(
+            self._parameters, lr=config.lr, weight_decay=config.weight_decay
+        )
         self.step = 0
+        self.optimizer_steps = 0
         self.total_skips = 0
         self.consecutive_skips = 0
+        self._accumulated = 0
+        self._accumulation_batch_size: int | None = None
+        self.discarded_microbatches = 0
+        if dataset is not None and len(self._epoch_loader(0)) == 0:
+            raise ValueError("dataset yields no full batches; lower batch_size or add episodes")
 
-    def _validate_fixed_protocol(self) -> None:
-        """Reject invalid fixed T=2/OE settings before the first batch."""
-        config = self.config
-        if config.rollout_t2_horizon != 2:
-            raise ValueError(f"rollout_t2_horizon must equal 2, got {config.rollout_t2_horizon}")
-        if not math.isfinite(config.lambda_rollout_t2) or config.lambda_rollout_t2 < 0:
-            raise ValueError("lambda_rollout_t2 must be finite and non-negative")
-        if config.num_rollout_t2_anchors < 1:
-            raise ValueError("num_rollout_t2_anchors must be positive")
-        if config.oe_eval_horizon < 1:
-            raise ValueError("oe_eval_horizon must be positive")
-        if not math.isfinite(config.oe_tolerance_nrmse) or config.oe_tolerance_nrmse < 0:
-            raise ValueError("oe_tolerance_nrmse must be finite and non-negative")
-        if config.eval_every is not None and isinstance(self.model, StateToStateModel):
-            scales = config.oe_coordinate_std
-            if scales is None or not scales:
-                raise ValueError("state-to-state evaluation requires fixed oe_coordinate_std")
-            if any(not math.isfinite(value) or value <= 0 for value in scales):
-                raise ValueError("oe_coordinate_std must contain finite positive values")
+    @property
+    def pending_microbatches(self) -> int:
+        """Number of accumulated microbatches awaiting an optimizer update."""
+        return self._accumulated
 
-    # ------------------------------------------------------------- data ----
     def _epoch_loader(self, epoch: int) -> DataLoader[dict[str, Tensor]]:
-        """Create deterministic per-epoch shuffling so resume replays order."""
-        generator = torch.Generator()
-        generator.manual_seed(self.config.seed * 100_003 + epoch)
+        if self.dataset is None:
+            raise ValueError("train() requires a dataset")
+        generator = torch.Generator().manual_seed(self.config.seed * 100_003 + epoch)
         workers = self.config.num_workers
-        if world_size() > 1:
-            return DataLoader(
-                self.dataset,
-                batch_sampler=GlobalBatchSampler(
-                    dataset_size=len(self.dataset),  # pyright: ignore[reportArgumentType]
-                    batch_size=self.config.batch_size,
-                    seed=self.config.seed,
-                    epoch=epoch,
-                ),
-                generator=generator,
-                num_workers=workers,
-                pin_memory=self.device.type == "cuda",
-                persistent_workers=workers > 0,
-                prefetch_factor=self.config.prefetch_factor if workers > 0 else None,
-                # NCCL is not fork-safe after group initialization.
-                multiprocessing_context="spawn" if workers > 0 else None,
-            )
         return DataLoader(
             self.dataset,
-            batch_size=self.config.batch_size,
-            shuffle=True,
+            batch_sampler=GlobalBatchSampler(
+                dataset_size=len(cast(Sized, self.dataset)),
+                batch_size=self.config.batch_size,
+                seed=self.config.seed,
+                epoch=epoch,
+            ),
             generator=generator,
-            drop_last=True,
             num_workers=workers,
             pin_memory=self.device.type == "cuda",
             persistent_workers=workers > 0,
             prefetch_factor=self.config.prefetch_factor if workers > 0 else None,
+            multiprocessing_context="spawn" if workers > 0 else None,
         )
 
     def _batches(self) -> Iterator[dict[str, Tensor]]:
-        """Yield an endless batch stream, fast-forwarding on resume."""
-        first_loader = self._epoch_loader(0)
-        steps_per_epoch = len(first_loader)
-        epoch = self.step // steps_per_epoch
-        skip = self.step % steps_per_epoch
+        steps_per_epoch = len(self._epoch_loader(0))
+        epoch, skip = divmod(self.step, steps_per_epoch)
         while True:
             for index, batch in enumerate(self._epoch_loader(epoch)):
-                if skip and index < skip:
-                    continue
-                yield batch
-            skip = 0
-            epoch += 1
+                if index >= skip:
+                    yield batch
+            epoch, skip = epoch + 1, 0
 
-    # ------------------------------------------------------------ hooks ----
-    def _sparsity_active(self) -> bool:
-        """The fixed protocol applies sparsity from the first sparse update."""
-        return self.config.sparsity_enabled
+    def _validate_regularization_batch(self, batch: Mapping[str, Tensor]) -> None:
+        config = self.config.objective
+        if (config.state_regularizer_weight or config.parameter_regularizer_weight) and any_rank(
+            batch["observations"].shape[0] < 2, self.device
+        ):
+            raise ValueError("regularization requires at least two episodes per local batch")
+        if not config.parameter_regularizer_weight:
+            return
+        ids = batch.get("episode_ids")
+        bad_ids = ids is None or ids.ndim != 1 or ids.shape[0] != batch["observations"].shape[0]
+        if any_rank(bad_ids, self.device):
+            raise ValueError("parameter regularization requires episode_ids with shape (B,)")
+        assert ids is not None
+        ids = gather_batch_tensor(ids.to(self.device))
+        unique_ids = cast(Tensor, ids.unique())  # pyright: ignore[reportUnknownMemberType]
+        if unique_ids.numel() != ids.numel():
+            raise ValueError("parameter regularization requires distinct episodes in each batch")
 
-    def _forward(self, batch: dict[str, Tensor]) -> TransitionOutput:
-        """Run teacher forcing and, when weighted, exactly eight T=2 windows."""
-        states = batch["states"].to(self.device, non_blocking=self.device.type == "cuda")
-        # A zero coefficient bypasses sampling and both auxiliary predictor
-        # calls. This preserves TF tensors and the post-forward RNG state.
-        anchors = self.config.num_rollout_t2_anchors if self.config.lambda_rollout_t2 > 0 else 0
-        return cast(
-            TransitionOutput,
-            self._forward_model(
-                states,
-                context_len=self.config.context_len,
-                num_rollout_t2_anchors=anchors,
-            ),
-        )
+    def _forward(self, batch: Mapping[str, Tensor]) -> tuple[Tensor, dict[str, Tensor]]:
+        observations = batch["observations"].to(self.device, non_blocking=True)
+        actions = batch.get("actions")
+        if actions is not None:
+            actions = actions.to(self.device, non_blocking=True)
+        return cast(tuple[Tensor, dict[str, Tensor]], self._forward_model(observations, actions))
 
-    def _teacher_forcing_loss(self, output: TransitionOutput) -> Tensor:
-        """Teacher-forced prediction loss; subclasses may change alignment."""
-        return aligned_mse(output.prediction, output.target)
+    def discard_accumulation(self) -> None:
+        """Explicitly discard a partial accumulation group without an EMA update."""
+        self.discarded_microbatches += self._accumulated
+        self._accumulated = 0
+        self._accumulation_batch_size = None
+        self.optimizer.zero_grad(set_to_none=True)
 
-    def _auxiliary_loss(self, output: TransitionOutput) -> Tensor:
-        """Endpoint-only T=2 loss, or exact zero for the lambda=0 ablation."""
-        if output.rollout_t2_prediction is None:
-            return torch.zeros((), device=self.device)
-        assert output.rollout_t2_target is not None
-        return rollout_t2_endpoint_mse(output.rollout_t2_prediction, output.rollout_t2_target)
+    def _skip(self) -> None:
+        self.discard_accumulation()
+        self.total_skips += 1
+        self.consecutive_skips += 1
+        if self.consecutive_skips >= self.config.grad_skip_max_consecutive:
+            raise RuntimeError("too many consecutive rejected updates")
 
-    def _auxiliary_weight(self) -> float:
-        """Return the fixed state-to-state T=2 coefficient."""
-        return self.config.lambda_rollout_t2
+    def train_step(self, batch: Mapping[str, Tensor]) -> dict[str, float]:
+        """Consume one microbatch, updating EMA only after a successful optimizer step.
 
-    def _constraint(self, predictive_loss: Tensor, logit_loss: Tensor, output: object) -> Tensor:
-        """GECO bound: predictive sum plus logit term, excluding path/OE."""
-        del output
-        return mean_tensor(predictive_loss + logit_loss)
-
-    def _after_optimizer_step(self, output: TransitionOutput) -> None:
-        """Hook for the visual-to-visual EMA update."""
-
-    def _extra_metrics(self, output: TransitionOutput) -> dict[str, float]:
-        """Return experiment-specific metrics."""
-        del output
-        return {}
-
-    def _predictive_metrics(
-        self,
-        teacher_forcing: Tensor,
-        raw_auxiliary: Tensor,
-        weighted_auxiliary: Tensor,
-        total: Tensor,
-    ) -> dict[str, float]:
-        """Minimal state-to-state loss logging requested by the fixed protocol."""
-        return {
-            "train/loss_teacher_forcing": teacher_forcing.item(),
-            "train/loss_rollout_t2_raw": raw_auxiliary.item(),
-            "train/loss_rollout_t2_weighted": weighted_auxiliary.item(),
-            "train/loss_total": total.item(),
+        A nonfinite loss or gradient on any rank discards the entire accumulated
+        group on every rank. Gradients are synchronized on every microbatch;
+        they are clipped only when the complete group is ready for an update.
+        """
+        self.model.train()
+        batch_size = batch["observations"].shape[0]
+        if any_rank(batch_size != self.config.batch_size // world_size(), self.device):
+            raise ValueError("local episode count must equal batch_size / world_size")
+        self._validate_regularization_batch(batch)
+        if (
+            self._accumulation_batch_size is not None
+            and batch_size != self._accumulation_batch_size
+        ):
+            raise ValueError("accumulated microbatches must have equal episode counts")
+        self._accumulation_batch_size = batch_size
+        total, terms = self._forward(batch)
+        self.step += 1
+        rejected = any_rank(~torch.isfinite(total), self.device)
+        if rejected:
+            # Finish DDP's reducer traversal even for a rejected forward. Any
+            # gradients from this backward are discarded, never applied.
+            if world_size() > 1:
+                (total.nan_to_num() * 0).backward()  # pyright: ignore[reportUnknownMemberType]
+            self._skip()
+            grad_norm = total.new_tensor(math.nan)
+            updated = False
+        else:
+            (total / self.config.accumulation_steps).backward()  # pyright: ignore[reportUnknownMemberType]
+            self._accumulated += 1
+            grad_norm = torch.nn.utils.clip_grad_norm_(self._parameters, math.inf)
+            rejected = any_rank(~torch.isfinite(grad_norm), self.device)
+            updated = False
+            if not rejected and self._accumulated == self.config.accumulation_steps:
+                rejected = any_rank(grad_norm > self.config.grad_skip_threshold, self.device)
+                if not rejected:
+                    torch.nn.utils.clip_grad_norm_(self._parameters, self.config.grad_clip)
+                    self.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+                    self.model.update_target()
+                    self.optimizer_steps += 1
+                    self.consecutive_skips = 0
+                    self._accumulated = 0
+                    self._accumulation_batch_size = None
+                    self.optimizer.zero_grad(set_to_none=True)
+                    updated = True
+            if rejected:
+                self._skip()
+        return {f"loss/{name}": float(value.detach()) for name, value in terms.items()} | {
+            "loss/total": float(total.detach()),
+            "health/grad_norm": float(grad_norm),
+            "health/skipped": float(rejected),
+            "health/skipped_steps": float(self.total_skips),
+            "health/optimizer_steps": float(self.optimizer_steps),
+            "health/updated": float(updated),
+            "health/pending_microbatches": float(self._accumulated),
         }
 
-    def _branch_gradient_metrics(
-        self,
-        teacher_forcing: Tensor,
-        weighted_auxiliary: Tensor,
-        auxiliary_enabled: bool,
-    ) -> dict[str, float]:
-        """Compute branch norms only on logging steps to limit retained work."""
-        metrics = {"train/grad_norm_teacher_forcing": self._branch_gradient_norm(teacher_forcing)}
-        if auxiliary_enabled:
-            metrics["train/grad_norm_rollout_t2_weighted"] = self._branch_gradient_norm(
-                weighted_auxiliary
-            )
-        return metrics
-
-    def _branch_gradient_norm(self, loss: Tensor) -> float:
-        """Global pre-clip norm of one branch without changing ``.grad``."""
-        parameters = tuple(
-            parameter for parameter in self.model.parameters() if parameter.requires_grad
-        )
-        gradients = cast(
-            tuple[Tensor | None, ...],
-            torch.autograd.grad(
-                loss,
-                parameters,
-                retain_graph=True,
-                allow_unused=True,
-            ),
-        )
-        squared_norm: Tensor | None = None
-        for gradient in gradients:
-            if gradient is None:
-                continue
-            contribution = gradient.detach().square().sum()
-            squared_norm = contribution if squared_norm is None else squared_norm + contribution
-        return 0.0 if squared_norm is None else float(squared_norm.sqrt())
-
-    # ------------------------------------------------------------- steps ----
-    def _train_step(
-        self, batch: dict[str, Tensor], *, collect_metrics: bool = True
-    ) -> dict[str, float]:
-        """Execute one optimizer attempt; materialize metrics only when requested.
-
-        Loss/gradient rejection and optimizer, EMA, and GECO updates always run.
-        Direct callers retain scalar results by default; the main loop avoids
-        monitoring reductions and device-to-host copies on unlogged steps.
-        """
-        output = self._forward(batch)
-        teacher_forcing = self._teacher_forcing_loss(output)
-        raw_auxiliary = self._auxiliary_loss(output)
-        weighted_auxiliary = self._auxiliary_weight() * raw_auxiliary
-        predictive_loss = teacher_forcing + weighted_auxiliary
-        logit_loss = self.config.lambda_logit * output.logit_penalty
-        total = predictive_loss + logit_loss
-        sparsity_active = self._sparsity_active()
-        if sparsity_active:
-            total = total + self.lagrangian.penalty_weight * output.sparsity
-        constraint = self._constraint(predictive_loss, logit_loss, output)
-
-        if any_rank(~torch.isfinite(total), self.device):
-            raise RuntimeError(
-                f"non-finite loss on at least one rank at step {self.step}: "
-                f"local tf={teacher_forcing.item():.4g} "
-                f"rollout_t2={weighted_auxiliary.item():.4g} "
-                f"sparsity={output.sparsity.item():.4g}"
-            )
-
-        branch_grad_metrics: dict[str, float] = {}
-        diagnostic_step = self.step + 1
-        log_step = (
-            diagnostic_step % self.config.log_every == 0 or diagnostic_step == self.config.steps
-        )
-        if collect_metrics and world_size() == 1 and log_step:
-            # DDP requires .backward() accumulation and does not support these
-            # extra autograd.grad traversals. Global total gradient norm is
-            # still logged in every distributed run.
-            branch_grad_metrics = self._branch_gradient_metrics(
-                teacher_forcing,
-                weighted_auxiliary,
-                getattr(output, "rollout_t2_prediction", None) is not None,
-            )
-
-        self.optimizer.zero_grad(set_to_none=True)
-        total.backward()  # pyright: ignore[reportUnknownMemberType]
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-        skip = any_rank(
-            ~torch.isfinite(grad_norm) | (grad_norm > self.config.grad_skip_threshold),
-            self.device,
-        )
-        if skip:
-            self.optimizer.zero_grad(set_to_none=True)
-            self.total_skips += 1
-            self.consecutive_skips += 1
-            if self.consecutive_skips >= self.config.grad_skip_max_consecutive:
-                raise RuntimeError(
-                    f"{self.consecutive_skips} consecutive grad-spike skips at step "
-                    f"{self.step} (grad_norm={float(grad_norm):.3g}): the model is no "
-                    "longer trainable — resume from the last healthy checkpoint."
-                )
-        else:
-            self.consecutive_skips = 0
-            self.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
-            self._after_optimizer_step(output)
-            if sparsity_active:
-                self.lagrangian.update(constraint)
-
-        if not collect_metrics:
-            return {}
-
-        # The episode-level parameter width names the decoded state-token rows
-        # in both experiments, independently of flattened transition axes.
-        num_decoded = output.causal_params.shape[1]
-        return (
-            # Collapse spectra and distributed gathers are monitoring only;
-            # calculate them when their values will actually be logged.
-            (self._extra_metrics(output) if log_step else {})
-            | self._predictive_metrics(
-                teacher_forcing,
-                raw_auxiliary,
-                weighted_auxiliary,
-                total,
-            )
-            | branch_grad_metrics
-            | {
-                "loss/logit": logit_loss.item(),
-                "loss/sparsity": output.sparsity.item(),
-                "attention/logit_penalty": output.logit_penalty.item(),
-                "attention/mean_abs_logit": output.mean_abs_logit.item(),
-                "attention/gate_entropy": output.gate_entropy.item(),
-                "sparsity/constraint": constraint.item(),
-                "sparsity/lambda": float(torch.exp(self.lagrangian.log_lambda)),
-                "sparsity/path_density": (output.path_matrix[:, :num_decoded] >= 0.5)
-                .float()
-                .mean()
-                .item(),
-                "sparsity/path_density_full": (output.path_matrix >= 0.5).float().mean().item(),
-                "sparsity/active": float(sparsity_active),
-                "health/grad_norm": float(grad_norm),
-                "health/skipped_steps": float(self.total_skips),
-            }
-        )
-
-    def train(self) -> dict[str, float]:
-        """Run through ``config.steps`` attempted batches."""
-        self.model.train()
-        out_dir = Path(self.config.out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        metrics: dict[str, float] = {}
-        batches = self._batches()
-        self._synchronize_device()
-        interval_started = time.perf_counter()
-        interval_step = self.step
-        interval_training_seconds = 0.0
-        first_step = self.step
-        print(f"[rank {rank()}] Loading first training batch...", flush=True)
-        while self.step < self.config.steps:
-            upcoming_step = self.step + 1
-            log_step = (
-                upcoming_step % self.config.log_every == 0 or upcoming_step == self.config.steps
-            )
-            batch = next(batches)
-            if self.step == first_step:
-                print(f"[rank {rank()}] First batch ready; running first update...", flush=True)
-            metrics = self._train_step(batch, collect_metrics=log_step)
-            self.step += 1
-            if self.step == first_step + 1:
-                print(f"[rank {rank()}] First update finished.", flush=True)
-            eval_step = (
-                self.config.eval_every is not None
-                and self.eval_dataset is not None
-                and (self.step % self.config.eval_every == 0 or self.step == self.config.steps)
-            )
-            rolling_checkpoint = self.step % self.config.checkpoint_every == 0
-            kept_checkpoint = (
-                self.config.checkpoint_keep_every is not None
-                and self.step % self.config.checkpoint_keep_every == 0
-            )
-            pause_training_timer = log_step or eval_step or rolling_checkpoint or kept_checkpoint
-            if pause_training_timer:
-                # CUDA launches are asynchronous. Finish the measured training
-                # work before pausing, without imposing a new per-step sync.
-                self._synchronize_device()
-                interval_training_seconds += time.perf_counter() - interval_started
-            if log_step:
-                metrics = mean_metrics(metrics, self.device)
-                seconds_per_step = interval_training_seconds / (self.step - interval_step)
-                metrics["train/seconds_per_step"] = seconds_per_step
-                metrics["train/episodes_per_second"] = self.config.batch_size / seconds_per_step
-                if is_main_process():
-                    self.logger.log(self.step, metrics)
-                interval_training_seconds, interval_step = 0.0, self.step
-            if eval_step:
-                # Evaluation uses the unwrapped model and the original global
-                # batch size, preserving dense calibration's variance ruler.
-                distributed_barrier()
-                if is_main_process():
-                    self.logger.log(self.step, self._eval_step())
-                distributed_barrier()
-            if rolling_checkpoint:
-                self.save_checkpoint(out_dir / "last.pt")
-            if kept_checkpoint:
-                self.save_checkpoint(out_dir / f"step_{self.step}.pt")
-            if pause_training_timer:
-                # Evaluation/checkpoint/logging time is excluded, including any
-                # queued CUDA work from those operations. Data loading stays in.
-                self._synchronize_device()
-                interval_started = time.perf_counter()
+    def _log_metrics(self, metrics: dict[str, float]) -> None:
+        error: Exception | None = None
         if is_main_process():
-            print("Training finished; saving final checkpoint...", flush=True)
-        self.save_checkpoint(out_dir / "last.pt")
+            try:
+                self.logger.log(self.step, metrics)
+            except Exception as caught:
+                error = caught
+        if any_rank(error is not None, self.device):
+            raise RuntimeError("metric logging failed on rank zero") from error
+
+    def _run_validation(
+        self, callback: Callable[[SCJEPA], dict[str, float]], selection_metric: str
+    ) -> dict[str, float]:
+        """Protect training RNG/modes and synchronize a rank-zero callback result."""
+        metrics: dict[str, float] = {}
+        error: Exception | None = None
+        if is_main_process():
+            modes = [(module, module.training) for module in self.model.modules()]
+            self.model.eval()
+            try:
+                # Evaluation can fit its own probes. Learned model extraction
+                # should use no_grad inside the callback, without preventing
+                # gradients for those separate evaluation-only modules.
+                with preserve_rng(self.device):
+                    metrics = callback(self.model)
+                if selection_metric not in metrics:
+                    raise ValueError(f"validation metrics require {selection_metric!r}")
+                if any(not math.isfinite(value) for value in metrics.values()):
+                    raise ValueError("validation metrics must be finite")
+            except Exception as caught:
+                error = caught
+            finally:
+                for module, mode in modes:
+                    module.training = mode
+                self.model.target_encoder.eval()
+        if any_rank(error is not None, self.device):
+            raise RuntimeError("validation failed on rank zero") from error
+        metrics = cast(dict[str, float], gather_rank_objects(metrics)[0])
+        score = metrics[selection_metric]
+        previous = self.validation_state.get("best_score")
+        improved = previous is None or score < float(previous)
+        self.validation_state["last_step"] = self.step
+        if improved:
+            self.validation_state["best_score"] = score
+            self.validation_state["best_step"] = self.step
+        self._log_metrics(metrics)
+        if improved:
+            self.save_checkpoint(Path(self.config.out_dir) / "best.pt")
         return metrics
 
-    def _synchronize_device(self) -> None:
-        """Finish pending CUDA work only when starting or pausing a timed interval."""
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+    def train(
+        self,
+        validation_callback: Callable[[SCJEPA], dict[str, float]] | None = None,
+        validation_every: int | None = None,
+        selection_metric: str = "validation/physical_prediction_nrmse",
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> dict[str, float]:
+        """Consume ``config.steps`` microbatches, resuming deterministic dataset order.
 
-    def _eval_step(self) -> dict[str, float]:
-        """Run deterministic held-out identifiability and K=30 OE evaluation."""
-        assert self.eval_dataset is not None
-        report = evaluate_identifiability(
-            cast(StateToStateModel, self.model),
-            self.eval_dataset,
-            batch_size=self.config.batch_size,
-            device=self.config.device,
-            context_len=self.config.context_len,
-            lambda_logit=self.config.lambda_logit,
-            lambda_rollout_t2=self.config.lambda_rollout_t2,
-            num_rollout_t2_anchors=self.config.num_rollout_t2_anchors,
-            rollout_t2_horizon=self.config.rollout_t2_horizon,
-            oe_eval_horizon=self.config.oe_eval_horizon,
-            oe_tolerance_nrmse=self.config.oe_tolerance_nrmse,
-            oe_coordinate_std=self.config.oe_coordinate_std,
-        )
-        self.model.train()
-        return {f"eval/{key}": value for key, value in report.metrics.items()}
-
-    # ------------------------------------------------------- checkpoints ----
-    def save_checkpoint(self, path: Path) -> None:
-        """Collect each rank's RNG and write one portable checkpoint on rank zero.
-
-        All ranks must call this method together in distributed training.
-        The model is saved unwrapped so ordinary single-device evaluation can
-        load it directly. Resuming training requires the same world/global batch.
+        Final partial groups are explicitly discarded. Periodic checkpoints
+        wait for an accumulation boundary; direct saves reject pending groups.
+        Dataset transforms must be deterministic for exact data replay.
+        Validation intervals count microbatches and defer to a completed group;
+        callbacks run only on rank zero, with protected RNG and module modes.
+        Normal completion validates once at the final step. A synchronized stop
+        finishes the current group and checkpoints without a final evaluation.
+        Resume services any validation due at that saved boundary before taking
+        another optimizer step, preserving the uninterrupted selection candidates.
         """
+        if self.dataset is None:
+            raise ValueError("train() requires a dataset")
+        if validation_every is not None and validation_every < 1:
+            raise ValueError("validation_every must be positive")
+        if validation_every is not None and validation_callback is None:
+            raise ValueError("validation_every requires a validation_callback")
+        if not selection_metric:
+            raise ValueError("selection_metric must be nonempty")
+        if validation_callback is not None:
+            if (
+                self.validation_state
+                and self.validation_state["selection_metric"] != selection_metric
+            ):
+                raise ValueError("selection_metric differs from resumed validation state")
+            if not self.validation_state:
+                self.validation_state = {
+                    "last_step": None,
+                    "best_score": None,
+                    "best_step": None,
+                    "selection_metric": selection_metric,
+                }
+        batches = self._batches()
+        metrics: dict[str, float] = {}
+        checkpoint_due = False
+        last_validation = self.validation_state.get("last_step")
+        validation_due = (
+            validation_every is not None
+            and self.step // validation_every > int(last_validation or 0) // validation_every
+        )
+        stopping = False
+        self.interrupted = False
+        while self.step < self.config.steps:
+            if stop_requested is not None:
+                stopping = any_rank(stop_requested(), self.device) or stopping
+            if stopping and self._accumulated == 0:
+                self.interrupted = True
+                break
+            if validation_callback is not None and validation_due and self._accumulated == 0:
+                metrics.update(self._run_validation(validation_callback, selection_metric))
+                validation_due = False
+                self.save_checkpoint(Path(self.config.out_dir) / "last.pt")
+                # A signal may arrive during validation. Recheck before
+                # consuming the next batch, even though evaluation is complete.
+                continue
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            started = time.perf_counter()
+            metrics = self.train_step(next(batches))
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            metrics["train/seconds_per_microbatch"] = time.perf_counter() - started
+            if self.step % self.config.log_every == 0 or self.step == self.config.steps:
+                metrics = mean_metrics(metrics, self.device)
+                self._log_metrics(metrics)
+            if stop_requested is not None:
+                stopping = any_rank(stop_requested(), self.device) or stopping
+            if stopping and self._accumulated == 0:
+                self.interrupted = True
+                break
+            validation_due = validation_due or (
+                validation_every is not None and self.step % validation_every == 0
+            )
+            if validation_callback is not None and validation_due and self._accumulated == 0:
+                metrics.update(self._run_validation(validation_callback, selection_metric))
+                validation_due = False
+            every = self.config.checkpoint_every
+            checkpoint_due = checkpoint_due or (every is not None and self.step % every == 0)
+            if checkpoint_due and self._accumulated == 0:
+                self.save_checkpoint(Path(self.config.out_dir) / "last.pt")
+                checkpoint_due = False
+        self.discard_accumulation()
+        self.interrupted = self.interrupted or stopping
+        if (
+            validation_callback is not None
+            and not self.interrupted
+            and self.validation_state["last_step"] != self.step
+        ):
+            metrics.update(self._run_validation(validation_callback, selection_metric))
+        metrics["health/discarded_microbatches"] = float(self.discarded_microbatches)
+        metrics["health/pending_microbatches"] = 0.0
+        metrics["health/interrupted"] = float(self.interrupted)
+        self.save_checkpoint(Path(self.config.out_dir) / "last.pt")
+        return metrics
+
+    def _validate_dataset_identity(self) -> None:
+        changed = (
+            self.dataset is not None and dataset_fingerprint(self.dataset) != self.dataset_identity
+        )
+        if any_rank(changed, self.device):
+            raise ValueError("dataset_identity changed after Trainer initialization")
+
+    def save_checkpoint(self, path: Path) -> None:
+        """Atomically save online/target weights, configs, optimizer, counters, and RNGs.
+
+        Every rank must participate. Saves at partial accumulation boundaries
+        are rejected because pending gradients are deliberately not serialized.
+        A dataset changed since initialization cannot produce an exact checkpoint.
+        """
+        self._validate_dataset_identity()
+        if any_rank(self._accumulated != 0, self.device):
+            raise ValueError("save checkpoints at an accumulation boundary")
         local_rng = {
             "rng_python": random.getstate(),
             "rng_numpy": np.random.get_state(),  # noqa: NPY002
             "rng_torch": torch.get_rng_state(),
-            "rng_cuda": (
-                torch.cuda.get_rng_state(self.device) if self.device.type == "cuda" else None
-            ),
+            "rng_cuda": torch.cuda.get_rng_state(self.device)
+            if self.device.type == "cuda"
+            else None,
         }
         rank_rng = gather_rank_objects(local_rng)
+        saving_error: Exception | None = None
         if is_main_process():
-            path.parent.mkdir(parents=True, exist_ok=True)
             temporary = path.with_suffix(path.suffix + ".tmp")
-            torch.save(
-                {
-                    "model": self.model.state_dict(),
-                    "optimizer": self.optimizer.state_dict(),
-                    "lagrangian": self.lagrangian.state_dict(),
-                    "step": self.step,
-                    "total_skips": self.total_skips,
-                    "consecutive_skips": self.consecutive_skips,
-                    "oe_coordinate_std": self.config.oe_coordinate_std,
-                    **local_rng,
-                    "rank_rng": rank_rng,
-                    "world_size": world_size(),
-                    "global_batch_size": self.config.batch_size,
-                    **(
-                        {"visual_constraint_version": VISUAL_CONSTRAINT_VERSION}
-                        if isinstance(self.model, VisualToVisualModel)
-                        else {}
-                    ),
-                },
-                temporary,
-            )
-            temporary.replace(path)
-        # Returning means all ranks can immediately load the complete file.
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "format_version": 1,
+                        "model": self.model.state_dict(),
+                        "model_config": self.model_config,
+                        "dataset_identity": self.dataset_identity,
+                        "run_metadata": self.run_metadata,
+                        "validation_state": self.validation_state,
+                        "train_config": asdict(self.config),
+                        "objective": self.objective.state_dict(),
+                        "optimizer": self.optimizer.state_dict(),
+                        "step": self.step,
+                        "optimizer_steps": self.optimizer_steps,
+                        "total_skips": self.total_skips,
+                        "consecutive_skips": self.consecutive_skips,
+                        "discarded_microbatches": self.discarded_microbatches,
+                        "rank_rng": rank_rng,
+                        "world_size": world_size(),
+                    },
+                    temporary,
+                )
+                temporary.replace(path)
+            except Exception as error:
+                saving_error = error
+        if any_rank(saving_error is not None, self.device):
+            raise RuntimeError("checkpoint writing failed on rank zero") from saving_error
         distributed_barrier()
 
     def load_checkpoint(self, path: Path) -> None:
-        """Restore everything written by :meth:`save_checkpoint`."""
-        payload = torch.load(path, map_location="cpu", weights_only=False)
-        if (
-            isinstance(self.model, VisualToVisualModel)
-            and payload.get("visual_constraint_version") != VISUAL_CONSTRAINT_VERSION
-        ):
-            raise ValueError(
-                "visual checkpoint uses a legacy or unknown constraint; "
-                "start a fresh raw-constraint run and recalibrate tau (D42)"
-            )
-        if int(payload.get("world_size", 1)) != world_size():
+        """Restore training state; retain current run length, device, and output settings.
+
+        Only load trusted checkpoints: full optimizer and Python/NumPy RNG
+        restoration requires pickle. Exact resume requires the same world size,
+        model configuration, global batch size, and identical dataset fingerprint.
+        Dataset compatibility is checked before restoring any training state.
+        Older identity-free checkpoints remain usable for caller-managed steps
+        with no dataset identity; they cannot establish exact dataset-backed replay.
+        """
+        if self._accumulated:
+            raise ValueError("load checkpoints at an accumulation boundary")
+        self._validate_dataset_identity()
+        payload: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=False)
+        if payload.get("format_version") != 1:
+            raise ValueError("unsupported checkpoint format")
+        if payload.get("dataset_identity") != self.dataset_identity:
+            raise ValueError("exact training resume requires the checkpoint dataset_identity")
+        if payload["world_size"] != world_size():
             raise ValueError("exact training resume requires the checkpoint's world_size")
-        if int(payload.get("global_batch_size", self.config.batch_size)) != self.config.batch_size:
-            raise ValueError("exact training resume requires the checkpoint's global_batch_size")
-        checkpoint_scales = payload.get("oe_coordinate_std")
-        configured_scales = self.config.oe_coordinate_std
-        if checkpoint_scales is not None:
-            saved_scale_tensor = torch.as_tensor(checkpoint_scales, dtype=torch.float64)
-            configured_scale_tensor = (
-                torch.as_tensor(configured_scales, dtype=torch.float64)
-                if configured_scales is not None
-                else None
-            )
+        saved_config = cast(dict[str, Any], payload["train_config"])
+        if saved_config["batch_size"] != self.config.batch_size:
+            raise ValueError("exact training resume requires the checkpoint's batch_size")
+        saved_model_config = cast(dict[str, object] | None, payload["model_config"])
+        if self.model_config is not None and self.model_config != saved_model_config:
+            raise ValueError("model_config differs from checkpoint")
+        saved_run_metadata = payload.get("run_metadata", {})
+        if not isinstance(saved_run_metadata, dict):
+            raise ValueError("checkpoint run_metadata must be a mapping")
+        saved_validation = payload.get("validation_state", {})
+        if not isinstance(saved_validation, dict):
+            raise ValueError("checkpoint validation_state must be a mapping")
+        validation = cast(dict[str, Any], saved_validation)
+        if validation:
+            if set(validation) != {"last_step", "best_score", "best_step", "selection_metric"}:
+                raise ValueError("invalid checkpoint validation_state fields")
             if (
-                configured_scale_tensor is None
-                or saved_scale_tensor.shape != configured_scale_tensor.shape
-                or not torch.allclose(
-                    saved_scale_tensor,
-                    configured_scale_tensor,
-                    rtol=1e-7,
-                    atol=1e-12,
-                )
+                not isinstance(validation["selection_metric"], str)
+                or not validation["selection_metric"]
             ):
-                raise ValueError(
-                    "checkpoint oe_coordinate_std differs from the resolved training set"
-                )
+                raise ValueError("invalid checkpoint validation selection_metric")
+            for name in ("last_step", "best_step"):
+                value = validation[name]
+                if value is not None and (
+                    not isinstance(value, int) or not 0 <= value <= int(payload["step"])
+                ):
+                    raise ValueError("invalid checkpoint validation step")
+            score = validation["best_score"]
+            if score is not None and (
+                not isinstance(score, int | float) or not math.isfinite(score)
+            ):
+                raise ValueError("invalid checkpoint validation score")
+            if (score is None) != (validation["best_step"] is None):
+                raise ValueError("inconsistent checkpoint validation score and step")
+        self.run_metadata = dict(cast(dict[str, object], saved_run_metadata))
+        self.validation_state = dict(validation)
+        self.model_config = saved_model_config
+        for name in (
+            "steps",
+            "device",
+            "out_dir",
+            "log_every",
+            "checkpoint_every",
+            "num_workers",
+            "prefetch_factor",
+        ):
+            saved_config[name] = getattr(self.config, name)
+        saved_config["objective"] = ObjectiveConfig(**saved_config["objective"])
+        self.config = TrainConfig(**saved_config)
+        self.objective = TrainingObjective(self.config.objective).to(self.device)
+        self._loss_model.objective = self.objective
+        self.objective.load_state_dict(payload["objective"])
         self.model.load_state_dict(payload["model"])
         self.optimizer.load_state_dict(payload["optimizer"])
-        self.lagrangian.load_state_dict(payload["lagrangian"])
         self.step = int(payload["step"])
-        self.total_skips = int(payload.get("total_skips", 0))
-        self.consecutive_skips = int(payload.get("consecutive_skips", 0))
-        rng_state = cast(
-            dict[str, Any], payload["rank_rng"][rank()] if "rank_rng" in payload else payload
-        )
+        self.optimizer_steps = int(payload["optimizer_steps"])
+        self.total_skips = int(payload["total_skips"])
+        self.consecutive_skips = int(payload["consecutive_skips"])
+        self.discarded_microbatches = int(payload["discarded_microbatches"])
+        self.optimizer.zero_grad(set_to_none=True)
+        rng_state = cast(dict[str, Any], payload["rank_rng"][rank()])
         random.setstate(rng_state["rng_python"])
         np.random.set_state(rng_state["rng_numpy"])  # noqa: NPY002
         torch.set_rng_state(rng_state["rng_torch"])
-        cuda_rng = rng_state.get("rng_cuda")
-        if cuda_rng is not None and self.device.type == "cuda":
-            torch.cuda.set_rng_state(cuda_rng, self.device)
+        if rng_state["rng_cuda"] is not None and self.device.type == "cuda":
+            torch.cuda.set_rng_state(rng_state["rng_cuda"], self.device)
 
 
-__all__ = ["MetricLogger", "NoopLogger", "TrainConfig", "Trainer", "seed_everything"]
+__all__ = [
+    "MetricLogger",
+    "NoopLogger",
+    "ObjectiveConfig",
+    "TrainConfig",
+    "Trainer",
+    "TrainingObjective",
+    "seed_everything",
+]

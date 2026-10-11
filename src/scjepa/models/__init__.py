@@ -1,30 +1,18 @@
-"""Model modules for the two active experiments (outdated_experiments.pdf §6).
+"""Framewise state encoding, contextual parameters, finite-lag dynamics, and EMA."""
 
-State-to-state: ``ParameterEncoder`` (P_η, §6.2 Eqs. 16-26) + ``Spartan``
-(f_gamma, Eqs. 27-37) composed by ``StateToStateModel`` (Eq. 38). ``SAViEncoder``
-is the causal encoder for Experiment 2, with online and EMA target branches (§6.3).
-"""
-
+from scjepa.models.encoders import FramewiseEncoder, ImageEncoder, VectorEncoder
+from scjepa.models.model import SCJEPA, ModelOutput
 from scjepa.models.parameter_encoder import ParameterEncoder
-from scjepa.models.savi import SAViEncoder
 from scjepa.models.spartan import Spartan, SpartanLayer, SpartanOutput
-from scjepa.models.state_to_state import (
-    StateToStateModel,
-    TransitionOutput,
-    build_state_to_state,
-    num_valid_rollout_t2_offsets,
-    sample_rollout_t2_offsets,
-)
 
 __all__ = [
+    "SCJEPA",
+    "FramewiseEncoder",
+    "ImageEncoder",
+    "ModelOutput",
     "ParameterEncoder",
-    "SAViEncoder",
     "Spartan",
     "SpartanLayer",
     "SpartanOutput",
-    "StateToStateModel",
-    "TransitionOutput",
-    "build_state_to_state",
-    "num_valid_rollout_t2_offsets",
-    "sample_rollout_t2_offsets",
+    "VectorEncoder",
 ]

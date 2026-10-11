@@ -28,9 +28,9 @@ def training_coordinate_std(
     batch_size: int = 256,
     eps: float = 1e-12,
 ) -> Float[Tensor, " d"]:
-    """Compute fixed population standard deviations over all training states.
+    """Compute fixed population standard deviations over all supplied vector observations.
 
-    Every episode, time step, and object in the finite training set contributes
+    Every episode and time step in the finite training set contributes
     once. Float64 streaming moments avoid materializing another copy of the
     potentially 100k-episode preload. The finite training split is treated as
     the reference population (``correction=0``); only genuinely constant
@@ -50,9 +50,9 @@ def training_coordinate_std(
     total_square: Tensor | None = None
     count = 0
     for batch in loader:
-        states = batch["states"]
-        if states.ndim != 4:
-            raise ValueError(f"dataset states must batch to (B,T,N,d), got {states.shape}")
+        states = batch["observations"]
+        if states.ndim != 3:
+            raise ValueError(f"vector observations must batch to (B,T,d), got {states.shape}")
         flat = states.reshape(-1, states.shape[-1]).to(dtype=torch.float64)
         batch_total = flat.sum(dim=0)
         batch_square = flat.square().sum(dim=0)
@@ -67,18 +67,18 @@ def training_coordinate_std(
 
 
 def oe_worst_step_nrmse(
-    prediction: Float[Tensor, "b k n d"],
-    target: Float[Tensor, "b k n d"],
+    prediction: Float[Tensor, "b k d"],
+    target: Float[Tensor, "b k d"],
     coordinate_std: Float[Tensor, " d"],
 ) -> Float[Tensor, " b"]:
-    """Return ``E_i = max_k sqrt(mean_(n,d) standardized_error²)``.
+    """Return ``E_i = max_k sqrt(mean_d standardized_error²)``.
 
-    The maximum is taken after the object/coordinate reduction, so one bad
+    The maximum is taken after the coordinate reduction, so one bad
     rollout step cannot be hidden by averaging over time.
     """
-    if prediction.shape != target.shape or prediction.ndim != 4:
+    if prediction.shape != target.shape or prediction.ndim != 3:
         raise ValueError(
-            f"expected matching (B,K,N,d), got {tuple(prediction.shape)} vs {tuple(target.shape)}"
+            f"expected matching (B,K,d), got {tuple(prediction.shape)} vs {tuple(target.shape)}"
         )
     if coordinate_std.shape != prediction.shape[-1:]:
         raise ValueError(
@@ -88,7 +88,7 @@ def oe_worst_step_nrmse(
     scales = coordinate_std.to(device=prediction.device, dtype=prediction.dtype)
     if not bool(torch.isfinite(scales).all()) or bool((scales <= 0).any()):
         raise ValueError("coordinate_std must contain finite positive values")
-    per_step = ((prediction - target) / scales).square().mean(dim=(2, 3)).sqrt()
+    per_step = ((prediction - target) / scales).square().mean(dim=2).sqrt()
     return per_step.amax(dim=1)
 
 

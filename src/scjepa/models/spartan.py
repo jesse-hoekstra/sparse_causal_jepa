@@ -1,42 +1,21 @@
-"""SPARTAN sparse transition predictor f_gamma — outdated_experiments.pdf §6.2, Eqs. 27-37.
+"""Coordinate-level sparse attention for finite-lag, parameterized dynamics.
 
-Implements the paper's token layout exactly: N current-state tokens and N
-track-attached scalar parameter tokens, M = 2N tokens total, L_sp single-head
-hard-gated sparse-attention layers in a D_sp-dimensional workspace; only the
-state-token positions are decoded (Eq. 37). Traceability:
+Inputs are scalar tokens in the fixed order ``[state lags | action lags | parameters]``.
+Within the first two groups the order is lag-major, oldest to newest. Every
+coordinate has its own learned identity; state/action identities also include a
+lag embedding. No coordinates are mixed by the input projections, value
+normalization, token MLPs, or scalar output head.
 
-    Eq. 27  x⁰ = W_Z z + b_Z + rho^Z + κᵢ  |  W_θ θ̂ + b_θ + rho^θ + κᵢ
-    Eq. 31  g = q·k / √D_sp  (single head, bias-free q/k/v after pre-LN, Eq. 30)
-    Eq. 32  A ~ Bernoulli(sigma(g)), hard {0,1}
-    Eq. 33  straight-through binary Gumbel-softmax, τ_g = 1, fresh noise
-            per transition (these are one-step predictions — no chains)
-    Eq. 34  eval gates: A = 1{g > 0}, deterministic
-    Eq. 35  masked softmax over OPEN incoming edges; fully closed row → h = 0
-    Eq. 36  x^(l) = MLP(x^(l-1) + h): three D_sp-wide linears, ReLU after the
-            first two, no post-MLP residual or LayerNorm
-    Eq. 10  Ā = (A^(L)+I)···(A^(1)+I), path counts
-    Eq. 11  L_path = Σ decoded state rows of Ā;  rho_path thresholds it
-
-Track keys κᵢ (Eq. 27, §6.4): one key is SHARED by the state token and the
-parameter token descended from track i — it records their common trajectory
-origin without forcing any same-track edge open. Keys are drawn once from a
-fixed non-trainable codebook (registered as a buffer: excluded from gradient
-updates, independent of states and parameters). The state-to-state regime's tracks are the
-ordered simulator rows, so codebook row i serves track i in every episode; the
-visual experiments will add the episode-level codebook permutation of §6.4.
-Key SCALE is unspecified upstream — matched to the role-embedding init (0.02).
-
-Reference modes (§6.1.3, matched initialization — same modules, same codebook):
-    dense:    A ≡ 1 in every layer, no gates sampled (τ-calibration reference).
-    identity: A ≡ 0 — token-local: only each token's residual-MLP path remains.
-
-Numerics kept from the audited implementation (they compute Eq. 35 exactly but
-stably): row-max subtraction over unmasked entries only, and a denominator that
-avoids the 1e-8-floor gradient amplification on fully masked rows.
-
-Logit penalty is Eq. 11-of-Baumgartner / the write-up's §6.1.3 form:
-mean of exp(a) + exp(-a) over layer logits, theoretical minimum 2, with a
-linear continuation beyond |a| = 30 for fp32 stability (as declared there).
+Attention logits and gates depend only on these identities, never on observation
+values. This deliberate choice makes the extracted graph a complete structural
+upper bound on information flow within the predictor, conditional on its
+independently supplied parameter vector. It does not include the context-to-
+parameter inference path. Content-dependent queries or keys would create control
+paths through attention weights that a masked value graph could miss.
+Sparse gates use straight-through binary sampling in training and deterministic
+thresholding in evaluation. Dense and token-local reference modes share the same
+modules. Stable masked normalization and residual path accounting are retained
+from the previous implementation.
 """
 
 import math
@@ -47,17 +26,59 @@ from jaxtyping import Float
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-# One fixed codebook for every model built at any size: dense reference,
-# token-local reference, and sparse run share track keys by construction.
-_TRACK_KEY_SEED = 0
+
+class AggregatedGraphBlocks(NamedTuple):
+    """Any-lag maximum path counts; ``> 0`` gives any-lag reachability."""
+
+    state: Float[Tensor, "b dz dz"]
+    action: Float[Tensor, "b dz da"]
+    parameter: Float[Tensor, "b dz dp"]
+
+
+class GraphPenalties(NamedTuple):
+    """Independent block means of residual-inclusive path counts.
+
+    Disabling a block's loss weight removes that objective. Other source-block
+    paths may still traverse the same intermediate token workspaces, and gate
+    projections are shared; it does not freeze parameter-related gates.
+    """
+
+    state: Float[Tensor, ""]
+    action: Float[Tensor, ""]
+    parameter: Float[Tensor, ""]
+
+
+class GraphBlocks(NamedTuple):
+    """Paths from each input coordinate to each predicted state coordinate.
+
+    State/action lag index zero is the oldest supplied input. Counts include
+    every residual path and every sparse-attention layer. Nonzero entries are
+    possible dependencies, not proof of causal influence or identifiability.
+    """
+
+    state: Float[Tensor, "b dz lag dz"]
+    action: Float[Tensor, "b dz lag da"]
+    parameter: Float[Tensor, "b dz dp"]
+
+    def aggregate_lags(self) -> AggregatedGraphBlocks:
+        """Take a maximum over lags; threshold at zero for any-lag dependencies."""
+        return AggregatedGraphBlocks(
+            self.state.amax(dim=2), self.action.amax(dim=2), self.parameter
+        )
+
+    def penalties(self) -> GraphPenalties:
+        """Average each block independently; an absent action block costs zero."""
+        action = self.action.mean() if self.action.numel() else self.state.new_zeros(())
+        return GraphPenalties(self.state.mean(), action, self.parameter.mean())
 
 
 class SpartanOutput(NamedTuple):
-    """Everything the loss and the SHD/MCC evaluation need from one forward."""
+    """Prediction, structural path counts, and explicit regularization terms."""
 
-    prediction: Float[Tensor, "b n k"]
+    prediction: Float[Tensor, "b dz"]
     path_matrix: Float[Tensor, "b m m"]
-    sparsity: Float[Tensor, ""]
+    graphs: GraphBlocks
+    sparsity: GraphPenalties
     logit_penalty: Float[Tensor, ""]
     mean_abs_logit: Float[Tensor, ""]
     mean_gate_probability: Float[Tensor, ""]
@@ -65,18 +86,18 @@ class SpartanOutput(NamedTuple):
 
 
 def _sample_hard_adjacency(logits: Tensor, temperature: float, training: bool) -> Tensor:
-    """Hard {0,1} gates: Eq. 33 in training, Eq. 34 deterministic in eval."""
+    """Sample hard gates with a straight-through derivative; threshold at eval."""
     if not training:
         return (logits > 0).to(logits.dtype)
     uniform = torch.rand_like(logits).clamp(1e-6, 1 - 1e-6)
-    noise = uniform.log() - (-uniform).log1p()  # Logistic(0,1) = Gumbel difference
+    noise = uniform.log() - (-uniform).log1p()
     soft = torch.sigmoid((logits + noise) / temperature)
     hard = (soft > 0.5).to(logits.dtype)
-    return hard + soft - soft.detach()  # straight-through
+    return hard + soft - soft.detach()
 
 
 class SpartanLayer(nn.Module):
-    """One single-head hard-gated sparse-attention layer (Eqs. 30-36)."""
+    """Single-head attention with structure-only control and token-local values."""
 
     def __init__(
         self,
@@ -87,10 +108,14 @@ class SpartanLayer(nn.Module):
         dense: bool = False,
         identity: bool = False,
     ) -> None:
-        """Build one layer; ``dim`` = D_sp, other args as in ``Spartan``."""
+        """Build attention and a token-local residual MLP."""
         super().__init__()
+        if dim <= 0 or mlp_hidden_size <= 0:
+            raise ValueError("dim and mlp_hidden_size must be positive")
         if mlp_num_layers < 2:
             raise ValueError("mlp_num_layers must be >= 2")
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be finite and positive")
         if dense and identity:
             raise ValueError("dense and identity are mutually exclusive")
         self.temperature = temperature
@@ -98,6 +123,7 @@ class SpartanLayer(nn.Module):
         self.identity = identity
         self.scale = 1.0 / math.sqrt(dim)
         self.norm = nn.LayerNorm(dim)
+        self.structure_norm = nn.LayerNorm(dim)
         self.project_q = nn.Linear(dim, dim, bias=False)
         self.project_k = nn.Linear(dim, dim, bias=False)
         self.project_v = nn.Linear(dim, dim, bias=False)
@@ -110,22 +136,16 @@ class SpartanLayer(nn.Module):
         self.mlp = nn.Sequential(*mlp_layers)
 
     def forward(
-        self, tokens: Float[Tensor, "b m d"]
-    ) -> tuple[
-        Float[Tensor, "b m d"],
-        Float[Tensor, "b m m"],
-        Float[Tensor, ""],
-        Float[Tensor, ""],
-        Float[Tensor, ""],
-        Float[Tensor, ""],
-    ]:
-        """Apply hard-masked attention; return outputs plus logit diagnostics."""
-        normed = self.norm(tokens)  # Eq. 30 pre-LN
-        q = self.project_q(normed)
-        k = self.project_k(normed)
-        v = self.project_v(normed)
-        logits = torch.einsum("bid,bjd->bij", q, k) * self.scale  # Eq. 31
-
+        self,
+        tokens: Float[Tensor, "b m d"],
+        identities: Float[Tensor, "1 m d"],
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Return updated tokens, sampled adjacency, and logit diagnostics."""
+        structural = self.structure_norm(identities)
+        q = self.project_q(structural)
+        k = self.project_k(structural)
+        v = self.project_v(self.norm(tokens))
+        logits = (torch.einsum("bid,bjd->bij", q, k) * self.scale).expand(tokens.shape[0], -1, -1)
         if self.dense:
             adjacency = torch.ones_like(logits)
         elif self.identity:
@@ -133,32 +153,28 @@ class SpartanLayer(nn.Module):
         else:
             adjacency = _sample_hard_adjacency(logits, self.temperature, self.training)
 
-        # Eq. 35, computed stably: subtract the row max over UNMASKED entries
-        # only (using the global max collapses the denominator to ~0 when the
-        # row's largest logit is masked, amplifying gradients ~1e6x), and give
-        # fully masked rows a denominator of 1 instead of a 1e-8 floor (which
-        # amplified straight-through gradients ~1e8x during pruning).
-        unmasked_max = logits.masked_fill(adjacency == 0, float("-inf")).max(dim=-1, keepdim=True)
-        row_max = torch.where(
-            torch.isfinite(unmasked_max.values), unmasked_max.values, 0.0
-        ).detach()
+        # Subtract only the open-entry maximum. A closed row uses denominator
+        # one instead of an epsilon floor that amplifies straight-through grads.
+        unmasked_max = logits.masked_fill(adjacency == 0, float("-inf")).amax(dim=-1, keepdim=True)
+        row_max = torch.where(torch.isfinite(unmasked_max), unmasked_max, 0.0).detach()
         weights = adjacency * (logits - row_max).clamp(max=0.0).exp()
         denom = weights.sum(dim=-1, keepdim=True)
         weights = weights / (denom + (denom.detach() < 0.5).to(weights.dtype))
         h = torch.einsum("bij,bjd->bid", weights, v)
 
-        # Logit penalty: exp(a) + exp(-a), exact within |a| <= 30, linear
-        # continuation beyond (slope e^30 — an effectively hard wall that
-        # stays fp32-finite), as declared in §6.1.3.
-        magnitude = logits.abs()
+        # exp(a) + exp(-a), with a linear continuation above |a|=30. Evaluate
+        # in float32 under mixed precision so half-precision exp does not overflow.
+        diagnostic_logits = logits.float()
+        magnitude = diagnostic_logits.abs()
         core = magnitude.clamp(max=30.0)
         tail = (magnitude - 30.0).clamp(min=0.0)
         logit_penalty = (core.exp() + (-core).exp() + core.exp() * tail).mean()
         with torch.no_grad():
-            gate_probability = torch.sigmoid(logits.detach())
-            gate_entropy = (F.softplus(logits.detach()) - logits.detach() * gate_probability).mean()
+            detached = diagnostic_logits.detach()
+            gate_probability = torch.sigmoid(detached)
+            gate_entropy = (F.softplus(detached) - detached * gate_probability).mean()
         return (
-            self.mlp(tokens + h),  # Eq. 36: MLP(x + h)
+            self.mlp(tokens + h),
             adjacency,
             logit_penalty,
             magnitude.detach().mean(),
@@ -168,70 +184,59 @@ class SpartanLayer(nn.Module):
 
 
 class Spartan(nn.Module):
-    """Sparse transition predictor over [state | parameter] tokens (Eq. 38)."""
+    """Predict a state vector from finite state/action history and one parameter vector."""
 
     def __init__(
         self,
-        state_dim: int = 4,
-        param_dim: int = 1,
-        num_slots: int = 5,
-        num_layers: int = 3,
-        embed_dim: int = 512,
-        mlp_hidden_size: int = 512,
+        state_dim: int,
+        param_dim: int,
+        action_dim: int = 0,
+        history_len: int = 1,
+        num_layers: int = 2,
+        embed_dim: int = 64,
+        mlp_hidden_size: int = 64,
         mlp_num_layers: int = 3,
         temperature: float = 1.0,
         dense: bool = False,
         identity: bool = False,
-        output_dim: int | None = None,
     ) -> None:
-        """Build the predictor (defaults are the state-to-state configuration).
+        """Configure independent coordinate counts and the finite input-history length.
 
-        Args:
-            state_dim: Width of the state interface. The state-to-state regime feeds the raw
-                k = 4 state (Eq. 27); the visual experiments feed the learned
-                latent state, d_s = 32 (Eqs. 93/117).
-            param_dim: Scalar parameter coordinates (Eq. 25): 1.
-            num_slots: N tracked objects; the token count is M = 2N.
-            num_layers: L_sp = 3.
-            embed_dim: D_sp = 512 workspace width.
-            mlp_hidden_size: Width of Eq. 36's hidden linears (512).
-            mlp_num_layers: Linear layers per token MLP (Eq. 36: three).
-            temperature: τ_g = 1 Gumbel-softmax temperature (Eq. 33).
-            dense: A ≡ 1 — the fully connected τ-calibration reference.
-            identity: A ≡ 0 — the token-local reference. Mutually exclusive.
-            output_dim: Width of the decoded head. ``None`` = ``state_dim``,
-                which covers state-to-state (Eq. 37, R^4 -> R^4) and visual-to-visual
-                (Eq. 118, R^d_s -> R^d_s). Both active experiments use an output
-                width equal to the state input width, enabling autoregression.
+        ``history_len`` counts input lags, not rollout transitions. ``param_dim``
+        need not match ``state_dim``. Set ``action_dim=0`` for autonomous dynamics.
         """
         super().__init__()
+        if state_dim <= 0 or param_dim <= 0 or history_len <= 0 or num_layers <= 0:
+            raise ValueError("state_dim, param_dim, history_len, num_layers must be positive")
+        if action_dim < 0:
+            raise ValueError("action_dim must be nonnegative")
         if dense and identity:
             raise ValueError("dense and identity are mutually exclusive")
-        if num_slots <= 0:
-            raise ValueError("num_slots must be positive")
         self.state_dim = state_dim
         self.param_dim = param_dim
-        self.num_slots = num_slots
+        self.action_dim = action_dim
+        self.history_len = history_len
         self.embed_dim = embed_dim
-        self.output_dim = state_dim if output_dim is None else output_dim
+        self.num_tokens = history_len * (state_dim + action_dim) + param_dim
         self.dense = dense
         self.identity = identity
-        # Eq. 27/28: separate input projections into the shared workspace.
-        self.state_project = nn.Linear(state_dim, embed_dim)
-        self.param_project = nn.Linear(param_dim, embed_dim)
-        self.out_project = nn.Linear(embed_dim, self.output_dim)  # Eq. 37 / 95 / 118
-        # Learned role embeddings rho^Z, rho^θ (Eq. 27).
-        self.state_role = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.param_role = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        nn.init.normal_(self.state_role, std=0.02)
-        nn.init.normal_(self.param_role, std=0.02)
-        # Track keys κᵢ (Eq. 27): fixed, non-trainable, shared by the state and
-        # parameter token of track i. Buffer => excluded from gradient updates
-        # and saved with the checkpoint. Scale 0.02 is our choice (unspecified).
-        generator = torch.Generator().manual_seed(_TRACK_KEY_SEED)
-        track_keys = 0.02 * torch.randn(1, num_slots, embed_dim, generator=generator)
-        self.track_keys: Tensor
-        self.register_buffer("track_keys", track_keys)
+        self.state_project = nn.Linear(1, embed_dim)
+        self.action_project = nn.Linear(1, embed_dim) if action_dim else None
+        self.param_project = nn.Linear(1, embed_dim)
+        self.out_project = nn.Linear(embed_dim, 1)
+        self.state_identity = nn.Parameter(torch.empty(state_dim, embed_dim))
+        self.action_identity = nn.Parameter(torch.empty(action_dim, embed_dim))
+        self.parameter_identity = nn.Parameter(torch.empty(param_dim, embed_dim))
+        self.lag_identity = nn.Parameter(torch.empty(history_len, embed_dim))
+        self.role_identity = nn.Parameter(torch.empty(3, embed_dim))
+        for embedding in (
+            self.state_identity,
+            self.action_identity,
+            self.parameter_identity,
+            self.lag_identity,
+            self.role_identity,
+        ):
+            nn.init.normal_(embedding, std=0.02)
         self.layers = nn.ModuleList(
             [
                 SpartanLayer(
@@ -246,92 +251,89 @@ class Spartan(nn.Module):
             ]
         )
 
-    def sample_track_keys(
-        self, batch: int, generator: torch.Generator | None = None
-    ) -> Float[Tensor, "b n d"]:
-        """Episode-level permuted track keys for the visual experiments (§6.4).
+    def token_identities(self) -> Float[Tensor, "1 m d"]:
+        """Return content-independent identities in the documented token order."""
+        state = self.state_identity[None] + self.lag_identity[:, None] + self.role_identity[0]
+        action = self.action_identity[None] + self.lag_identity[:, None] + self.role_identity[1]
+        parameter = self.parameter_identity + self.role_identity[2]
+        return torch.cat((state.flatten(0, 1), action.flatten(0, 1), parameter), dim=0).unsqueeze(0)
 
-        The state-to-state regime's tracks ARE the ordered simulator rows, so codebook row i
-        serves track i in every episode and the fixed buffer is used directly.
-        Visual tracks are anonymous, so §6.4 draws the keys "from a fixed
-        non-trainable codebook under an independently sampled episode-level
-        permutation": the key still records that a state token and a parameter
-        token share one recurrent origin, but it cannot harden into a persistent
-        simulator-row identity, because which codebook row a track receives is
-        redrawn every episode.
-        """
-        device = self.track_keys.device
-        permutations = torch.stack(
-            [
-                torch.randperm(self.num_slots, generator=generator, device=device)
-                for _ in range(batch)
-            ]
-        )
-        return self.track_keys.expand(batch, -1, -1).gather(
-            1, permutations.unsqueeze(-1).expand(batch, self.num_slots, self.embed_dim)
+    def extract_graphs(self, path_matrix: Float[Tensor, "b m m"]) -> GraphBlocks:
+        """Slice decoded latest-state rows into lag-resolved input blocks."""
+        if path_matrix.ndim != 3 or path_matrix.shape[1:] != (self.num_tokens, self.num_tokens):
+            raise ValueError("path_matrix must have shape (B, num_tokens, num_tokens)")
+        state_end = self.history_len * self.state_dim
+        action_end = state_end + self.history_len * self.action_dim
+        rows = path_matrix[:, state_end - self.state_dim : state_end]
+        batch = path_matrix.shape[0]
+        return GraphBlocks(
+            rows[:, :, :state_end].reshape(batch, self.state_dim, self.history_len, self.state_dim),
+            rows[:, :, state_end:action_end].reshape(
+                batch, self.state_dim, self.history_len, self.action_dim
+            ),
+            rows[:, :, action_end:],
         )
 
     def forward(
         self,
-        state: Float[Tensor, "b n k"],
-        params: Float[Tensor, "b n p"],
-        track_keys: Float[Tensor, "b n d"] | None = None,
+        states: Float[Tensor, "b lag dz"],
+        parameters: Float[Tensor, "b dp"],
+        actions: Float[Tensor, "b lag da"] | None = None,
     ) -> SpartanOutput:
-        """One transition: predict Ẑ_{t+1} from (Z_t, θ̂) and expose the graph.
+        """Predict the next state; action at each lag accompanies that lag's state."""
+        if states.ndim != 3 or states.shape[1:] != (self.history_len, self.state_dim):
+            raise ValueError(f"expected states (B, {self.history_len}, {self.state_dim})")
+        batch = states.shape[0]
+        if parameters.shape != (batch, self.param_dim):
+            raise ValueError(f"expected parameters (B, {self.param_dim})")
+        if self.action_dim:
+            if actions is None or actions.shape != (batch, self.history_len, self.action_dim):
+                raise ValueError(f"expected actions (B, {self.history_len}, {self.action_dim})")
+        elif actions is not None:
+            raise ValueError("actions must be None when action_dim=0")
+        if batch == 0:
+            raise ValueError("batch must be nonempty")
 
-        ``track_keys`` overrides the fixed codebook rows with per-episode keys
-        (§6.4); ``None`` keeps the state-to-state regime's fixed assignment.
-        """
-        if (
-            state.ndim != 3
-            or params.ndim != 3
-            or state.shape[:2] != params.shape[:2]
-            or state.shape[1] != self.num_slots
-            or state.shape[2] != self.state_dim
-            or params.shape[2] != self.param_dim
-        ):
-            raise ValueError(
-                f"expected state (B, {self.num_slots}, {self.state_dim}) and params "
-                f"(B, {self.num_slots}, {self.param_dim}), got {tuple(state.shape)} "
-                f"vs {tuple(params.shape)}"
-            )
-        keys = self.track_keys if track_keys is None else track_keys
-        if keys.shape[-2:] != (self.num_slots, self.embed_dim):
-            raise ValueError(
-                f"track_keys must be (..., {self.num_slots}, {self.embed_dim}), "
-                f"got {tuple(keys.shape)}"
-            )
-        # Eq. 27: token construction, [state 0..N-1 | params N..2N-1]. The SAME
-        # key is added to the state and parameter token of a track.
-        state_tokens = self.state_project(state) + self.state_role + keys
-        param_tokens = self.param_project(params) + self.param_role + keys
-        tokens = torch.cat((state_tokens, param_tokens), dim=1)  # (B, 2N, D_sp)
-
+        state_tokens = self.state_project(states.flatten(1).unsqueeze(-1))
+        parameter_tokens = self.param_project(parameters.unsqueeze(-1))
+        parts = [state_tokens]
+        if self.action_project is not None and actions is not None:
+            parts.append(self.action_project(actions.flatten(1).unsqueeze(-1)))
+        parts.append(parameter_tokens)
+        identities = self.token_identities()
+        tokens = torch.cat(parts, dim=1) + identities
         adjacencies: list[Tensor] = []
         logit_penalties: list[Tensor] = []
         mean_abs_logits: list[Tensor] = []
         mean_gate_probabilities: list[Tensor] = []
         gate_entropies: list[Tensor] = []
         for layer in self.layers:
-            tokens, adjacency, penalty, abs_logit, gate_prob, entropy = layer(tokens)
+            tokens, adjacency, penalty, abs_logit, gate_prob, entropy = layer(tokens, identities)
             adjacencies.append(adjacency)
             logit_penalties.append(penalty)
             mean_abs_logits.append(abs_logit)
             mean_gate_probabilities.append(gate_prob)
             gate_entropies.append(entropy)
 
-        # Eq. 10: Ā = (A^(L)+I)···(A^(1)+I); entries are path counts.
-        eye = torch.eye(tokens.shape[1], device=tokens.device, dtype=tokens.dtype)
-        path_matrix = eye.expand(tokens.shape[0], -1, -1)
-        for adjacency in adjacencies:
-            path_matrix = (adjacency + eye) @ path_matrix
-        # Eq. 11: the path objective covers only the N decoded state rows.
-        sparsity = path_matrix[:, : self.num_slots].sum(dim=(1, 2)).mean()
-
+        # Every token-local residual is an identity edge. Left multiplication
+        # follows receiver-row/source-column convention across successive layers.
+        path_dtype = (
+            torch.float32 if tokens.dtype in (torch.float16, torch.bfloat16) else tokens.dtype
+        )
+        eye = torch.eye(self.num_tokens, device=tokens.device, dtype=path_dtype)
+        path_matrix = eye.expand(batch, -1, -1)
+        with torch.autocast(device_type=tokens.device.type, enabled=False):
+            for adjacency in adjacencies:
+                path_matrix = (adjacency.to(path_dtype) + eye) @ path_matrix
+        graphs = self.extract_graphs(path_matrix)
+        state_end = self.history_len * self.state_dim
         return SpartanOutput(
-            prediction=self.out_project(tokens[:, : self.num_slots]),  # Eq. 37
+            prediction=self.out_project(tokens[:, state_end - self.state_dim : state_end]).squeeze(
+                -1
+            ),
             path_matrix=path_matrix,
-            sparsity=sparsity,
+            graphs=graphs,
+            sparsity=graphs.penalties(),
             logit_penalty=torch.stack(logit_penalties).mean(),
             mean_abs_logit=torch.stack(mean_abs_logits).mean(),
             mean_gate_probability=torch.stack(mean_gate_probabilities).mean(),
@@ -339,4 +341,11 @@ class Spartan(nn.Module):
         )
 
 
-__all__ = ["Spartan", "SpartanLayer", "SpartanOutput"]
+__all__ = [
+    "AggregatedGraphBlocks",
+    "GraphBlocks",
+    "GraphPenalties",
+    "Spartan",
+    "SpartanLayer",
+    "SpartanOutput",
+]

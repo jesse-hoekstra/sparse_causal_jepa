@@ -1,41 +1,54 @@
-"""Tests for the Experiment-1 prediction loss (outdated_experiments.pdf Eq. 39)."""
+"""Direct latent comparison and episode-wise representation statistics."""
 
 import pytest
 import torch
+from torch import Tensor
 
-from scjepa.losses import aligned_mse
-
-
-def test_zero_at_identity() -> None:
-    pred = torch.randn(4, 5, 4)
-    assert aligned_mse(pred, pred).item() == 0
+from scjepa.losses import RepresentationRegularizer, prediction_mse
 
 
-def test_matches_eq39_elementwise_mean() -> None:
-    """L_pred = (1/(|I| N k)) sum of squared errors == element-wise MSE."""
-    torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
-    pred, target = torch.randn(6, 5, 4), torch.randn(6, 5, 4)
-    manual = (pred - target).square().sum() / pred.numel()
-    torch.testing.assert_close(aligned_mse(pred, target), manual)
+def test_prediction_mse_matches_coordinatewise_mean_and_stops_target_gradient() -> None:
+    prediction = torch.randn(3, 4, 5, requires_grad=True)
+    target = torch.randn(3, 4, 5, requires_grad=True)
+    loss = prediction_mse(prediction, target)
+    torch.testing.assert_close(loss, (prediction - target).square().mean())
+    loss.backward()  # pyright: ignore[reportUnknownMemberType]
+    assert prediction.grad is not None
+    assert target.grad is None
+    assert prediction_mse(target, target).item() == 0
+    assert prediction_mse(target[:, :, [2, 1, 0, 3, 4]], target).item() > 0
 
 
-def test_keeps_known_object_correspondence() -> None:
-    """Row identity is tracked: swapping rows changes the loss (no matching)."""
-    torch.manual_seed(1)  # pyright: ignore[reportUnknownMemberType]
-    target = torch.randn(2, 3, 4)
-    pred = target[:, [1, 0, 2]]
-    assert aligned_mse(pred, target).item() > 0
+def test_prediction_mse_rejects_broadcasting_or_empty_inputs() -> None:
+    for prediction, target in (
+        (torch.randn(2, 3, 4), torch.randn(2, 1, 4)),
+        (torch.randn(2, 4), torch.randn(2, 4)),
+        (torch.empty(2, 0, 4), torch.empty(2, 0, 4)),
+    ):
+        with pytest.raises(ValueError, match="matching|nonempty"):
+            prediction_mse(prediction, target)
 
 
-def test_gradients_flow() -> None:
-    pred = torch.randn(2, 3, 4, requires_grad=True)
-    aligned_mse(pred, torch.randn(2, 3, 4)).backward()  # pyright: ignore[reportUnknownMemberType]
-    assert pred.grad is not None
-    assert torch.isfinite(pred.grad).all()
+def test_sigreg_is_finite_and_differentiable() -> None:
+    regularizer = RepresentationRegularizer("sigreg", num_projections=8)
+    samples = torch.randn(2, 4, 5, requires_grad=True)
+    loss: Tensor = regularizer(samples)
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+    loss.backward()  # pyright: ignore[reportUnknownMemberType]
+    assert samples.grad is not None
+    assert torch.isfinite(samples.grad).all()
+    assert samples.grad.abs().sum() > 0
+    with pytest.raises(ValueError, match="two episodes"):
+        regularizer(torch.randn(2, 1, 5))
 
 
-def test_rejects_shape_mismatch() -> None:
-    with pytest.raises(ValueError, match="matching"):
-        aligned_mse(torch.randn(2, 3, 4), torch.randn(2, 4, 4))
-    with pytest.raises(ValueError, match="matching"):
-        aligned_mse(torch.randn(2, 3, 4, 1), torch.randn(2, 3, 4, 1))
+def test_no_regularizer_is_exact_zero() -> None:
+    loss: Tensor = RepresentationRegularizer("none")(torch.randn(1, 1, 3))
+    assert loss.item() == 0
+    assert not loss.requires_grad
+
+
+def test_visreg_is_not_an_active_regularizer() -> None:
+    with pytest.raises(ValueError, match="none or sigreg"):
+        RepresentationRegularizer("visreg")  # pyright: ignore[reportArgumentType]

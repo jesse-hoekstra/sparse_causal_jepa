@@ -1,5 +1,6 @@
-"""Shared prediction losses for the two SCJEPA observation regimes."""
+"""Experiment-independent latent prediction and optional representation penalties."""
 
-from scjepa.losses.predictive import aligned_mse, rollout_t2_endpoint_mse
+from scjepa.losses.predictive import prediction_mse
+from scjepa.losses.regularization import RegularizerKind, RepresentationRegularizer
 
-__all__ = ["aligned_mse", "rollout_t2_endpoint_mse"]
+__all__ = ["RegularizerKind", "RepresentationRegularizer", "prediction_mse"]
