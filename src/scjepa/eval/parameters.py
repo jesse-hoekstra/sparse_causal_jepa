@@ -1,36 +1,10 @@
-"""Mass-recovery metric: the MCC of Baumgartner et al. App. F.1.
+"""Nonlinear coordinate recovery probes adapted from Baumgartner et al., App. F.1.
 
-This module deliberately implements ONE metric. Earlier revisions also carried a
-Pearson mean-max proxy, a strict Hungarian one-to-one score, and a marginal
-scatter helper; having several similar numbers in flight made run comparisons
-ambiguous, so they were removed rather than kept as ablations.
-
-The metric (sources/dynamical_system.pdf, App. F.1, p. 39 — quoted):
-
-    "The MCC disentanglement metric is computed by encoding all trajectories in
-     a validation dataset into the learnt parameters, θ̂, and fitting a small MLP
-     onto every combination of marginalised predictions and marginalised ground
-     truth parameters, θ_i ≈ MLP_ij(θ̂_j). The predictions from this collection
-     of MLPs are used to form a matrix of non-linear correlation coefficients,
-     R² ∈ R^{I x J}. The MCC metric is calculated as MCC = 1/I Σ_i max_j(R²_ij)."
-
-so the score is a MEAN OF MAXIMA over ground-truth rows: each true parameter is
-credited with the best-fitting learned coordinate, with no bijection constraint.
-One learned coordinate may therefore be the argmax for several true parameters,
-and the argmax need not be the track-matched coordinate — the metric measures
-whether the information exists somewhere in θ̂, not where it is stored.
-
-Their probe protocol (p. 40, quoted): "a one-hidden-layer MLP with a hidden
-dimension of 32 and 5,000 sampled training points, as well as cross-validation
-with a 10% and 90% split to prevent overfitting". Reproduced exactly here.
-UNSPECIFIED upstream, hence ours (interpretation, per project policy): the tanh
-activation, Adam at lr 1e-2, 300 full-batch steps, and clamping negative R² to
-zero. The paper itself flags that "exact values depend upon the size and
-convergence of the MLP used".
-
-Sample convention: one row per episode. For bounce that is θ̂ ∈ R^{E x 5} against
-masses ∈ R^{E x 5}, so R² is 5 x 5 with rows = true masses, columns = learned
-coordinates — the paper's I x J orientation.
+Each target coordinate is regressed on each learned coordinate independently.
+The reported MCC is the mean of row-wise best held-out R² values, not a
+one-to-one assignment. Finite probe fits are diagnostics, not guarantees of
+invariance or identifiability. Rows must represent independent episodes; split
+selection and scientific interpretation belong to the experiment.
 """
 
 from typing import NamedTuple
@@ -61,8 +35,8 @@ def _validate_pairs(learned: Tensor, target: Tensor) -> None:
             f"expected (S, d) and (S, P) with equal S, got "
             f"{tuple(learned.shape)} vs {tuple(target.shape)}"
         )
-    if learned.shape[0] < 2:
-        raise ValueError("need at least 2 samples for the recovery probes")
+    if learned.shape[0] < 4 or min(learned.shape[1], target.shape[1]) < 1:
+        raise ValueError("need at least 4 samples and nonempty coordinates for recovery probes")
 
 
 def _r_squared(prediction: Tensor, target: Tensor) -> float:
@@ -90,9 +64,8 @@ def nonlinear_mcc(
     Fits θ_i ≈ MLP(θ̂_j) for every (true, learned) pair with a one-hidden-layer
     MLP (width ``hidden``, Adam, full batch), scores R² on the held-out
     ``val_fraction`` split, and returns ``mean_i max_j R²_ij``. Deterministic
-    given ``seed``. Invariant to element-wise diffeomorphisms, permutations,
-    scale and shift — and, by construction, indifferent to WHICH learned
-    coordinate carries a given mass.
+    given ``seed``. Intended to assess recovery under coordinate transformations,
+    scale and shift only insofar as the finite probes can fit those maps.
 
     The probe MLPs are CPU modules whose initialization is isolated from the
     caller's global torch RNG, so periodic evaluation cannot alter the
@@ -123,12 +96,14 @@ def _nonlinear_mcc_impl(
     _validate_pairs(learned, target)
     if not 0.0 < val_fraction < 1.0:
         raise ValueError("val_fraction must be in (0, 1)")
+    if hidden < 1 or max_samples < 4 or epochs < 1:
+        raise ValueError("hidden/epochs must be positive and max_samples >= 4")
     generator = torch.Generator().manual_seed(seed)
     num_samples = min(learned.shape[0], max_samples)
     order = torch.randperm(learned.shape[0], generator=generator)[:num_samples]
     learned = learned.detach().cpu()[order].float()
     target = target.detach().cpu()[order].float()
-    split = max(1, int(num_samples * val_fraction))
+    split = min(num_samples - 2, max(2, int(num_samples * val_fraction)))
     r2 = torch.zeros(target.shape[1], learned.shape[1])
     for i in range(target.shape[1]):
         for j in range(learned.shape[1]):

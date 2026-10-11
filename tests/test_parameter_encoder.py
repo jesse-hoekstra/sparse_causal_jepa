@@ -1,70 +1,55 @@
-"""Tests for the parameter encoder P_eta (outdated_experiments.pdf Eqs. 16-26)."""
-
 import pytest
 import torch
+from torch import nn
 
 from scjepa.models import ParameterEncoder
 
-B, T, N, K = 2, 6, 4, 4
 
-
-@pytest.fixture
-def encoder() -> ParameterEncoder:
-    torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
-    return ParameterEncoder(state_dim=K, dim=16, num_heads=4, max_history=8)
-
-
-@pytest.fixture
-def states() -> torch.Tensor:
-    torch.manual_seed(1)  # pyright: ignore[reportUnknownMemberType]
-    return torch.randn(B, T, N, K)
-
-
-def test_scalar_per_track(encoder: ParameterEncoder, states: torch.Tensor) -> None:
-    """One unconstrained scalar coordinate per tracked object (Eq. 26)."""
-    theta = encoder(states)
-    assert theta.shape == (B, N, 1)
-    assert torch.isfinite(theta).all()
-
-
-def test_track_permutation_equivariance(encoder: ParameterEncoder, states: torch.Tensor) -> None:
-    """No absolute track-index embedding: permuting tracks permutes theta (§6.2)."""
-    encoder.eval()
-    perm = torch.randperm(N)
-    with torch.no_grad():
-        theta = encoder(states)
-        theta_perm = encoder(states[:, :, perm])
-    torch.testing.assert_close(theta_perm, theta[:, perm], atol=1e-5, rtol=1e-4)
-
-
-def test_relational_evidence_reaches_other_tracks(
-    encoder: ParameterEncoder, states: torch.Tensor
-) -> None:
-    """Eq. 18: per-timestep cross-track attention lets partner states affect theta_i."""
-    states = states.clone().requires_grad_(True)
-    encoder(states)[0, 0, 0].backward()  # pyright: ignore[reportUnknownMemberType]
+@pytest.mark.parametrize("action_dim", [0, 2])
+@pytest.mark.parametrize("history", [1, 5])
+def test_independent_dimensions_and_context_lengths(action_dim: int, history: int) -> None:
+    encoder = ParameterEncoder(7, 3, action_dim, dim=16, num_heads=4, max_history=6)
+    states = torch.randn(2, history, 7, requires_grad=True)
+    actions = (
+        None if action_dim == 0 else torch.randn(2, history - 1, action_dim, requires_grad=True)
+    )
+    parameters = encoder(states, actions)
+    assert parameters.shape == (2, 3)
+    assert torch.isfinite(parameters).all()
+    parameters.square().mean().backward()  # pyright: ignore[reportUnknownMemberType]
     assert states.grad is not None
-    # Gradient w.r.t. a DIFFERENT track's state must be nonzero.
-    assert states.grad[0, :, 1].abs().sum() > 0
+    assert states.grad.abs().sum() > 0
+    if actions is not None and history > 1:
+        assert actions.grad is not None
+        assert actions.grad.abs().sum() > 0
+    assert isinstance(encoder.head, nn.Linear)
+    assert encoder.head.out_features == 3
 
 
-def test_time_order_awareness(encoder: ParameterEncoder, states: torch.Tensor) -> None:
-    """The learned temporal PE makes theta depend on the order of observations."""
-    encoder.eval()
-    with torch.no_grad():
-        theta = encoder(states)
-        theta_reversed = encoder(states.flip(dims=[1]))
-    assert not torch.allclose(theta, theta_reversed, atol=1e-5)
+def test_parameter_context_has_time_order() -> None:
+    encoder = ParameterEncoder(5, 2, dim=16, max_history=6).eval()
+    states = torch.randn(2, 6, 5)
+    assert not torch.allclose(encoder(states), encoder(states.flip(1)), atol=1e-6)
 
 
-def test_history_length_guard(encoder: ParameterEncoder) -> None:
-    with pytest.raises(ValueError, match="max_history"):
-        encoder(torch.randn(1, 9, N, K))
-    with pytest.raises(ValueError, match="expected"):
-        encoder(torch.randn(1, 9, K))
+def test_episode_independence() -> None:
+    encoder = ParameterEncoder(5, 2, action_dim=3, dim=16)
+    states, actions = torch.randn(3, 4, 5), torch.randn(3, 3, 3)
+    first = encoder(states[:1], actions[:1])
+    torch.testing.assert_close(first, encoder(states, actions)[:1])
 
 
-def test_no_normalization_after_scalar_head(encoder: ParameterEncoder) -> None:
-    """Eq. 25: the head is a bare linear map (no norm may follow it)."""
-    assert isinstance(encoder.head, torch.nn.Linear)
-    assert encoder.head.out_features == 1
+def test_parameter_shape_guards() -> None:
+    encoder = ParameterEncoder(5, 2, action_dim=3, max_history=4)
+    with pytest.raises(ValueError, match="expected states"):
+        encoder(torch.randn(2, 4, 7), torch.randn(2, 3, 3))
+    with pytest.raises(ValueError, match="context length"):
+        encoder(torch.randn(2, 5, 5), torch.randn(2, 4, 3))
+    with pytest.raises(ValueError, match="K-1"):
+        encoder(torch.randn(2, 4, 5), torch.randn(2, 4, 3))
+    with pytest.raises(ValueError, match="K-1"):
+        encoder(torch.randn(2, 4, 5))
+    with pytest.raises(ValueError, match="action_dim=0"):
+        ParameterEncoder(5, 2)(torch.randn(2, 4, 5), torch.randn(2, 3, 1))
+    with pytest.raises(ValueError, match="positive"):
+        ParameterEncoder(5, 0)

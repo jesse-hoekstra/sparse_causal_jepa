@@ -1,4 +1,4 @@
-# Vendored code is exempt from all gates (D5).
+# Vendored code is exempt from all gates.
 exclude: ^src/scjepa/third_party/
 
 repos:
@@ -22,7 +22,7 @@ repos:
       - id: ruff-format
 
   # Local hook (language: system) so pyright runs in the project venv, where
-  # torch/scipy/etc. are importable — a mirrored hook env would lack them.
+  # project dependencies are importable — a mirrored hook env would lack them.
   # Requires `pip install -e ".[dev]"` in the active environment.
   - repo: local
     hooks:

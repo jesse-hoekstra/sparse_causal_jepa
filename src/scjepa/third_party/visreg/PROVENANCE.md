@@ -7,15 +7,15 @@
 - **License:** **CC BY-NC 4.0** — declared via the README badge linking to
   <https://creativecommons.org/licenses/by-nc/4.0/>; the repo ships **no LICENSE file**
   (recorded as found, 2026-07-09). **Non-commercial use only**; attribution required.
-  Fine for this academic project — flag to Jesse before any commercial use (D5).
+  Attribution and non-commercial restrictions apply to reuse.
 - **Files taken:** `visreg/losses/{visreg.py, sigreg.py}`.
 
-## Why this codebase
+## Use in this project
 
-D3 (docs/decisions.md): VISReg is the anti-collapse regularizer, with SIGReg kept as a
-config-selectable ablation/safety hatch. This repo is the official implementation
-accompanying `sources/VISReg.pdf`, its losses directory is designed to be interchangeable
-(same `(G, B, D) → scalar` contract), and both files are torch-only.
+Only SIGReg is an active, explicitly weighted training choice. The retained VISReg
+source is unused. The typed SIGReg wrapper uses online state samples and one
+parameter vector per distinct episode.
+Regularization does not establish information preservation or identifiability.
 
 ## Input contract (verified against source, savers beware)
 

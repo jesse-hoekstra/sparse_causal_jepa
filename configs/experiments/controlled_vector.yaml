@@ -1,0 +1,70 @@
+# Complete comparison protocol; numeric optimization/probe defaults are untuned.
+name: controlled-vector
+output_dir: outputs/controlled_vector
+graphs: [dense, complementary, diagonal]
+seeds: [0, 1, 2, 3, 4]
+train_episodes: 8192
+trajectory_length: 16
+data_seed: 0
+observation_seed: 1729
+validation_every: 1000
+upload_evaluation_artifacts: true
+model:
+  observation_kind: vector
+  observation_dim: 10
+  state_dim: 10
+  param_dim: 10
+  action_dim: 10
+  context_len: 2
+  history_len: 1
+  encoder_hidden_dims: [64, 64]
+  parameter_embed_dim: 64
+  parameter_heads: 4
+  spartan_layers: 2
+  spartan_embed_dim: 64
+  spartan_mlp_hidden: 64
+  spartan_mlp_layers: 3
+  ema_decay: 0.996
+train:
+  steps: 10000
+  batch_size: 64
+  accumulation_steps: 1
+  device: cpu
+  lr: 0.001
+  weight_decay: 0.0
+  grad_clip: 1.0
+  checkpoint_every: 250
+  log_every: 25
+  objective:
+    state_sparsity_weight: 0.001
+    action_sparsity_weight: 0.001
+    parameter_sparsity_weight: 0.001 # full; baseline sets only this to zero
+    logit_weight: 0.0
+    state_regularizer: sigreg
+    state_regularizer_weight: 0.1
+    parameter_regularizer: sigreg
+    parameter_regularizer_weight: 0.1
+    regularizer_num_projections: 256
+evaluation:
+  calibration_episodes: 512
+  validation_episodes: 256
+  test_episodes: 512
+  paired_episodes: 128
+  batch_size: 64
+  rollout_steps: 8
+  validation_probe_steps: 100
+  seed: 42
+  probe:
+    hidden_dim: 64
+    steps: 300
+    batch_size: 256
+    lr: 0.001
+    ridge: 0.001
+    seed: 0
+wandb:
+  mode: ${oc.env:WANDB_MODE,online}
+  project: ${oc.env:WANDB_PROJECT,null}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  group: controlled-vector
+  job_type: controlled-experiment
+  tags: [controlled-vector]

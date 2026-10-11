@@ -1,7 +1,7 @@
-"""Small torchrun helpers that preserve the experiment's total batch size.
+"""Small torchrun helpers that preserve the configured total batch size.
 
 Gradient synchronization belongs to DistributedDataParallel. These reductions
-are detached statistics for GECO, logging, and all-or-nothing update decisions;
+are detached statistics for logging, and all-or-nothing update decisions;
 they must never replace DDP's differentiable local loss.
 """
 
@@ -53,7 +53,7 @@ def initialize_distributed(device: str | torch.device) -> torch.device:
     if processes > 1 and not dist.is_initialized():
         dist.init_process_group(
             backend="nccl" if requested.type == "cuda" else "gloo",
-            # Other workers wait while rank zero runs the visual evaluation.
+            # Other workers wait while rank zero runs optional evaluation.
             timeout=timedelta(hours=4),
         )
     return requested
@@ -167,10 +167,10 @@ class GlobalBatchSampler(Sampler[list[int]]):
         return self.dataset_size // self.batch_size
 
     def __iter__(self) -> Iterator[list[int]]:
-        """Yield this rank's slice in the legacy DataLoader's shuffle order."""
+        """Yield this rank's slice in a deterministic DataLoader shuffle order."""
         generator = torch.Generator().manual_seed(self.seed * 100_003 + self.epoch)
-        # The original DataLoader consumes one worker-base-seed draw before its
-        # RandomSampler calls randperm. Preserve that exact episode order.
+        # A DataLoader consumes one worker-base-seed draw before its
+        # RandomSampler calls randperm. Match that episode order.
         torch.empty((), dtype=torch.int64).random_(generator=generator)
         indices = cast(
             list[int],

@@ -1,182 +1,194 @@
-"""Two-process integration of real visual training, EMA, GECO, and checkpoint RNG."""
+"""Two CPU ranks verify generic optimizer/EMA synchronization and resume."""
 
-import math
+import copy
 import os
-import socket
+import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
-from typing import cast
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch import Tensor
 
-from scjepa.data.bounce import BounceDataset
-from scjepa.models.visual_to_visual import VisualToVisualOutput, build_visual_to_visual
+from scjepa.data import TensorEpisodes
+from scjepa.models.encoders import VectorEncoder
+from scjepa.models.model import SCJEPA, ModelOutput
+from scjepa.models.parameter_encoder import ParameterEncoder
+from scjepa.models.spartan import Spartan
+from scjepa.training import TrainConfig, Trainer
 from scjepa.training.distributed import (
     destroy_distributed,
     gather_rank_objects,
     initialize_distributed,
     rank,
 )
-from scjepa.training.loop import TrainConfig
-from scjepa.training.visual_to_visual import VisualToVisualTrainer
 
 
-class _RankVarianceTrainer(VisualToVisualTrainer):
-    """Report deliberately unequal variances without changing predictive tensors."""
-
-    def _forward(self, batch: dict[str, torch.Tensor]) -> VisualToVisualOutput:
-        output = super()._forward(batch)
-        return output._replace(target_variance=torch.tensor(1e-8 if rank() == 0 else 100.0))
+class _FailingLogger:
+    def log(self, step: int, metrics: dict[str, float]) -> None:
+        raise RuntimeError(f"logger rejected step {step} with {len(metrics)} metrics")
 
 
-def _trainer(directory: str, steps: int = 2) -> VisualToVisualTrainer:
+def _trainer(
+    directory: str, identity: bool = False, dataset: TensorEpisodes | None = None
+) -> Trainer:
     torch.manual_seed(7)  # pyright: ignore[reportUnknownMemberType]
-    model = build_visual_to_visual(
-        num_slots=2,
-        slot_size=8,
-        state_dim=8,
-        param_encoder_dim=8,
-        param_encoder_heads=2,
-        max_history=8,
-        spartan_layers=1,
-        spartan_embed_dim=16,
-        spartan_mlp_hidden=16,
-        spartan_mlp_layers=2,
+    model = SCJEPA(
+        VectorEncoder(4, 3, (8,)),
+        ParameterEncoder(3, 2, dim=8, num_heads=2, max_history=4),
+        Spartan(3, 2, num_layers=1, embed_dim=8, mlp_hidden_size=8, identity=identity),
+        context_len=2,
+        ema_decay=0.8,
     )
-    dataset = BounceDataset(
-        num_episodes=8,
-        clip_len=4,
-        num_balls=2,
-        render=True,
-        uniform_appearance=True,
-        render_radius_from_mass=False,
-    )
-    return _RankVarianceTrainer(
-        model,
-        dataset,
-        TrainConfig(
-            steps=steps,
-            batch_size=4,
-            context_len=2,
-            num_rollout_t2_anchors=1,
-            oe_eval_horizon=2,
-            lambda_logit=1e-5,
-            sparsity_tau=0.5,
-            grad_skip_threshold=1e6,
-            # Exercise one unlogged update before gathering final metrics.
-            log_every=2,
-            checkpoint_every=1,
-            out_dir=directory,
-        ),
+    return Trainer(
+        model, TrainConfig(batch_size=4, accumulation_steps=2, out_dir=directory), dataset
     )
 
 
-def _visual_worker(worker: int, port: int, directory: str) -> None:
+def _worker(worker: int, rendezvous: str, directory: str) -> None:
     os.environ.update(
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(port),
         WORLD_SIZE="2",
         RANK=str(worker),
         LOCAL_RANK=str(worker),
+        GLOO_SOCKET_IFNAME="lo0" if sys.platform == "darwin" else "lo",
     )
     torch.set_num_threads(1)
+    # File rendezvous avoids host DNS lookup and TCPStore startup on developer
+    # machines; production torchrun initialization remains independently tested.
+    dist.init_process_group("gloo", init_method=rendezvous, rank=worker, world_size=2)
     initialize_distributed("cpu")
     try:
         trainer = _trainer(directory)
-        target_before = next(trainer.model.target.parameters()).detach().clone()
-        metrics = trainer.train()
-        assert metrics["health/skipped_steps"] == 0
-        assert metrics["train/loss_rollout_t2_raw"] > 0
-        assert metrics["train/seconds_per_step"] > 0
-        # The raw global predictive/logit mean determines GECO, even when
-        # different ranks report wildly different representation variances.
-        assert math.isclose(
-            metrics["sparsity/constraint"],
-            metrics["train/loss_teacher_forcing"]
-            + metrics["train/loss_rollout_t2_weighted"]
-            + metrics["loss/logit"],
-            rel_tol=1e-6,
+        batch = {"observations": torch.randn(2, 4, 4), "episode_ids": torch.arange(2) + worker * 2}
+        initial_target = copy.deepcopy(trainer.model.target_encoder.state_dict())
+        trainer.train_step(batch)
+        assert trainer.optimizer_steps == 0
+        torch.testing.assert_close(trainer.model.target_encoder.state_dict(), initial_target)
+        trainer.train_step(batch)
+        assert trainer.optimizer_steps == 1
+        assert any(
+            not torch.equal(initial_target[key], value)
+            for key, value in trainer.model.target_encoder.state_dict().items()
         )
-        assert metrics["collapse/target_variance"] == metrics["collapse/target/content_var"]
-        assert "train/grad_norm_teacher_forcing" not in metrics
-        assert not torch.equal(target_before, next(trainer.model.target.parameters()))
-        assert all(parameter.grad is None for parameter in trainer.model.target.parameters())
-        # train/save_checkpoint must return only after rank-zero writing finishes.
-        path = Path(directory) / "last.pt"
+        path = Path(directory) / "shared.pt"
+        trainer.save_checkpoint(path)
         payload = torch.load(path, map_location="cpu", weights_only=False)
         assert payload["world_size"] == 2
-        assert payload["global_batch_size"] == 4
         assert len(payload["rank_rng"]) == 2
         assert not torch.equal(
             payload["rank_rng"][0]["rng_torch"], payload["rank_rng"][1]["rng_torch"]
         )
-        # Both online and EMA replicas must equal rank zero's portable model;
-        # the dual must have the same value on every process as well.
-        for key, value in trainer.model.state_dict().items():
-            torch.testing.assert_close(value, payload["model"][key], rtol=0, atol=0)
-        torch.testing.assert_close(
-            trainer.lagrangian.log_lambda, payload["lagrangian"]["log_lambda"]
-        )
-
+        torch.testing.assert_close(trainer.model.state_dict(), payload["model"], rtol=0, atol=0)
         expected_rng = torch.get_rng_state().clone()
-        resumed = _trainer(directory, steps=3)
+        resumed = _trainer(directory)
         resumed.load_checkpoint(path)
-        torch.testing.assert_close(torch.get_rng_state(), expected_rng)
+        torch.testing.assert_close(torch.get_rng_state(), expected_rng, rtol=0, atol=0)
+        assert resumed.optimizer_steps == 1
         assert resumed.step == 2
-        # A rejection on just rank one must leave *every* replica and its EMA
-        # and dual unchanged. The other worker deliberately has a loose bound.
-        resumed.config.grad_skip_threshold = 0.0 if worker == 1 else 1e6
-        before = {key: value.clone() for key, value in resumed.model.state_dict().items()}
-        dual_before = resumed.lagrangian.log_lambda.clone()
-        rejected = resumed.train()
-        assert rejected["health/skipped_steps"] == 1
-        for key, value in resumed.model.state_dict().items():
-            torch.testing.assert_close(value, before[key], rtol=0, atol=0)
-        torch.testing.assert_close(resumed.lagrangian.log_lambda, dual_before, rtol=0, atol=0)
+        before = copy.deepcopy(resumed.model.state_dict())
+        # A gradient threshold rejection on one rank invalidates both accumulated groups.
+        resumed.config.grad_skip_threshold = 0 if worker == 1 else float("inf")
+        resumed.train_step(batch)
+        skipped = resumed.train_step(batch)
+        assert skipped["health/skipped"] == 1
+        torch.testing.assert_close(resumed.model.state_dict(), before, rtol=0, atol=0)
         assert gather_rank_objects(resumed.total_skips) == [1, 1]
+        resumed.config.grad_skip_threshold = float("inf")
+        original = resumed.objective.forward
 
-        # Each rank's target is constant; all content variation comes from the
-        # different episode means. Monitoring must gather first, rather than
-        # average local variance or trust the output's diagnostic scalar.
-        suffix_states = torch.full((2, 4, 2, 8), worker * 4.0)
-        diagnostic_output = cast(
-            VisualToVisualOutput,
-            SimpleNamespace(
-                target=torch.zeros(4, 2, 8),
-                causal_params=torch.zeros(2, 2, 1),
-                context_states=suffix_states,
-                target_states=suffix_states,
-                target_variance=torch.tensor(1e-8 if worker == 0 else 100.0),
-                target_assignment=torch.arange(2).expand(2, -1),
-            ),
+        def bad_loss(output: ModelOutput) -> tuple[Tensor, dict[str, Tensor]]:
+            total, terms = original(output)
+            return (total * float("nan") if rank() == 1 else total), terms
+
+        patch = pytest.MonkeyPatch()
+        patch.setattr(resumed.objective, "forward", bad_loss)
+        skipped = resumed.train_step(batch)
+        patch.undo()
+        assert skipped["health/skipped"] == 1
+        torch.testing.assert_close(resumed.model.state_dict(), before, rtol=0, atol=0)
+        resumed.train_step(batch)
+        resumed.train_step(batch)
+        assert resumed.optimizer_steps == 2
+        assert gather_rank_objects(resumed.total_skips) == [2, 2]
+        assert all(
+            parameter.grad is None for parameter in resumed.model.target_encoder.parameters()
         )
-        diagnostics = resumed._extra_metrics(diagnostic_output)  # pyright: ignore[reportPrivateUsage]
-        assert diagnostics["collapse/target_variance"] == 4.0
-        assert diagnostics["collapse/target/content_var"] == 4.0
-        assert diagnostics["collapse/target/temporal_var"] == 0.0
+        # Episode IDs must be distinct globally, not merely within each rank.
+        resumed.config.objective.parameter_regularizer_weight = 1
+        duplicate_ids = {"observations": batch["observations"], "episode_ids": torch.arange(2)}
+        with pytest.raises(ValueError, match="distinct episodes"):
+            resumed.train_step(duplicate_ids)
+        # Identity mode genuinely leaves parameter inference and attention unused.
+        # DDP discovers this from the loss, rather than unused returned diagnostics.
+        identity = _trainer(directory, identity=True)
+        for _ in range(4):
+            identity.train_step(batch)
+        assert identity.optimizer_steps == 2
+        # Only rank zero evaluates; all ranks receive identical selection state
+        # and participate in atomic best/last checkpoint creation.
+        validation = _trainer(directory, dataset=TensorEpisodes(torch.zeros(8, 4, 4)))
+        validation.config.steps = 6
+        evaluated: list[int] = []
+
+        def evaluate(model: SCJEPA) -> dict[str, float]:
+            assert worker == 0
+            assert model is validation.model
+            assert not model.training
+            assert validation.pending_microbatches == 0
+            evaluated.append(validation.step)
+            torch.randn(3)
+            return {"validation/physical_prediction_nrmse": 1 / validation.step}
+
+        validation.train(
+            evaluate,
+            validation_every=1,
+            stop_requested=lambda: worker == 1 and validation.step >= 3,
+        )
+        assert validation.interrupted
+        assert validation.step == 4
+        assert gather_rank_objects(evaluated) == [[2], []]
+        assert gather_rank_objects(validation.validation_state) == [
+            validation.validation_state,
+            validation.validation_state,
+        ]
+        assert validation.validation_state["best_step"] == 2
+        assert torch.load(Path(directory) / "last.pt", weights_only=False)["step"] == 4
+
+        def failing_evaluate(_model: SCJEPA) -> dict[str, float]:
+            assert worker == 0
+            raise ValueError("intentional rank-zero validation error")
+
+        with pytest.raises(RuntimeError, match="validation failed on rank zero"):
+            validation.train(failing_evaluate, validation_every=1)
+        assert validation.model.training
+        assert not validation.model.target_encoder.training
+        # A checkpoint write failure must also release all ranks with an error.
+        with pytest.raises(RuntimeError, match="checkpoint writing failed on rank zero"):
+            validation.save_checkpoint(Path(directory) / "last.pt" / "impossible.pt")
+        # A rank-zero logging failure must stop peers before their next backward.
+        identity.dataset = TensorEpisodes(torch.zeros(4, 4, 4))
+        identity.config.steps = identity.step + 2
+        identity.logger = _FailingLogger()
+        with pytest.raises(RuntimeError, match="metric logging failed on rank zero"):
+            identity.train()
     finally:
         destroy_distributed()
 
 
-def test_two_rank_visual_training_synchronizes_ema_geco_skips_and_resume(tmp_path: Path) -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = int(listener.getsockname()[1])
-    context = mp.spawn(_visual_worker, args=(port, str(tmp_path)), nprocs=2, join=False)  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+def test_two_rank_accumulation_ema_skips_checkpoints_and_unused_paths(tmp_path: Path) -> None:
+    rendezvous = (tmp_path / "rendezvous").as_uri()
+    context = mp.spawn(_worker, args=(rendezvous, str(tmp_path)), nprocs=2, join=False)  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
     assert context is not None
     deadline = time.monotonic() + 90
     try:
         while not context.join(timeout=1):
             if time.monotonic() > deadline:
-                pytest.fail("two-rank visual training did not finish within 90 seconds")
+                pytest.fail("two-rank generic training did not finish within 90 seconds")
     finally:
         for process in context.processes:
             assert process is not None
             if process.is_alive():
                 process.terminate()
-        for process in context.processes:
-            assert process is not None
             process.join(timeout=5)

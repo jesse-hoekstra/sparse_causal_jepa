@@ -1,332 +1,103 @@
-"""Training entrypoint: ``python scripts/train.py [experiment=bounce_baumgartner] [key=value ...]``.
+"""Generic training entrypoint for configured data adapters; no scientific protocol is imposed."""
 
-Hydra manages the config and the run directory; the resolved config is saved
-next to the run outputs. W&B is opt-in (``wandb.enabled=true``) so offline
-development and CI never block on it.
-"""
-
-import subprocess
+import json
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 import hydra
-from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
-from scjepa.eval.observational_equivalence import training_coordinate_std
-from scjepa.models.visual_to_visual import VISUAL_CONSTRAINT_VERSION
-from scjepa.training import MetricLogger, NoopLogger, TrainConfig, Trainer, seed_everything
+from scjepa.data import TensorEpisodes
+from scjepa.data.bundle import load_dataset_bundle
+from scjepa.data.factory import build_dgp_dataset
+from scjepa.training import TrainConfig, Trainer, seed_everything
 from scjepa.training.distributed import (
+    any_rank,
     destroy_distributed,
     initialize_distributed,
     is_main_process,
-    world_size,
 )
-from scjepa.training.factory import build_dataset, build_model
-from scjepa.training.visual_to_visual import VisualToVisualTrainer
+from scjepa.training.factory import build_model
+from scjepa.training.logging import WandbConfig, WandbLogger
 
 
-class WandbLogger:
-    """Thin W&B adapter satisfying ``MetricLogger`` (imported lazily)."""
-
-    def __init__(self, project: str, mode: str, config: dict[str, Any], name: str) -> None:
-        """Start a W&B run tagged with the resolved config and git SHA."""
-        import wandb
-
-        if mode not in ("online", "offline", "disabled"):
-            raise ValueError(f"unknown wandb mode {mode!r}")
-        self._run = wandb.init(project=project, mode=mode, config=config, name=name)
-
-    @property
-    def run_id(self) -> str:
-        """W&B run id, so post-hoc evaluation can resume this same run."""
-        return str(self._run.id)
-
-    def log(self, step: int, metrics: dict[str, float]) -> None:
-        """Forward metrics to W&B."""
-        self._run.log(metrics, step=step)
-
-
-class ConsoleLogger:
-    """Keep W&B-disabled runs visibly progressing without dumping every metric."""
-
-    def log(self, step: int, metrics: dict[str, float]) -> None:
-        """Print timing and update health at the configured logging interval."""
-        keys = ("train/seconds_per_step", "train/loss_total", "health/skipped_steps")
-        values = ", ".join(f"{key}={metrics[key]:.4g}" for key in keys if key in metrics)
-        print(f"step {step}: {values}", flush=True)
-
-
-def _source_of(key: str, overrides: list[str], preset: DictConfig | None) -> str:
-    """Where a config key's value came from — CLI, experiment preset, or base.
-
-    Answers "why is it this value?" without making anyone diff three yaml files.
-    """
-    if any(o.lstrip("+~").startswith(f"{key}=") for o in overrides):
-        return "CLI"
-    section, _, leaf = key.partition(".")
-    if preset is not None and leaf in (preset.get(section) or {}):
-        return "preset"
-    return "config.yaml"
-
-
-def _print_run_banner(cfg: DictConfig, experiment: str, phase: str, git_sha: str) -> None:
-    """Print the decision-critical resolved values and where each came from.
-
-    Every slurm log then OPENS with exactly what the run trained, so a wrong
-    config is visible in seconds instead of being reconstructed afterwards from
-    resolved_config.yaml. Keys listed here are the ones whose wrong value is
-    silent rather than loud.
-    """
-    overrides: list[str] = list(HydraConfig.get().overrides.task)
-    preset: DictConfig | None = None
-    preset_path = (
-        Path(__file__).resolve().parent.parent / "configs" / "experiment" / f"{experiment}.yaml"
+def run_training(cfg: DictConfig) -> None:
+    """Validate/resume training before starting one rank-zero tracking run."""
+    if (cfg.data_path is None) == (cfg.data is None):
+        raise ValueError("select exactly one data preset or data_path; see README.md")
+    train_cfg = cast(
+        TrainConfig,
+        OmegaConf.to_object(OmegaConf.merge(OmegaConf.structured(TrainConfig), cfg.train)),
     )
-    if preset_path.exists():
-        loaded = OmegaConf.load(preset_path)
-        preset = loaded if isinstance(loaded, DictConfig) else None
-
-    sparsity_on = bool(cfg.train.sparsity_enabled)
-    regime = str(cfg.model.get("regime", "state_to_state"))
-    rows: list[tuple[str, str, str]] = [
-        ("experiment", experiment, "preset"),
-        ("phase", phase, "-"),
-        # tau is MISSING-by-design on reference stages, which never read it.
-        (
-            "train.sparsity_tau",
-            f"{float(cfg.train.sparsity_tau):.6g}" if sparsity_on else "(unused: sparsity off)",
-            _source_of("train.sparsity_tau", overrides, preset) if sparsity_on else "-",
-        ),
-        (
-            "train.lambda_logit",
-            f"{float(cfg.train.lambda_logit):g}",
-            _source_of("train.lambda_logit", overrides, preset),
-        ),
-        (
-            "train.sparsity_lambda_init",
-            f"{float(cfg.train.sparsity_lambda_init):g}",
-            _source_of("train.sparsity_lambda_init", overrides, preset),
-        ),
-        (
-            "train.sparsity_step_size",
-            f"{float(cfg.train.sparsity_step_size):g}",
-            _source_of("train.sparsity_step_size", overrides, preset),
-        ),
-        ("train.steps", str(cfg.train.steps), _source_of("train.steps", overrides, preset)),
-        (
-            "train.batch_size (global)",
-            str(cfg.train.batch_size),
-            _source_of("train.batch_size", overrides, preset),
-        ),
-        ("distributed.world_size", str(world_size()), "torchrun environment"),
-        ("distributed.local_batch_size", str(int(cfg.train.batch_size) // world_size()), "derived"),
-        (
-            "train.context_len",
-            str(cfg.train.get("context_len", None)),
-            _source_of("train.context_len", overrides, preset),
-        ),
-        ("data.clip_len", str(cfg.data.clip_len), _source_of("data.clip_len", overrides, preset)),
-        (
-            "data.num_clips",
-            str(cfg.data.num_clips),
-            _source_of("data.num_clips", overrides, preset),
-        ),
-        ("data.preload", str(cfg.data.preload), _source_of("data.preload", overrides, preset)),
-        ("git_sha", git_sha, "-"),
-    ]
-    if regime in ("state_to_state", "visual_to_visual"):
-        rows[4:4] = [
-            (
-                "train.lambda_rollout_t2",
-                f"{float(cfg.train.lambda_rollout_t2):g}",
-                _source_of("train.lambda_rollout_t2", overrides, preset),
-            ),
-            (
-                "train.num_rollout_t2_anchors",
-                str(cfg.train.num_rollout_t2_anchors),
-                _source_of("train.num_rollout_t2_anchors", overrides, preset),
-            ),
-            (
-                "train.rollout_t2_horizon",
-                str(cfg.train.rollout_t2_horizon),
-                _source_of("train.rollout_t2_horizon", overrides, preset),
-            ),
-            (
-                "train.oe_eval_horizon",
-                str(cfg.train.oe_eval_horizon),
-                _source_of("train.oe_eval_horizon", overrides, preset),
-            ),
-            (
-                "train.oe_tolerance_nrmse",
-                f"{float(cfg.train.oe_tolerance_nrmse):g}",
-                _source_of("train.oe_tolerance_nrmse", overrides, preset),
-            ),
-        ]
-    width = max(len(name) for name, _, _ in rows)
-    print("─" * 78)
-    print("RUN CONFIGURATION")
-    for name, value, source in rows:
-        print(f"  {name:<{width}}  {value:<22} [{source}]")
-    print("─" * 78, flush=True)
-
-
-def _git_sha() -> str:
-    """Current commit SHA + dirty flag (reproducibility record)."""
+    wandb_cfg = cast(
+        WandbConfig,
+        OmegaConf.to_object(OmegaConf.merge(OmegaConf.structured(WandbConfig), cfg.wandb)),
+    )
+    train_cfg.device = str(initialize_distributed(train_cfg.device))
+    logger: WandbLogger | None = None
+    exit_code = 1
     try:
-        sha = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True
-        ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain"], capture_output=True, text=True, check=True
-        ).stdout.strip()
-        return sha + ("-dirty" if dirty else "")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return "unknown"
+        seed_everything(train_cfg.seed)
+        model = build_model(cfg.model)
+        if cfg.data is not None:
+            data = build_dgp_dataset(cfg.data)
+            cfg.data = OmegaConf.structured(data.config)
+        else:
+            path = Path(str(cfg.data_path))
+            data = (
+                load_dataset_bundle(path)
+                if path.is_dir() or path.suffix == ".json"
+                else TensorEpisodes.load(path)
+            )
+        model_config = cast(dict[str, object], OmegaConf.to_container(cfg.model, resolve=True))
+        trainer = Trainer(model, train_cfg, dataset=data, model_config=model_config)
+        if cfg.resume is not None:
+            trainer.load_checkpoint(Path(str(cfg.resume)))
+        setup_error: Exception | None = None
+        if is_main_process():
+            try:
+                cfg.train = OmegaConf.structured(trainer.config)
+                cfg.wandb = OmegaConf.structured(wandb_cfg)
+                run_dir = Path(trainer.config.out_dir)
+                run_dir.mkdir(parents=True, exist_ok=True)
+                saved_tracking = trainer.run_metadata.get("wandb")
+                if saved_tracking is not None and not isinstance(saved_tracking, dict):
+                    raise ValueError("checkpoint W&B identity must be a mapping")
+                logger = WandbLogger(
+                    wandb_cfg,
+                    resolved_config=cast(
+                        dict[str, object], OmegaConf.to_container(cfg, resolve=True)
+                    ),
+                    dataset_identity=trainer.dataset_identity,
+                    out_dir=run_dir,
+                    resume_state=cast(dict[str, object] | None, saved_tracking),
+                )
+                trainer.logger = logger
+                if logger.metadata:
+                    trainer.run_metadata["wandb"] = logger.metadata
+                OmegaConf.save(cfg, run_dir / "resolved_config.yaml")
+                metadata_path = run_dir / "run_metadata.json"
+                temporary = metadata_path.with_suffix(".json.tmp")
+                temporary.write_text(json.dumps(trainer.run_metadata, indent=2) + "\n")
+                temporary.replace(metadata_path)
+            except Exception as error:
+                setup_error = error
+        if any_rank(setup_error is not None, trainer.device):
+            raise RuntimeError("run logging initialization failed on rank zero") from setup_error
+        trainer.train()
+        exit_code = 0
+    finally:
+        try:
+            if logger is not None:
+                logger.finish(exit_code=exit_code)
+        finally:
+            destroy_distributed()
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig) -> None:
-    """Bind each torchrun worker to its GPU and clean up the process group."""
-    cfg.train.device = str(initialize_distributed(str(cfg.train.device)))
-    try:
-        _train(cfg)
-    finally:
-        destroy_distributed()
-
-
-def _train(cfg: DictConfig) -> None:
-    """Build one replica per worker and let rank zero own run artifacts."""
-    if int(cfg.train.batch_size) < world_size() or int(cfg.train.batch_size) % world_size():
-        raise ValueError("train.batch_size is global and must be divisible by the worker count")
-    # Trainer.__init__ seeds the training stream, but that is too late for
-    # reproducible dataset/model construction. Seed before either is built.
-    seed_everything(int(cfg.train.seed))
-    experiment = str(HydraConfig.get().runtime.choices.get("experiment") or cfg.data.name)
-    if cfg.model.get("spartan_identity", False):
-        phase = "token-local"
-    elif cfg.model.get("spartan_dense", False):
-        phase = "dense"
-    elif cfg.train.sparsity_enabled:
-        phase = "sparse"
-    else:
-        phase = "gated-no-sparsity"  # ablation only; NOT the dense reference
-    git_sha = _git_sha()
-    # BEFORE anything is written or any W&B run is opened: the banner touches
-    # every mandatory key, so a missing one aborts here rather than after a run
-    # directory, a checkpoint and a W&B entry already exist. NOTE: never read
-    # these with DictConfig.get(key, default) — it returns the default for a
-    # MISSING value and would silently reinstate the footgun this replaces.
-    if is_main_process():
-        _print_run_banner(cfg, experiment, phase, git_sha)
-
-    out_dir = Path(str(HydraConfig.get().runtime.output_dir))
-    if is_main_process():
-        print("Loading training dataset...", flush=True)
-    dataset = build_dataset(cfg.data)
-    if is_main_process():
-        print("Training dataset ready.", flush=True)
-    regime = str(cfg.model.get("regime", "state_to_state"))
-    if regime == "state_to_state":
-        # A fixed all-training-state population std is part of the OE ruler.
-        # Computing it before model construction uses only dataset-private RNGs
-        # and cannot perturb model initialization or anchor/Gumbel sampling.
-        scales = training_coordinate_std(dataset)
-        cfg.train.oe_coordinate_std = [float(value) for value in scales]
-
-    resolved: dict[str, Any] = OmegaConf.to_container(cfg, resolve=True)  # pyright: ignore[reportAssignmentType]
-    resolved["git_sha"] = git_sha
-    if regime == "visual_to_visual":
-        resolved["visual_constraint_version"] = VISUAL_CONSTRAINT_VERSION
-    resolved["distributed"] = {
-        "world_size": world_size(),
-        "global_batch_size": int(cfg.train.batch_size),
-        "local_batch_size": int(cfg.train.batch_size) // world_size(),
-    }
-    if world_size() > 1 and str(cfg.train.device).startswith("cuda"):
-        # Rank-local CUDA indices belong to execution, not the portable protocol.
-        resolved["train"]["device"] = "cuda"
-    if is_main_process():
-        OmegaConf.save(config=OmegaConf.create(resolved), f=out_dir / "resolved_config.yaml")
-
-    eval_dataset = None
-    if cfg.train.get("eval_every") is not None:
-        eval_cfg = OmegaConf.merge(
-            cfg.data, {"num_clips": int(cfg.train.get("eval_episodes", 128))}
-        )
-        eval_dataset = build_dataset(eval_cfg, seed_offset=17)  # pyright: ignore[reportArgumentType]
-    model = build_model(cfg.model)
-    if is_main_process():
-        print("Model constructed.", flush=True)
-    train_config = TrainConfig(
-        steps=cfg.train.steps,
-        batch_size=cfg.train.batch_size,
-        lr=cfg.train.lr,
-        grad_clip=cfg.train.grad_clip,
-        sparsity_enabled=cfg.train.sparsity_enabled,
-        # MANDATORY (`???`) but read ONLY when the dual is active: accessing a
-        # MISSING value raises, which is exactly the guard we want for sparse
-        # runs and exactly what must NOT fire on dense/token-local references.
-        sparsity_tau=float(cfg.train.sparsity_tau) if cfg.train.sparsity_enabled else 0.0,
-        sparsity_step_size=cfg.train.sparsity_step_size,
-        sparsity_lambda_init=cfg.train.sparsity_lambda_init,
-        sparsity_momentum=cfg.train.sparsity_momentum,
-        lambda_logit=float(cfg.train.lambda_logit),  # mandatory: .get() would mask MISSING
-        lambda_rollout_t2=float(cfg.train.lambda_rollout_t2),
-        num_rollout_t2_anchors=int(cfg.train.num_rollout_t2_anchors),
-        rollout_t2_horizon=int(cfg.train.rollout_t2_horizon),
-        oe_eval_horizon=int(cfg.train.oe_eval_horizon),
-        oe_tolerance_nrmse=float(cfg.train.oe_tolerance_nrmse),
-        oe_coordinate_std=(
-            tuple(float(value) for value in cfg.train.oe_coordinate_std)
-            if cfg.train.get("oe_coordinate_std") is not None
-            else None
-        ),
-        seed=cfg.train.seed,
-        device=cfg.train.device,
-        context_len=cfg.train.get("context_len", None),
-        eval_every=cfg.train.get("eval_every", None),
-        grad_skip_threshold=cfg.train.get("grad_skip_threshold", 1e3),
-        grad_skip_max_consecutive=cfg.train.get("grad_skip_max_consecutive", 2000),
-        num_workers=int(cfg.train.get("num_workers", 0)),
-        prefetch_factor=int(cfg.train.get("prefetch_factor", 4)),
-        log_every=cfg.train.log_every,
-        checkpoint_every=cfg.train.checkpoint_every,
-        checkpoint_keep_every=cfg.train.get("checkpoint_keep_every", None),
-        out_dir=str(out_dir),
-    )
-    lambda_logit = float(cfg.train.lambda_logit)
-    run_name = f"{experiment}-{phase}-ll{lambda_logit:g}-seed{cfg.train.seed}"
-    if cfg.wandb.get("run_tag") is not None:
-        run_name = f"{run_name}-{cfg.wandb.run_tag}"
-    logger: MetricLogger = (
-        WandbLogger(project=cfg.wandb.project, mode=cfg.wandb.mode, config=resolved, name=run_name)
-        if cfg.wandb.enabled and is_main_process()
-        else ConsoleLogger()
-        if is_main_process()
-        else NoopLogger()
-    )
-    # Record the run id so scripts/eval_identifiability.py can attach the final
-    # 5000-episode metrics and recovery_grid.png to THIS run instead of opening
-    # a detached second entry.
-    if isinstance(logger, WandbLogger):
-        (out_dir / "wandb_run_id.txt").write_text(logger.run_id)
-    # Each regime keeps every guard, checkpoint and resume path of the shared
-    # Trainer and overrides only what its observation contract implies. The
-    # state-to-state path is untouched by this dispatch.
-    trainers = {
-        "state_to_state": Trainer,
-        "visual_to_visual": VisualToVisualTrainer,
-    }
-    trainer_class = trainers[str(cfg.model.get("regime", "state_to_state"))]
-    final = trainer_class(
-        cast(Any, model), dataset, train_config, logger, eval_dataset=eval_dataset
-    ).train()
-    if is_main_process():
-        print(
-            f"done at step {train_config.steps}: "
-            + ", ".join(f"{k}={v:.4g}" for k, v in final.items())
-        )
+    """Run configured training with W&B and terminal metrics."""
+    run_training(cfg)
 
 
 if __name__ == "__main__":

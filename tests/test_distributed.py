@@ -1,8 +1,10 @@
 """CPU verification of batch-preserving torchrun helpers and DDP arithmetic."""
 
 import os
-import socket
+import sys
 import time
+from datetime import timedelta
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -31,7 +33,7 @@ from scjepa.training.distributed import (
 
 @pytest.mark.parametrize("processes", [1, 2, 4])
 @pytest.mark.parametrize("epoch", [0, 1, 7])
-def test_global_batch_sampler_preserves_legacy_batch_order(processes: int, epoch: int) -> None:
+def test_global_batch_sampler_preserves_global_batch_order(processes: int, epoch: int) -> None:
     seed, dataset_size, batch_size = 13, 23, 4
     generator = torch.Generator().manual_seed(seed * 100_003 + epoch)
     original = DataLoader(
@@ -96,16 +98,24 @@ def test_single_cuda_device_resolves_current_index(monkeypatch: pytest.MonkeyPat
     assert selected == [torch.device("cuda:3"), torch.device("cuda:1")]
 
 
-def _distributed_worker(worker: int, port: int) -> None:
+def _distributed_worker(worker: int, rendezvous: str) -> None:
     os.environ.update(
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(port),
+        GLOO_SOCKET_IFNAME="lo0" if sys.platform == "darwin" else "lo",
         RANK=str(worker),
         LOCAL_RANK=str(worker),
         WORLD_SIZE="2",
     )
     torch.set_num_threads(1)
     try:
+        # Local tests avoid TCPStore reverse-DNS stalls on unregistered hostnames.
+        # The production helper retains torchrun's normal environment rendezvous.
+        dist.init_process_group(
+            "gloo",
+            init_method=rendezvous,
+            rank=worker,
+            world_size=2,
+            timeout=timedelta(seconds=30),
+        )
         assert initialize_distributed("cpu") == torch.device("cpu")
         assert dist.get_backend() == "gloo"
         assert rank() == worker
@@ -124,10 +134,10 @@ def _distributed_worker(worker: int, port: int) -> None:
         }
 
         # Gather the episodes in rank order for global representation diagnostics.
-        slot_offsets = torch.tensor([0.0, 1000.0]).view(1, 1, 2, 1)
-        local_states = slot_offsets.expand(1, 3, 2, 3) + worker * 4.0
+        coordinate_offsets = torch.tensor([0.0, 1000.0, 2000.0]).view(1, 1, 3)
+        local_states = coordinate_offsets.expand(1, 3, 3) + worker * 4.0
         global_states = torch.cat(
-            (slot_offsets.expand(1, 3, 2, 3), slot_offsets.expand(1, 3, 2, 3) + 4)
+            (coordinate_offsets.expand(1, 3, 3), coordinate_offsets.expand(1, 3, 3) + 4)
         )
         torch.testing.assert_close(gather_batch_tensor(local_states), global_states)
         assert gather_rank_objects({"worker": worker}) == [{"worker": 0}, {"worker": 1}]
@@ -166,11 +176,9 @@ def _distributed_worker(worker: int, port: int) -> None:
         destroy_distributed()
 
 
-def test_two_cpu_ranks_match_global_statistics_and_full_batch_gradients() -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = int(listener.getsockname()[1])
-    context = mp.spawn(_distributed_worker, args=(port,), nprocs=2, join=False)  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+def test_two_cpu_ranks_match_global_statistics_and_full_batch_gradients(tmp_path: Path) -> None:
+    rendezvous = (tmp_path / "rendezvous").as_uri()
+    context = mp.spawn(_distributed_worker, args=(rendezvous,), nprocs=2, join=False)  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
     assert context is not None
     deadline = time.monotonic() + 60
     try:
@@ -183,3 +191,25 @@ def test_two_cpu_ranks_match_global_statistics_and_full_batch_gradients() -> Non
             if process.is_alive():
                 process.terminate()
             process.join(timeout=5)
+
+
+def test_torchrun_cpu_initialization_preserves_default_rendezvous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    initialized = False
+    backends: list[str] = []
+
+    def initialize(*, backend: str, timeout: timedelta) -> None:
+        nonlocal initialized
+        assert timeout > timedelta(0)
+        backends.append(backend)
+        initialized = True
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: initialized)
+    # The keyword-only signature verifies no explicit store or init_method is
+    # substituted for torchrun's environment-based production rendezvous.
+    monkeypatch.setattr(dist, "init_process_group", initialize)
+    assert initialize_distributed("cpu") == torch.device("cpu")
+    assert initialize_distributed("cpu") == torch.device("cpu")
+    assert backends == ["gloo"]

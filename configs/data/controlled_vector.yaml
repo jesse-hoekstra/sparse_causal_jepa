@@ -1,0 +1,19 @@
+# @package _global_
+# Paper dynamics/dimensions; episode count, length, seeds and K=2 are interface defaults.
+data:
+  family: controlled_vector
+  parameter_graph: dense
+  root_seed: 0
+  split: train
+  num_episodes: 8
+  trajectory_length: 16
+  dtype: float32
+  observation_seed: 1729
+model:
+  observation_kind: vector
+  observation_dim: 10
+  state_dim: 10
+  param_dim: 10
+  action_dim: 10
+  history_len: 1
+  context_len: 2

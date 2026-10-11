@@ -1,25 +1,21 @@
-"""Training loops and optimization for the two active experiments.
+"""Generic optimization, independent loss controls, distributed helpers, and resume."""
 
-Experiment 1 predicts true states; Experiment 2 learns online visual states and
-stopped-gradient EMA targets. Both train teacher forcing and sampled T=2
-endpoints, with shared gradient safeguards, checkpointing, seeding, and W&B
-logging. Representation regularizers are not active in either current preset.
-"""
-
-from scjepa.training.lagrangian import SparsityLagrangian
 from scjepa.training.loop import (
     MetricLogger,
     NoopLogger,
+    ObjectiveConfig,
     TrainConfig,
     Trainer,
+    TrainingObjective,
     seed_everything,
 )
 
 __all__ = [
     "MetricLogger",
     "NoopLogger",
-    "SparsityLagrangian",
+    "ObjectiveConfig",
     "TrainConfig",
     "Trainer",
+    "TrainingObjective",
     "seed_everything",
 ]

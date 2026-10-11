@@ -1,497 +1,305 @@
-"""End-to-end tests for the fixed teacher-forcing-plus-T=2 trainer."""
+"""CPU training contracts: losses, accepted updates, accumulation, and exact resume."""
 
-# These tests intentionally exercise protected training hooks and loader methods.
-# pyright: reportPrivateUsage=false
-
-from dataclasses import fields
+import copy
 from pathlib import Path
-from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
-from omegaconf import DictConfig, OmegaConf
+from torch import Tensor
+from torch.utils.data import Dataset
+from torch.utils.hooks import RemovableHandle
 
-import scjepa.training.loop as training_loop
-from scjepa.data import BounceDataset
-from scjepa.models import StateToStateModel, build_state_to_state
-from scjepa.training import SparsityLagrangian, TrainConfig, Trainer
-from scjepa.training.factory import REGIMES, build_dataset, build_model
+from scjepa.models.encoders import VectorEncoder
+from scjepa.models.model import SCJEPA, ModelOutput
+from scjepa.models.parameter_encoder import ParameterEncoder
+from scjepa.models.spartan import GraphPenalties, Spartan
+from scjepa.training import ObjectiveConfig, TrainConfig, Trainer, TrainingObjective
+from scjepa.training.lagrangian import SparsityLagrangian
 
-N = 3
 
-
-def tiny_model(dense: bool = False, identity: bool = False) -> StateToStateModel:
-    torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
-    return build_state_to_state(
-        num_slots=N,
-        param_encoder_dim=16,
-        param_encoder_heads=2,
-        max_history=8,
-        spartan_layers=1,
-        spartan_embed_dim=32,
-        spartan_mlp_hidden=32,
-        spartan_mlp_layers=2,
-        spartan_dense=dense,
-        spartan_identity=identity,
+def tiny_model() -> SCJEPA:
+    return SCJEPA(
+        VectorEncoder(6, 3, (8,)),
+        ParameterEncoder(3, 2, action_dim=1, dim=8, num_heads=2, max_history=5),
+        Spartan(3, 2, action_dim=1, history_len=2, num_layers=1, embed_dim=8, mlp_hidden_size=8),
+        context_len=3,
+        ema_decay=0.8,
     )
 
 
-def tiny_dataset(num_episodes: int = 8, clip_len: int = 6) -> BounceDataset:
-    return BounceDataset(
-        num_episodes=num_episodes,
-        clip_len=clip_len,
-        num_balls=N,
-        seed=2,
-        render=False,
-        cache=True,
-        mass_normal=(1.5, 0.5),
-        radius_from_mass=True,
-    )
-
-
-def tiny_config(out_dir: Path, steps: int = 3, **overrides: object) -> TrainConfig:
-    defaults: dict[str, object] = {
-        "steps": steps,
-        "batch_size": 4,
-        "sparsity_tau": 0.5,
-        "context_len": 2,
-        "lambda_logit": 1e-3,
-        # T=6/C=2 has three valid T=2 offsets: 0,1,2.
-        "lambda_rollout_t2": 1.0,
-        "num_rollout_t2_anchors": 3,
-        "rollout_t2_horizon": 2,
-        "oe_eval_horizon": 4,
-        "oe_coordinate_std": (1.0, 1.0, 1.0, 1.0),
-        "log_every": 1,
-        "checkpoint_every": 1000,
-        "out_dir": str(out_dir),
-        "seed": 0,
+def tiny_batch() -> dict[str, Tensor]:
+    return {
+        "observations": torch.randn(4, 5, 6),
+        "actions": torch.randn(4, 4, 1),
+        "episode_ids": torch.arange(4),
     }
-    defaults.update(overrides)
-    return TrainConfig(**defaults)  # pyright: ignore[reportArgumentType]
 
 
-def test_lagrangian_dual_dynamics() -> None:
-    controller = SparsityLagrangian(tau=0.1, step_size=1.0, lambda_init=1e4, momentum=0.0)
-    start = float(controller.log_lambda)
-    controller.update(torch.tensor(1.1))
-    assert float(controller.log_lambda) == pytest.approx(start + 1.0)
-    for _ in range(40):
-        controller.update(torch.tensor(0.0))
-    assert float(controller.log_lambda) < start - 2.0
-    assert controller.penalty_weight.item() == pytest.approx(
-        float(torch.exp(-controller.log_lambda))
+def tiny_trainer(tmp_path: Path, accumulation_steps: int = 1) -> Trainer:
+    return Trainer(
+        tiny_model(),
+        TrainConfig(batch_size=4, accumulation_steps=accumulation_steps, out_dir=str(tmp_path)),
+        model_config={"test": "tiny"},
     )
 
 
-def test_training_smoke_has_finite_fixed_objective_and_no_schedule_keys(tmp_path: Path) -> None:
-    trainer = Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path))
+def test_cpu_forward_backward_and_target_is_excluded_from_optimizer(tmp_path: Path) -> None:
+    trainer = tiny_trainer(tmp_path)
+    optimized = {
+        id(parameter) for group in trainer.optimizer.param_groups for parameter in group["params"]
+    }
+    assert optimized.isdisjoint(
+        id(parameter) for parameter in trainer.model.target_encoder.parameters()
+    )
+    output = trainer.model(**{k: v for k, v in tiny_batch().items() if k != "episode_ids"})
+    loss, _ = trainer.objective(output)
+    loss.backward()
+    for module in (
+        trainer.model.online_encoder,
+        trainer.model.parameter_encoder,
+        trainer.model.predictor,
+    ):
+        gradients = [
+            parameter.grad for parameter in module.parameters() if parameter.grad is not None
+        ]
+        assert gradients
+        assert all(torch.isfinite(gradient).all() for gradient in gradients)
+        assert sum(float(gradient.abs().sum()) for gradient in gradients) > 0
+    assert all(parameter.grad is None for parameter in trainer.model.target_encoder.parameters())
+    assert not trainer.model.target_encoder.training
+
+
+def test_accumulation_updates_optimizer_and_ema_exactly_once(tmp_path: Path) -> None:
+    trainer = tiny_trainer(tmp_path, accumulation_steps=2)
+    before_online = copy.deepcopy(trainer.model.online_encoder.state_dict())
+    before_target = copy.deepcopy(trainer.model.target_encoder.state_dict())
+    first = trainer.train_step(tiny_batch())
+    assert first["health/updated"] == 0
+    assert trainer.pending_microbatches == 1
+    torch.testing.assert_close(
+        trainer.model.online_encoder.state_dict(), before_online, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        trainer.model.target_encoder.state_dict(), before_target, rtol=0, atol=0
+    )
+    with pytest.raises(ValueError, match="accumulation boundary"):
+        trainer.save_checkpoint(tmp_path / "partial.pt")
+    second = trainer.train_step(tiny_batch())
+    assert second["health/updated"] == 1
+    assert trainer.optimizer_steps == 1
+    assert trainer.pending_microbatches == 0
+    assert trainer.step == 2
+    for key, value in trainer.model.target_encoder.state_dict().items():
+        expected = before_target[key] * 0.8 + trainer.model.online_encoder.state_dict()[key] * 0.2
+        torch.testing.assert_close(value, expected)
+
+
+@pytest.mark.parametrize("rejection", ["loss", "gradient", "threshold"])
+def test_rejected_group_discards_accumulation_without_ema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rejection: str
+) -> None:
+    trainer = tiny_trainer(tmp_path, accumulation_steps=2)
+    before = copy.deepcopy(trainer.model.state_dict())
+    trainer.train_step(tiny_batch())
+    original_forward = trainer.objective.forward
+    hook: RemovableHandle | None = None
+    if rejection == "loss":
+
+        def bad_loss(output: ModelOutput) -> tuple[Tensor, dict[str, Tensor]]:
+            total, terms = original_forward(output)
+            return total * float("nan"), terms
+
+        monkeypatch.setattr(trainer.objective, "forward", bad_loss)
+    elif rejection == "gradient":
+
+        def poison(gradient: Tensor) -> Tensor:
+            return torch.full_like(gradient, float("nan"))
+
+        parameter = next(trainer.model.online_encoder.parameters())
+        hook = cast(RemovableHandle, parameter.register_hook(poison))  # pyright: ignore[reportUnknownMemberType]
+    else:
+        trainer.config.grad_skip_threshold = 0
+    metrics = trainer.train_step(tiny_batch())
+    assert metrics["health/skipped"] == 1
+    assert trainer.optimizer_steps == 0
+    assert trainer.pending_microbatches == 0
+    assert trainer.total_skips == 1
+    assert not trainer.optimizer.state
+    assert all(parameter.grad is None for parameter in trainer.model.parameters())
+    torch.testing.assert_close(trainer.model.state_dict(), before, rtol=0, atol=0)
+    if hook is not None:
+        hook.remove()
+    monkeypatch.setattr(trainer.objective, "forward", original_forward)
+    trainer.config.grad_skip_threshold = float("inf")
+    trainer.train_step(tiny_batch())
+    trainer.train_step(tiny_batch())
+    assert trainer.optimizer_steps == 1
+    assert trainer.consecutive_skips == 0
+
+
+def test_checkpoint_restores_ema_config_rng_optimizer_and_exact_continuation(
+    tmp_path: Path,
+) -> None:
+    trainer = tiny_trainer(tmp_path)
+    trainer.config.objective.state_sparsity_weight = 0.02
+    trainer.train_step(tiny_batch())
+    next_batch = tiny_batch()
+    checkpoint = tmp_path / "state.pt"
+    trainer.save_checkpoint(checkpoint)
+    metrics = trainer.train_step(next_batch)
+    expected_model = copy.deepcopy(trainer.model.state_dict())
+    expected_optimizer = copy.deepcopy(trainer.optimizer.state_dict())
+    expected_rng = torch.get_rng_state().clone()
+    resumed = tiny_trainer(tmp_path)
+    resumed.model.ema_decay = 0.2
+    resumed.load_checkpoint(checkpoint)
+    assert resumed.model.ema_decay == 0.8
+    assert resumed.config.objective.state_sparsity_weight == 0.02
+    assert resumed.step == resumed.optimizer_steps == 1
+    actual_metrics = resumed.train_step(next_batch)
+    assert actual_metrics == metrics
+    torch.testing.assert_close(resumed.model.state_dict(), expected_model, rtol=0, atol=0)
+    torch.testing.assert_close(resumed.optimizer.state_dict(), expected_optimizer, rtol=0, atol=0)
+    torch.testing.assert_close(torch.get_rng_state(), expected_rng, rtol=0, atol=0)
+    assert not resumed.model.target_encoder.training
+    assert all(
+        not parameter.requires_grad for parameter in resumed.model.target_encoder.parameters()
+    )
+
+
+def test_separate_sparsity_weights_change_only_the_selected_loss_block() -> None:
+    model = tiny_model()
+    batch = tiny_batch()
+    output: ModelOutput = model(batch["observations"], batch["actions"])
+    baseline, _ = TrainingObjective(ObjectiveConfig())(output)
+    for name, block in (("state", "state"), ("action", "action"), ("parameter", "parameter")):
+        config = ObjectiveConfig()
+        setattr(config, f"{name}_sparsity_weight", 0.7)
+        total, terms = TrainingObjective(config)(output)
+        torch.testing.assert_close(total, baseline + 0.7 * terms[f"{block}_sparsity"])
+    # Parameter-conditioned predictive gradients exist with parameter sparsity off.
+    baseline.backward()
+    gradient = model.parameter_encoder.head.weight.grad
+    assert gradient is not None
+    assert gradient.abs().sum() > 0
+
+
+def test_disabled_auxiliary_terms_cannot_poison_prediction_with_infinite_diagnostics() -> None:
+    model = tiny_model()
+    batch = tiny_batch()
+    output: ModelOutput = model(batch["observations"], batch["actions"])
+    infinite = torch.tensor(float("inf"))
+    dynamics = tuple(
+        item._replace(sparsity=GraphPenalties(infinite, infinite, infinite), logit_penalty=infinite)
+        for item in output.dynamics
+    )
+    loss, terms = TrainingObjective(ObjectiveConfig())(output._replace(dynamics=dynamics))
+    assert torch.isfinite(loss)
+    torch.testing.assert_close(loss, terms["prediction"])
+    loss.backward()
+
+
+def test_parameter_regularizer_uses_one_sample_per_distinct_episode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = Trainer(
+        tiny_model(),
+        TrainConfig(
+            batch_size=4,
+            objective=ObjectiveConfig(
+                parameter_regularizer="sigreg",
+                parameter_regularizer_weight=0.1,
+                regularizer_num_projections=8,
+            ),
+        ),
+    )
+    seen: list[tuple[int, ...]] = []
+    original = trainer.objective.parameter_regularizer.forward
+
+    def record(samples: Tensor) -> Tensor:
+        seen.append(tuple(samples.shape))
+        return original(samples)
+
+    monkeypatch.setattr(trainer.objective.parameter_regularizer, "forward", record)
+    batch = tiny_batch()
+    trainer.train_step(batch)
+    assert seen == [(1, 4, 2)]
+    batch["episode_ids"] = torch.tensor([0, 1, 1, 2])
+    with pytest.raises(ValueError, match="distinct episodes"):
+        trainer.train_step(batch)
+    del batch["episode_ids"]
+    with pytest.raises(ValueError, match="episode_ids"):
+        trainer.train_step(batch)
+    trainer.save_checkpoint(tmp_path / "regularized.pt")
+
+
+class _TensorEpisodes(Dataset[dict[str, Tensor]]):
+    def __init__(self, count: int = 12) -> None:
+        self.observations = torch.randn(count, 5, 6)
+        self.actions = torch.randn(count, 4, 1)
+
+    def __len__(self) -> int:
+        return self.observations.shape[0]
+
+    def __getitem__(self, index: int) -> dict[str, Tensor]:
+        return {"observations": self.observations[index], "actions": self.actions[index]}
+
+
+def test_dataset_loop_and_resume_replay_batch_order(tmp_path: Path) -> None:
+    dataset = _TensorEpisodes()
+    trainer = Trainer(
+        tiny_model(), TrainConfig(steps=2, batch_size=4, out_dir=str(tmp_path)), dataset
+    )
+    trainer.train()
+    resumed = Trainer(
+        tiny_model(), TrainConfig(steps=3, batch_size=4, out_dir=str(tmp_path)), dataset
+    )
+    resumed.load_checkpoint(tmp_path / "last.pt")
+    expected = next(trainer._batches())  # pyright: ignore[reportPrivateUsage]
+    actual = next(resumed._batches())  # pyright: ignore[reportPrivateUsage]
+    torch.testing.assert_close(actual, expected)
+    resumed.train()
+    assert resumed.step == resumed.optimizer_steps == 3
+
+
+def test_partial_final_group_is_discarded_and_checkpoint_is_safe(tmp_path: Path) -> None:
+    trainer = Trainer(
+        tiny_model(),
+        TrainConfig(steps=3, batch_size=4, accumulation_steps=2, out_dir=str(tmp_path)),
+        _TensorEpisodes(),
+    )
     metrics = trainer.train()
-    required = {
-        "train/loss_teacher_forcing",
-        "train/loss_rollout_t2_raw",
-        "train/loss_rollout_t2_weighted",
-        "train/loss_total",
-        "train/grad_norm_teacher_forcing",
-        "train/grad_norm_rollout_t2_weighted",
-        "loss/logit",
-        "loss/sparsity",
-        "sparsity/constraint",
-        "sparsity/lambda",
-        "sparsity/path_density",
-        "health/grad_norm",
-        "health/skipped_steps",
-    }
-    assert required <= metrics.keys()
-    assert all(torch.isfinite(torch.tensor(metrics[key])) for key in required)
-    assert metrics["sparsity/constraint"] == pytest.approx(
-        metrics["train/loss_teacher_forcing"]
-        + metrics["train/loss_rollout_t2_weighted"]
-        + metrics["loss/logit"],
-        rel=1e-6,
-    )
-    assert not any(key.startswith("schedule/") for key in metrics)
+    assert trainer.optimizer_steps == 1
+    assert trainer.pending_microbatches == 0
+    assert metrics["health/discarded_microbatches"] == 1
     assert (tmp_path / "last.pt").exists()
 
 
-def test_shipped_state_protocol_is_fixed_and_has_no_obsolete_schema() -> None:
-    path = Path(__file__).parents[1] / "configs" / "experiment" / "bounce_baumgartner.yaml"
-    preset = OmegaConf.load(path)
-    assert isinstance(preset, DictConfig)
-    assert int(preset.train.steps) == 300_000
-    assert float(preset.train.lambda_rollout_t2) == 1.0
-    assert int(preset.train.num_rollout_t2_anchors) == 8
-    assert int(preset.train.rollout_t2_horizon) == 2
-    assert int(preset.train.oe_eval_horizon) == 30
-    assert float(preset.train.oe_tolerance_nrmse) == pytest.approx(0.10)
-    assert float(preset.train.lambda_logit) == pytest.approx(1e-5)
-    assert float(preset.train.sparsity_lambda_init) == pytest.approx(1e4)
-    obsolete = {"rollout_curriculum", "rollout_len", "lambda_roll"}
-    assert obsolete.isdisjoint(preset.train.keys())
-    assert obsolete.isdisjoint(field.name for field in fields(TrainConfig))
-
-
-def test_two_experiment_configuration_and_retired_regime() -> None:
-    root = Path(__file__).parents[1] / "configs"
-    base = OmegaConf.load(root / "config.yaml")
-    visual = OmegaConf.merge(base, OmegaConf.load(root / "experiment/bounce_visual_to_visual.yaml"))
-    assert isinstance(visual, DictConfig)
-    assert REGIMES == ("state_to_state", "visual_to_visual")
-    assert set(path.stem for path in (root / "experiment").glob("*.yaml")) == {
-        "bounce_baumgartner",
-        "bounce_visual_to_visual",
-    }
-    assert visual.model.regime == "visual_to_visual"
-    assert visual.data.uniform_appearance
-    assert not visual.data.render_radius_from_mass
-    assert visual.train.lambda_rollout_t2 == 1.0
-    assert visual.train.num_rollout_t2_anchors == 8
-    assert visual.train.rollout_t2_horizon == 2
-    assert {"visual_rollout_len", "lambda_visual_rollout"}.isdisjoint(
-        field.name for field in fields(TrainConfig)
-    )
-    with pytest.raises(ValueError, match="model.regime"):
-        build_model(OmegaConf.create({"regime": "visual_to_state"}))
-    visual.data.num_clips = 2
-    visual.data.cache = True
-    held_out = build_dataset(visual.data, seed_offset=29)
-    assert isinstance(held_out, BounceDataset)
-    assert not held_out.cache
-    assert held_out._preloaded is None  # pyright: ignore[reportPrivateUsage]
-
-
-@pytest.mark.parametrize(
-    ("override", "message"),
-    [
-        ({"rollout_t2_horizon": 3}, "must equal 2"),
-        ({"lambda_rollout_t2": -1.0}, "non-negative"),
-        ({"num_rollout_t2_anchors": 0}, "positive"),
-        ({"oe_eval_horizon": 0}, "positive"),
-        ({"oe_tolerance_nrmse": -0.1}, "non-negative"),
-    ],
-)
-def test_fixed_protocol_validation(
-    tmp_path: Path, override: dict[str, object], message: str
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path, **override))
-
-
-def test_lambda_zero_bypasses_auxiliary_calls_and_reproduces_tf_rng(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    trainer = Trainer(
-        tiny_model(),
-        tiny_dataset(),
-        tiny_config(tmp_path, steps=1, lambda_rollout_t2=0.0, sparsity_enabled=False),
-    )
-    batch = next(trainer._batches())
-    states = batch["states"]
-    trainer.model.train()
-
-    torch.manual_seed(123)  # pyright: ignore[reportUnknownMemberType]
-    expected = trainer.model(states, context_len=2)
-    expected_rng = torch.get_rng_state().clone()
-
-    def forbidden(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise AssertionError("lambda=0 must not construct a T=2 branch")
-
-    monkeypatch.setattr(trainer.model, "rollout_t2_from_offsets", forbidden)
-    torch.manual_seed(123)  # pyright: ignore[reportUnknownMemberType]
-    actual = trainer._forward(batch)
-    actual_rng = torch.get_rng_state().clone()
-    torch.testing.assert_close(actual.prediction, expected.prediction)
-    torch.testing.assert_close(actual.target, expected.target)
-    torch.testing.assert_close(actual.causal_params, expected.causal_params)
-    assert actual.rollout_t2_prediction is None
-    assert torch.equal(actual_rng, expected_rng)
-
-    metrics = trainer._train_step(batch)
-    assert metrics["train/loss_rollout_t2_raw"] == 0.0
-    assert metrics["train/loss_rollout_t2_weighted"] == 0.0
-    assert metrics["train/loss_total"] == pytest.approx(
-        metrics["train/loss_teacher_forcing"] + metrics["loss/logit"], rel=1e-6
-    )
-
-
-def test_training_builds_only_tf_plus_two_recurrent_calls_not_k30(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    model = tiny_model()
-    calls: list[None] = []
-    hook = model.predictor.register_forward_hook(
-        lambda _module, _inputs, _output: calls.append(None)
-    )
-
-    def forbidden(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise AssertionError("K=30 evaluation may not participate in training")
-
-    monkeypatch.setattr(model, "rollout_for_evaluation", forbidden)
-    try:
-        trainer = Trainer(model, tiny_dataset(), tiny_config(tmp_path, steps=1))
-        trainer._train_step(next(trainer._batches()))
-    finally:
-        hook.remove()
-    assert len(calls) == 3  # one B*K TF call, then exactly two B*W calls
-
-
-def test_sparsity_and_geco_are_active_from_first_fixed_update(tmp_path: Path) -> None:
-    trainer = Trainer(
-        tiny_model(),
-        tiny_dataset(),
-        tiny_config(
-            tmp_path,
-            steps=1,
-            sparsity_enabled=True,
-            sparsity_tau=-1.0,
-            sparsity_momentum=0.0,
-            grad_skip_threshold=float("inf"),
-        ),
-    )
-    initial = trainer.lagrangian.log_lambda.clone()
-    metrics = trainer._train_step(next(trainer._batches()))
-    assert metrics["sparsity/active"] == 1.0
-    assert not torch.equal(trainer.lagrangian.log_lambda, initial)
-    predictive = (
-        metrics["train/loss_teacher_forcing"]
-        + metrics["train/loss_rollout_t2_weighted"]
-        + metrics["loss/logit"]
-    )
-    assert metrics["train/loss_total"] > predictive
-
-
-def test_checkpoint_resume_restores_t2_anchor_sampling_sequence(tmp_path: Path) -> None:
-    run_dir = tmp_path / "run"
-    trained = Trainer(tiny_model(), tiny_dataset(), tiny_config(run_dir, steps=2))
-    trained.train()
-    checkpoint = run_dir / "last.pt"
-
-    def next_offsets() -> torch.Tensor:
-        restored = Trainer(tiny_model(), tiny_dataset(), tiny_config(run_dir, steps=3))
-        restored.load_checkpoint(checkpoint)
-        output = restored._forward(next(restored._batches()))
-        assert output.rollout_t2_offsets is not None
-        return output.rollout_t2_offsets.clone()
-
-    torch.testing.assert_close(next_offsets(), next_offsets())
-    payload = torch.load(checkpoint, weights_only=False)
-    assert tuple(payload["oe_coordinate_std"]) == (1.0, 1.0, 1.0, 1.0)
-    assert "successful_updates" not in payload
-
-
-def test_checkpoint_rejects_a_different_oe_ruler(tmp_path: Path) -> None:
-    trainer = Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path, steps=1))
-    trainer.train()
-    incompatible = Trainer(
-        tiny_model(),
-        tiny_dataset(),
-        tiny_config(tmp_path, steps=2, oe_coordinate_std=(2.0, 1.0, 1.0, 1.0)),
-    )
-    with pytest.raises(ValueError, match="oe_coordinate_std"):
-        incompatible.load_checkpoint(tmp_path / "last.pt")
-
-
-@pytest.mark.parametrize("collect_metrics", [False, True])
-@pytest.mark.parametrize("reported_norm", [11.0, float("inf"), float("nan")])
-def test_gradient_spike_rejects_primal_and_dual_update(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    collect_metrics: bool,
-    reported_norm: float,
-) -> None:
-    trainer = Trainer(
-        tiny_model(),
-        tiny_dataset(),
-        tiny_config(tmp_path, steps=1, grad_skip_threshold=10.0),
-    )
-    before_model = {key: value.clone() for key, value in trainer.model.state_dict().items()}
-    before_dual = trainer.lagrangian.log_lambda.clone()
-
-    def oversized_norm(*_args: object, **_kwargs: object) -> torch.Tensor:
-        return torch.tensor(reported_norm)
-
-    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", oversized_norm)
-    trainer._train_step(next(trainer._batches()), collect_metrics=collect_metrics)
-    assert trainer.total_skips == 1
-    assert torch.equal(trainer.lagrangian.log_lambda, before_dual)
-    for key, value in trainer.model.state_dict().items():
-        torch.testing.assert_close(value, before_model[key])
-
-
-def test_unlogged_update_preserves_model_dual_optimizer_and_rng(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    reference = Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path, log_every=100))
-    unlogged = Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path, log_every=100))
-    batch = next(reference._batches())
-    rng = torch.get_rng_state().clone()
-    reference_metrics = reference._train_step(batch)
-    assert reference_metrics["health/skipped_steps"] == 0.0
-    expected_rng = torch.get_rng_state().clone()
-
-    def forbidden(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("unlogged steps must not collect monitoring statistics")
-
-    monkeypatch.setattr(unlogged, "_predictive_metrics", forbidden)
-    monkeypatch.setattr(unlogged, "_extra_metrics", forbidden)
-    monkeypatch.setattr(unlogged, "_branch_gradient_metrics", forbidden)
-    torch.set_rng_state(rng)
-    assert unlogged._train_step(batch, collect_metrics=False) == {}
-    torch.testing.assert_close(
-        unlogged.model.state_dict(), reference.model.state_dict(), rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        unlogged.optimizer.state_dict(), reference.optimizer.state_dict(), rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        unlogged.lagrangian.state_dict(), reference.lagrangian.state_dict(), rtol=0, atol=0
-    )
-    torch.testing.assert_close(torch.get_rng_state(), expected_rng, rtol=0, atol=0)
-
-
-def test_unlogged_nonfinite_loss_still_aborts_before_update(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    trainer = Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path))
-    before = {key: value.clone() for key, value in trainer.model.state_dict().items()}
-
-    def nonfinite_loss(_output: object) -> torch.Tensor:
-        return torch.tensor(float("nan"))
-
-    monkeypatch.setattr(trainer, "_teacher_forcing_loss", nonfinite_loss)
-    with pytest.raises(RuntimeError, match="non-finite loss"):
-        trainer._train_step(next(trainer._batches()), collect_metrics=False)
-    torch.testing.assert_close(trainer.model.state_dict(), before, rtol=0, atol=0)
-    assert not trainer.optimizer.state_dict()["state"]
-
-
-def test_training_timing_excludes_evaluation_checkpoint_and_logging(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    trainer = Trainer(
-        tiny_model(),
-        tiny_dataset(),
-        tiny_config(tmp_path, steps=5, log_every=3, eval_every=2, checkpoint_every=2),
-        eval_dataset=tiny_dataset(6),
-    )
-    now = 0.0
-    collected: list[bool] = []
-    logged_training: list[dict[str, float]] = []
-    original_step = trainer._train_step
-
-    def timed_step(
-        batch: dict[str, torch.Tensor], *, collect_metrics: bool = True
-    ) -> dict[str, float]:
-        nonlocal now
-        collected.append(collect_metrics)
-        metrics = original_step(batch, collect_metrics=collect_metrics)
-        now += 2.0
-        return metrics
-
-    def slow_eval() -> dict[str, float]:
-        nonlocal now
-        now += 100.0
-        return {"eval/constraint_loss": 0.25}
-
-    def slow_checkpoint(_path: Path) -> None:
-        nonlocal now
-        now += 40.0
-
-    def slow_log(_step: int, metrics: dict[str, float]) -> None:
-        nonlocal now
-        now += 20.0
-        if "train/seconds_per_step" in metrics:
-            logged_training.append(dict(metrics))
-
-    monkeypatch.setattr(training_loop.time, "perf_counter", lambda: now)
-    monkeypatch.setattr(trainer, "_train_step", timed_step)
-    monkeypatch.setattr(trainer, "_eval_step", slow_eval)
-    monkeypatch.setattr(trainer, "save_checkpoint", slow_checkpoint)
-    monkeypatch.setattr(trainer.logger, "log", slow_log)
-    final = trainer.train()
-    assert collected == [False, False, True, False, True]
-    assert len(logged_training) == 2
-    assert all(metrics["train/seconds_per_step"] == 2.0 for metrics in logged_training)
-    assert all(metrics["train/episodes_per_second"] == 2.0 for metrics in logged_training)
-    assert final == logged_training[-1]
-
-
-@pytest.mark.parametrize("device", ["cpu", "cuda:0"])
-@pytest.mark.parametrize("distributed", [False, True])
-def test_loader_pins_memory_only_for_cuda(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, device: str, distributed: bool
-) -> None:
-    trainer = Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path))
-    # Inspect loader configuration without allocating a CUDA tensor or starting
-    # a process group, so the configuration is covered on CPU development hosts.
-    trainer.device = torch.device(device)
-    monkeypatch.setattr(training_loop, "world_size", lambda: 2 if distributed else 1)
-    assert trainer._epoch_loader(0).pin_memory == (device == "cuda:0")
-
-
-def test_sparsity_ablation_removes_path_term_and_freezes_dual(tmp_path: Path) -> None:
-    trainer = Trainer(
-        tiny_model(), tiny_dataset(), tiny_config(tmp_path, steps=1, sparsity_enabled=False)
-    )
-    initial = trainer.lagrangian.log_lambda.clone()
-    metrics = trainer.train()
-    assert torch.equal(trainer.lagrangian.log_lambda, initial)
-    assert metrics["train/loss_total"] == pytest.approx(
-        metrics["train/loss_teacher_forcing"]
-        + metrics["train/loss_rollout_t2_weighted"]
-        + metrics["loss/logit"],
-        rel=1e-6,
-    )
-
-
-def test_periodic_eval_passes_fixed_objective_and_oe_ruler(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls: list[dict[str, object]] = []
-
-    def fake_evaluate(*args: object, **kwargs: object) -> SimpleNamespace:
-        del args
-        calls.append(kwargs)
-        return SimpleNamespace(metrics={"constraint_loss": 0.25})
-
-    monkeypatch.setattr(training_loop, "evaluate_identifiability", fake_evaluate)
-    trainer = Trainer(
-        tiny_model(),
-        tiny_dataset(),
-        tiny_config(tmp_path, eval_every=1),
-        eval_dataset=tiny_dataset(6),
-    )
-    assert trainer._eval_step() == {"eval/constraint_loss": 0.25}
-    assert calls == [
-        {
-            "batch_size": 4,
-            "device": "cpu",
-            "context_len": 2,
-            "lambda_logit": 1e-3,
-            "lambda_rollout_t2": 1.0,
-            "num_rollout_t2_anchors": 3,
-            "rollout_t2_horizon": 2,
-            "oe_eval_horizon": 4,
-            "oe_tolerance_nrmse": 0.1,
-            "oe_coordinate_std": (1.0, 1.0, 1.0, 1.0),
-        }
+def test_config_validation_and_dataset_size(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="no full batches"):
+        Trainer(tiny_model(), TrainConfig(batch_size=16), _TensorEpisodes())
+    with pytest.raises(ValueError, match="requires a dataset"):
+        tiny_trainer(tmp_path).train()
+    with pytest.raises(ValueError, match="episode count"):
+        tiny_trainer(tmp_path).train_step({"observations": torch.randn(2, 5, 6)})
+    invalid: list[dict[str, Any]] = [
+        {"accumulation_steps": 0},
+        {"lr": float("nan")},
+        {"grad_clip": 0},
     ]
+    for settings in invalid:
+        with pytest.raises(ValueError, match="positive|finite"):
+            TrainConfig(**settings)
+    with pytest.raises(ValueError, match="regularizer weight"):
+        ObjectiveConfig(state_regularizer_weight=1)
 
 
-def test_eval_requires_dataset_and_fixed_training_scales(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="eval_every"):
-        Trainer(tiny_model(), tiny_dataset(), tiny_config(tmp_path, eval_every=1))
-    with pytest.raises(ValueError, match="oe_coordinate_std"):
-        Trainer(
-            tiny_model(),
-            tiny_dataset(),
-            tiny_config(tmp_path, eval_every=1, oe_coordinate_std=None),
-            eval_dataset=tiny_dataset(6),
-        )
-
-
-def test_dataset_smaller_than_one_batch_raises(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="yields no batches"):
-        Trainer(tiny_model(), tiny_dataset(4), tiny_config(tmp_path, batch_size=8))
+def test_optional_dual_controller_has_explicit_settings_and_serialized_state() -> None:
+    controller = SparsityLagrangian(tau=0.5, step_size=0.1, lambda_init=2, momentum=0)
+    torch.testing.assert_close(controller.penalty_weight, torch.tensor(0.5))
+    controller.update(torch.tensor(1.5))
+    torch.testing.assert_close(controller.ma_error, torch.tensor(1.0))
+    restored = SparsityLagrangian(tau=0.5, step_size=0.1, lambda_init=1, momentum=0)
+    restored.load_state_dict(controller.state_dict())
+    torch.testing.assert_close(restored.penalty_weight, controller.penalty_weight)
