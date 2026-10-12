@@ -1,66 +1,61 @@
-"""Held-out evaluation for the controlled-vector comparison.
+"""Calibration-frozen MCC and graph SHD for the controlled-vector experiment.
 
-All fitting and matching use evaluation-calibration episodes. Physical predictions
-are decoded by a frozen nonlinear probe fitted to the EMA target coordinates.
-This is a measured approximation to an inverse, not an exact inverse encoder.
-No labels, fitted probes, or same-parameter pairings enter model training.
+MCC uses absolute Pearson correlation and a Hungarian assignment, following
+Lachapelle et al.'s mechanism-sparsity implementation. We fit that assignment on
+calibration episodes and score independent test episodes. Graph SHD counts false
+positives plus false negatives after applying those same assignments. Local
+SPARTAN graphs describe residual-inclusive value-routing support, conditional on
+inferred parameters, rather than an identified causal graph.
 """
 
 import json
 import math
-from collections.abc import Generator, Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import cast
 
 import torch
 from torch import Tensor
 
-from scjepa.data.controlled_vector import ParameterGraph, VectorObservationMap, simulate
+from scjepa.data.controlled_vector import ParameterGraph, VectorObservationMap, graphs
 from scjepa.data.processes import ControlledVectorDGP
-from scjepa.data.random import episode_id, generator
-from scjepa.data.types import DGPConfig, ScientificEpisode
+from scjepa.data.types import DGPConfig
 from scjepa.eval.recovery import (
-    FrozenProbe,
-    ProbeConfig,
+    CoordinateMatch,
     fit_coordinate_match,
-    fit_group_probes,
-    fit_nonlinear_probe,
-    probe_metrics,
-    score_coordinate_match,
+    mean_correlation_coefficient,
 )
 from scjepa.models.model import SCJEPA
+from scjepa.training.loop import ObjectiveConfig, TrainingObjective
 from scjepa.training.rng import preserve_rng
 
 
 @dataclass(frozen=True)
 class EvaluationConfig:
-    """Explicit evaluation sizes and probe choices, independent of training data."""
+    """Held-out episode counts and a predeclared local-graph aggregation rule."""
 
     calibration_episodes: int = 512
     validation_episodes: int = 256
     test_episodes: int = 512
-    paired_episodes: int = 128
     batch_size: int = 64
-    rollout_steps: int = 8
-    probe: ProbeConfig = field(default_factory=ProbeConfig)
-    validation_probe_steps: int = 100
     seed: int = 42
+    graph_support_threshold: float = 0.0
 
     def __post_init__(self) -> None:
-        """Reject undefined evaluation statistics and invalid stream addresses."""
-        for name in ("calibration_episodes", "validation_episodes", "test_episodes"):
-            if getattr(self, name) < 2:
-                raise ValueError(f"{name} must be at least two")
-        if not 2 <= self.paired_episodes <= self.test_episodes:
-            raise ValueError("paired_episodes must lie between two and test_episodes")
-        if min(self.batch_size, self.rollout_steps, self.validation_probe_steps) < 1:
-            raise ValueError(
-                "batch_size, rollout_steps, and validation_probe_steps must be positive"
-            )
-        if not 0 <= self.seed < 2**63:
+        """Require defined correlation/SIGReg statistics and a finite threshold."""
+        for name in ("calibration_episodes", "validation_episodes", "test_episodes", "batch_size"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 2:
+                raise ValueError(f"{name} must be an integer at least two")
+        if type(self.seed) is not int or not 0 <= self.seed < 2**63:
             raise ValueError("evaluation seed must be a nonnegative 63-bit integer")
+        if (
+            not math.isfinite(self.graph_support_threshold)
+            or not 0 <= self.graph_support_threshold < 1
+        ):
+            raise ValueError("graph_support_threshold must lie in [0, 1)")
 
 
 @dataclass(frozen=True)
@@ -69,21 +64,27 @@ class _EncodedSplit:
     ids: Tensor
     states: Tensor
     parameters: Tensor
-    actions: Tensor
     online: Tensor
     target: Tensor
+    target_states: Tensor
     codes: Tensor
-    predictions: Tensor
-    start: int
-    graphs: dict[str, Tensor]
+    graph_frequencies: dict[str, Tensor]
+    prediction_mse: float
+    base_loss: float
+    sparsity: float
 
 
 @contextmanager
-def _evaluation_context(model: SCJEPA) -> Generator[None]:
-    """Preserve all module modes and host/device random streams, including errors."""
+def _evaluation_context(model: SCJEPA, seed: int = 42) -> Generator[None]:
+    """Isolate random projections and restore module modes even after an error."""
     modes = [(module, module.training) for module in model.modules()]
+    device = next(model.parameters()).device
     try:
-        with preserve_rng(next(model.parameters()).device):
+        with preserve_rng(device):
+            torch.default_generator.manual_seed(seed)
+            if device.type == "cuda":
+                with torch.cuda.device(device):
+                    torch.cuda.manual_seed(seed)
             model.eval()
             yield
     finally:
@@ -91,7 +92,7 @@ def _evaluation_context(model: SCJEPA) -> Generator[None]:
             module.training = training
 
 
-def _check_model(model: SCJEPA, data: DGPConfig, config: EvaluationConfig) -> None:
+def _check_model(model: SCJEPA, data: DGPConfig) -> None:
     if data.family != "controlled_vector":
         raise ValueError("this experiment evaluates only controlled_vector data")
     predictor = model.predictor
@@ -103,177 +104,90 @@ def _check_model(model: SCJEPA, data: DGPConfig, config: EvaluationConfig) -> No
         or predictor.history_len != 1
         or model.context_len < 2
     ):
-        raise ValueError(
-            "vector experiment requires vector observations, dimensions 10/10/10, L=1, K>=2"
-        )
-    if data.trajectory_length < model.context_len + config.rollout_steps:
-        raise ValueError("trajectory_length must cover the context and requested rollout_steps")
+        raise ValueError("vector experiment requires dimensions 10/10/10, L=1, K>=2")
+    if data.trajectory_length <= model.context_len:
+        raise ValueError("trajectory_length must include a target after the context")
 
 
-def _split_config(base: DGPConfig, split: str, count: int) -> DGPConfig:
-    return replace(base, split=split, num_episodes=count)
+def _batch_sizes(count: int, batch_size: int) -> list[int]:
+    sizes = [min(batch_size, count - begin) for begin in range(0, count, batch_size)]
+    if len(sizes) > 1 and sizes[-1] == 1:
+        tail = sizes.pop()
+        sizes[-1] += tail
+    return sizes
 
 
 @torch.no_grad()
-def _encode_episodes(
-    model: SCJEPA,
-    data: DGPConfig,
-    episodes: Iterator[ScientificEpisode],
-    batch_size: int,
-) -> _EncodedSplit:
-    reference = next(model.online_encoder.parameters())
-    buckets: dict[str, list[Tensor]] = {
-        key: []
-        for key in (
-            "ids",
-            "states",
-            "parameters",
-            "actions",
-            "online",
-            "target",
-            "codes",
-            "predictions",
-        )
-    }
-    graph_blocks: dict[str, Tensor] = {}
-    start = model.context_len - 1
-    batch: list[ScientificEpisode] = []
-
-    def consume() -> None:
-        observations = torch.stack([item.observations for item in batch]).to(reference)
-        actions = torch.stack([item.actions for item in batch]).to(reference)
-        result = model(observations, actions)
-        buckets["ids"].append(torch.tensor([item.episode_id for item in batch], dtype=torch.int64))
-        buckets["states"].append(torch.stack([item.ground_truth["states"] for item in batch]))
-        buckets["parameters"].append(
-            torch.stack([item.ground_truth["parameters"] for item in batch])
-        )
-        buckets["actions"].append(actions.cpu())
-        buckets["online"].append(result.online_states.cpu())
-        buckets["target"].append(model.target_encoder.encode_sequence(observations).cpu())
-        buckets["codes"].append(result.parameters.cpu())
-        buckets["predictions"].append(result.predictions.cpu())
-        if not graph_blocks:
-            graph = result.dynamics[0].graphs
-            graph_blocks.update(
-                {
-                    "state": graph.state[0].cpu(),
-                    "action": graph.action[0].cpu(),
-                    "parameter": graph.parameter[0].cpu(),
-                }
-            )
-
-    for episode in episodes:
-        batch.append(episode)
-        if len(batch) == batch_size:
-            consume()
-            batch.clear()
-    if batch:
-        consume()
-    values = {key: torch.cat(items) for key, items in buckets.items()}
-    for name, value in values.items():
-        if not torch.isfinite(value).all():
-            raise FloatingPointError(f"nonfinite evaluation values in {name}")
-    return _EncodedSplit(data, **values, start=start, graphs=graph_blocks)
-
-
 def _collect(
-    model: SCJEPA, base: DGPConfig, matrix: Tensor, config: EvaluationConfig, split: str, count: int
+    model: SCJEPA,
+    base: DGPConfig,
+    matrix: Tensor,
+    config: EvaluationConfig,
+    split: str,
+    count: int,
+    objective: ObjectiveConfig | None = None,
 ) -> _EncodedSplit:
-    data = _split_config(base, split, count)
+    data = replace(base, split=split, num_episodes=count)
     process = ControlledVectorDGP(data)
     process.restore_observation_matrix(matrix)
-    return _encode_episodes(
-        model, data, (process.generate(index) for index in range(count)), config.batch_size
-    )
-
-
-def _diagnostics(values: Tensor, prefix: str) -> dict[str, float]:
-    rows = values.detach().cpu().double().reshape(-1, values.shape[-1])
-    centered = rows - rows.mean(0)
-    variance = centered.square().mean(0)
-    eigenvalues = cast(
-        Tensor,
-        torch.linalg.eigvalsh(centered.T @ centered / rows.shape[0]),  # pyright: ignore[reportUnknownMemberType]
-    ).clamp(min=0)
-    total = eigenvalues.sum()
-    probabilities = eigenvalues / total.clamp(min=1e-30)
-    entropy = -(probabilities * probabilities.clamp(min=1e-30).log()).sum()
-    return {
-        f"{prefix}/std_mean": float(variance.sqrt().mean()),
-        f"{prefix}/std_min": float(variance.sqrt().min()),
-        f"{prefix}/effective_rank": float(entropy.exp()) if float(total) > 0 else 0.0,
-        f"{prefix}/collapsed_coordinates": float((variance <= 1e-12).sum()),
+    reference = next(model.online_encoder.parameters())
+    criterion = TrainingObjective(objective or ObjectiveConfig()).to(reference)
+    buckets: dict[str, list[Tensor]] = {
+        key: []
+        for key in ("ids", "states", "parameters", "online", "target", "target_states", "codes")
     }
-
-
-def _physical_metrics(
-    predicted: Tensor, truth: Tensor, variance: Tensor, prefix: str
-) -> dict[str, float]:
-    if predicted.shape != truth.shape:
-        raise ValueError("physical predictions and truth must have identical shapes")
-    squared = (predicted.double().cpu() - truth.double().cpu()).square()
-    return {
-        f"{prefix}_mse": float(squared.mean()),
-        f"{prefix}_nrmse": float((squared / variance).mean().sqrt()),
-    }
-
-
-def _calibration_variance(calibration: _EncodedSplit) -> Tensor:
-    variance = calibration.states.flatten(0, 1).var(0, unbiased=False)
-    if (variance <= 0).any() or not torch.isfinite(variance).all():
-        raise ValueError("calibration physical-coordinate variances must be positive and finite")
-    return variance
-
-
-def _check_metrics(metrics: dict[str, float]) -> dict[str, float]:
-    if any(not math.isfinite(value) for value in metrics.values()):
-        raise FloatingPointError("evaluation produced a nonfinite metric")
-    return metrics
-
-
-def _probe_config(
-    config: EvaluationConfig, offset: int = 0, *, validation: bool = False
-) -> ProbeConfig:
-    return replace(
-        config.probe,
-        steps=config.validation_probe_steps if validation else config.probe.steps,
-        seed=(config.seed + config.probe.seed + offset) % (2**63),
-    )
-
-
-def _target_probe(calibration: _EncodedSplit, config: ProbeConfig) -> FrozenProbe:
-    return fit_nonlinear_probe(
-        calibration.target.flatten(0, 1),
-        calibration.states.flatten(0, 1),
-        config=config,
-        episode_ids=calibration.ids[:, None].expand(calibration.target.shape[:2]).flatten(),
-    )
-
-
-def _physical_evaluation(
-    split: _EncodedSplit, probe: FrozenProbe, variance: Tensor, prefix: str
-) -> dict[str, float]:
-    truth = split.states[:, split.start + 1 :]
-    metrics = _physical_metrics(
-        probe.predict(split.predictions), truth, variance, f"{prefix}/physical_prediction"
-    )
-    metrics.update(
-        _physical_metrics(
-            probe.predict(split.target[:, split.start + 1 :]),
-            truth,
-            variance,
-            f"{prefix}/encoded_target_decoding",
+    graph_counts: dict[str, Tensor] = {}
+    transition_count = 0
+    prediction_sum = base_sum = sparsity_sum = 0.0
+    begin = 0
+    for size in _batch_sizes(count, config.batch_size):
+        episodes = [process.generate(index) for index in range(begin, begin + size)]
+        begin += size
+        observations = torch.stack([item.observations for item in episodes]).to(reference)
+        actions = torch.stack([item.actions for item in episodes]).to(reference)
+        result = model(observations, actions)
+        _, terms = criterion.forward(result)
+        prediction_sum += float(terms["prediction"]) * size
+        base_sum += float(terms["base"]) * size
+        sparsity_sum += float(terms["sparsity"]) * size
+        buckets["ids"].append(
+            torch.tensor([item.episode_id for item in episodes], dtype=torch.int64)
         )
+        buckets["states"].append(torch.stack([item.ground_truth["states"] for item in episodes]))
+        buckets["parameters"].append(
+            torch.stack([item.ground_truth["parameters"] for item in episodes])
+        )
+        buckets["online"].append(result.online_states.cpu())
+        buckets["target"].append(result.targets.cpu())
+        buckets["target_states"].append(buckets["states"][-1][:, result.prediction_start + 1 :])
+        buckets["codes"].append(result.parameters.cpu())
+        for dynamics in result.dynamics:
+            for name in ("state", "action", "parameter"):
+                paths = cast(Tensor, getattr(dynamics.graphs, name))
+                counts = (paths > 0).double().sum(0).cpu()
+                graph_counts[name] = graph_counts.get(name, torch.zeros_like(counts)) + counts
+            transition_count += size
+    values = {key: torch.cat(items) for key, items in buckets.items()}
+    if any(not bool(torch.isfinite(value).all()) for value in values.values()):
+        raise FloatingPointError("nonfinite evaluation encodings")
+    return _EncodedSplit(
+        data,
+        **values,
+        graph_frequencies={key: value / transition_count for key, value in graph_counts.items()},
+        prediction_mse=prediction_sum / count,
+        base_loss=base_sum / count,
+        sparsity=sparsity_sum / count,
     )
-    metrics[f"{prefix}/latent_prediction_mse"] = float(
-        (split.predictions - split.target[:, split.start + 1 :]).square().mean()
-    )
-    metrics[f"{prefix}/online_target_coordinate_mse"] = float(
-        (split.online - split.target).square().mean()
-    )
-    metrics.update(_diagnostics(split.online, f"{prefix}/state"))
-    metrics.update(_diagnostics(split.codes, f"{prefix}/parameter"))
+
+
+def _loss_metrics(split: _EncodedSplit, prefix: str) -> dict[str, float]:
+    metrics = {
+        f"{prefix}/prediction_mse": split.prediction_mse,
+        f"{prefix}/base_loss": split.base_loss,
+        f"{prefix}/sparsity": split.sparsity,
+    }
+    if any(not math.isfinite(value) for value in metrics.values()):
+        raise FloatingPointError("nonfinite evaluation loss")
     return metrics
 
 
@@ -282,15 +196,18 @@ def validate_model(
     base_data: DGPConfig,
     observation_matrix: Tensor,
     config: EvaluationConfig,
+    *,
+    objective: ObjectiveConfig | None = None,
 ) -> dict[str, float]:
-    """Fit a calibration-only target probe and score validation; never read test data.
+    """Score validation loss and calibration-aligned MCC/SHD without test data.
 
-    The physical NRMSE selector includes probe approximation error. Its encoded-
-    target decoding baseline and collapse diagnostics must be reported alongside it.
-    Probe settings are fixed in advance; validation is not used to fit the probe.
+    Base loss is MSE plus weighted state/parameter SIGReg and logit regularization,
+    excluding every structural sparsity term. Random projections and evaluation
+    batching are fixed by ``config`` and do not advance the training RNG.
+    Label-based recovery diagnostics do not enter the loss or checkpoint selector.
     """
-    _check_model(model, base_data, config)
-    with _evaluation_context(model):
+    _check_model(model, base_data)
+    with _evaluation_context(model, config.seed):
         calibration = _collect(
             model,
             base_data,
@@ -299,238 +216,105 @@ def validate_model(
             "evaluation_calibration",
             config.calibration_episodes,
         )
-        validation = _collect(
-            model, base_data, observation_matrix, config, "validation", config.validation_episodes
-        )
-        probe = _target_probe(calibration, _probe_config(config, validation=True))
-        metrics = _physical_evaluation(
-            validation, probe, _calibration_variance(calibration), "validation"
-        )
-    return _check_metrics(metrics)
-
-
-@torch.no_grad()
-def _rollout(model: SCJEPA, split: _EncodedSplit, config: EvaluationConfig) -> Tensor:
-    reference = next(model.online_encoder.parameters())
-    predictions: list[Tensor] = []
-    for begin in range(0, len(split.ids), config.batch_size):
-        rows = slice(begin, begin + config.batch_size)
-        start = split.start
-        history = split.online[rows, start : start + 1].to(reference)
-        codes = split.codes[rows].to(reference)
-        actions = split.actions[rows, start : start + config.rollout_steps].to(reference)
-        predictions.append(model.rollout(history, codes, config.rollout_steps, actions).cpu())
-    return torch.cat(predictions)
-
-
-def _paired_episodes(
-    base: DGPConfig, matrix: Tensor, original: _EncodedSplit, count: int
-) -> Iterator[ScientificEpisode]:
-    """Keep each test theta, independently redraw its initial state and every action."""
-    observation = VectorObservationMap(matrix=matrix)
-    dtype = torch.float32 if base.dtype == "float32" else torch.float64
-    variant = cast(ParameterGraph, base.parameter_graph)
-    for index in range(count):
-        initial = torch.randn(
-            10,
-            dtype=torch.float64,
-            generator=generator(
-                base.root_seed, "test", index, "parameter_consistency/initial_position"
-            ),
-        )
-        actions = (
-            2
-            * torch.rand(
-                base.trajectory_length - 1,
-                10,
-                dtype=torch.float64,
-                generator=generator(base.root_seed, "test", index, "parameter_consistency/actions"),
+        with _evaluation_context(model, config.seed):
+            split = _collect(
+                model,
+                base_data,
+                observation_matrix,
+                config,
+                "validation",
+                config.validation_episodes,
+                objective,
             )
-            - 1
-        )
-        parameters = original.parameters[index]
-        states = simulate(initial, parameters, actions, variant)
-        # A paired trajectory is tagged by its original theta-group ID. It is an
-        # evaluation-only replicate, never a new independent parameter sample.
-        yield ScientificEpisode(
-            observations=observation.forward(states).to(dtype),
-            actions=actions.to(dtype),
-            episode_id=episode_id(base.root_seed, "test", index),
-            ground_truth={"states": states, "parameters": parameters.clone()},
-        )
-
-
-@torch.no_grad()
-def _swapped_predictions(
-    model: SCJEPA, original: _EncodedSplit, codes: Tensor, batch_size: int
-) -> Tensor:
-    reference = next(model.online_encoder.parameters())
-    predictions: list[Tensor] = []
-    for begin in range(0, len(codes), batch_size):
-        rows = slice(begin, min(begin + batch_size, len(codes)))
-        parameters = codes[rows].to(reference)
-        steps: list[Tensor] = []
-        for source in range(original.start, original.online.shape[1] - 1):
-            states = original.online[rows, source : source + 1].to(reference)
-            actions = original.actions[rows, source : source + 1].to(reference)
-            steps.append(model.predictor(states, parameters, actions).prediction.cpu())
-        predictions.append(torch.stack(steps, dim=1))
-    return torch.cat(predictions)
-
-
-def _paired_metrics(
-    model: SCJEPA,
-    base: DGPConfig,
-    matrix: Tensor,
-    test: _EncodedSplit,
-    config: EvaluationConfig,
-    probe: FrozenProbe,
-    variance: Tensor,
-) -> tuple[dict[str, float], dict[str, Tensor]]:
-    count = config.paired_episodes
-    paired_config = _split_config(base, "test", count)
-    paired = _encode_episodes(
-        model, paired_config, _paired_episodes(base, matrix, test, count), config.batch_size
-    )
-    first, second = test.codes[:count].double(), paired.codes.double()
-    within = (first - second).square().mean(0) / 2
-    between = ((first + second) / 2).var(0, unbiased=False)
-    metrics = {
-        "consistency/within_parameter_variance": float(within.mean()),
-        "consistency/between_pair_mean_variance": float(between.mean()),
-        "consistency/within_over_between_variance": float(
-            within.mean() / between.mean().clamp(min=1e-12)
-        ),
-        "consistency/collapsed_code": float(
-            (torch.cat((first, second)).var(0, unbiased=False) <= 1e-12).all()
-        ),
+        diagnostics, _, _ = _recovery_metrics(calibration, split, config.graph_support_threshold)
+    return {
+        **_loss_metrics(split, "validation"),
+        **{f"validation/{name}": value for name, value in diagnostics.items()},
     }
-    truth = test.states[:count, test.start + 1 :]
-    own = test.predictions[:count]
-    same = _swapped_predictions(model, test, paired.codes, config.batch_size)
-    different = _swapped_predictions(model, test, test.codes[:count].roll(1, 0), config.batch_size)
-    for name, prediction in (
-        ("own", own),
-        ("same_parameter_swap", same),
-        ("different_parameter_swap", different),
-    ):
-        metrics.update(
-            _physical_metrics(probe.predict(prediction), truth, variance, f"consistency/{name}")
+
+
+def calibrate_tau(
+    model: SCJEPA,
+    base_data: DGPConfig,
+    observation_matrix: Tensor,
+    config: EvaluationConfig,
+    *,
+    objective: ObjectiveConfig | None = None,
+) -> dict[str, float]:
+    """Measure a selected dense model on the independent calibration split.
+
+    No labels or coordinate matching enter this loss. The caller persists the
+    measured base loss as the shared GECO threshold for both sparse conditions.
+    """
+    _check_model(model, base_data)
+    with _evaluation_context(model, config.seed):
+        split = _collect(
+            model,
+            base_data,
+            observation_matrix,
+            config,
+            "evaluation_calibration",
+            config.calibration_episodes,
+            objective,
         )
-    metrics["consistency/same_parameter_swap_nrmse_change"] = (
-        metrics["consistency/same_parameter_swap_nrmse"] - metrics["consistency/own_nrmse"]
-    )
-    metrics["consistency/different_parameter_swap_nrmse_change"] = (
-        metrics["consistency/different_parameter_swap_nrmse"] - metrics["consistency/own_nrmse"]
-    )
-    metrics["consistency/same_parameter_latent_prediction_change_mse"] = float(
-        (same - own).square().mean()
-    )
-    metrics["consistency/different_parameter_latent_prediction_change_mse"] = float(
-        (different - own).square().mean()
-    )
-    return metrics, {
-        "group_episode_ids": test.ids[:count],
-        "true_parameters": test.parameters[:count],
-        "original_codes": first,
-        "paired_codes": second,
-        "paired_true_parameters": paired.parameters,
+    return _loss_metrics(split, "calibration")
+
+
+def _aligned_support(
+    frequencies: dict[str, Tensor],
+    state_match: CoordinateMatch,
+    parameter_match: CoordinateMatch,
+    threshold: float,
+    *,
+    target_match: CoordinateMatch | None = None,
+) -> dict[str, Tensor]:
+    """Align EMA output rows separately from online-state and parameter inputs."""
+    state_columns, parameter_columns = list(state_match.columns), list(parameter_match.columns)
+    output_rows = list((target_match or state_match).columns)
+    return {
+        "state": (frequencies["state"][output_rows][:, :, state_columns] > threshold),
+        "action": frequencies["action"][output_rows] > threshold,
+        "parameter": frequencies["parameter"][output_rows][:, parameter_columns] > threshold,
     }
 
 
 def _recovery_metrics(
-    calibration: _EncodedSplit,
-    test: _EncodedSplit,
-    config: EvaluationConfig,
-    artifact_dir: Path,
-) -> dict[str, float]:
-    metrics: dict[str, float] = {}
-    state_groups = (tuple(range(5)), tuple(range(5, 10)))
-    variant = calibration.config.parameter_graph
-    parameter_groups = (
-        (tuple(range(10)),)
-        if variant == "dense"
-        else tuple((index, index + 5) for index in range(5))
-        if variant == "complementary"
-        else tuple((index,) for index in range(10))
+    calibration: _EncodedSplit, scored: _EncodedSplit, threshold: float
+) -> tuple[dict[str, float], dict[str, CoordinateMatch], dict[str, Tensor]]:
+    """Fit only calibration assignments and score a separate validation/test split."""
+    matches = {
+        "state": fit_coordinate_match(
+            calibration.online.flatten(0, 1), calibration.states.flatten(0, 1), method="pearson"
+        ),
+        "parameter": fit_coordinate_match(
+            calibration.codes, calibration.parameters, method="pearson"
+        ),
+        "target": fit_coordinate_match(
+            calibration.target.flatten(0, 1),
+            calibration.target_states.flatten(0, 1),
+            method="pearson",
+        ),
+    }
+    metrics = {
+        "state_mcc": mean_correlation_coefficient(
+            matches["state"], scored.online.flatten(0, 1), scored.states.flatten(0, 1)
+        ),
+        "parameter_mcc": mean_correlation_coefficient(
+            matches["parameter"], scored.codes, scored.parameters
+        ),
+    }
+    support = _aligned_support(
+        scored.graph_frequencies,
+        matches["state"],
+        matches["parameter"],
+        threshold,
+        target_match=matches["target"],
     )
-    for offset, (
-        name,
-        fit_features,
-        fit_truth,
-        test_features,
-        test_truth,
-        groups,
-        ids,
-    ) in enumerate(
-        (
-            (
-                "state",
-                calibration.online.flatten(0, 1),
-                calibration.states.flatten(0, 1),
-                test.online.flatten(0, 1),
-                test.states.flatten(0, 1),
-                state_groups,
-                calibration.ids[:, None].expand(calibration.online.shape[:2]).flatten(),
-            ),
-            (
-                "parameter",
-                calibration.codes,
-                calibration.parameters,
-                test.codes,
-                test.parameters,
-                parameter_groups,
-                calibration.ids,
-            ),
-        )
-    ):
-        matching = fit_coordinate_match(fit_features, fit_truth)
-        scores = score_coordinate_match(matching, test_features, test_truth)
-        metrics.update(
-            {f"recovery/{name}/coordinate/{key}": value for key, value in scores.items()}
-        )
-        probe_config = _probe_config(config, 100 + offset)
-        full_probe = fit_nonlinear_probe(
-            fit_features, fit_truth, config=probe_config, episode_ids=ids
-        )
-        metrics.update(
-            {
-                f"recovery/{name}/full/{key}": value
-                for key, value in probe_metrics(
-                    full_probe.predict(test_features), test_truth
-                ).items()
-            }
-        )
-        group_probes = fit_group_probes(
-            fit_features, fit_truth, groups, match=matching, config=probe_config, episode_ids=ids
-        )
-        group_scores: list[float] = []
-        group_payloads: list[dict[str, object]] = []
-        for index, group in enumerate(group_probes):
-            scores = probe_metrics(
-                group.predict(test_features), test_truth[:, list(group.truth_columns)]
-            )
-            metrics.update(
-                {f"recovery/{name}/group_{index}/{key}": value for key, value in scores.items()}
-            )
-            group_scores.append(scores["r2"])
-            group_payloads.append(
-                {
-                    "truth_columns": list(group.truth_columns),
-                    "feature_columns": list(group.feature_columns),
-                    "probe": group.probe.to_payload(),
-                }
-            )
-        metrics[f"recovery/{name}/group_mean_r2"] = sum(group_scores) / len(group_scores)
-        torch.save(
-            {
-                "coordinate_match": torch.tensor(matching.columns),
-                "full_probe": full_probe.to_payload(),
-                "group_probes": group_payloads,
-            },
-            artifact_dir / f"{name}_recovery.pt",
-        )
-    return metrics
+    truth = graphs(cast(ParameterGraph, scored.config.parameter_graph))
+    for name, predicted in support.items():
+        target = cast(Tensor, getattr(truth, name))
+        metrics[f"{name}_shd"] = float((predicted != target).sum())
+    return metrics, matches, support
 
 
 def evaluate_model(
@@ -539,18 +323,21 @@ def evaluate_model(
     observation_matrix: Tensor,
     config: EvaluationConfig,
     artifact_dir: Path,
+    *,
+    objective: ObjectiveConfig | None = None,
 ) -> dict[str, float]:
-    """Fit frozen calibration maps and report final held-out test measurements.
+    """Report held-out MCC and permutation-aligned residual-inclusive routing SHD.
 
-    Saves weights-only-loadable probe/matching payloads, actual observation map,
-    paired-code audit tensors, and JSON results/provenance. Group feature selection
-    uses calibration coordinate matching; it is not invariant to within-group
-    rotations. Full-vector probes measure recoverable information separately.
+    The default global support is the union of deterministic local routing paths
+    over every test transition. For a positive predeclared threshold an edge must
+    occur in a strictly greater fraction of transitions. The threshold is never
+    fitted to graph labels. SHD counts false positives plus false negatives;
+    poor MCC or nonlinear coordinate mixing limits its causal interpretation.
     """
-    _check_model(model, base_data, config)
+    _check_model(model, base_data)
     artifact_dir = Path(artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    with _evaluation_context(model):
+    with _evaluation_context(model, config.seed):
         calibration = _collect(
             model,
             base_data,
@@ -558,70 +345,67 @@ def evaluate_model(
             config,
             "evaluation_calibration",
             config.calibration_episodes,
+            objective,
         )
-        test = _collect(model, base_data, observation_matrix, config, "test", config.test_episodes)
-        probe = _target_probe(calibration, _probe_config(config))
-        variance = _calibration_variance(calibration)
-        metrics = _physical_evaluation(test, probe, variance, "test")
-        metrics.update(_recovery_metrics(calibration, test, config, artifact_dir))
-        rollout = _rollout(model, test, config)
-        truth = test.states[:, test.start + 1 : test.start + 1 + config.rollout_steps]
-        decoded = probe.predict(rollout)
-        metrics.update(_physical_metrics(decoded, truth, variance, "test/rollout"))
-        for step in range(config.rollout_steps):
-            metrics.update(
-                _physical_metrics(
-                    decoded[:, step], truth[:, step], variance, f"test/rollout_step_{step + 1}"
-                )
+        # The test loss uses the same fixed projection stream regardless of
+        # how many calibration batches were needed to fit its permutations.
+        with _evaluation_context(model, config.seed):
+            test = _collect(
+                model,
+                base_data,
+                observation_matrix,
+                config,
+                "test",
+                config.test_episodes,
+                objective,
             )
-        paired_metrics, paired_payload = _paired_metrics(
-            model, base_data, observation_matrix, test, config, probe, variance
+        diagnostics, matches, support = _recovery_metrics(
+            calibration, test, config.graph_support_threshold
         )
-        metrics.update(paired_metrics)
-        for name, paths in test.graphs.items():
-            support = paths > 0
-            aggregate = support.any(1) if name in {"state", "action"} else support
-            metrics[f"graph/{name}/lag_resolved_edges"] = float(support.sum())
-            metrics[f"graph/{name}/edges"] = float(aggregate.sum())
-            metrics[f"graph/{name}/density"] = float(aggregate.double().mean())
-        _check_metrics(metrics)
-        torch.save(probe.to_payload(), artifact_dir / "target_state_probe.pt")
-        torch.save(paired_payload, artifact_dir / "parameter_consistency.pt")
+        metrics = _loss_metrics(test, "test")
+        for name, value in diagnostics.items():
+            prefix = "recovery" if name.endswith("_mcc") else "graph"
+            metrics[f"{prefix}/{name}"] = value
+        truth = graphs(cast(ParameterGraph, base_data.parameter_graph))
         torch.save(
             {
                 "matrix": observation_matrix.detach().cpu(),
                 "calibration_episode_ids": calibration.ids,
                 "test_episode_ids": test.ids,
-                "physical_normalization_variance": variance,
-                **test.graphs,
+                **{f"{name}_match": torch.tensor(match.columns) for name, match in matches.items()},
+                "routing_frequencies": test.graph_frequencies,
+                "aligned_support": support,
+                "reference_graphs": {name: getattr(truth, name) for name in support},
             },
             artifact_dir / "evaluation_references.pt",
         )
         metadata = {
-            "format_version": 1,
+            "format_version": 2,
             "evaluation_config": asdict(config),
             "calibration_data": asdict(calibration.config),
             "test_data": asdict(test.config),
             "observation_matrix_sha256": VectorObservationMap(
                 matrix=observation_matrix
             ).fingerprint,
-            "physical_decoder": "frozen nonlinear calibration probe on complete EMA target encoder",
-            "normalization": "per-coordinate population variance of all calibration true states",
-            "state_rows": (
-                "all frames, equal episode length; parameter rows one per distinct episode"
-            ),
-            "group_selection": (
-                "calibration Spearman coordinate assignment, then corresponding learned subsets"
-            ),
-            "rollout_coordinates": (
-                "online encoded initial history; appended predictions are EMA target coordinates"
-            ),
-            "consistency": (
-                "two independent initial-state/action trajectories per test theta; "
-                "cyclic different-theta swaps"
+            "mcc": "mean absolute Pearson correlation with calibration-only Hungarian assignment",
+            "matching_reference": "https://github.com/slachapelle/disentanglement_via_mechanism_sparsity/blob/7fd50ded090a51a7527520f07d933450aa5b872a/metrics.py",
+            "state_rows": "all frames; parameters have one row per distinct episode",
+            "shd": "false positives plus false negatives; no reversal discount",
+            "graph_aggregation": (
+                "frequency > predeclared threshold over all test transitions; zero means union"
             ),
             "graph_semantics": (
-                "residual-inclusive structural reachability conditional on supplied parameter code"
+                "residual-inclusive local value-routing support conditional on inferred "
+                "parameters; not a causal guarantee"
+            ),
+            "graph_alignment": (
+                "EMA target assignment on output rows; online state assignment on state "
+                "columns; parameter assignment on parameter columns; observed actions retain "
+                "their ordering; oldest-first lags; all assignments fitted on calibration only"
+            ),
+            "interpretation": (
+                "MCC is a linear coordinate-recovery measure; poor MCC or nonlinear mixing "
+                "prevents causal interpretation of routing SHD"
             ),
         }
         (artifact_dir / "protocol.json").write_text(

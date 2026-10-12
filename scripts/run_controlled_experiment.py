@@ -1,4 +1,4 @@
-"""Run, resume, evaluate, or summarize the paired controlled-vector experiment."""
+"""Calibrate a dense JEPA reference, then compare two GECO-sparse models."""
 
 import argparse
 import json
@@ -34,7 +34,7 @@ def main() -> None:
     )
     parser.add_argument("--graph", choices=("dense", "complementary", "diagonal"))
     parser.add_argument("--seed", type=int)
-    parser.add_argument("--condition", choices=("baseline", "full"))
+    parser.add_argument("--condition", choices=("dense", "baseline", "full"))
     parser.add_argument("overrides", nargs="*", help="typed YAML overrides, e.g. train.device=cuda")
     args = parser.parse_args()
     config = load_experiment_config(args.config, args.overrides)

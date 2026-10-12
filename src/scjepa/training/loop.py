@@ -26,9 +26,11 @@ from scjepa.training.distributed import (
     gather_rank_objects,
     is_main_process,
     mean_metrics,
+    mean_tensor,
     rank,
     world_size,
 )
+from scjepa.training.lagrangian import GECOConfig, SparsityLagrangian
 from scjepa.training.rng import preserve_rng
 
 
@@ -86,7 +88,7 @@ class ObjectiveConfig:
 
 
 class TrainingObjective(nn.Module):
-    """Prediction MSE plus independent graph, logit, and representation terms.
+    """JEPA base loss with fixed or GECO-controlled independent graph penalties.
 
     Representation statistics use the local batch on each distributed rank.
     State samples have shape ``(T, B, d_z)``; parameter samples ``(1, B, d_theta)``.
@@ -94,8 +96,8 @@ class TrainingObjective(nn.Module):
     across all ranks. It never counts repeated times as new parameter samples.
     """
 
-    def __init__(self, config: ObjectiveConfig) -> None:
-        """Construct optional upstream regularizers."""
+    def __init__(self, config: ObjectiveConfig, geco: GECOConfig | None = None) -> None:
+        """Construct SIGReg and an optional controller, without updating its state."""
         super().__init__()
         self.config = config
         self.state_regularizer = RepresentationRegularizer(
@@ -104,6 +106,17 @@ class TrainingObjective(nn.Module):
         self.parameter_regularizer = RepresentationRegularizer(
             cast(RegularizerKind, config.parameter_regularizer), config.regularizer_num_projections
         )
+        self.geco: SparsityLagrangian | None = None
+        if geco is not None and geco.enabled:
+            assert geco.tau is not None
+            self.geco = SparsityLagrangian(
+                tau=geco.tau,
+                step_size=geco.step_size,
+                lambda_init=geco.lambda_init,
+                momentum=geco.momentum,
+                log_lambda_min=geco.log_lambda_min,
+                log_lambda_max=geco.log_lambda_max,
+            )
 
     def forward(self, output: ModelOutput) -> tuple[Tensor, dict[str, Tensor]]:
         """Compute scalar terms without a rollout or experiment-specific schedule."""
@@ -119,25 +132,31 @@ class TrainingObjective(nn.Module):
             ).mean(),
             "logit": torch.stack([item.logit_penalty for item in output.dynamics]).mean(),
         }
-        total = terms["prediction"]
+        base = terms["prediction"]
+        sparsity = base.new_zeros(())
         for name, weight in (
             ("state_sparsity", config.state_sparsity_weight),
             ("action_sparsity", config.action_sparsity_weight),
             ("parameter_sparsity", config.parameter_sparsity_weight),
-            ("logit", config.logit_weight),
         ):
             if weight:
-                total = total + weight * terms[name]
+                sparsity = sparsity + weight * terms[name]
+        if config.logit_weight:
+            base = base + config.logit_weight * terms["logit"]
         if config.state_regularizer_weight:
             terms["state_regularizer"] = self.state_regularizer(
                 output.online_states.transpose(0, 1)
             )
-            total = total + config.state_regularizer_weight * terms["state_regularizer"]
+            base = base + config.state_regularizer_weight * terms["state_regularizer"]
         if config.parameter_regularizer_weight:
             terms["parameter_regularizer"] = self.parameter_regularizer(
                 output.parameters.unsqueeze(0)
             )
-            total = total + config.parameter_regularizer_weight * terms["parameter_regularizer"]
+            base = base + config.parameter_regularizer_weight * terms["parameter_regularizer"]
+        terms["base"] = base
+        terms["sparsity"] = sparsity
+        weight = self.geco.penalty_weight if self.geco is not None else base.new_ones(())
+        total = base + weight * sparsity
         return total, terms
 
 
@@ -182,6 +201,7 @@ class TrainConfig:
     checkpoint_every: int | None = None
     out_dir: str = "outputs"
     objective: ObjectiveConfig = field(default_factory=ObjectiveConfig)
+    geco: GECOConfig = field(default_factory=GECOConfig)
 
     def __post_init__(self) -> None:
         """Validate numerical and batching controls."""
@@ -251,7 +271,7 @@ class Trainer:
         self.logger: MetricLogger = logger if logger is not None else NoopLogger()
         if config.batch_size % world_size():
             raise ValueError("batch_size must be divisible by world_size")
-        self.objective = TrainingObjective(config.objective).to(self.device)
+        self.objective = TrainingObjective(config.objective, config.geco).to(self.device)
         self._loss_model = _LossForward(self.model, self.objective)
         self._forward_model: nn.Module = self._loss_model
         if world_size() > 1:
@@ -276,9 +296,15 @@ class Trainer:
         self.consecutive_skips = 0
         self._accumulated = 0
         self._accumulation_batch_size: int | None = None
+        self._accumulated_base_loss = torch.zeros((), device=self.device)
         self.discarded_microbatches = 0
         if dataset is not None and len(self._epoch_loader(0)) == 0:
             raise ValueError("dataset yields no full batches; lower batch_size or add episodes")
+
+    @property
+    def geco(self) -> SparsityLagrangian | None:
+        """The optional checkpointed controller attached to the training objective."""
+        return self.objective.geco
 
     @property
     def pending_microbatches(self) -> int:
@@ -345,6 +371,7 @@ class Trainer:
         self.discarded_microbatches += self._accumulated
         self._accumulated = 0
         self._accumulation_batch_size = None
+        self._accumulated_base_loss.zero_()
         self.optimizer.zero_grad(set_to_none=True)
 
     def _skip(self) -> None:
@@ -355,11 +382,13 @@ class Trainer:
             raise RuntimeError("too many consecutive rejected updates")
 
     def train_step(self, batch: Mapping[str, Tensor]) -> dict[str, float]:
-        """Consume one microbatch, updating EMA only after a successful optimizer step.
+        """Consume one microbatch, updating EMA/GECO only after an accepted step.
 
         A nonfinite loss or gradient on any rank discards the entire accumulated
         group on every rank. Gradients are synchronized on every microbatch;
         they are clipped only when the complete group is ready for an update.
+        GECO uses the detached mean base loss over the complete accumulation
+        group and all ranks, with the pre-update multiplier shared by the group.
         """
         self.model.train()
         batch_size = batch["observations"].shape[0]
@@ -386,6 +415,7 @@ class Trainer:
         else:
             (total / self.config.accumulation_steps).backward()  # pyright: ignore[reportUnknownMemberType]
             self._accumulated += 1
+            self._accumulated_base_loss.add_(terms["base"])
             grad_norm = torch.nn.utils.clip_grad_norm_(self._parameters, math.inf)
             rejected = any_rank(~torch.isfinite(grad_norm), self.device)
             updated = False
@@ -395,15 +425,20 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self._parameters, self.config.grad_clip)
                     self.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
                     self.model.update_target()
+                    if self.geco is not None:
+                        self.geco.update(
+                            mean_tensor(self._accumulated_base_loss / self._accumulated)
+                        )
                     self.optimizer_steps += 1
                     self.consecutive_skips = 0
                     self._accumulated = 0
                     self._accumulation_batch_size = None
+                    self._accumulated_base_loss.zero_()
                     self.optimizer.zero_grad(set_to_none=True)
                     updated = True
             if rejected:
                 self._skip()
-        return {f"loss/{name}": float(value.detach()) for name, value in terms.items()} | {
+        metrics = {f"loss/{name}": float(value.detach()) for name, value in terms.items()} | {
             "loss/total": float(total.detach()),
             "health/grad_norm": float(grad_norm),
             "health/skipped": float(rejected),
@@ -412,6 +447,16 @@ class Trainer:
             "health/updated": float(updated),
             "health/pending_microbatches": float(self._accumulated),
         }
+        if self.geco is not None:
+            metrics.update(
+                {
+                    "geco/tau": self.geco.tau,
+                    "geco/constraint": float(terms["base"]) - self.geco.tau,
+                    "geco/sparsity_weight": float(self.geco.penalty_weight),
+                    "geco/multiplier": float(self.geco.log_lambda.exp()),
+                }
+            )
+        return metrics
 
     def _log_metrics(self, metrics: dict[str, float]) -> None:
         error: Exception | None = None
@@ -467,7 +512,7 @@ class Trainer:
         self,
         validation_callback: Callable[[SCJEPA], dict[str, float]] | None = None,
         validation_every: int | None = None,
-        selection_metric: str = "validation/physical_prediction_nrmse",
+        selection_metric: str = "validation/base_loss",
         stop_requested: Callable[[], bool] | None = None,
     ) -> dict[str, float]:
         """Consume ``config.steps`` microbatches, resuming deterministic dataset order.
@@ -693,10 +738,15 @@ class Trainer:
         ):
             saved_config[name] = getattr(self.config, name)
         saved_config["objective"] = ObjectiveConfig(**saved_config["objective"])
+        saved_config["geco"] = GECOConfig(**saved_config.get("geco", {}))
         self.config = TrainConfig(**saved_config)
-        self.objective = TrainingObjective(self.config.objective).to(self.device)
+        self.objective = TrainingObjective(self.config.objective, self.config.geco).to(self.device)
         self._loss_model.objective = self.objective
         self.objective.load_state_dict(payload["objective"])
+        if self.geco is not None:
+            self.geco.validate_state()
+            if int(self.geco.num_updates) != int(payload["optimizer_steps"]):
+                raise ValueError("checkpoint GECO updates must match successful optimizer steps")
         self.model.load_state_dict(payload["model"])
         self.optimizer.load_state_dict(payload["optimizer"])
         self.step = int(payload["step"])
@@ -714,6 +764,7 @@ class Trainer:
 
 
 __all__ = [
+    "GECOConfig",
     "MetricLogger",
     "NoopLogger",
     "ObjectiveConfig",

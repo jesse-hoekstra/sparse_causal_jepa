@@ -51,17 +51,17 @@ def test_shipped_configs_resolve_to_sigreg_only(name: str) -> None:
     config.validate()
 
 
-def test_default_dry_run_reports_thirty_tasks_without_output_or_wandb(tmp_path: Path) -> None:
+def test_default_dry_run_reports_three_stages_without_output_or_wandb(tmp_path: Path) -> None:
     output = tmp_path / "experiment"
     result = _invoke(tmp_path, "--dry-run", f"output_dir={output}")
     assert result.returncode == 0, result.stderr
     plan = cast(dict[str, object], json.loads(result.stdout))
-    assert plan["runs"] == 30
+    assert plan["runs"] == 3
     tasks = cast(list[dict[str, object]], plan["plan"])
-    assert len(tasks) == 30
-    assert {task["condition"] for task in tasks} == {"baseline", "full"}
-    assert {task["graph"] for task in tasks} == {"dense", "complementary", "diagonal"}
-    assert {task["seed"] for task in tasks} == set(range(5))
+    assert len(tasks) == 3
+    assert [task["condition"] for task in tasks] == ["dense", "baseline", "full"]
+    assert {task["graph"] for task in tasks} == {"complementary"}
+    assert {task["seed"] for task in tasks} == {0}
     assert not output.exists()
     assert not (tmp_path / "wandb").exists()
 
@@ -69,19 +69,19 @@ def test_default_dry_run_reports_thirty_tasks_without_output_or_wandb(tmp_path: 
 def test_task_selectors_leave_the_full_scientific_definition_unchanged(tmp_path: Path) -> None:
     config = load_experiment_config(CONFIGS / "controlled_vector.yaml")
     initial = canonical_fingerprint(json_safe(config.definition()))
-    tasks = experiment_plan(config, graph="diagonal", seed=3, condition="full")
+    tasks = experiment_plan(config, graph="complementary", seed=0, condition="full")
     assert len(tasks) == 1
-    assert tasks[0]["graph"] == "diagonal"
-    assert tasks[0]["seed"] == 3
+    assert tasks[0]["graph"] == "complementary"
+    assert tasks[0]["seed"] == 0
     assert tasks[0]["condition"] == "full"
     assert canonical_fingerprint(json_safe(config.definition())) == initial
     result = _invoke(
         tmp_path,
         "--dry-run",
         "--graph",
-        "diagonal",
+        "complementary",
         "--seed",
-        "3",
+        "0",
         "--condition",
         "full",
         f"output_dir={tmp_path / 'experiment'}",
@@ -89,8 +89,8 @@ def test_task_selectors_leave_the_full_scientific_definition_unchanged(tmp_path:
     assert result.returncode == 0, result.stderr
     plan = cast(dict[str, object], json.loads(result.stdout))
     assert plan["runs"] == 1
-    assert len(config.seeds) == 5
-    assert len(config.graphs) == 3
+    assert len(config.seeds) == 1
+    assert len(config.graphs) == 1
 
 
 @pytest.mark.parametrize(
@@ -114,14 +114,12 @@ def test_aggregate_only_requires_existing_manifest_and_creates_nothing(tmp_path:
     assert not (tmp_path / "wandb").exists()
 
 
-def test_tiny_cpu_cli_produces_selected_run_and_keeps_full_pair_definition(tmp_path: Path) -> None:
+def test_tiny_cpu_cli_produces_complete_three_stage_comparison(tmp_path: Path) -> None:
     output = tmp_path / "cpu-smoke"
     result = _invoke(
         tmp_path,
         "--config",
         str(CONFIGS / "controlled_vector_smoke.yaml"),
-        "--condition",
-        "baseline",
         f"output_dir={output}",
         "wandb.mode=disabled",
         "train.device=cpu",
@@ -129,23 +127,43 @@ def test_tiny_cpu_cli_produces_selected_run_and_keeps_full_pair_definition(tmp_p
     assert result.returncode == 0, result.stderr
     assert not (tmp_path / "wandb").exists()
     summary = read_json(output / "summary.json")
-    assert summary["completed_runs"] == 1
-    assert summary["expected_runs"] == 2
-    assert summary["complete"] is False
-    assert summary["missing_runs"] == ["complementary/seed-0/full"]
-    directory = output / "complementary/seed-0/baseline"
-    assert read_json(directory / "status.json")["status"] == "completed"
-    assert (directory / "best.pt").is_file()
-    assert (directory / "last.pt").is_file()
-    assert (directory / "evaluation/metrics.json").is_file()
+    assert summary["completed_runs"] == 3
+    assert summary["expected_runs"] == 3
+    assert summary["complete"] is True
+    assert summary["missing_runs"] == []
+    parent = output / "complementary/seed-0"
+    for condition in ("dense", "baseline", "full"):
+        directory = parent / condition
+        assert read_json(directory / "status.json")["status"] == "completed"
+        assert (directory / "best.pt").is_file()
+        assert (directory / "last.pt").is_file()
+        assert (directory / "evaluation/metrics.json").is_file()
+    tau = read_json(parent / "dense/tau.json")
     manifest = read_json(output / "experiment.json")
     definition = cast(dict[str, object], manifest["definition"])
     assert definition["seeds"] == [0]
     assert definition["graphs"] == ["complementary"]
     assert "condition" not in definition
-    run = read_json(directory / "run_config.json")
+    run = read_json(parent / "baseline/run_config.json")
     training = cast(dict[str, object], run["train"])
     objective = cast(dict[str, object], training["objective"])
     assert objective["parameter_sparsity_weight"] == 0.0
     assert objective["state_regularizer"] == "sigreg"
     assert objective["parameter_regularizer"] == "sigreg"
+    assert cast(dict[str, object], training["geco"])["tau"] == tau["tau"]
+
+
+def test_cli_sparse_only_requires_dense_calibration(tmp_path: Path) -> None:
+    output = tmp_path / "missing-dense"
+    result = _invoke(
+        tmp_path,
+        "--config",
+        str(CONFIGS / "controlled_vector_smoke.yaml"),
+        "--condition",
+        "full",
+        f"output_dir={output}",
+        "wandb.mode=disabled",
+    )
+    assert result.returncode != 0
+    assert "dense tau calibration is missing" in result.stderr
+    assert not (output / "complementary/seed-0/full/last.pt").exists()

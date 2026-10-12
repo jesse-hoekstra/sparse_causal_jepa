@@ -1,4 +1,4 @@
-"""Paired-seed summaries for completed controlled-vector runs."""
+"""Dense-reference and paired sparse summaries for completed controlled-vector runs."""
 
 import csv
 import io
@@ -36,7 +36,7 @@ def aggregate_results(config: ExperimentConfig) -> dict[str, object]:
     with file_lock(root / ".report.lock", blocking=True):
         for graph in config.graphs:
             for seed in config.seeds:
-                for condition in ("baseline", "full"):
+                for condition in ("dense", "baseline", "full"):
                     slug = f"{graph}/seed-{seed}/{condition}"
                     directory = root / slug
                     status_path = directory / "status.json"
@@ -70,7 +70,7 @@ def aggregate_results(config: ExperimentConfig) -> dict[str, object]:
         summaries: dict[str, object] = {}
         differences: dict[str, object] = {}
         for graph in config.graphs:
-            for condition in ("baseline", "full"):
+            for condition in ("dense", "baseline", "full"):
                 group = [
                     metrics
                     for (g, _, c), (_, metrics) in completed.items()
@@ -84,6 +84,7 @@ def aggregate_results(config: ExperimentConfig) -> dict[str, object]:
                     }
             pairs: list[tuple[dict[str, float], dict[str, float]]] = []
             for seed in config.seeds:
+                dense = completed.get((graph, seed, "dense"))
                 baseline, full = (
                     completed.get((graph, seed, "baseline")),
                     completed.get((graph, seed, "full")),
@@ -93,8 +94,25 @@ def aggregate_results(config: ExperimentConfig) -> dict[str, object]:
                     continue
                 for key in ("initial_state_fingerprint", "dataset_identity", "experiment_identity"):
                     value = baseline[0].get(key)
-                    if not isinstance(value, str) or not value or value != full[0].get(key):
+                    if (
+                        not isinstance(value, str)
+                        or not value
+                        or value != full[0].get(key)
+                        or (dense is not None and value != dense[0].get(key))
+                    ):
                         raise ValueError(f"unmatched {key} for {graph}, seed {seed}")
+                calibration = baseline[0].get("tau_calibration")
+                if (
+                    not isinstance(calibration, dict)
+                    or not calibration
+                    or calibration != full[0].get("tau_calibration")
+                    or (
+                        dense is not None
+                        and cast(dict[str, object], calibration).get("dense_run_identity")
+                        != dense[0].get("run_identity")
+                    )
+                ):
+                    raise ValueError(f"unmatched tau_calibration for {graph}, seed {seed}")
                 pairs.append((baseline[1], full[1]))
             if pairs:
                 keys = set[str].intersection(*(set(a) & set(b) for a, b in pairs))
@@ -103,12 +121,12 @@ def aggregate_results(config: ExperimentConfig) -> dict[str, object]:
                     for key in sorted(keys)
                 }
         result: dict[str, object] = {
-            "format_version": 1,
+            "format_version": 2,
             "complete": not missing,
             "missing_runs": missing,
             "missing_pairs": missing_pairs,
             "completed_runs": len(rows),
-            "expected_runs": 2 * len(config.graphs) * len(config.seeds),
+            "expected_runs": 3 * len(config.graphs) * len(config.seeds),
             "per_condition": summaries,
             "paired_full_minus_baseline": differences,
         }

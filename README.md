@@ -6,7 +6,7 @@ The motivating manuscript is `sources/Parameter_and_State_Identifiability.pdf`
 (local source PDFs are ignored by Git).
 
 The package supplies architecture, training infrastructure, the paper's data
-generators, and a complete paired controlled-vector experiment runner. See
+generators, and a three-stage controlled-vector experiment runner. See
 [the first experiment](docs/controlled_experiment.md) for the comparison,
 tmux/W&B server commands, validation, recovery metrics, and resume. The scientific
 protocol lives separately from the reusable model/trainer. See
@@ -55,8 +55,10 @@ episodes; separate clips from one episode must share an ID.
 
 The basic loss is latent prediction MSE. `ObjectiveConfig` exposes independent
 state/action/parameter sparsity weights, attention-logit weight, and independent
-state/parameter `none` or `sigreg` selections and weights. All auxiliary
-weights default to zero. Setting only `parameter_sparsity_weight=0` retains the
+state/parameter `none` or `sigreg` selections and weights. Generic auxiliary
+weights default to zero. Optional `GECOConfig` controls adaptive sparsity under
+a calibrated bound on prediction plus representation/logit regularization.
+The controlled experiment enables it for both sparse conditions. Setting only `parameter_sparsity_weight=0` retains the
 parameter encoder, conditioning, optimizer, and all other architecture choices.
 
 `TensorEpisodes` is a tensor adapter, not a scientific data generator. To use the
@@ -108,7 +110,9 @@ Missing dependencies or online initialization failures stop the run instead of
 silently dropping tracking. Keep API keys in W&B's credential store or environment,
 never in YAML or command-line configuration.
 
-Only rank zero creates the W&B run and logs the reduced metrics. It records the
+The controlled experiment logs only objective/GECO controls, MCC and SHD.
+Generic training retains detailed diagnostics. Only rank zero creates the W&B
+run and logs the reduced metrics. It records the
 resolved model/data/training configuration, dataset identity, loss components,
 gradient health, optimizer/skip counts and per-microbatch timing. Charts use
 `train/microbatch` as their training axis. Logging preserves training RNG state;

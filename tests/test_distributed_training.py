@@ -1,10 +1,12 @@
 """Two CPU ranks verify generic optimizer/EMA synchronization and resume."""
 
 import copy
+import math
 import os
 import sys
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 import torch
@@ -17,7 +19,7 @@ from scjepa.models.encoders import VectorEncoder
 from scjepa.models.model import SCJEPA, ModelOutput
 from scjepa.models.parameter_encoder import ParameterEncoder
 from scjepa.models.spartan import Spartan
-from scjepa.training import TrainConfig, Trainer
+from scjepa.training import GECOConfig, ObjectiveConfig, TrainConfig, Trainer
 from scjepa.training.distributed import (
     destroy_distributed,
     gather_rank_objects,
@@ -32,7 +34,10 @@ class _FailingLogger:
 
 
 def _trainer(
-    directory: str, identity: bool = False, dataset: TensorEpisodes | None = None
+    directory: str,
+    identity: bool = False,
+    dataset: TensorEpisodes | None = None,
+    geco: bool = False,
 ) -> Trainer:
     torch.manual_seed(7)  # pyright: ignore[reportUnknownMemberType]
     model = SCJEPA(
@@ -43,7 +48,15 @@ def _trainer(
         ema_decay=0.8,
     )
     return Trainer(
-        model, TrainConfig(batch_size=4, accumulation_steps=2, out_dir=directory), dataset
+        model,
+        TrainConfig(
+            batch_size=4,
+            accumulation_steps=2,
+            out_dir=directory,
+            objective=ObjectiveConfig(state_sparsity_weight=1 if geco else 0),
+            geco=GECOConfig(enabled=geco, tau=0.5, momentum=0),
+        ),
+        dataset,
     )
 
 
@@ -60,14 +73,23 @@ def _worker(worker: int, rendezvous: str, directory: str) -> None:
     dist.init_process_group("gloo", init_method=rendezvous, rank=worker, world_size=2)
     initialize_distributed("cpu")
     try:
-        trainer = _trainer(directory)
+        trainer = _trainer(directory, geco=True)
         batch = {"observations": torch.randn(2, 4, 4), "episode_ids": torch.arange(2) + worker * 2}
         initial_target = copy.deepcopy(trainer.model.target_encoder.state_dict())
-        trainer.train_step(batch)
+        first = trainer.train_step(batch)
         assert trainer.optimizer_steps == 0
         torch.testing.assert_close(trainer.model.target_encoder.state_dict(), initial_target)
-        trainer.train_step(batch)
+        second = trainer.train_step(batch)
         assert trainer.optimizer_steps == 1
+        assert trainer.geco is not None
+        assert int(trainer.geco.num_updates) == 1
+        losses = cast(
+            list[tuple[float, float]],
+            gather_rank_objects((first["loss/base"], second["loss/base"])),
+        )
+        rank_errors = cast(list[float], gather_rank_objects(float(trainer.geco.ma_error)))
+        global_mean = sum(sum(pair) for pair in losses) / 4
+        assert all(math.isclose(error, global_mean - 0.5, abs_tol=1e-6) for error in rank_errors)
         assert any(
             not torch.equal(initial_target[key], value)
             for key, value in trainer.model.target_encoder.state_dict().items()
@@ -84,16 +106,21 @@ def _worker(worker: int, rendezvous: str, directory: str) -> None:
         expected_rng = torch.get_rng_state().clone()
         resumed = _trainer(directory)
         resumed.load_checkpoint(path)
+        assert resumed.geco is not None
+        assert resumed.config.geco == trainer.config.geco
+        torch.testing.assert_close(resumed.geco.state_dict(), trainer.geco.state_dict())
         torch.testing.assert_close(torch.get_rng_state(), expected_rng, rtol=0, atol=0)
         assert resumed.optimizer_steps == 1
         assert resumed.step == 2
         before = copy.deepcopy(resumed.model.state_dict())
+        before_geco = copy.deepcopy(resumed.geco.state_dict())
         # A gradient threshold rejection on one rank invalidates both accumulated groups.
         resumed.config.grad_skip_threshold = 0 if worker == 1 else float("inf")
         resumed.train_step(batch)
         skipped = resumed.train_step(batch)
         assert skipped["health/skipped"] == 1
         torch.testing.assert_close(resumed.model.state_dict(), before, rtol=0, atol=0)
+        torch.testing.assert_close(resumed.geco.state_dict(), before_geco, rtol=0, atol=0)
         assert gather_rank_objects(resumed.total_skips) == [1, 1]
         resumed.config.grad_skip_threshold = float("inf")
         original = resumed.objective.forward
@@ -111,6 +138,9 @@ def _worker(worker: int, rendezvous: str, directory: str) -> None:
         resumed.train_step(batch)
         resumed.train_step(batch)
         assert resumed.optimizer_steps == 2
+        assert int(resumed.geco.num_updates) == 2
+        duals = gather_rank_objects(float(resumed.geco.log_lambda))
+        assert duals[0] == duals[1]
         assert gather_rank_objects(resumed.total_skips) == [2, 2]
         assert all(
             parameter.grad is None for parameter in resumed.model.target_encoder.parameters()
@@ -139,7 +169,7 @@ def _worker(worker: int, rendezvous: str, directory: str) -> None:
             assert validation.pending_microbatches == 0
             evaluated.append(validation.step)
             torch.randn(3)
-            return {"validation/physical_prediction_nrmse": 1 / validation.step}
+            return {"validation/base_loss": 1 / validation.step}
 
         validation.train(
             evaluate,

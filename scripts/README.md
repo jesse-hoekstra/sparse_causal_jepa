@@ -1,6 +1,6 @@
 # Entrypoints
 
-- `run_controlled_experiment.py`: paired controlled-vector comparison, validation,
+- `run_controlled_experiment.py`: dense calibration followed by two GECO-sparse comparisons, validation,
   best checkpoints, held-out evaluation, W&B, safe resume and aggregation. See
   [the experiment guide](../docs/controlled_experiment.md) for tmux/server commands.
 

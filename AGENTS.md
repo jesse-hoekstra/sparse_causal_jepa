@@ -23,7 +23,11 @@ utilities outside training items. Preserve addressable sampling and dataset
 identity validation; do not silently change distributions or renderer precision.
 
 The controlled-vector protocol lives in `scjepa.experiments`; follow
-`docs/controlled_experiment.md`. Baseline/full differ only in parameter sparsity.
+`docs/controlled_experiment.md`. The default sequence is dense tau calibration, baseline, full on complementary
+data and one seed. Baseline/full differ only in parameter sparsity. Use local
+content-dependent SPARTAN gates, active logit regularization and GECO for the
+sparse conditions. Preserve the shared calibrated bound and controller resume.
+Report MCC and aligned routing-support SHD; keep the dashboard concise.
 Use SIGReg only. Keep calibration, validation and test separate, preserve paired
 initialization/data and fixed observation maps, and validate checkpoint/run
 provenance. An ordinary MLP plus empirical probes does not guarantee injectivity.

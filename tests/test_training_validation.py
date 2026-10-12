@@ -16,7 +16,7 @@ from scjepa.models.parameter_encoder import ParameterEncoder
 from scjepa.models.spartan import Spartan
 from scjepa.training import ObjectiveConfig, TrainConfig, Trainer
 
-SELECTION = "validation/physical_prediction_nrmse"
+SELECTION = "validation/base_loss"
 
 
 class _Logger:

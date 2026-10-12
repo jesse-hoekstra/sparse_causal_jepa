@@ -1,4 +1,4 @@
-"""Finite-lag coordinate graphs and sparse information-flow contracts."""
+"""Finite-lag coordinate graphs and local sparse-attention contracts."""
 
 import pytest
 import torch
@@ -143,7 +143,7 @@ def test_sparse_path_products_account_for_indirect_dependencies(
     assert output.graphs.action[0, 0, 0, 1].item() == 1
 
 
-def test_closed_edges_have_no_attention_control_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fixed_closed_routes_block_unrouted_values(monkeypatch: pytest.MonkeyPatch) -> None:
     model = tiny(history=2, actions=DA, layers=1).eval()
     prescribed = torch.zeros(1, model.num_tokens, model.num_tokens)
     prescribed[0, DZ, 1] = 1  # latest output 0 may read oldest state 1
@@ -169,13 +169,38 @@ def test_closed_edges_have_no_attention_control_bypass(monkeypatch: pytest.Monke
     torch.testing.assert_close(output.prediction[:, 0], changed.prediction[:, 0])
 
 
-def test_graph_and_attention_logits_are_independent_of_input_values() -> None:
-    model = tiny(history=2, actions=DA).eval()
-    first = model(torch.randn(2, 2, DZ), torch.randn(2, DP), torch.randn(2, 2, DA))
-    changed = model(100 * torch.randn(2, 2, DZ), torch.randn(2, DP), torch.randn(2, 2, DA))
-    torch.testing.assert_close(first.path_matrix, changed.path_matrix)
-    torch.testing.assert_close(first.logit_penalty, changed.logit_penalty)
-    torch.testing.assert_close(first.mean_abs_logit, changed.mean_abs_logit)
+def test_local_gates_change_with_content_within_the_same_batch() -> None:
+    layer = SpartanLayer(dim=2, mlp_hidden_size=4, mlp_num_layers=2, temperature=1).eval()
+    with torch.no_grad():
+        layer.project_q.weight.copy_(torch.eye(2))
+        layer.project_k.weight.copy_(torch.eye(2))
+    # Same query token, but an opposite/same-direction key changes the route.
+    tokens = torch.tensor([[[1.0, -1.0], [-1.0, 1.0]], [[1.0, -1.0], [1.0, -1.0]]])
+    _, adjacency, *_ = layer(tokens)
+    assert adjacency[0, 0, 1].item() == 0
+    assert adjacency[1, 0, 1].item() == 1
+
+
+def test_paper_uses_unscaled_gate_logits_and_scaled_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer = SpartanLayer(dim=DIM, mlp_hidden_size=DIM, mlp_num_layers=2, temperature=1)
+    tokens = torch.randn(2, 3, DIM)
+    normalized = layer.norm(tokens)
+    raw = layer.project_q(normalized) @ layer.project_k(normalized).transpose(-1, -2)
+    captured: list[Tensor] = []
+
+    def open_adjacency(logits: Tensor, _temperature: float, _training: bool) -> Tensor:
+        captured.append(logits)
+        return torch.ones_like(logits)
+
+    monkeypatch.setattr(spartan_module, "_sample_hard_adjacency", open_adjacency)
+    updated, _, penalty, _, probability, _ = layer(tokens)
+    expected_attention = (raw * layer.scale).softmax(dim=-1) @ layer.project_v(normalized)
+    torch.testing.assert_close(captured[0], raw)
+    torch.testing.assert_close(updated, layer.mlp(tokens + expected_attention))
+    torch.testing.assert_close(penalty, (raw.exp() + (-raw).exp()).mean())
+    torch.testing.assert_close(probability, raw.sigmoid().mean())
 
 
 def test_sparsity_blocks_can_be_weighted_independently() -> None:
@@ -199,6 +224,14 @@ def test_dense_mode_deterministic_without_gate_sampling() -> None:
     assert torch.all(first.path_matrix > 0)
 
 
+def test_dense_and_sparse_predictors_have_identical_initial_parameters() -> None:
+    sparse, dense = tiny(actions=DA), tiny(actions=DA, dense=True)
+    sparse_state, dense_state = sparse.state_dict(), dense.state_dict()
+    assert sparse_state.keys() == dense_state.keys()
+    for name, value in sparse_state.items():
+        torch.testing.assert_close(value, dense_state[name])
+
+
 def test_sparse_evaluation_deterministic_training_resamples() -> None:
     model = tiny()
     states, parameters = torch.randn(2, 1, DZ), torch.randn(2, DP)
@@ -212,7 +245,7 @@ def test_sparse_evaluation_deterministic_training_resamples() -> None:
     torch.testing.assert_close(first.path_matrix, first.path_matrix.round())
 
 
-def test_gradients_reach_states_actions_parameters_and_structural_logits() -> None:
+def test_gradients_reach_states_actions_parameters_and_attention_logits() -> None:
     model = tiny(history=2, actions=DA, dense=True)
     states = torch.randn(2, 2, DZ, requires_grad=True)
     parameters = torch.randn(2, DP, requires_grad=True)

@@ -19,7 +19,7 @@ from scjepa.data.datasets import canonical_fingerprint
 from scjepa.data.factory import build_dgp_dataset
 from scjepa.data.identity import training_tensors_fingerprint
 from scjepa.experiments.config import ExperimentConfig
-from scjepa.experiments.evaluation import evaluate_model, validate_model
+from scjepa.experiments.evaluation import calibrate_tau, evaluate_model, validate_model
 from scjepa.experiments.reporting import aggregate_results
 from scjepa.experiments.storage import (
     claim_execution,
@@ -29,16 +29,49 @@ from scjepa.experiments.storage import (
     read_json,
     write_json,
 )
+from scjepa.models.model import SCJEPA
 from scjepa.training import Trainer, seed_everything
 from scjepa.training.distributed import (
     any_rank,
     destroy_distributed,
+    gather_rank_objects,
     initialize_distributed,
     is_main_process,
     world_size,
 )
 from scjepa.training.factory import build_model
 from scjepa.training.logging import WandbLogger
+
+
+class ExperimentLogger:
+    """Keep the experiment dashboard focused on its objective and recovery scores."""
+
+    def __init__(self, logger: WandbLogger) -> None:
+        """Wrap the existing W&B/terminal sink without changing its identity."""
+        self.logger = logger
+
+    def log(self, step: int, metrics: dict[str, float]) -> None:
+        """Forward only interpretable losses, GECO controls and scientific scores."""
+        selected = {
+            key: value
+            for key, value in metrics.items()
+            if key
+            in {
+                "loss/prediction",
+                "loss/base",
+                "loss/sparsity",
+                "geco/tau",
+                "geco/constraint",
+                "geco/sparsity_weight",
+                "health/skipped_steps",
+            }
+            or (
+                key.startswith(("validation/", "test/", "recovery/", "graph/"))
+                and key != "validation/selection_score"
+            )
+        }
+        if selected:
+            self.logger.log(step, selected)
 
 
 class StopController:
@@ -98,8 +131,8 @@ def experiment_plan(
         raise ValueError("selected graph is not in the experiment definition")
     if seed is not None and seed not in config.seeds:
         raise ValueError("selected seed is not in the experiment definition")
-    if condition is not None and condition not in {"baseline", "full"}:
-        raise ValueError("condition must be baseline or full")
+    if condition is not None and condition not in {"dense", "baseline", "full"}:
+        raise ValueError("condition must be dense, baseline or full")
     return [
         {
             "graph": g,
@@ -111,7 +144,7 @@ def experiment_plan(
         if graph is None or graph == g
         for s in config.seeds
         if seed is None or seed == s
-        for c in ("baseline", "full")
+        for c in ("dense", "baseline", "full")
         if condition is None or condition == c
     ]
 
@@ -169,10 +202,54 @@ def _selected_checkpoint(path: Path, trainer: Trainer, identity: str) -> dict[st
         or cast(dict[str, object], selection).get("last_step") != payload["step"]
         or not isinstance(score, int | float)
         or not math.isfinite(score)
-        or current.get("selection_metric") != "validation/physical_prediction_nrmse"
+        or current.get("selection_metric")
+        != ("validation/selection_score" if trainer.config.geco.enabled else "validation/base_loss")
     ):
         raise ValueError("best checkpoint has an invalid selection step or score")
     return payload
+
+
+def _checkpoint_hash(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _load_tau(
+    config: ExperimentConfig, manifest: dict[str, object], graph: str, seed: int
+) -> dict[str, object]:
+    """Require the completed dense reference and verify the bound's provenance."""
+    directory = Path(config.output_dir) / graph / f"seed-{seed}" / "dense"
+    if not (directory / "tau.json").is_file():
+        raise ValueError("dense tau calibration is missing; run --condition dense first")
+    record = read_json(directory / "tau.json")
+    identity = canonical_fingerprint([manifest["identity"], graph, seed, "dense"])
+    status = read_json(directory / "status.json")
+    if (
+        record.get("dense_run_identity") != identity
+        or record.get("experiment_identity") != manifest["identity"]
+        or status.get("status") != "completed"
+        or status.get("run_identity") != identity
+        or record.get("checkpoint_sha256") != _checkpoint_hash(directory / "best.pt")
+        or record.get("tau_multiplier") != config.tau_multiplier
+    ):
+        raise ValueError("dense tau calibration provenance differs from this experiment")
+    tau, base = record.get("tau"), record.get("calibration/base_loss")
+    if (
+        not isinstance(tau, int | float)
+        or not isinstance(base, int | float)
+        or not math.isfinite(tau)
+        or tau <= 0
+        or tau != base * config.tau_multiplier
+    ):
+        raise ValueError("dense tau calibration is invalid")
+    return record
+
+
+def _sparse_selection_score(base: float, sparsity: float, tau: float) -> float:
+    """Rank feasible checkpoints by sparsity, then infeasible ones by base loss."""
+    if base <= tau:
+        return sparsity / (1.0 + sparsity)
+    return 1.0 + (base - tau) / (base + tau)
 
 
 def _run_one(
@@ -205,6 +282,17 @@ def _run_one(
                 if status.get("status") == "completed" and not evaluate_only:
                     if not (directory / "evaluation" / "metrics.json").exists():
                         raise ValueError("completed run is missing evaluation; use --evaluate-only")
+                    if condition == "dense":
+                        _load_tau(config, manifest, graph, seed)
+                    else:
+                        current_calibration = _load_tau(config, manifest, graph, seed)
+                        if (
+                            read_json(directory / "run_config.json").get("tau_calibration")
+                            != current_calibration
+                        ):
+                            raise ValueError(
+                                "completed run tau calibration differs from dense reference"
+                            )
                     return True
             elif any(
                 (directory / name).exists() for name in ("last.pt", "best.pt", "run_config.json")
@@ -222,7 +310,8 @@ def _run_one(
             seed_everything(seed)
             data_config = config.data_config(graph)
             data = build_dgp_dataset(data_config, observation_matrix=matrix)
-            model = build_model(config.model)
+            model_config = config.condition_model(condition)
+            model = build_model(model_config)
             initial_identity = training_tensors_fingerprint(
                 {
                     name: value
@@ -230,10 +319,20 @@ def _run_one(
                     if isinstance(value, Tensor)
                 }
             )
+            calibration: dict[str, object] | None = None
+            if condition != "dense":
+                result = _rank_zero(lambda: _load_tau(config, manifest, graph, seed), device)
+                calibration = cast(dict[str, object], gather_rank_objects(result)[0])
             training = replace(
-                config.training_config(condition, seed, directory), device=str(device)
+                config.training_config(
+                    condition,
+                    seed,
+                    directory,
+                    tau=float(cast(float, calibration["tau"])) if calibration else None,
+                ),
+                device=str(device),
             )
-            trainer = Trainer(model, training, data, model_config=asdict(config.model))
+            trainer = Trainer(model, training, data, model_config=asdict(model_config))
             checkpoint = directory / ("last.pt" if (directory / "last.pt").exists() else "best.pt")
             if (resume or evaluate_only) and checkpoint.exists():
                 trainer.load_checkpoint(checkpoint)
@@ -243,6 +342,10 @@ def _run_one(
                 if restored_training != expected_training:
                     raise ValueError("checkpoint training configuration differs from experiment")
             trainer.run_metadata["experiment_run_identity"] = identity
+            if calibration is not None:
+                if trainer.run_metadata.get("tau_calibration", calibration) != calibration:
+                    raise ValueError("checkpoint tau calibration differs from the dense reference")
+                trainer.run_metadata["tau_calibration"] = calibration
             record: dict[str, object] = {
                 "experiment_identity": manifest["identity"],
                 "run_identity": identity,
@@ -251,12 +354,13 @@ def _run_one(
                 "condition": condition,
                 "initial_state_fingerprint": initial_identity,
                 "dataset_identity": trainer.dataset_identity,
-                "model": asdict(config.model),
+                "model": asdict(model_config),
                 "train": asdict(trainer.config),
                 "data": asdict(data_config),
                 "evaluation": asdict(config.evaluation),
                 "world_size": world_size(),
                 "source_fingerprint": manifest["source_fingerprint"],
+                "tau_calibration": calibration,
             }
 
             def start_logging() -> None:
@@ -294,7 +398,7 @@ def _run_one(
                     out_dir=directory,
                     resume_state=cast(dict[str, object] | None, saved_wandb),
                 )
-                trainer.logger = logger
+                trainer.logger = ExperimentLogger(logger)
                 if logger.metadata:
                     trainer.run_metadata["wandb"] = logger.metadata
                 write_json(metadata_path, trainer.run_metadata)
@@ -307,11 +411,33 @@ def _run_one(
 
             _rank_zero(start_logging, device)
             if not evaluate_only:
+
+                def validation(current: SCJEPA) -> dict[str, float]:
+                    scores = validate_model(
+                        current,
+                        data_config,
+                        matrix,
+                        config.evaluation,
+                        objective=training.objective,
+                    )
+                    if calibration is not None:
+                        bound = float(cast(float, calibration["tau"]))
+                        scores["validation/selection_score"] = _sparse_selection_score(
+                            scores["validation/base_loss"], scores["validation/sparsity"], bound
+                        )
+                        scores["validation/feasible"] = float(
+                            scores["validation/base_loss"] <= bound
+                        )
+                    return scores
+
                 trainer.train(
-                    validation_callback=lambda current: validate_model(
-                        current, data_config, matrix, config.evaluation
-                    ),
+                    validation_callback=validation,
                     validation_every=config.validation_every,
+                    selection_metric=(
+                        "validation/selection_score"
+                        if calibration is not None
+                        else "validation/base_loss"
+                    ),
                     stop_requested=stop,
                 )
             if trainer.interrupted or any_rank(stop(), device):
@@ -326,17 +452,50 @@ def _run_one(
                 if not best_path.exists():
                     raise ValueError("training finished without a finite selected checkpoint")
                 payload = _selected_checkpoint(best_path, trainer, identity)
-                selected = build_model(config.model).to(device)
+                selected = build_model(model_config).to(device)
                 selected.load_state_dict(cast(dict[str, object], payload["model"]))
                 metrics = evaluate_model(
-                    selected, data_config, matrix, config.evaluation, directory / "evaluation"
+                    selected,
+                    data_config,
+                    matrix,
+                    config.evaluation,
+                    directory / "evaluation",
+                    objective=training.objective,
                 )
                 metrics["evaluation/selected_step"] = float(cast(int, payload["step"]))
-                metrics["evaluation/selection_physical_nrmse"] = float(
+                metrics["evaluation/selection_score"] = float(
                     cast(float, trainer.validation_state["best_score"])
                 )
-                with best_path.open("rb") as stream:
-                    checkpoint_fingerprint = hashlib.file_digest(stream, "sha256").hexdigest()
+                checkpoint_fingerprint = _checkpoint_hash(best_path)
+                if condition == "dense":
+                    bound = calibrate_tau(
+                        selected,
+                        data_config,
+                        matrix,
+                        config.evaluation,
+                        objective=training.objective,
+                    )
+                    tau = bound["calibration/base_loss"] * config.tau_multiplier
+                    if not math.isfinite(tau) or tau <= 0:
+                        raise ValueError("dense calibration must produce a finite positive tau")
+                    write_json(
+                        directory / "tau.json",
+                        {
+                            "experiment_identity": manifest["identity"],
+                            "dense_run_identity": identity,
+                            "checkpoint_sha256": checkpoint_fingerprint,
+                            "selected_step": payload["step"],
+                            "tau_multiplier": config.tau_multiplier,
+                            "tau": tau,
+                            **bound,
+                        },
+                    )
+                    metrics["geco/tau"] = tau
+                elif calibration is not None:
+                    metrics["geco/tau"] = float(cast(float, calibration["tau"]))
+                    metrics["test/feasible"] = float(
+                        metrics["test/base_loss"] <= metrics["geco/tau"]
+                    )
                 write_json(
                     directory / "evaluation" / "selected_checkpoint.json",
                     {
@@ -349,7 +508,14 @@ def _run_one(
                 )
                 write_json(directory / "evaluation" / "metrics.json", metrics)
                 assert logger is not None
-                logger.log(trainer.step, metrics)
+                logger.log(
+                    trainer.step,
+                    {
+                        key: value
+                        for key, value in metrics.items()
+                        if not key.startswith("evaluation/")
+                    },
+                )
                 if config.upload_evaluation_artifacts:
                     logger.log_artifact(
                         directory / "evaluation" / "metrics.json",
@@ -400,6 +566,20 @@ def run_experiment(
             raise ValueError(
                 "SIGReg needs at least two episodes per rank and equal global sharding"
             )
+        if config.evaluation.batch_size != config.train.batch_size // world_size():
+            raise ValueError(
+                "evaluation.batch_size must equal train.batch_size / world_size so tau "
+                "and training use the same SIGReg statistic"
+            )
+        if any(
+            count % config.evaluation.batch_size
+            for count in (
+                config.evaluation.calibration_episodes,
+                config.evaluation.validation_episodes,
+                config.evaluation.test_episodes,
+            )
+        ):
+            raise ValueError("held-out episode counts must be divisible by evaluation.batch_size")
         _rank_zero(lambda: prepare_experiment(config), device)
         manifest, matrix = prepare_experiment(config)
         _rank_zero(lambda: claim_execution(config, str(manifest["identity"]), world_size()), device)

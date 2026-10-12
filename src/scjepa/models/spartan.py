@@ -6,12 +6,12 @@ coordinate has its own learned identity; state/action identities also include a
 lag embedding. No coordinates are mixed by the input projections, value
 normalization, token MLPs, or scalar output head.
 
-Attention logits and gates depend only on these identities, never on observation
-values. This deliberate choice makes the extracted graph a complete structural
-upper bound on information flow within the predictor, conditional on its
-independently supplied parameter vector. It does not include the context-to-
-parameter inference path. Content-dependent queries or keys would create control
-paths through attention weights that a masked value graph could miss.
+Attention logits and gates depend on the current token representations, as in
+SPARTAN and its parameter-identification extension (Baumgartner et al., 2026,
+arXiv:2603.14483, equations 7--11). Extracted paths describe local attention
+routing with residuals. They are not a global functional dependency graph: a
+different input may change the gates, and the context-to-parameter inference
+path is outside this predictor.
 Sparse gates use straight-through binary sampling in training and deterministic
 thresholding in evaluation. Dense and token-local reference modes share the same
 modules. Stable masked normalization and residual path accounting are retained
@@ -49,11 +49,12 @@ class GraphPenalties(NamedTuple):
 
 
 class GraphBlocks(NamedTuple):
-    """Paths from each input coordinate to each predicted state coordinate.
+    """Local routing paths from inputs to each predicted state coordinate.
 
     State/action lag index zero is the oldest supplied input. Counts include
     every residual path and every sparse-attention layer. Nonzero entries are
-    possible dependencies, not proof of causal influence or identifiability.
+    possible routed dependencies for the current input and mask realization,
+    not proof of causal influence, global independence, or identifiability.
     """
 
     state: Float[Tensor, "b dz lag dz"]
@@ -73,7 +74,7 @@ class GraphBlocks(NamedTuple):
 
 
 class SpartanOutput(NamedTuple):
-    """Prediction, structural path counts, and explicit regularization terms."""
+    """Prediction, local routing path counts, and explicit regularization terms."""
 
     prediction: Float[Tensor, "b dz"]
     path_matrix: Float[Tensor, "b m m"]
@@ -97,7 +98,7 @@ def _sample_hard_adjacency(logits: Tensor, temperature: float, training: bool) -
 
 
 class SpartanLayer(nn.Module):
-    """Single-head attention with structure-only control and token-local values."""
+    """Content-dependent single-head attention with token-local projections."""
 
     def __init__(
         self,
@@ -123,7 +124,6 @@ class SpartanLayer(nn.Module):
         self.identity = identity
         self.scale = 1.0 / math.sqrt(dim)
         self.norm = nn.LayerNorm(dim)
-        self.structure_norm = nn.LayerNorm(dim)
         self.project_q = nn.Linear(dim, dim, bias=False)
         self.project_k = nn.Linear(dim, dim, bias=False)
         self.project_v = nn.Linear(dim, dim, bias=False)
@@ -138,14 +138,18 @@ class SpartanLayer(nn.Module):
     def forward(
         self,
         tokens: Float[Tensor, "b m d"],
-        identities: Float[Tensor, "1 m d"],
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Return updated tokens, sampled adjacency, and logit diagnostics."""
-        structural = self.structure_norm(identities)
-        q = self.project_q(structural)
-        k = self.project_k(structural)
-        v = self.project_v(self.norm(tokens))
-        logits = (torch.einsum("bid,bjd->bij", q, k) * self.scale).expand(tokens.shape[0], -1, -1)
+        normalized = self.norm(tokens)
+        q = self.project_q(normalized)
+        k = self.project_k(normalized)
+        v = self.project_v(normalized)
+        # Equation 7 uses unscaled q^T k for Bernoulli probabilities, and scaled
+        # q^T k / sqrt(d) for attention. Compute logits in float32 under AMP to
+        # keep the symmetric exponential regularizer and gate sampling stable.
+        logit_dtype = torch.float32 if q.dtype in (torch.float16, torch.bfloat16) else q.dtype
+        with torch.autocast(device_type=tokens.device.type, enabled=False):
+            logits = torch.einsum("bid,bjd->bij", q.to(logit_dtype), k.to(logit_dtype))
         if self.dense:
             adjacency = torch.ones_like(logits)
         elif self.identity:
@@ -155,12 +159,15 @@ class SpartanLayer(nn.Module):
 
         # Subtract only the open-entry maximum. A closed row uses denominator
         # one instead of an epsilon floor that amplifies straight-through grads.
-        unmasked_max = logits.masked_fill(adjacency == 0, float("-inf")).amax(dim=-1, keepdim=True)
+        attention_logits = logits * self.scale
+        unmasked_max = attention_logits.masked_fill(adjacency == 0, float("-inf")).amax(
+            dim=-1, keepdim=True
+        )
         row_max = torch.where(torch.isfinite(unmasked_max), unmasked_max, 0.0).detach()
-        weights = adjacency * (logits - row_max).clamp(max=0.0).exp()
+        weights = adjacency * (attention_logits - row_max).clamp(max=0.0).exp()
         denom = weights.sum(dim=-1, keepdim=True)
         weights = weights / (denom + (denom.detach() < 0.5).to(weights.dtype))
-        h = torch.einsum("bij,bjd->bid", weights, v)
+        h = torch.einsum("bij,bjd->bid", weights.to(v.dtype), v)
 
         # exp(a) + exp(-a), with a linear continuation above |a|=30. Evaluate
         # in float32 under mixed precision so half-precision exp does not overflow.
@@ -308,7 +315,7 @@ class Spartan(nn.Module):
         mean_gate_probabilities: list[Tensor] = []
         gate_entropies: list[Tensor] = []
         for layer in self.layers:
-            tokens, adjacency, penalty, abs_logit, gate_prob, entropy = layer(tokens, identities)
+            tokens, adjacency, penalty, abs_logit, gate_prob, entropy = layer(tokens)
             adjacencies.append(adjacency)
             logit_penalties.append(penalty)
             mean_abs_logits.append(abs_logit)

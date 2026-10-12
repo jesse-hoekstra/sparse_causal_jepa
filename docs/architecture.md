@@ -53,14 +53,14 @@ Stable masked softmax handles fully closed rows without epsilon-gradient
 amplification. The optional logit penalty is `mean(exp(g)+exp(-g))`, using a linear
 continuation above `abs(g)=30` and float32 arithmetic.
 
-**Attention-control choice:** queries, keys, logits, and gates use learned
-coordinate identities only, not input values. Otherwise content-dependent
-attention controls could transmit information even when a value edge is closed.
-This makes the extracted graph a structural upper bound on all predictor input
-paths. It also makes evaluation graphs global rather than state-dependent.
-Parameter inference intentionally mixes its permitted context; predictor graphs
-are dependencies conditional on the inferred parameter vector, not graphs of
-the full raw-observation-to-prediction composition.
+**Local attention:** queries, keys and values use the current coordinate-token
+content. Bernoulli gates and logit regularization use unscaled `q @ k`; attention
+weights use `q @ k / sqrt(d)`. Coordinate, role and lag identities remain explicit.
+This follows SPARTAN's state-dependent local routing design. Extracted paths track
+masked value routing and residuals; they are not a complete global functional
+independence certificate because attention controls depend on the inputs.
+Parameter inference mixes only its permitted context. Predictor graphs are
+conditional on the supplied parameter code, not the full context-to-output graph.
 
 Path accounting multiplies `(A_layer + I)` through the layers in float32,
 including residuals. Decoded rows give separate `GraphBlocks`:
@@ -73,7 +73,7 @@ including residuals. Decoded rows give separate `GraphBlocks`:
 
 Lag zero means the oldest input. Nonzero counts mean at least one available path.
 `aggregate_lags()` takes the maximum over the lag axis; thresholding the result
-at zero implements the paper's any-lag dependency convention. Counts are potential
+at zero implements the paper's any-lag dependency convention. Counts are potential local routing
 paths, not measured causal effects. The unavoidable latest-state self path is
 included. Graph extraction never infers state size from parameter size.
 
@@ -112,10 +112,23 @@ rejected large gradients. A rejected microbatch discards its entire accumulated
 group. Full precision is the supported trainer mode; custom AMP/scaler integrations
 must call `update_target()` only when their optimizer update actually occurred.
 
-The objective is:
+The non-sparsity objective is:
 
-`MSE(predictions, stopgrad(targets)) + wz*state_paths + wa*action_paths`
-`+ wtheta*parameter_paths + wlogit*logit_penalty + ws*state_reg + wp*parameter_reg`.
+`base = MSE(predictions, stopgrad(targets)) + wlogit*logit_penalty`
+`       + ws*state_reg + wp*parameter_reg`.
+
+`path_loss = wz*state_paths + wa*action_paths + wtheta*parameter_paths`.
+
+Generic fixed-weight training uses `base + path_loss`. With `TrainConfig.geco`
+enabled, the primal loss is `base + path_loss/lambda` subject to the calibrated
+constraint `E[base] <= tau`. `GECOConfig` defines the explicit bound, dual step
+size, moving-average momentum, initial multiplier and log-multiplier bounds.
+After each accepted optimizer update the controller averages base loss over all
+accumulated microbatches and ranks, updates its moving constraint average, and
+adds `step_size * moving_constraint` to `log(lambda)`. Its state is checkpointed.
+Neither rejected updates nor partial accumulation advance GECO or encoder EMA.
+The controlled experiment obtains tau from a separate dense calibration stage;
+no graph budget or ground-truth edge count enters optimization.
 
 SIGReg uses the retained upstream implementation through a typed wrapper. The
 active choices are `none` and `sigreg`; VISReg is not an enabled training option.
@@ -134,14 +147,14 @@ motivates SIGReg but does not prescribe a universal coefficient here. These
 components do not establish the paper's information-preservation assumptions.
 The supplied vector MLP is not constrained to be invertible. The
 [controlled experiment](controlled_experiment.md) uses it with empirical recovery
-and information-preservation checks, and a calibrated probe for physical errors.
+and information-preservation checks, using held-out MCC and aligned routing-support SHD.
 
 ## Infrastructure and future experiments
 
 `Trainer` retains AdamW, clipping and synchronized finite/skip guards, deterministic
 global batch sharding, rank-aware logging, and atomic checkpoint writes. All ranks
 participate in checkpointing. Checkpoints store online and target state, EMA/context
-settings, optional full model configuration, objective configuration/state,
+settings, optional full model configuration, objective and GECO configuration/state,
 optimizer, accepted-update and skip counters, and each rank's Python/NumPy/Torch
 RNG. Resume restores optimization settings and deterministic episode position;
 run length/device/output/logging controls may be changed. Exact replay requires
