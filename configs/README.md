@@ -1,6 +1,7 @@
 # Configuration
 
-`experiments/controlled_vector.yaml` defines the complete paired first experiment;
+`experiments/controlled_vector.yaml` defines dense calibration and two GECO models on
+complementary data with seed 0;
 `experiments/controlled_vector_smoke.yaml` checks its infrastructure with two CPU
 microbatches. Use them with `scripts/run_controlled_experiment.py`, not the generic
 Hydra entrypoint. Both require SIGReg for state and parameter regularization.
@@ -9,7 +10,9 @@ selection, W&B, selectors, and reproducibility rules.
 
 `config.yaml` supplies small generic defaults, not an experiment preset.
 `ModelConfig` in `scjepa.training.factory` defines architecture fields;
-`TrainConfig` and `ObjectiveConfig` define optimization and explicit loss weights.
+`TrainConfig`, `ObjectiveConfig` and `GECOConfig` define optimization, explicit
+loss weights and optional adaptive sparsity. The experiment derives tau and
+enables GECO per condition automatically.
 Unknown model/training keys are rejected. The CLI requires an explicit data
 group or a saved tensor/bundle path; no scientific dataset is selected implicitly.
 

@@ -10,6 +10,7 @@ from scjepa.data.types import DGPConfig
 from scjepa.experiments.evaluation import EvaluationConfig
 from scjepa.training import ObjectiveConfig, TrainConfig
 from scjepa.training.factory import ModelConfig
+from scjepa.training.lagrangian import GECOConfig
 from scjepa.training.logging import WandbConfig
 
 
@@ -31,9 +32,10 @@ def _training() -> TrainConfig:
         checkpoint_every=250,
         log_every=25,
         objective=ObjectiveConfig(
-            state_sparsity_weight=0.001,
-            action_sparsity_weight=0.001,
-            parameter_sparsity_weight=0.001,
+            state_sparsity_weight=1.0,
+            action_sparsity_weight=1.0,
+            parameter_sparsity_weight=1.0,
+            logit_weight=1e-4,
             state_regularizer="sigreg",
             state_regularizer_weight=0.1,
             parameter_regularizer="sigreg",
@@ -51,16 +53,17 @@ class ExperimentConfig:
     the scientific data seed, observation matrix, or calibration/test splits.
     """
 
-    name: str = "controlled-vector"
-    output_dir: str = "outputs/controlled_vector"
-    graphs: tuple[str, ...] = ("dense", "complementary", "diagonal")
-    seeds: tuple[int, ...] = (0, 1, 2, 3, 4)
+    name: str = "complementary-geco"
+    output_dir: str = "outputs/complementary_geco"
+    graphs: tuple[str, ...] = ("complementary",)
+    seeds: tuple[int, ...] = (0,)
     train_episodes: int = 8192
     trajectory_length: int = 16
     data_seed: int = 0
     observation_seed: int = 1729
     validation_every: int = 1000
-    upload_evaluation_artifacts: bool = True
+    upload_evaluation_artifacts: bool = False
+    tau_multiplier: float = 1.0
     model: ModelConfig = field(default_factory=_model)
     train: TrainConfig = field(default_factory=_training)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
@@ -70,10 +73,15 @@ class ExperimentConfig:
         """Reject ambiguous comparisons before creating outputs or tracking runs."""
         self.train.__post_init__()
         self.train.objective.__post_init__()
+        self.train.geco.__post_init__()
         self.wandb.__post_init__()
         self.evaluation.__post_init__()
         if self.train.seed != 0:
             raise ValueError("set experiment seeds rather than the derived train.seed")
+        if self.train.geco.enabled or self.train.geco.tau is not None:
+            raise ValueError("GECO is enabled per sparse condition; tau comes from the dense run")
+        if not 1.0 <= self.tau_multiplier < float("inf"):
+            raise ValueError("tau_multiplier must be finite and at least one")
         if not self.name or not self.output_dir:
             raise ValueError("experiment name and output_dir must be nonempty")
         if (
@@ -100,7 +108,7 @@ class ExperimentConfig:
         ):
             raise ValueError("controlled comparison requires vector 10/10/10/10, L=1 and K>=2")
         if model.spartan_dense or model.spartan_identity:
-            raise ValueError("the sparse baseline/full comparison requires learned gates")
+            raise ValueError("comparison sets dense/learned gates per condition")
         objective = self.train.objective
         if (
             objective.state_regularizer != "sigreg"
@@ -117,10 +125,10 @@ class ExperimentConfig:
             <= 0
         ):
             raise ValueError("specify positive state/action and full-model parameter penalties")
+        if objective.logit_weight <= 0:
+            raise ValueError("SPARTAN comparison requires positive attention-logit regularization")
         if self.train.steps % self.train.accumulation_steps:
             raise ValueError("experiment steps must end at a complete accumulation boundary")
-        if self.evaluation.rollout_steps > self.trajectory_length - model.context_len:
-            raise ValueError("evaluation rollout does not fit after the parameter context")
         self.data_config(self.graphs[0])
 
     def data_config(self, graph: str) -> DGPConfig:
@@ -134,17 +142,31 @@ class ExperimentConfig:
             trajectory_length=self.trajectory_length,
         )
 
-    def training_config(self, condition: str, seed: int, out_dir: Path) -> TrainConfig:
-        """Make paired conditions differ only in parameter-graph sparsity."""
-        if condition not in {"baseline", "full"}:
-            raise ValueError("condition must be baseline or full")
+    def condition_model(self, condition: str) -> ModelConfig:
+        """Open every attention gate only for the dense reference."""
+        if condition not in {"dense", "baseline", "full"}:
+            raise ValueError("condition must be dense, baseline or full")
+        return replace(self.model, spartan_dense=condition == "dense")
+
+    def training_config(
+        self, condition: str, seed: int, out_dir: Path, *, tau: float | None = None
+    ) -> TrainConfig:
+        """Use one calibrated bound; baseline/full differ only in parameter sparsity."""
+        self.condition_model(condition)
         objective = replace(
             self.train.objective,
+            state_sparsity_weight=self.train.objective.state_sparsity_weight
+            if condition != "dense"
+            else 0.0,
+            action_sparsity_weight=self.train.objective.action_sparsity_weight
+            if condition != "dense"
+            else 0.0,
             parameter_sparsity_weight=self.train.objective.parameter_sparsity_weight
             if condition == "full"
             else 0.0,
         )
-        return replace(self.train, seed=seed, out_dir=str(out_dir), objective=objective)
+        geco: GECOConfig = replace(self.train.geco, enabled=condition != "dense", tau=tau)
+        return replace(self.train, seed=seed, out_dir=str(out_dir), objective=objective, geco=geco)
 
     def definition(self) -> dict[str, object]:
         """Return scientific identity, excluding execution/logging destinations."""

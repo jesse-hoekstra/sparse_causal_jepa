@@ -1,7 +1,8 @@
-"""Held-out scientific evaluation contracts using only tiny CPU tensor problems."""
+"""Small CPU contracts for loss calibration, frozen MCC matching and routing SHD."""
 
 import copy
 import json
+import math
 import pickle
 import random
 from dataclasses import replace
@@ -17,19 +18,26 @@ from scjepa.data.controlled_vector import VectorObservationMap
 from scjepa.data.processes import ControlledVectorDGP
 from scjepa.data.random import episode_id
 from scjepa.data.types import DGPConfig, ScientificEpisode
-from scjepa.eval.recovery import FrozenProbe, ProbeConfig, ProbePayload
+from scjepa.eval.recovery import (
+    CoordinateMatch,
+    fit_coordinate_match,
+    mean_correlation_coefficient,
+    pearson_matrix,
+)
 from scjepa.experiments.evaluation import (
     EvaluationConfig,
+    _aligned_support,  # pyright: ignore[reportPrivateUsage]
+    _batch_sizes,  # pyright: ignore[reportPrivateUsage]
     _collect,  # pyright: ignore[reportPrivateUsage]
     _evaluation_context,  # pyright: ignore[reportPrivateUsage]
-    _paired_episodes,  # pyright: ignore[reportPrivateUsage]
-    _physical_metrics,  # pyright: ignore[reportPrivateUsage]
-    _rollout,  # pyright: ignore[reportPrivateUsage]
+    calibrate_tau,
     evaluate_model,
     validate_model,
 )
 from scjepa.models.model import SCJEPA
+from scjepa.models.spartan import GraphBlocks, SpartanOutput
 from scjepa.training.factory import ModelConfig, build_model
+from scjepa.training.loop import ObjectiveConfig
 
 
 def _model() -> SCJEPA:
@@ -57,11 +65,7 @@ def _config() -> EvaluationConfig:
         calibration_episodes=8,
         validation_episodes=4,
         test_episodes=4,
-        paired_episodes=2,
         batch_size=2,
-        rollout_steps=2,
-        validation_probe_steps=2,
-        probe=ProbeConfig(hidden_dim=8, steps=2, batch_size=16),
     )
 
 
@@ -69,11 +73,22 @@ def _data() -> DGPConfig:
     return DGPConfig(trajectory_length=4, parameter_graph="complementary", root_seed=51)
 
 
-def test_validation_never_reads_test_and_preserves_model_rng_and_existing_gradients(
+def _objective() -> ObjectiveConfig:
+    return ObjectiveConfig(
+        state_regularizer="sigreg",
+        state_regularizer_weight=0.1,
+        parameter_regularizer="sigreg",
+        parameter_regularizer_weight=0.2,
+        logit_weight=0.001,
+        regularizer_num_projections=8,
+    )
+
+
+def test_validation_excludes_test_and_preserves_rng_modes_and_gradients(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = _model().train()
-    model.parameter_encoder.eval()  # Preserve a deliberately mixed module-mode tree.
+    model.parameter_encoder.eval()
     for parameter in model.online_encoder.parameters():
         parameter.grad = torch.ones_like(parameter)
     modes = [module.training for module in model.modules()]
@@ -81,7 +96,7 @@ def test_validation_never_reads_test_and_preserves_model_rng_and_existing_gradie
     gradients = [None if p.grad is None else p.grad.clone() for p in model.parameters()]
     torch_state = torch.get_rng_state().clone()
     python_state = random.getstate()
-    numpy_state = np.random.get_state()  # noqa: NPY002 — verify preservation of caller RNG
+    numpy_state = np.random.get_state()  # noqa: NPY002
     seen: list[str] = []
     generate = ControlledVectorDGP.generate
 
@@ -91,31 +106,56 @@ def test_validation_never_reads_test_and_preserves_model_rng_and_existing_gradie
         return generate(process, index)
 
     monkeypatch.setattr(ControlledVectorDGP, "generate", checked_generate)
-    with torch.no_grad():
-        result = validate_model(model, _data(), VectorObservationMap().matrix, _config())
-    assert result["validation/physical_prediction_nrmse"] >= 0
-    assert result["validation/encoded_target_decoding_nrmse"] >= 0
-    assert seen.count("evaluation_calibration") == 8
-    assert seen.count("validation") == 4
+    result = validate_model(
+        model, _data(), VectorObservationMap().matrix, _config(), objective=_objective()
+    )
+    assert set(result) == {
+        "validation/prediction_mse",
+        "validation/base_loss",
+        "validation/sparsity",
+        "validation/state_mcc",
+        "validation/parameter_mcc",
+        "validation/state_shd",
+        "validation/action_shd",
+        "validation/parameter_shd",
+    }
+    assert result["validation/base_loss"] > result["validation/prediction_mse"] >= 0
+    assert seen == ["evaluation_calibration"] * 8 + ["validation"] * 4
+    assert 0 <= result["validation/state_mcc"] <= 1
+    assert 0 <= result["validation/parameter_mcc"] <= 1
     assert [module.training for module in model.modules()] == modes
     torch.testing.assert_close(model.state_dict(), state, rtol=0, atol=0)
     for parameter, expected in zip(model.parameters(), gradients, strict=True):
         torch.testing.assert_close(parameter.grad, expected, rtol=0, atol=0)
     torch.testing.assert_close(torch.get_rng_state(), torch_state, rtol=0, atol=0)
     assert random.getstate() == python_state
-    actual_numpy = np.random.get_state()  # noqa: NPY002 — compare legacy caller RNG state
+    actual_numpy = np.random.get_state()  # noqa: NPY002
     assert pickle.dumps(actual_numpy) == pickle.dumps(numpy_state)
 
 
-def test_validation_is_deterministic_and_preserves_modes_on_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model = _model()
-    data, config, matrix = _data(), _config(), VectorObservationMap().matrix
-    first = validate_model(model, data, matrix, config)
+def test_validation_deterministic_and_excludes_sparsity_terms() -> None:
+    model, matrix = _model(), VectorObservationMap().matrix
+    first = validate_model(model, _data(), matrix, _config(), objective=_objective())
     torch.randn(23)
-    second = validate_model(model, data, matrix, config)
-    assert first == second
+    second = validate_model(
+        model,
+        _data(),
+        matrix,
+        _config(),
+        objective=replace(
+            _objective(),
+            state_sparsity_weight=9,
+            action_sparsity_weight=7,
+            parameter_sparsity_weight=2,
+        ),
+    )
+    assert first["validation/base_loss"] == second["validation/base_loss"]
+    assert first["validation/prediction_mse"] == second["validation/prediction_mse"]
+    assert second["validation/sparsity"] > first["validation/sparsity"]
+
+
+def test_validation_preserves_modes_and_rng_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = _model().train()
     modes = [module.training for module in model.modules()]
     rng = torch.get_rng_state().clone()
 
@@ -126,49 +166,127 @@ def test_validation_is_deterministic_and_preserves_modes_on_failure(
 
     monkeypatch.setattr(ControlledVectorDGP, "generate", failing_generate)
     with pytest.raises(RuntimeError, match="injected evaluator failure"):
-        validate_model(model, data, matrix, config)
+        validate_model(model, _data(), VectorObservationMap().matrix, _config())
     assert [module.training for module in model.modules()] == modes
     torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
 
 
-def test_paired_episodes_reuse_parameters_and_redraw_independent_histories() -> None:
-    model, data, config = _model().eval(), _data(), _config()
-    matrix = VectorObservationMap().matrix
+def test_tau_uses_calibration_only_and_handles_last_singleton(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+    generate = ControlledVectorDGP.generate
+
+    def checked_generate(process: ControlledVectorDGP, index: int) -> ScientificEpisode:
+        seen.append(process.config.split)
+        return generate(process, index)
+
+    monkeypatch.setattr(ControlledVectorDGP, "generate", checked_generate)
+    config = replace(_config(), calibration_episodes=3)
+    result = calibrate_tau(
+        _model(), _data(), VectorObservationMap().matrix, config, objective=_objective()
+    )
+    assert result["calibration/base_loss"] > result["calibration/prediction_mse"] >= 0
+    assert seen == ["evaluation_calibration"] * 3
+    assert _batch_sizes(3, 2) == [3]
+    assert _batch_sizes(5, 2) == [2, 3]
+    assert _batch_sizes(4, 2) == [2, 2]
+
+
+def test_pearson_mcc_recovers_permutation_and_sign_and_never_rematches_test() -> None:
+    generator = torch.Generator().manual_seed(70)
+    truth = torch.randn(1000, 3, generator=generator, dtype=torch.float64)
+    features = truth[:, [2, 0, 1]] * torch.tensor([-4.0, 2.0, 3.0]) + 5
+    match = fit_coordinate_match(features, truth, method="pearson")
+    assert match.columns == (1, 2, 0)
+    assert math.isclose(mean_correlation_coefficient(match, features, truth), 1.0)
+    assert mean_correlation_coefficient(match, features[:, [2, 0, 1]], truth) < 0.1
+    assert bool((pearson_matrix(torch.ones_like(features), truth) == 0).all())
+    with pytest.raises(ValueError, match="dimensions"):
+        mean_correlation_coefficient(CoordinateMatch((0, 1)), features, truth)
+
+
+def test_graph_alignment_permutates_output_and_latent_inputs_but_not_actions_or_lags() -> None:
+    state_order, parameter_order = (2, 0, 1), (1, 0)
+    frequencies = {
+        "state": torch.arange(18).reshape(3, 2, 3).double() / 18,
+        "action": torch.arange(24).reshape(3, 2, 4).double() / 24,
+        "parameter": torch.arange(6).reshape(3, 2).double() / 6,
+    }
+    actual = _aligned_support(
+        frequencies, CoordinateMatch(state_order), CoordinateMatch(parameter_order), 0.5
+    )
+    for output in range(3):
+        for lag in range(2):
+            for source in range(3):
+                assert actual["state"][output, lag, source] == (
+                    frequencies["state"][state_order[output], lag, state_order[source]] > 0.5
+                )
+            torch.testing.assert_close(
+                actual["action"][output, lag], frequencies["action"][state_order[output], lag] > 0.5
+            )
+        for source in range(2):
+            assert actual["parameter"][output, source] == (
+                frequencies["parameter"][state_order[output], parameter_order[source]] > 0.5
+            )
+
+
+def test_local_graph_aggregation_includes_every_batch_and_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _model().eval()
+    forward = model.predictor.forward
+    calls = 0
+
+    def local_graph(
+        states: Tensor, parameters: Tensor, actions: Tensor | None = None
+    ) -> SpartanOutput:
+        nonlocal calls
+        result = forward(states, parameters, actions)
+        graph = GraphBlocks(*(torch.zeros_like(block) for block in result.graphs))
+        graph.state[:, :, 0, :] = torch.eye(10)
+        graph.parameter[:, 0, 1] = float(calls == 3)
+        calls += 1
+        return result._replace(graphs=graph)
+
+    monkeypatch.setattr(model.predictor, "forward", local_graph)
     with _evaluation_context(model):
-        test = _collect(model, data, matrix, config, "test", config.test_episodes)
-    paired = list(_paired_episodes(data, matrix, test, config.paired_episodes))
-    again = list(_paired_episodes(data, matrix, test, config.paired_episodes))
-    for index, (episode, repeat) in enumerate(zip(paired, again, strict=True)):
-        torch.testing.assert_close(
-            episode.ground_truth["parameters"], test.parameters[index], rtol=0, atol=0
-        )
-        assert not torch.equal(episode.ground_truth["states"][0], test.states[index, 0])
-        assert not torch.equal(episode.actions, test.actions[index])
-        assert episode.episode_id == int(test.ids[index])
-        torch.testing.assert_close(episode.observations, repeat.observations, rtol=0, atol=0)
-        torch.testing.assert_close(episode.actions, repeat.actions, rtol=0, atol=0)
+        result = _collect(model, _data(), VectorObservationMap().matrix, _config(), "test", 4)
+    assert calls == 4
+    assert result.graph_frequencies["parameter"][0, 1] == 0.25
+    assert result.graph_frequencies["state"].sum() == 10
+    matched = _aligned_support(
+        result.graph_frequencies,
+        CoordinateMatch(tuple(range(10))),
+        CoordinateMatch(tuple(range(10))),
+        0.0,
+    )
+    assert matched["parameter"][0, 1]
 
 
 @pytest.mark.parametrize("variant", ["dense", "complementary", "diagonal"])
-def test_final_evaluation_reports_metrics_and_frozen_separate_calibration_artifacts(
-    variant: str,
-    tmp_path: Path,
+def test_final_evaluation_has_only_core_metrics_and_frozen_separate_calibration_artifacts(
+    variant: str, tmp_path: Path
 ) -> None:
-    model, config = _model(), replace(_config(), paired_episodes=3)
-    data = replace(_data(), parameter_graph=variant)
-    matrix = VectorObservationMap(seed=194).matrix
-    state = copy.deepcopy(model.state_dict())
-    rng = torch.get_rng_state().clone()
-    metrics = evaluate_model(model, data, matrix, config, tmp_path)
-    assert metrics["test/physical_prediction_nrmse"] >= 0
-    assert metrics["test/encoded_target_decoding_nrmse"] >= 0
-    assert metrics["test/rollout_nrmse"] >= 0
-    assert "test/rollout_step_2_nrmse" in metrics
-    assert "recovery/state/full/r2" in metrics
-    assert "recovery/parameter/coordinate/spearman_mean" in metrics
-    assert "consistency/different_parameter_swap_nrmse_change" in metrics
-    assert 0 <= metrics["graph/state/density"] <= 1
-    assert metrics["graph/state/edges"] >= 10  # Mandatory diagonal residual paths.
+    model, config = _model(), _config()
+    data, matrix = replace(_data(), parameter_graph=variant), VectorObservationMap(seed=194).matrix
+    state, rng = copy.deepcopy(model.state_dict()), torch.get_rng_state().clone()
+    metrics = evaluate_model(model, data, matrix, config, tmp_path, objective=_objective())
+    assert set(metrics) == {
+        "test/prediction_mse",
+        "test/base_loss",
+        "test/sparsity",
+        "recovery/state_mcc",
+        "recovery/parameter_mcc",
+        "graph/state_shd",
+        "graph/action_shd",
+        "graph/parameter_shd",
+    }
+    assert 0 <= metrics["recovery/state_mcc"] <= 1
+    assert 0 <= metrics["recovery/parameter_mcc"] <= 1
+    assert all(
+        0 <= metrics[f"graph/{name}_shd"] <= 100 for name in ("state", "action", "parameter")
+    )
     assert not any(parameter.grad is not None for parameter in model.parameters())
     torch.testing.assert_close(model.state_dict(), state, rtol=0, atol=0)
     torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
@@ -177,57 +295,41 @@ def test_final_evaluation_reports_metrics_and_frozen_separate_calibration_artifa
     assert protocol["calibration_data"]["split"] == "evaluation_calibration"
     assert protocol["test_data"]["split"] == "test"
     assert protocol["observation_matrix_sha256"] == VectorObservationMap(matrix=matrix).fingerprint
-    refs: dict[str, Tensor] = torch.load(tmp_path / "evaluation_references.pt", weights_only=True)
-    torch.testing.assert_close(refs["matrix"], matrix, rtol=0, atol=0)
+    refs = cast(
+        dict[str, object], torch.load(tmp_path / "evaluation_references.pt", weights_only=True)
+    )
+    torch.testing.assert_close(cast(Tensor, refs["matrix"]), matrix, rtol=0, atol=0)
     torch.testing.assert_close(
-        refs["calibration_episode_ids"],
+        cast(Tensor, refs["calibration_episode_ids"]),
         torch.tensor([episode_id(data.root_seed, "evaluation_calibration", i) for i in range(8)]),
     )
     torch.testing.assert_close(
-        refs["test_episode_ids"],
+        cast(Tensor, refs["test_episode_ids"]),
         torch.tensor([episode_id(data.root_seed, "test", i) for i in range(4)]),
     )
-    paired: dict[str, Tensor] = torch.load(tmp_path / "parameter_consistency.pt", weights_only=True)
-    torch.testing.assert_close(
-        paired["true_parameters"], paired["paired_true_parameters"], rtol=0, atol=0
-    )
-    assert paired["original_codes"].shape == paired["paired_codes"].shape == (3, 10)
-    payload = cast(ProbePayload, torch.load(tmp_path / "target_state_probe.pt", weights_only=True))
-    probe = FrozenProbe.from_payload(payload)
-    assert probe.predict(torch.zeros(2, 3, 10)).shape == (2, 3, 10)
-    recovered: dict[str, object] = torch.load(tmp_path / "parameter_recovery.pt", weights_only=True)
-    groups = cast(list[object], recovered["group_probes"])
-    assert len(groups) == {"dense": 1, "complementary": 5, "diagonal": 10}[variant]
+    frequencies = cast(dict[str, Tensor], refs["routing_frequencies"])
+    assert bool((frequencies["state"][:, 0].diagonal() == 1).all())
+    assert cast(Tensor, refs["target_match"]).shape == (10,)
+    assert sorted(item.name for item in tmp_path.iterdir()) == [
+        "evaluation_references.pt",
+        "metrics.json",
+        "protocol.json",
+    ]
 
 
-def test_rollout_uses_context_endpoint_action_and_appends_predicted_states() -> None:
-    model, data, config = _model().eval(), _data(), _config()
-    with _evaluation_context(model):
-        test = _collect(model, data, VectorObservationMap().matrix, config, "test", 4)
-        actual = _rollout(model, test, config)
-        first = model.predictor(test.online[:, 1:2], test.codes, test.actions[:, 1:2]).prediction
-        second = model.predictor(first[:, None], test.codes, test.actions[:, 2:3]).prediction
-    torch.testing.assert_close(actual, torch.stack((first, second), 1))
-
-
-def test_physical_normalization_is_coordinatewise_and_calibration_fixed() -> None:
-    truth = torch.zeros(2, 2)
-    predicted = torch.tensor([[2.0, 3.0], [2.0, 3.0]])
-    result = _physical_metrics(predicted, truth, torch.tensor([4.0, 9.0]), "test")
-    assert result == {"test_mse": 6.5, "test_nrmse": 1.0}
-
-
-def test_evaluation_rejects_unsupported_model_and_short_prediction_window() -> None:
-    model, data, matrix, config = _model(), _data(), VectorObservationMap().matrix, _config()
+def test_evaluation_rejects_unsupported_model_and_bad_config() -> None:
+    model, matrix, config = _model(), VectorObservationMap().matrix, _config()
     with pytest.raises(ValueError, match="trajectory_length"):
-        validate_model(model, replace(data, trajectory_length=3), matrix, config)
+        validate_model(model, replace(_data(), trajectory_length=2), matrix, config)
     with pytest.raises(ValueError, match="controlled_vector"):
         validate_model(model, DGPConfig(family="coupled_springs"), matrix, config)
     model.context_len = 1
     with pytest.raises(ValueError, match="K>=2"):
-        validate_model(model, data, matrix, config)
-    with pytest.raises(ValueError, match="paired_episodes"):
-        replace(config, paired_episodes=5)
+        validate_model(model, _data(), matrix, config)
+    with pytest.raises(ValueError, match="graph_support_threshold"):
+        replace(config, graph_support_threshold=1)
+    with pytest.raises(ValueError, match="batch_size"):
+        replace(config, batch_size=1)
 
 
 def test_nonfinite_encodings_fail_explicitly_and_restore_training_mode() -> None:
@@ -243,8 +345,6 @@ def test_nonfinite_encodings_fail_explicitly_and_restore_training_mode() -> None
 def test_cpu_evaluation_does_not_touch_initialized_cuda_rngs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model = _model()
-
     def forbidden_cuda_rng(*_args: object, **_kwargs: object) -> Tensor:
         raise AssertionError("CPU evaluation touched another device's CUDA RNG")
 
@@ -252,5 +352,44 @@ def test_cpu_evaluation_does_not_touch_initialized_cuda_rngs(
     monkeypatch.setattr(torch.cuda, "get_rng_state", forbidden_cuda_rng)
     monkeypatch.setattr(torch.cuda, "get_rng_state_all", forbidden_cuda_rng)
     monkeypatch.setattr(torch.cuda, "device_count", forbidden_cuda_rng)
-    metrics = validate_model(model, _data(), VectorObservationMap().matrix, _config())
-    assert metrics["validation/physical_prediction_nrmse"] >= 0
+    metrics = validate_model(_model(), _data(), VectorObservationMap().matrix, _config())
+    assert metrics["validation/prediction_mse"] >= 0
+
+
+def test_graph_output_rows_use_ema_matching_separately_from_online_state_columns() -> None:
+    state_match = CoordinateMatch((2, 0, 1))
+    target_match = CoordinateMatch((1, 2, 0))
+    parameter_match = CoordinateMatch((1, 0))
+    # Ground truth contains only output true-state 0 <- input true-state 2.
+    state = torch.zeros(3, 1, 3)
+    action = torch.zeros(3, 1, 2)
+    parameter = torch.zeros(3, 2)
+    state[target_match.columns[0], 0, state_match.columns[2]] = 1
+    action[target_match.columns[0], 0, 1] = 1
+    parameter[target_match.columns[0], parameter_match.columns[1]] = 1
+    support = _aligned_support(
+        {"state": state, "action": action, "parameter": parameter},
+        state_match,
+        parameter_match,
+        0.0,
+        target_match=target_match,
+    )
+    expected_state = torch.zeros_like(state, dtype=torch.bool)
+    expected_state[0, 0, 2] = True
+    expected_action = torch.zeros_like(action, dtype=torch.bool)
+    expected_action[0, 0, 1] = True
+    expected_parameter = torch.zeros_like(parameter, dtype=torch.bool)
+    expected_parameter[0, 1] = True
+    torch.testing.assert_close(support["state"], expected_state)
+    torch.testing.assert_close(support["action"], expected_action)
+    torch.testing.assert_close(support["parameter"], expected_parameter)
+
+
+def test_validation_base_loss_is_independent_of_calibration_size() -> None:
+    model, matrix = _model(), VectorObservationMap().matrix
+    small = validate_model(model, _data(), matrix, _config(), objective=_objective())
+    large = validate_model(
+        model, _data(), matrix, replace(_config(), calibration_episodes=11), objective=_objective()
+    )
+    for key in ("prediction_mse", "base_loss", "sparsity"):
+        assert small[f"validation/{key}"] == large[f"validation/{key}"]

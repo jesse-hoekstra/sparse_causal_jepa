@@ -9,7 +9,7 @@ labels. These finite-sample diagnostics do not establish identifiability.
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import TypedDict, cast
+from typing import Literal, TypedDict, cast
 
 import torch
 from torch import Tensor, nn
@@ -60,6 +60,21 @@ def spearman_matrix(features: Tensor, truth: Tensor) -> Tensor:
     feature_ranks /= feature_ranks.square().sum(dim=0).sqrt().clamp_min(1e-15)
     truth_ranks /= truth_ranks.square().sum(dim=0).sqrt().clamp_min(1e-15)
     return (truth_ranks.T @ feature_ranks).abs().clamp(0.0, 1.0)
+
+
+def pearson_matrix(features: Tensor, truth: Tensor) -> Tensor:
+    """Absolute Pearson correlations, with true rows and learned columns.
+
+    Constant coordinates have correlation zero rather than NaN. This is the
+    MCC convention used by Lachapelle et al.; the assignment is fitted separately
+    so held-out rows need not participate in choosing the permutation.
+    """
+    features, truth = _paired(features, truth)
+    features = features - features.mean(0)
+    truth = truth - truth.mean(0)
+    features = features / features.square().sum(0).sqrt().clamp_min(1e-15)
+    truth = truth / truth.square().sum(0).sqrt().clamp_min(1e-15)
+    return (truth.T @ features).abs().clamp(0.0, 1.0)
 
 
 def _maximum_assignment(scores: Tensor) -> tuple[int, ...]:
@@ -124,12 +139,30 @@ class CoordinateMatch:
             raise ValueError("coordinate assignment must be a nonempty permutation")
 
 
-def fit_coordinate_match(features: Tensor, truth: Tensor) -> CoordinateMatch:
+def fit_coordinate_match(
+    features: Tensor,
+    truth: Tensor,
+    *,
+    method: Literal["pearson", "spearman"] = "spearman",
+) -> CoordinateMatch:
     """Fit a one-to-one assignment using only caller-supplied calibration rows."""
-    scores = spearman_matrix(features, truth)
+    if method not in {"pearson", "spearman"}:
+        raise ValueError("correlation method must be pearson or spearman")
+    scores = (
+        pearson_matrix(features, truth) if method == "pearson" else spearman_matrix(features, truth)
+    )
     if scores.shape[0] != scores.shape[1]:
         raise ValueError("one-to-one recovery requires equal learned and true dimensions")
     return CoordinateMatch(_maximum_assignment(scores))
+
+
+def mean_correlation_coefficient(match: CoordinateMatch, features: Tensor, truth: Tensor) -> float:
+    """Mean absolute Pearson correlation under a frozen one-to-one assignment."""
+    scores = pearson_matrix(features, truth)
+    size = len(match.columns)
+    if scores.shape != (size, size):
+        raise ValueError("scored dimensions must agree with the calibration assignment")
+    return float(scores[torch.arange(size), list(match.columns)].mean())
 
 
 def score_coordinate_match(

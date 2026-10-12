@@ -17,6 +17,7 @@ frame rendering, paired draws, split/worker determinism, dataset bundles, and
 dataset-aware resume. Their CPU integrations use only tiny generated episodes.
 
 Experiment tests cover paired initialization/data, SIGReg-only objectives,
-calibration-only recovery, physical prediction and code-swap evaluation, best
+dense tau calibration, calibration-only Pearson MCC matching and routing SHD,
+GECO accumulation/skip/distributed timing and checkpoint restoration, best
 checkpoint provenance, interrupted resume, aggregation, and CLI preflight.
 All use tiny synthetic CPU episodes; W&B unit tests use isolated mocks.

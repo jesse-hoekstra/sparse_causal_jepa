@@ -40,6 +40,10 @@ def _record(
         "dataset_identity": "paired-dataset",
         "experiment_identity": "same-experiment",
         "world_size": 1,
+        "run_identity": f"{condition}-{seed}",
+        "tau_calibration": None
+        if condition == "dense"
+        else {"tau": 0.5, "dense_run_identity": f"dense-{seed}"},
     }
     record.update(identity_changes or {})
     write_json(directory / "run_config.json", record)
@@ -56,6 +60,7 @@ def _mapping(value: object) -> dict[str, object]:
 def test_paired_aggregation_uses_full_minus_baseline_and_sample_uncertainty(tmp_path: Path) -> None:
     config = _configuration(tmp_path)
     for seed, baseline, full in ((0, 1.0, 4.0), (1, 3.0, 8.0)):
+        _record(tmp_path, seed, "dense", baseline)
         _record(tmp_path, seed, "baseline", baseline)
         _record(tmp_path, seed, "full", full)
     result = aggregate_results(config)
@@ -67,23 +72,28 @@ def test_paired_aggregation_uses_full_minus_baseline_and_sample_uncertainty(tmp_
     assert math.isclose(cast(float, scores["standard_error"]), 1.0)
     assert result["complete"] is True
     assert result["missing_runs"] == []
-    assert result["completed_runs"] == result["expected_runs"] == 4
+    assert result["completed_runs"] == result["expected_runs"] == 6
     assert read_json(tmp_path / "summary.json") == result
     csv_rows = (tmp_path / "results.csv").read_text().splitlines()
-    assert len(csv_rows) == 5
+    assert len(csv_rows) == 7
 
 
 def test_missing_runs_and_single_seed_uncertainty_are_explicit(tmp_path: Path) -> None:
     config = _configuration(tmp_path)
+    _record(tmp_path, 0, "dense", 0.0)
     _record(tmp_path, 0, "baseline", 1.0)
     _record(tmp_path, 0, "full", 4.0)
     unfinished = _record(tmp_path, 1, "baseline", 2.0)
     write_json(unfinished / "status.json", {"status": "running"})
     result = aggregate_results(config)
     assert result["complete"] is False
-    assert result["completed_runs"] == 2
-    assert result["expected_runs"] == 4
-    assert result["missing_runs"] == ["complementary/seed-1/baseline", "complementary/seed-1/full"]
+    assert result["completed_runs"] == 3
+    assert result["expected_runs"] == 6
+    assert result["missing_runs"] == [
+        "complementary/seed-1/dense",
+        "complementary/seed-1/baseline",
+        "complementary/seed-1/full",
+    ]
     assert result["missing_pairs"] == ["complementary/seed-1"]
     paired = _mapping(_mapping(result["paired_full_minus_baseline"])["complementary"])
     assert paired["recovery"] == {"n": 1, "mean": 3.0, "std": None, "standard_error": None}
@@ -142,14 +152,14 @@ def test_nonfinite_or_nonscalar_metrics_are_rejected(tmp_path: Path, invalid: ob
 def test_paired_configs_only_change_parameter_penalty_and_enforce_sigreg(tmp_path: Path) -> None:
     config = _configuration(tmp_path)
     config.validate()
-    baseline = asdict(config.training_config("baseline", 3, tmp_path / "run"))
-    full = asdict(config.training_config("full", 3, tmp_path / "run"))
+    baseline = asdict(config.training_config("baseline", 3, tmp_path / "run", tau=0.5))
+    full = asdict(config.training_config("full", 3, tmp_path / "run", tau=0.5))
     baseline_objective, full_objective = (
         _mapping(baseline["objective"]),
         _mapping(full["objective"]),
     )
     assert baseline_objective.pop("parameter_sparsity_weight") == 0.0
-    assert full_objective.pop("parameter_sparsity_weight") == 0.001
+    assert full_objective.pop("parameter_sparsity_weight") == 1.0
     assert baseline == full
     assert baseline_objective["state_regularizer"] == "sigreg"
     assert baseline_objective["parameter_regularizer"] == "sigreg"
@@ -298,3 +308,22 @@ def test_exact_resume_rejects_changed_runtime_versions(
     write_json(tmp_path / "experiment.json", manifest)
     with pytest.raises(ValueError, match="same Python/PyTorch versions"):
         prepare_experiment(config)
+
+
+def test_dense_reference_provenance_and_sparse_tau_must_match(tmp_path: Path) -> None:
+    config = _configuration(tmp_path)
+    dense = _record(tmp_path, 0, "dense", 1.0)
+    _record(tmp_path, 0, "baseline", 1.0)
+    full = _record(tmp_path, 0, "full", 1.0)
+    record = read_json(dense / "run_config.json")
+    record["initial_state_fingerprint"] = "unpaired"
+    write_json(dense / "run_config.json", record)
+    with pytest.raises(ValueError, match="unmatched initial_state_fingerprint"):
+        aggregate_results(config)
+    record["initial_state_fingerprint"] = "initial-0"
+    write_json(dense / "run_config.json", record)
+    record = read_json(full / "run_config.json")
+    record["tau_calibration"] = {"tau": 0.6, "dense_run_identity": "dense-0"}
+    write_json(full / "run_config.json", record)
+    with pytest.raises(ValueError, match="unmatched tau_calibration"):
+        aggregate_results(config)

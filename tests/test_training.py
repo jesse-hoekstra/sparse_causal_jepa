@@ -1,6 +1,7 @@
 """CPU training contracts: losses, accepted updates, accumulation, and exact resume."""
 
 import copy
+import math
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,7 +15,7 @@ from scjepa.models.encoders import VectorEncoder
 from scjepa.models.model import SCJEPA, ModelOutput
 from scjepa.models.parameter_encoder import ParameterEncoder
 from scjepa.models.spartan import GraphPenalties, Spartan
-from scjepa.training import ObjectiveConfig, TrainConfig, Trainer, TrainingObjective
+from scjepa.training import GECOConfig, ObjectiveConfig, TrainConfig, Trainer, TrainingObjective
 from scjepa.training.lagrangian import SparsityLagrangian
 
 
@@ -303,3 +304,164 @@ def test_optional_dual_controller_has_explicit_settings_and_serialized_state() -
     restored = SparsityLagrangian(tau=0.5, step_size=0.1, lambda_init=1, momentum=0)
     restored.load_state_dict(controller.state_dict())
     torch.testing.assert_close(restored.penalty_weight, controller.penalty_weight)
+
+
+def test_geco_controls_sparsity_in_the_correct_direction_and_is_bounded() -> None:
+    controller = SparsityLagrangian(
+        tau=1,
+        step_size=1,
+        lambda_init=1,
+        momentum=0,
+        log_lambda_min=-2,
+        log_lambda_max=2,
+    )
+    controller.update(torch.tensor(2.0))
+    assert float(controller.penalty_weight) < 1
+    controller.update(torch.tensor(0.0))
+    torch.testing.assert_close(controller.penalty_weight, torch.tensor(1.0))
+    controller.update(torch.tensor(1000.0))
+    assert float(controller.log_lambda) == 2
+    for _ in range(5):
+        controller.update(torch.tensor(0.0))
+    assert float(controller.log_lambda) == -2
+    assert int(controller.num_updates) == 8
+    with pytest.raises(ValueError, match="finite scalar"):
+        controller.update(torch.tensor(float("nan")))
+
+
+def test_geco_base_contains_sigreg_and_logit_but_no_graph_penalty() -> None:
+    model = tiny_model()
+    batch = tiny_batch()
+    output = model(batch["observations"], batch["actions"])
+    config = ObjectiveConfig(
+        state_sparsity_weight=1,
+        action_sparsity_weight=2,
+        parameter_sparsity_weight=0,
+        logit_weight=0.01,
+        state_regularizer="sigreg",
+        parameter_regularizer="sigreg",
+        state_regularizer_weight=0.1,
+        parameter_regularizer_weight=0.2,
+        regularizer_num_projections=8,
+    )
+    objective = TrainingObjective(config, GECOConfig(enabled=True, tau=0.5, lambda_init=4))
+    loss, terms = objective(output)
+    expected_base = (
+        terms["prediction"]
+        + 0.01 * terms["logit"]
+        + 0.1 * terms["state_regularizer"]
+        + 0.2 * terms["parameter_regularizer"]
+    )
+    expected_graph = terms["state_sparsity"] + 2 * terms["action_sparsity"]
+    torch.testing.assert_close(terms["base"], expected_base)
+    torch.testing.assert_close(terms["sparsity"], expected_graph)
+    torch.testing.assert_close(loss, expected_base + expected_graph / 4)
+    assert objective.geco is not None
+    assert int(objective.geco.num_updates) == 0
+
+
+def test_geco_averages_accumulation_and_never_updates_after_a_skip(tmp_path: Path) -> None:
+    trainer = Trainer(
+        tiny_model(),
+        TrainConfig(
+            batch_size=4,
+            accumulation_steps=2,
+            out_dir=str(tmp_path),
+            objective=ObjectiveConfig(state_sparsity_weight=1),
+            geco=GECOConfig(enabled=True, tau=0.5, lambda_init=1, momentum=0),
+        ),
+    )
+    controller = trainer.geco
+    assert controller is not None
+    first = trainer.train_step(tiny_batch())
+    assert int(controller.num_updates) == 0
+    second = trainer.train_step(tiny_batch())
+    assert int(controller.num_updates) == 1
+    expected_error = (first["loss/base"] + second["loss/base"]) / 2 - 0.5
+    assert math.isclose(float(controller.ma_error), expected_error, abs_tol=1e-6)
+    assert math.isclose(float(controller.log_lambda), 0.1 * expected_error, abs_tol=1e-6)
+    before = copy.deepcopy(controller.state_dict())
+    trainer.config.grad_skip_threshold = 0
+    trainer.train_step(tiny_batch())
+    rejected = trainer.train_step(tiny_batch())
+    assert rejected["health/skipped"] == 1
+    torch.testing.assert_close(controller.state_dict(), before, rtol=0, atol=0)
+    trainer.config.grad_skip_threshold = float("inf")
+    trainer.train_step(tiny_batch())
+    trainer.discard_accumulation()
+    torch.testing.assert_close(controller.state_dict(), before, rtol=0, atol=0)
+    third = trainer.train_step(tiny_batch())
+    fourth = trainer.train_step(tiny_batch())
+    assert int(controller.num_updates) == trainer.optimizer_steps == 2
+    assert math.isclose(
+        float(controller.ma_error),
+        (third["loss/base"] + fourth["loss/base"]) / 2 - 0.5,
+        abs_tol=1e-6,
+    )
+
+
+def test_geco_checkpoint_restores_config_controller_and_exact_continuation(tmp_path: Path) -> None:
+    trainer = Trainer(
+        tiny_model(),
+        TrainConfig(
+            batch_size=4,
+            out_dir=str(tmp_path),
+            objective=ObjectiveConfig(state_sparsity_weight=1, parameter_sparsity_weight=1),
+            geco=GECOConfig(enabled=True, tau=0.7, step_size=0.2, momentum=0.8, lambda_init=5),
+        ),
+        model_config={"test": "tiny"},
+    )
+    trainer.train_step(tiny_batch())
+    batch = tiny_batch()
+    path = tmp_path / "geco.pt"
+    trainer.save_checkpoint(path)
+    expected_metrics = trainer.train_step(batch)
+    assert trainer.geco is not None
+    expected_controller = copy.deepcopy(trainer.geco.state_dict())
+    resumed = tiny_trainer(tmp_path)
+    resumed.load_checkpoint(path)
+    assert resumed.config.geco == trainer.config.geco
+    assert resumed.geco is not None
+    assert resumed.geco.tau == 0.7
+    assert resumed.geco.step_size == 0.2
+    assert resumed.geco.momentum == 0.8
+    assert resumed.train_step(batch) == expected_metrics
+    torch.testing.assert_close(resumed.geco.state_dict(), expected_controller, rtol=0, atol=0)
+    torch.testing.assert_close(
+        resumed.model.state_dict(), trainer.model.state_dict(), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("corruption", ["nonfinite", "counter"])
+def test_geco_checkpoint_rejects_invalid_controller_state(tmp_path: Path, corruption: str) -> None:
+    trainer = Trainer(
+        tiny_model(), TrainConfig(batch_size=4, geco=GECOConfig(enabled=True, tau=0.5))
+    )
+    path = tmp_path / "invalid_geco.pt"
+    trainer.save_checkpoint(path)
+    payload: dict[str, Any] = torch.load(path, weights_only=False)
+    if corruption == "nonfinite":
+        payload["objective"]["geco.log_lambda"] = torch.tensor(float("nan"))
+    else:
+        payload["objective"]["geco.num_updates"] = torch.tensor(3, dtype=torch.long)
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="GECO"):
+        trainer.load_checkpoint(path)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"enabled": True},
+        {"tau": -1},
+        {"tau": float("nan")},
+        {"momentum": 1},
+        {"step_size": -1},
+        {"lambda_init": 0},
+        {"log_lambda_min": 20},
+        {"log_lambda_max": 100},
+    ],
+)
+def test_geco_rejects_invalid_configuration(settings: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="GECO|require"):
+        GECOConfig(**settings)
