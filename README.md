@@ -58,8 +58,14 @@ state/action/parameter sparsity weights, attention-logit weight, and independent
 state/parameter `none` or `sigreg` selections and weights. Generic auxiliary
 weights default to zero. Optional `GECOConfig` controls adaptive sparsity under
 a calibrated bound on prediction plus representation/logit regularization.
-The controlled experiment enables it for both sparse conditions. Setting only `parameter_sparsity_weight=0` retains the
-parameter encoder, conditioning, optimizer, and all other architecture choices.
+The controlled experiment enables it for both sparse conditions. Its baseline
+forces parameter-source gates into decoded latest-state rows open in every SPARTAN
+layer, during training and evaluation, and sets `parameter_sparsity_weight=0`.
+The full model learns those gates and adds their sparsity penalty. Both retain
+learned attention weights, all other learned gates, and state/action regularization.
+Both infer and reuse parameters through the same encoder and predictor interfaces.
+The generic `spartan_parameter_gates_open` option defaults to false; setting a loss
+weight to zero alone does not force any gates open.
 
 `TensorEpisodes` is a tensor adapter, not a scientific data generator. To use the
 saved-tensor CLI route, supply a `torch.save` mapping of episode-major `observations`,

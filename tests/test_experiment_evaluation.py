@@ -14,6 +14,7 @@ import pytest
 import torch
 from torch import Tensor
 
+import scjepa.models.spartan as spartan_module
 from scjepa.data.controlled_vector import VectorObservationMap
 from scjepa.data.processes import ControlledVectorDGP
 from scjepa.data.random import episode_id
@@ -34,13 +35,13 @@ from scjepa.experiments.evaluation import (
     evaluate_model,
     validate_model,
 )
-from scjepa.models.model import SCJEPA
+from scjepa.models.model import SCJEPA, ModelOutput
 from scjepa.models.spartan import GraphBlocks, SpartanOutput
 from scjepa.training.factory import ModelConfig, build_model
-from scjepa.training.loop import ObjectiveConfig
+from scjepa.training.loop import ObjectiveConfig, TrainingObjective
 
 
-def _model() -> SCJEPA:
+def _model(*, dense: bool = False) -> SCJEPA:
     return build_model(
         ModelConfig(
             observation_dim=10,
@@ -56,6 +57,7 @@ def _model() -> SCJEPA:
             spartan_mlp_hidden=8,
             spartan_layers=1,
             spartan_mlp_layers=2,
+            spartan_dense=dense,
         )
     )
 
@@ -191,6 +193,83 @@ def test_tau_uses_calibration_only_and_handles_last_singleton(
     assert _batch_sizes(3, 2) == [3]
     assert _batch_sizes(5, 2) == [2, 3]
     assert _batch_sizes(4, 2) == [2, 2]
+
+
+def test_sampled_calibration_preserves_model_rng_and_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _model().train()
+    model.parameter_encoder.eval()
+    for parameter in model.online_encoder.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    modes = [module.training for module in model.modules()]
+    state = copy.deepcopy(model.state_dict())
+    gradients = [None if p.grad is None else p.grad.clone() for p in model.parameters()]
+    torch_state = torch.get_rng_state().clone()
+    python_state = random.getstate()
+    numpy_state = pickle.dumps(np.random.get_state())  # noqa: NPY002
+    sample = spartan_module._sample_hard_adjacency  # pyright: ignore[reportPrivateUsage]
+    calls = 0
+
+    def checked_sample(logits: Tensor, temperature: float, training: bool) -> Tensor:
+        nonlocal calls
+        calls += 1
+        assert training
+        assert model.predictor.training
+        assert not model.online_encoder.training
+        assert not model.parameter_encoder.training
+        assert not model.target_encoder.training
+        return sample(logits, temperature, training)
+
+    monkeypatch.setattr(spartan_module, "_sample_hard_adjacency", checked_sample)
+    matrix = VectorObservationMap().matrix
+    first = calibrate_tau(
+        model, _data(), matrix, _config(), objective=_objective(), training_gates=True
+    )
+    second = calibrate_tau(
+        model, _data(), matrix, _config(), objective=_objective(), training_gates=True
+    )
+    assert calls > 0
+    assert first == second
+    assert [module.training for module in model.modules()] == modes
+    torch.testing.assert_close(model.state_dict(), state, rtol=0, atol=0)
+    for parameter, expected in zip(model.parameters(), gradients, strict=True):
+        torch.testing.assert_close(parameter.grad, expected, rtol=0, atol=0)
+    torch.testing.assert_close(torch.get_rng_state(), torch_state, rtol=0, atol=0)
+    assert random.getstate() == python_state
+    assert pickle.dumps(np.random.get_state()) == numpy_state  # noqa: NPY002
+
+
+def test_dense_calibration_unchanged_with_training_gates() -> None:
+    model, matrix = _model(dense=True), VectorObservationMap().matrix
+    ordinary = calibrate_tau(model, _data(), matrix, _config(), objective=_objective())
+    sampled = calibrate_tau(
+        model, _data(), matrix, _config(), objective=_objective(), training_gates=True
+    )
+    assert ordinary == sampled
+
+
+def test_sampled_calibration_keeps_sigreg_projection_rng(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, matrix = _model(), VectorObservationMap().matrix
+    states: list[Tensor] = []
+    objective_forward = TrainingObjective.forward
+
+    def checked_objective(
+        objective: TrainingObjective, output: ModelOutput
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        states.append(torch.get_rng_state().clone())
+        return objective_forward(objective, output)
+
+    monkeypatch.setattr(TrainingObjective, "forward", checked_objective)
+    calibrate_tau(model, _data(), matrix, _config(), objective=_objective())
+    ordinary_states = states.copy()
+    states.clear()
+    calibrate_tau(model, _data(), matrix, _config(), objective=_objective(), training_gates=True)
+    assert len(states) == 4
+    for ordinary, sampled in zip(ordinary_states, states, strict=True):
+        torch.testing.assert_close(ordinary, sampled, rtol=0, atol=0)
 
 
 def test_pearson_mcc_recovers_permutation_and_sign_and_never_rematches_test() -> None:

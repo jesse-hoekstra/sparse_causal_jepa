@@ -49,6 +49,13 @@ for coordinate `i` decodes output `i`, retaining its local residual path.
 The retained binary straight-through gates use logistic noise while training;
 evaluation thresholds logits at zero. Dense mode opens every gate, and identity
 mode closes every attention edge. These modes use the same modules.
+The independent `parameter_gates_open` option (`spartan_parameter_gates_open` in
+`ModelConfig`) forces the parameter-source columns into the decoded latest-state
+receiver rows open in every layer, in both training and evaluation. Other gates
+remain learned. Attention weights remain learned even for forced-open gates, so
+dense parameter routing does not guarantee that every parameter has a nonzero
+functional effect. The option introduces no learned tensors or random draws;
+paired model tensor initialization is unchanged.
 Stable masked softmax handles fully closed rows without epsilon-gradient
 amplification. The optional logit penalty is `mean(exp(g)+exp(-g))`, using a linear
 continuation above `abs(g)=30` and float32 arithmetic.
@@ -81,10 +88,12 @@ Each sparsity term is the mean path count of its own lag-resolved block; the
 empty action term is exactly zero. These are differentiable straight-through
 path penalties, **not exact edge-budget constraints**. The means include constant
 residual contributions. Independent objective weights permit removal of the
-parameter-block penalty without architectural changes. Shared attention paths
-can contribute to more than one block, so other penalties can still change shared
-gates. Hard budgets or other surrogates, if wanted, require an explicit future
-experiment choice.
+parameter-block penalty without changing gate modes. The controlled experiment
+also forces direct parameter gates open in the baseline; the full model learns
+those gates and adds the parameter-block penalty. Both regularize state/action
+paths. Shared attention paths can contribute to more than one block, so other
+penalties can still change gates that remain learned. Hard budgets or other
+surrogates, if wanted, require an explicit future experiment choice.
 
 ## Rollout
 

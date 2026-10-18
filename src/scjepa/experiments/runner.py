@@ -20,6 +20,7 @@ from scjepa.data.factory import build_dgp_dataset
 from scjepa.data.identity import training_tensors_fingerprint
 from scjepa.experiments.config import ExperimentConfig
 from scjepa.experiments.evaluation import calibrate_tau, evaluate_model, validate_model
+from scjepa.experiments.reference import dense_directory, external_dense_manifest
 from scjepa.experiments.reporting import aggregate_results
 from scjepa.experiments.storage import (
     claim_execution,
@@ -131,8 +132,8 @@ def experiment_plan(
         raise ValueError("selected graph is not in the experiment definition")
     if seed is not None and seed not in config.seeds:
         raise ValueError("selected seed is not in the experiment definition")
-    if condition is not None and condition not in {"dense", "baseline", "full"}:
-        raise ValueError("condition must be dense, baseline or full")
+    if condition is not None and condition not in config.conditions:
+        raise ValueError(f"condition must be one of {config.conditions} for this configuration")
     return [
         {
             "graph": g,
@@ -144,7 +145,7 @@ def experiment_plan(
         if graph is None or graph == g
         for s in config.seeds
         if seed is None or seed == s
-        for c in ("dense", "baseline", "full")
+        for c in config.conditions
         if condition is None or condition == c
     ]
 
@@ -218,15 +219,20 @@ def _load_tau(
     config: ExperimentConfig, manifest: dict[str, object], graph: str, seed: int
 ) -> dict[str, object]:
     """Require the completed dense reference and verify the bound's provenance."""
-    directory = Path(config.output_dir) / graph / f"seed-{seed}" / "dense"
+    directory = dense_directory(config, graph, seed)
     if not (directory / "tau.json").is_file():
-        raise ValueError("dense tau calibration is missing; run --condition dense first")
+        raise ValueError(f"dense tau calibration is missing at {directory}")
+    reference_manifest = (
+        external_dense_manifest(config, manifest, graph, seed)
+        if config.dense_reference_dir
+        else manifest
+    )
     record = read_json(directory / "tau.json")
-    identity = canonical_fingerprint([manifest["identity"], graph, seed, "dense"])
+    identity = canonical_fingerprint([reference_manifest["identity"], graph, seed, "dense"])
     status = read_json(directory / "status.json")
     if (
         record.get("dense_run_identity") != identity
-        or record.get("experiment_identity") != manifest["identity"]
+        or record.get("experiment_identity") != reference_manifest["identity"]
         or status.get("status") != "completed"
         or status.get("run_identity") != identity
         or record.get("checkpoint_sha256") != _checkpoint_hash(directory / "best.pt")
@@ -312,6 +318,19 @@ def _run_one(
             data = build_dgp_dataset(data_config, observation_matrix=matrix)
             model_config = config.condition_model(condition)
             model = build_model(model_config)
+            calibration: dict[str, object] | None = None
+            if condition != "dense":
+                result = _rank_zero(lambda: _load_tau(config, manifest, graph, seed), device)
+                calibration = cast(dict[str, object], gather_rank_objects(result)[0])
+                # _load_tau verifies this selected checkpoint's hash. Copy the
+                # complete model, including EMA, but leave the new Trainer's
+                # optimizer, GECO controller, RNG and step counters fresh.
+                dense_checkpoint = torch.load(
+                    dense_directory(config, graph, seed) / "best.pt",
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                model.load_state_dict(dense_checkpoint["model"])
             initial_identity = training_tensors_fingerprint(
                 {
                     name: value
@@ -319,10 +338,6 @@ def _run_one(
                     if isinstance(value, Tensor)
                 }
             )
-            calibration: dict[str, object] | None = None
-            if condition != "dense":
-                result = _rank_zero(lambda: _load_tau(config, manifest, graph, seed), device)
-                calibration = cast(dict[str, object], gather_rank_objects(result)[0])
             training = replace(
                 config.training_config(
                     condition,
@@ -334,7 +349,8 @@ def _run_one(
             )
             trainer = Trainer(model, training, data, model_config=asdict(model_config))
             checkpoint = directory / ("last.pt" if (directory / "last.pt").exists() else "best.pt")
-            if (resume or evaluate_only) and checkpoint.exists():
+            restoring = (resume or evaluate_only) and checkpoint.exists()
+            if restoring:
                 trainer.load_checkpoint(checkpoint)
                 if trainer.run_metadata.get("experiment_run_identity") != identity:
                     raise ValueError("checkpoint belongs to a different experiment run")
@@ -411,6 +427,32 @@ def _run_one(
 
             _rank_zero(start_logging, device)
             if not evaluate_only:
+                if calibration is not None and not restoring:
+
+                    def check_initial_loss() -> None:
+                        assert calibration is not None
+                        dense_base = float(cast(float, calibration["calibration/base_loss"]))
+                        losses = [
+                            calibrate_tau(
+                                trainer.model,
+                                data_config,
+                                matrix,
+                                config.evaluation,
+                                objective=training.objective,
+                                training_gates=sampled,
+                            )["calibration/base_loss"]
+                            for sampled in (False, True)
+                        ]
+                        print(
+                            f"{condition} warm-start base loss: dense={dense_base:.6g}, "
+                            f"eval gates={losses[0]:.6g} (change={losses[0] - dense_base:+.6g}), "
+                            f"sampled gates={losses[1]:.6g} "
+                            f"(change={losses[1] - dense_base:+.6g}), "
+                            f"tau={float(cast(float, calibration['tau'])):.6g}",
+                            flush=True,
+                        )
+
+                    _rank_zero(check_initial_loss, device)
 
                 def validation(current: SCJEPA) -> dict[str, float]:
                     scores = validate_model(

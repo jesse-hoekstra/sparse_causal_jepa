@@ -24,9 +24,21 @@ identity validation; do not silently change distributions or renderer precision.
 
 The controlled-vector protocol lives in `scjepa.experiments`; follow
 `docs/controlled_experiment.md`. The default sequence is dense tau calibration, baseline, full on complementary
-data and one seed. Baseline/full differ only in parameter sparsity. Use local
-content-dependent SPARTAN gates, active logit regularization and GECO for the
-sparse conditions. Preserve the shared calibrated bound and controller resume.
+data and one seed. Baseline forces parameter-source columns to decoded latest-state
+receiver rows open in every SPARTAN layer during training and evaluation, with zero
+parameter sparsity weight. Full learns those gates and adds the parameter penalty.
+Both retain learned attention weights, all other learned gates, state/action
+regularization, active logit regularization and GECO. Preserve the shared calibrated
+bound, paired tensor initialization and controller resume. Both sparse runs start
+from the exact dense best checkpoint bound to tau, including its EMA encoder,
+with fresh optimizer, GECO controller and step counters. Resume restores each
+sparse run's own checkpoint and training state. Older protocols require a new
+output directory because source/configuration provenance differs. An optional
+`dense_reference_dir` reuses a compatible previous experiment's selected dense
+checkpoint and original tau, running only baseline/full in the new output.
+Keep the reference read-only and verify architecture, data, base objective,
+calibration batching, observation map and checkpoint hash before reuse; older
+source versions are allowed when these checks pass.
 Report MCC and aligned routing-support SHD; keep the dashboard concise.
 Use SIGReg only. Keep calibration, validation and test separate, preserve paired
 initialization/data and fixed observation maps, and validate checkpoint/run

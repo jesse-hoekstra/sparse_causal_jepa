@@ -5,13 +5,33 @@ The default command runs **three models, complementary data, seed 0**, sequentia
 | Condition | Attention | Sparsity objective |
 |---|---|---|
 | `dense` | All connections open | None; calibrates tau |
-| `baseline` | Learned local SPARTAN gates | State and action paths |
+| `baseline` | Parameter-to-output gates forced open; other gates learned | State and action paths |
 | `full` | Learned local SPARTAN gates | State, action and parameter paths |
 
-All three start from identical weights and use identical training episodes, data
-order, and observation map. Sparse runs start from that paired initialization,
-not from the trained dense checkpoint. Baseline/full differ only in the parameter
-sparsity coefficient; neither removes the parameter encoder or parameter inputs.
+All three use identical training episodes, data order, and observation map.
+Baseline and full start from the exact dense best checkpoint used to calibrate
+tau, including its online and EMA state encoders, parameter encoder and predictor.
+Each sparse run starts with a fresh optimizer, GECO controller and step counters;
+its condition-specific gate modes remain as specified above. Baseline forces
+parameter-source columns to decoded latest-state receiver rows open in every
+SPARTAN layer, during training and evaluation, and uses zero parameter sparsity
+weight. Full learns those gates
+and adds the parameter path penalty. Both retain learned attention weights, all
+other learned gates, the parameter encoder and parameter inputs, and state/action
+regularization. The gate override adds no learned tensors or random draws;
+both sparse runs retain identical initial tensors.
+
+Set `dense_reference_dir` to an existing experiment root to reuse its selected
+dense checkpoint and original tau in a new output directory. This runs only
+baseline and full; no new dense run is trained. The reference files remain
+untouched. Compatible dense checkpoints from older source versions are accepted
+after checking architecture, data, base objective, calibration batching,
+observation map and checkpoint hash.
+
+Each fresh sparse run prints one startup line comparing dense, deterministic-gate
+and sampled-gate base losses on the calibration split, with differences and tau.
+The check matches SIGReg projection draws, preserves weights, GECO state and
+training RNG, adds no W&B metrics, and is skipped on checkpoint resume or evaluation-only runs.
 
 ## Model and objective
 
@@ -26,6 +46,10 @@ SPARTAN now uses content-dependent queries and keys, hard Bernoulli gates from
 `sigmoid(q @ k)`, and masked attention weights from `softmax(q @ k / sqrt(d))`.
 Residual-inclusive path products track local routing through all layers. The
 symmetric exponential logit penalty remains active to discourage saturation.
+Baseline parameter routing is dense by construction. Forced-open gates still use
+learned attention weights, so they do not guarantee a nonzero functional effect
+from every parameter. The runner derives `spartan_parameter_gates_open` per
+condition; manual gate-mode overrides in the experiment configuration are rejected.
 
 The non-sparsity objective is
 
@@ -64,8 +88,9 @@ checkpoints or calibrate tau.
 
 ## What to observe
 
-W&B has three named runs: `complementary-dense-seed0`,
+The default sequence has three named W&B runs: `complementary-dense-seed0`,
 `complementary-baseline-seed0`, and `complementary-full-seed0`.
+With `dense_reference_dir`, only the latter two are created in the new group.
 MCC and SHD are logged at each validation interval and on the final held-out
 test set. Calibration matching is refitted per evaluated checkpoint; recovery
 scores do not enter checkpoint selection. The dashboard retains:
@@ -90,6 +115,9 @@ support: content-dependent attention controls also affect outputs. Poor MCC or
 mixing within identifiable groups also limits SHD's interpretation. In particular,
 complementary parameters may remain mixed within pairs under the paper's equivalence
 class; perfect coordinatewise MCC is a stricter criterion than pair recovery.
+For the complementary baseline, parameter SHD is therefore 80 by construction:
+all 100 parameter routing edges are available, against 20 true edges. Changes in
+that baseline metric cannot be used to assess learning of parameter support.
 
 Matching tensors, supports, references and concise metrics are saved locally.
 Nonlinear probes, code swaps, rollout dashboards and automatic evaluation artifact
@@ -110,27 +138,43 @@ python -m pip install -e '.[dev,logging]'
 export WANDB_PROJECT=sparse_causal_jepa
 export WANDB_ENTITY=jesse-hoekstra-university-of-oxford
 python -u scripts/run_controlled_experiment.py \
+  --config configs/experiments/controlled_vector.yaml \
   train.device=cuda \
-  output_dir=outputs/complementary_geco_seed0 \
-  wandb.group=complementary-geco-seed0
+  wandb.mode=online \
+  wandb.group=exp2_dense_warmstart \
+  output_dir=outputs/exp2_dense_warmstart \
+  dense_reference_dir=outputs/exp1
 ```
 
 Detach with **Ctrl-b, then d**; return with `tmux attach -t scjepa-geco`.
-The one command completes dense calibration before starting baseline and full.
-It launches no other seed or graph. The numeric optimizer, logit coefficient and
-GECO controller defaults are explicit starting choices, not validated scientific
-hyperparameters. Use `--dry-run` to print the three-stage plan without starting W&B.
+This command reads the completed dense run from `outputs/exp1` and starts fresh
+baseline/full runs in `outputs/exp2_dense_warmstart`, including the dense EMA
+weights and using the original calibrated tau. Do not add `--resume` on this
+initial invocation. Omit `dense_reference_dir` to train all three stages in a new
+output directory, completing dense calibration before baseline and full.
+Neither command launches another seed or graph. The numeric optimizer, logit
+coefficient and GECO controller defaults are explicit starting choices, not
+validated scientific hyperparameters. Use `--dry-run` to print the selected stages
+without starting W&B.
 
-Resume after interruption by repeating the same command with `--resume`.
+Resume after interruption by repeating the same command, including
+`dense_reference_dir` when set, with `--resume`; sparse runs restore their own
+checkpoint, optimizer and controller state.
 Completed stages are skipped. To select a stage, add `--condition dense`,
 `--condition baseline`, or `--condition full`; sparse-only execution requires an
-already completed, matching dense calibration. `--evaluate-only` recomputes the
-selected checkpoint's metrics without training. `--aggregate-only` refreshes local
+already completed, compatible dense calibration. `--condition dense` is incompatible
+with `dense_reference_dir`. `--evaluate-only` recomputes the selected checkpoint's
+metrics without training. `--aggregate-only` refreshes local
 `results.csv` and `summary.json`.
 
-Use a **new output directory** for this protocol. Old identity-attention/fixed-weight
-runs have different architecture and objective provenance and cannot be resumed
-as GECO runs. Existing outputs, checkpoints and logs are preserved.
+Use a **new output directory** for this protocol. Earlier GECO runs that started
+sparse models from random initialization or learned the baseline parameter gates,
+as well as identity-attention/fixed-weight runs, have different source and model
+provenance and cannot be resumed as this comparison.
+Their compatible selected dense checkpoint and original calibration record can
+still be reused through `dense_reference_dir`; dense retraining is unnecessary
+when the compatibility checks pass. Existing outputs, checkpoints and logs are
+preserved.
 
 A tiny CPU check of all three stages (not a scientific run):
 
