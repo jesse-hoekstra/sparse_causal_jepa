@@ -316,12 +316,14 @@ def test_dense_reference_provenance_and_sparse_tau_must_match(tmp_path: Path) ->
     _record(tmp_path, 0, "baseline", 1.0)
     full = _record(tmp_path, 0, "full", 1.0)
     record = read_json(dense / "run_config.json")
-    record["initial_state_fingerprint"] = "unpaired"
+    record["initial_state_fingerprint"] = "dense-random-initialization"
     write_json(dense / "run_config.json", record)
-    with pytest.raises(ValueError, match="unmatched initial_state_fingerprint"):
-        aggregate_results(config)
-    record["initial_state_fingerprint"] = "initial-0"
-    write_json(dense / "run_config.json", record)
+    assert aggregate_results(config)["completed_runs"] == 3
+    for key in ("dataset_identity", "experiment_identity"):
+        write_json(dense / "run_config.json", {**record, key: "different"})
+        with pytest.raises(ValueError, match=f"unmatched {key}"):
+            aggregate_results(config)
+        write_json(dense / "run_config.json", record)
     record = read_json(full / "run_config.json")
     record["tau_calibration"] = {"tau": 0.6, "dense_run_identity": "dense-0"}
     write_json(full / "run_config.json", record)

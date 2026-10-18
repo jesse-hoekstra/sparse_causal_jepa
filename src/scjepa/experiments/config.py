@@ -49,12 +49,14 @@ class ExperimentConfig:
     """An explicit comparison protocol; numeric defaults are untuned choices.
 
     ``train.objective.parameter_sparsity_weight`` is the full-model weight.
-    The baseline changes only that weight to zero. Model seeds do not change
-    the scientific data seed, observation matrix, or calibration/test splits.
+    The baseline sets that weight to zero and forces direct parameter-to-output
+    gates open. Model seeds do not change the scientific data seed, observation
+    matrix, or calibration/test splits.
     """
 
     name: str = "complementary-geco"
     output_dir: str = "outputs/complementary_geco"
+    dense_reference_dir: str | None = None
     graphs: tuple[str, ...] = ("complementary",)
     seeds: tuple[int, ...] = (0,)
     train_episodes: int = 8192
@@ -84,6 +86,11 @@ class ExperimentConfig:
             raise ValueError("tau_multiplier must be finite and at least one")
         if not self.name or not self.output_dir:
             raise ValueError("experiment name and output_dir must be nonempty")
+        if self.dense_reference_dir is not None:
+            if not self.dense_reference_dir.strip():
+                raise ValueError("dense_reference_dir must be nonempty when supplied")
+            if Path(self.dense_reference_dir).resolve() == Path(self.output_dir).resolve():
+                raise ValueError("dense_reference_dir requires a different output_dir")
         if (
             not self.graphs
             or len(set(self.graphs)) != len(self.graphs)
@@ -107,8 +114,8 @@ class ExperimentConfig:
             or not 2 <= model.context_len < self.trajectory_length
         ):
             raise ValueError("controlled comparison requires vector 10/10/10/10, L=1 and K>=2")
-        if model.spartan_dense or model.spartan_identity:
-            raise ValueError("comparison sets dense/learned gates per condition")
+        if model.spartan_dense or model.spartan_identity or model.spartan_parameter_gates_open:
+            raise ValueError("comparison sets gate modes per condition")
         objective = self.train.objective
         if (
             objective.state_regularizer != "sigreg"
@@ -131,6 +138,11 @@ class ExperimentConfig:
             raise ValueError("experiment steps must end at a complete accumulation boundary")
         self.data_config(self.graphs[0])
 
+    @property
+    def conditions(self) -> tuple[str, ...]:
+        """Train only sparse conditions when reusing an existing dense reference."""
+        return ("baseline", "full") if self.dense_reference_dir else ("dense", "baseline", "full")
+
     def data_config(self, graph: str) -> DGPConfig:
         """Resolve the training data definition without using model random seeds."""
         return DGPConfig(
@@ -143,15 +155,19 @@ class ExperimentConfig:
         )
 
     def condition_model(self, condition: str) -> ModelConfig:
-        """Open every attention gate only for the dense reference."""
+        """Derive dense reference, open parameter baseline, or fully learned gates."""
         if condition not in {"dense", "baseline", "full"}:
             raise ValueError("condition must be dense, baseline or full")
-        return replace(self.model, spartan_dense=condition == "dense")
+        return replace(
+            self.model,
+            spartan_dense=condition == "dense",
+            spartan_parameter_gates_open=condition == "baseline",
+        )
 
     def training_config(
         self, condition: str, seed: int, out_dir: Path, *, tau: float | None = None
     ) -> TrainConfig:
-        """Use one calibrated bound; baseline/full differ only in parameter sparsity."""
+        """Use one calibrated bound and add the parameter path penalty only for full."""
         self.condition_model(condition)
         objective = replace(
             self.train.objective,

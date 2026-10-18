@@ -66,6 +66,28 @@ def test_default_dry_run_reports_three_stages_without_output_or_wandb(tmp_path: 
     assert not (tmp_path / "wandb").exists()
 
 
+def test_external_reference_dry_run_reports_only_sparse_stages(tmp_path: Path) -> None:
+    output, reference = tmp_path / "exp2", tmp_path / "exp1"
+    overrides = (f"output_dir={output}", f"dense_reference_dir={reference}")
+    result = _invoke(tmp_path, "--dry-run", *overrides)
+    assert result.returncode == 0, result.stderr
+    plan = cast(dict[str, object], json.loads(result.stdout))
+    assert plan["runs"] == 2
+    assert [task["condition"] for task in cast(list[dict[str, object]], plan["plan"])] == [
+        "baseline",
+        "full",
+    ]
+    rejected = _invoke(tmp_path, "--dry-run", "--condition", "dense", *overrides)
+    assert rejected.returncode != 0
+    assert "dense" in rejected.stderr
+    same_directory = _invoke(
+        tmp_path, "--dry-run", f"output_dir={reference}", f"dense_reference_dir={reference}"
+    )
+    assert same_directory.returncode != 0
+    assert not output.exists()
+    assert not reference.exists()
+
+
 def test_task_selectors_leave_the_full_scientific_definition_unchanged(tmp_path: Path) -> None:
     config = load_experiment_config(CONFIGS / "controlled_vector.yaml")
     initial = canonical_fingerprint(json_safe(config.definition()))

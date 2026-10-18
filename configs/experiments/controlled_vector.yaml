@@ -1,6 +1,8 @@
 # Dense tau calibration followed by two paired GECO runs. Numeric defaults are untuned.
 name: complementary-geco
 output_dir: outputs/complementary_geco
+# Optional CLI override: dense_reference_dir=outputs/exp1 reuses its dense best/tau
+# and runs only baseline/full in a new output_dir, without modifying exp1.
 graphs: [complementary]
 seeds: [0]
 train_episodes: 8192
@@ -25,6 +27,8 @@ model:
   spartan_embed_dim: 64
   spartan_mlp_hidden: 64
   spartan_mlp_layers: 3
+  # Derived per condition: baseline opens parameter-to-output gates in every layer.
+  spartan_parameter_gates_open: false
   ema_decay: 0.996
 train:
   steps: 10000
@@ -49,7 +53,7 @@ train:
     # Relative block weights; GECO controls their common effective strength.
     state_sparsity_weight: 1.0
     action_sparsity_weight: 1.0
-    parameter_sparsity_weight: 1.0 # baseline sets only this to zero
+    parameter_sparsity_weight: 1.0 # baseline sets this to zero and opens parameter gates
     logit_weight: 0.0001
     state_regularizer: sigreg
     state_regularizer_weight: 0.1

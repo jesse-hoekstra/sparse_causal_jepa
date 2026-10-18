@@ -126,6 +126,8 @@ def _collect(
     split: str,
     count: int,
     objective: ObjectiveConfig | None = None,
+    *,
+    isolate_gate_rng: bool = False,
 ) -> _EncodedSplit:
     data = replace(base, split=split, num_episodes=count)
     process = ControlledVectorDGP(data)
@@ -140,12 +142,22 @@ def _collect(
     transition_count = 0
     prediction_sum = base_sum = sparsity_sum = 0.0
     begin = 0
-    for size in _batch_sizes(count, config.batch_size):
+    for batch_index, size in enumerate(_batch_sizes(count, config.batch_size)):
         episodes = [process.generate(index) for index in range(begin, begin + size)]
         begin += size
         observations = torch.stack([item.observations for item in episodes]).to(reference)
         actions = torch.stack([item.actions for item in episodes]).to(reference)
-        result = model(observations, actions)
+        if isolate_gate_rng:
+            # Gate draws must not change the SIGReg projection sequence below.
+            with preserve_rng(reference.device):
+                gate_seed = (config.seed + 1_000_003 + batch_index) % (2**63)
+                torch.default_generator.manual_seed(gate_seed)
+                if reference.device.type == "cuda":
+                    with torch.cuda.device(reference.device):
+                        torch.cuda.manual_seed(gate_seed)
+                result = model(observations, actions)
+        else:
+            result = model(observations, actions)
         _, terms = criterion.forward(result)
         prediction_sum += float(terms["prediction"]) * size
         base_sum += float(terms["base"]) * size
@@ -240,14 +252,19 @@ def calibrate_tau(
     config: EvaluationConfig,
     *,
     objective: ObjectiveConfig | None = None,
+    training_gates: bool = False,
 ) -> dict[str, float]:
     """Measure a selected dense model on the independent calibration split.
 
     No labels or coordinate matching enter this loss. The caller persists the
     measured base loss as the shared GECO threshold for both sparse conditions.
+    ``training_gates`` samples predictor gates for a startup loss comparison while
+    keeping encoders in evaluation mode and retaining the same SIGReg projections.
     """
     _check_model(model, base_data)
     with _evaluation_context(model, config.seed):
+        if training_gates:
+            model.predictor.train()
         split = _collect(
             model,
             base_data,
@@ -256,6 +273,7 @@ def calibrate_tau(
             "evaluation_calibration",
             config.calibration_episodes,
             objective,
+            isolate_gate_rng=training_gates,
         )
     return _loss_metrics(split, "calibration")
 

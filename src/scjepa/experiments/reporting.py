@@ -36,7 +36,7 @@ def aggregate_results(config: ExperimentConfig) -> dict[str, object]:
     with file_lock(root / ".report.lock", blocking=True):
         for graph in config.graphs:
             for seed in config.seeds:
-                for condition in ("dense", "baseline", "full"):
+                for condition in config.conditions:
                     slug = f"{graph}/seed-{seed}/{condition}"
                     directory = root / slug
                     status_path = directory / "status.json"
@@ -70,7 +70,7 @@ def aggregate_results(config: ExperimentConfig) -> dict[str, object]:
         summaries: dict[str, object] = {}
         differences: dict[str, object] = {}
         for graph in config.graphs:
-            for condition in ("dense", "baseline", "full"):
+            for condition in config.conditions:
                 group = [
                     metrics
                     for (g, _, c), (_, metrics) in completed.items()
@@ -98,7 +98,11 @@ def aggregate_results(config: ExperimentConfig) -> dict[str, object]:
                         not isinstance(value, str)
                         or not value
                         or value != full[0].get(key)
-                        or (dense is not None and value != dense[0].get(key))
+                        or (
+                            dense is not None
+                            and key != "initial_state_fingerprint"
+                            and value != dense[0].get(key)
+                        )
                     ):
                         raise ValueError(f"unmatched {key} for {graph}, seed {seed}")
                 calibration = baseline[0].get("tau_calibration")
@@ -126,7 +130,7 @@ def aggregate_results(config: ExperimentConfig) -> dict[str, object]:
             "missing_runs": missing,
             "missing_pairs": missing_pairs,
             "completed_runs": len(rows),
-            "expected_runs": 3 * len(config.graphs) * len(config.seeds),
+            "expected_runs": len(config.conditions) * len(config.graphs) * len(config.seeds),
             "per_condition": summaries,
             "paired_full_minus_baseline": differences,
         }

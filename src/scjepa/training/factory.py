@@ -33,6 +33,7 @@ class ModelConfig:
     spartan_temperature: float = 1.0
     spartan_dense: bool = False
     spartan_identity: bool = False
+    spartan_parameter_gates_open: bool = False
     ema_decay: float = 0.996
 
 
@@ -74,6 +75,7 @@ def build_model(config: ModelConfig | DictConfig) -> SCJEPA:
         temperature=cfg.spartan_temperature,
         dense=cfg.spartan_dense,
         identity=cfg.spartan_identity,
+        parameter_gates_open=cfg.spartan_parameter_gates_open,
     )
     return SCJEPA(encoder, parameter_encoder, predictor, cfg.context_len, cfg.ema_decay)
 
