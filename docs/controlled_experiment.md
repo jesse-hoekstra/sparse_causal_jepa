@@ -131,6 +131,12 @@ test set. Calibration matching is refitted per evaluated checkpoint; recovery
 scores do not enter checkpoint selection. The dashboard retains:
 
 - Prediction MSE, base loss and weighted sparsity loss.
+- `validation/target_variance`: population variance of EMA targets across all
+  validation groups, computed separately per direction, horizon and coordinate,
+  then averaged. `validation/normalized_prediction_mse` divides prediction MSE by
+  this variance (floored at `1e-12`). A ratio below 1 beats the corresponding
+  validation target-mean predictor when the variance exceeds that floor. Both are
+  monitoring metrics only; they do not change the objective, tau or checkpoint selection.
 - `train/lr`: the learning rate for the next optimizer update.
 - Tau, constraint violation and effective sparsity weight for GECO.
 - Validation/test feasibility and the count of skipped updates.

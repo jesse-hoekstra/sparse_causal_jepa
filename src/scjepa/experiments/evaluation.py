@@ -255,8 +255,15 @@ def validate_model(
                 objective,
             )
         diagnostics, _, _ = _recovery_metrics(calibration, split, config.graph_support_threshold)
+    # Keep direction/horizon means separate; use all validation groups, not batch variances.
+    targets = split.target.double().reshape(
+        -1, split.config.episodes_per_parameter, *split.target.shape[1:]
+    )
+    target_variance = float(targets.var(dim=0, correction=0).mean())
     return {
         **_loss_metrics(split, "validation"),
+        "validation/target_variance": target_variance,
+        "validation/normalized_prediction_mse": split.prediction_mse / max(target_variance, 1e-12),
         **{f"validation/{name}": value for name, value in diagnostics.items()},
     }
 

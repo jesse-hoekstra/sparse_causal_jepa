@@ -119,6 +119,8 @@ def test_validation_excludes_test_and_preserves_rng_modes_and_gradients(
     )
     assert set(result) == {
         "validation/prediction_mse",
+        "validation/target_variance",
+        "validation/normalized_prediction_mse",
         "validation/base_loss",
         "validation/sparsity",
         "validation/state_mcc",
@@ -139,6 +141,52 @@ def test_validation_excludes_test_and_preserves_rng_modes_and_gradients(
     assert random.getstate() == python_state
     actual_numpy = np.random.get_state()  # noqa: NPY002
     assert pickle.dumps(actual_numpy) == pickle.dumps(numpy_state)
+
+
+@pytest.mark.parametrize("episodes_per_parameter", [1, 2])
+@pytest.mark.parametrize("scale", [0.0, 1.0])
+def test_validation_target_variance_uses_all_groups_and_separate_direction_horizon_means(
+    monkeypatch: pytest.MonkeyPatch, episodes_per_parameter: int, scale: float
+) -> None:
+    model, matrix = _model(), VectorObservationMap().matrix
+    forward = model.forward
+    offset = 0
+
+    def controlled_targets(
+        observations: Tensor,
+        actions: Tensor | None = None,
+        prediction_start: int | None = None,
+    ) -> ModelOutput:
+        nonlocal offset
+        output = forward(observations, actions, prediction_start)
+        size = observations.shape[0]
+        groups = torch.arange(offset, offset + size, dtype=torch.float64)
+        offset += size
+        # Large differences between directions, horizons and coordinates must not
+        # count as variation across groups. A fixed residual gives prediction MSE=1.
+        targets = (
+            scale * groups[:, None, None, None]
+            + 10 * torch.arange(episodes_per_parameter)[None, :, None, None]
+            + 100 * torch.arange(2)[None, None, :, None]
+            + 1000 * torch.arange(10)[None, None, None, :]
+        ).reshape(output.targets.shape)
+        return output._replace(targets=targets, predictions=targets + 1)
+
+    monkeypatch.setattr(model, "forward", controlled_targets)
+    for batch_size in (2, 5):  # Split into unequal batches (2, 3), then a single batch.
+        result = validate_model(
+            model,
+            _data(episodes_per_parameter),
+            matrix,
+            replace(_config(), validation_episodes=5, batch_size=batch_size),
+        )
+        # Five consecutive group values have population variance 2, regardless of offset.
+        expected_variance = 2 * scale**2
+        assert math.isclose(result["validation/target_variance"], expected_variance)
+        assert math.isclose(result["validation/prediction_mse"], 1.0)
+        assert math.isclose(
+            result["validation/normalized_prediction_mse"], 1.0 / max(expected_variance, 1e-12)
+        )
 
 
 def test_validation_deterministic_and_excludes_sparsity_terms() -> None:
@@ -531,5 +579,11 @@ def test_validation_base_loss_is_independent_of_calibration_size() -> None:
     large = validate_model(
         model, _data(), matrix, replace(_config(), calibration_episodes=11), objective=_objective()
     )
-    for key in ("prediction_mse", "base_loss", "sparsity"):
+    for key in (
+        "prediction_mse",
+        "base_loss",
+        "sparsity",
+        "target_variance",
+        "normalized_prediction_mse",
+    ):
         assert small[f"validation/{key}"] == large[f"validation/{key}"]
