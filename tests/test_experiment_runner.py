@@ -32,6 +32,7 @@ from scjepa.experiments.storage import (
     read_json,
     write_json,
 )
+from scjepa.losses import RepresentationRegularizer
 from scjepa.models.model import SCJEPA
 from scjepa.training import Trainer
 from scjepa.training.factory import ModelConfig, build_model
@@ -79,12 +80,26 @@ def _config(directory: Path) -> ExperimentConfig:
     return config
 
 
-@pytest.mark.parametrize("closed_gates", [False, True])
+@pytest.mark.parametrize(
+    ("closed_gates", "without_sigreg"), [(False, False), (True, False), (False, True)]
+)
 def test_real_three_stage_experiment_artifacts_and_resume_are_reproducible(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, closed_gates: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    closed_gates: bool,
+    without_sigreg: bool,
 ) -> None:
     config = _config(tmp_path)
     config.tau_multiplier = 1.05
+    if without_sigreg:
+        config.train.objective.state_regularizer_weight = 0.0
+        config.train.objective.parameter_regularizer_weight = 0.0
+        config.train.lr_final_ratio = 1.0
+
+        def forbidden_sigreg(*_args: object, **_kwargs: object) -> Tensor:
+            raise AssertionError("zero-weight SIGReg must not run in training or evaluation")
+
+        monkeypatch.setattr(RepresentationRegularizer, "forward", forbidden_sigreg)
     if closed_gates:
 
         def closed_adjacency(logits: Tensor, _temperature: float, _training: bool) -> Tensor:
@@ -151,6 +166,9 @@ def test_real_three_stage_experiment_artifacts_and_resume_are_reproducible(
         assert last["model_config"]["spartan_parameter_gates_open"] == (index == 1)
         assert best["model_config"]["spartan_parameter_gates_open"] == (index == 1)
         saved_objectives.append(last["train_config"]["objective"])
+        for name in ("state_regularizer_weight", "parameter_regularizer_weight"):
+            assert saved_objectives[-1][name] == getattr(config.train.objective, name)
+        assert last["model_config"]["ema_decay"] == config.model.ema_decay == 0.996
         evaluation = directory / "evaluation"
         metrics = read_json(evaluation / "metrics.json")
         assert metrics["test/prediction_mse"] >= 0  # pyright: ignore[reportOperatorIssue]

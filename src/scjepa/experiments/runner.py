@@ -406,7 +406,15 @@ def _run_one(
                     config.wandb,
                     name=f"{config.wandb.name}-{label}" if config.wandb.name else label,
                     group=config.wandb.group or config.name,
-                    tags=[*config.wandb.tags, graph, condition, "sigreg"],
+                    tags=[
+                        *config.wandb.tags,
+                        graph,
+                        condition,
+                        "sigreg"
+                        if config.train.objective.state_regularizer_weight
+                        or config.train.objective.parameter_regularizer_weight
+                        else "no-sigreg",
+                    ],
                 )
                 logger = WandbLogger(
                     logging_config,
