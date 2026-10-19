@@ -90,6 +90,13 @@ parameter encoder. SIGReg is calculated separately for each episode view across
 parameter codes, then averaged over the two views. The two codes of one parameter
 are never treated as independent samples in a `2B` SIGReg batch.
 
+To run without SIGReg, set both `train.objective.state_regularizer_weight=0.0`
+and `train.objective.parameter_regularizer_weight=0.0`. This skips both penalties
+in all three conditions while retaining EMA, target stop-gradient and logit
+regularization. Use fresh dense training and tau calibration in a new output
+directory. Set `train.lr=0.001 train.lr_final_ratio=1.0` for a constant learning
+rate of 0.001 in every condition. W&B labels this ablation with `no-sigreg`.
+
 Following the newer SPARTAN paper's loss-constrained optimization, sparse training
 minimizes weighted path counts subject to `E[base] <= tau`. The implemented primal
 loss is `base + sparsity / lambda`, with a positive adaptive multiplier. After

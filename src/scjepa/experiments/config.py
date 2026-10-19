@@ -120,12 +120,8 @@ class ExperimentConfig:
         if model.spartan_dense or model.spartan_identity or model.spartan_parameter_gates_open:
             raise ValueError("comparison sets gate modes per condition")
         objective = self.train.objective
-        if (
-            objective.state_regularizer != "sigreg"
-            or objective.parameter_regularizer != "sigreg"
-            or min(objective.state_regularizer_weight, objective.parameter_regularizer_weight) <= 0
-        ):
-            raise ValueError("both representations require explicitly weighted SIGReg")
+        if objective.state_regularizer != "sigreg" or objective.parameter_regularizer != "sigreg":
+            raise ValueError("use SIGReg for both representations; zero weights disable it")
         if (
             min(
                 objective.state_sparsity_weight,
