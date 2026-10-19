@@ -34,7 +34,11 @@ from scjepa.training.rng import preserve_rng
 
 @dataclass(frozen=True)
 class EvaluationConfig:
-    """Held-out episode counts and a predeclared local-graph aggregation rule."""
+    """Held-out independent-group counts and predeclared routing aggregation.
+
+    When the DGP pairs episodes, each item/batch unit contains two trajectories
+    sharing one parameter. Both prediction directions contribute equally.
+    """
 
     calibration_episodes: int = 512
     validation_episodes: int = 256
@@ -162,23 +166,35 @@ def _collect(
         prediction_sum += float(terms["prediction"]) * size
         base_sum += float(terms["base"]) * size
         sparsity_sum += float(terms["sparsity"]) * size
-        buckets["ids"].append(
-            torch.tensor([item.episode_id for item in episodes], dtype=torch.int64)
+        ids = torch.tensor([item.episode_id for item in episodes], dtype=torch.int64)
+        states = torch.stack([item.ground_truth["states"] for item in episodes])
+        parameters = torch.stack([item.ground_truth["parameters"] for item in episodes])
+        online, target, codes = (
+            result.online_states.cpu(),
+            result.targets.cpu(),
+            result.parameters.cpu(),
         )
-        buckets["states"].append(torch.stack([item.ground_truth["states"] for item in episodes]))
-        buckets["parameters"].append(
-            torch.stack([item.ground_truth["parameters"] for item in episodes])
-        )
-        buckets["online"].append(result.online_states.cpu())
-        buckets["target"].append(result.targets.cpu())
-        buckets["target_states"].append(buckets["states"][-1][:, result.prediction_start + 1 :])
-        buckets["codes"].append(result.parameters.cpu())
+        if data.episodes_per_parameter == 2:
+            # Recovery scores each context code against its shared theta. Only
+            # diagnostics flatten views; the objective above keeps groups independent.
+            ids = ids.repeat_interleave(2)
+            states, online, target, codes = (
+                value.flatten(0, 1) for value in (states, online, target, codes)
+            )
+            parameters = parameters.repeat_interleave(2, dim=0)
+        buckets["ids"].append(ids)
+        buckets["states"].append(states)
+        buckets["parameters"].append(parameters)
+        buckets["online"].append(online)
+        buckets["target"].append(target)
+        buckets["target_states"].append(states[:, result.prediction_start + 1 :])
+        buckets["codes"].append(codes)
         for dynamics in result.dynamics:
             for name in ("state", "action", "parameter"):
                 paths = cast(Tensor, getattr(dynamics.graphs, name))
                 counts = (paths > 0).double().sum(0).cpu()
                 graph_counts[name] = graph_counts.get(name, torch.zeros_like(counts)) + counts
-            transition_count += size
+            transition_count += size * data.episodes_per_parameter
     values = {key: torch.cat(items) for key, items in buckets.items()}
     if any(not bool(torch.isfinite(value).all()) for value in values.values()):
         raise FloatingPointError("nonfinite evaluation encodings")
@@ -407,7 +423,17 @@ def evaluate_model(
             ).fingerprint,
             "mcc": "mean absolute Pearson correlation with calibration-only Hungarian assignment",
             "matching_reference": "https://github.com/slachapelle/disentanglement_via_mechanism_sparsity/blob/7fd50ded090a51a7527520f07d933450aa5b872a/metrics.py",
-            "state_rows": "all frames; parameters have one row per distinct episode",
+            "state_rows": (
+                "all frames from both views; parameters have one row per context code "
+                "with shared truth repeated; episode IDs identify independent parameter groups"
+                if base_data.episodes_per_parameter == 2
+                else "all frames; parameters have one row per distinct episode"
+            ),
+            "prediction_context": (
+                "paired episodes: opposite episode's code in both directions"
+                if base_data.episodes_per_parameter == 2
+                else "same-episode context"
+            ),
             "shd": "false positives plus false negatives; no reversal discount",
             "graph_aggregation": (
                 "frequency > predeclared threshold over all test transitions; zero means union"

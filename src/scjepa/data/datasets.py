@@ -221,9 +221,10 @@ class EpisodeWindows(Dataset[dict[str, Tensor]]):
         """Slice frame t with its original action t, retaining original identity."""
         episode_index, start, end = self.window_bounds(index)
         episode = self.dataset[episode_index]
+        time_axis = episode["observations"].ndim - len(self.observation_shape) - 1
         return {
-            "observations": episode["observations"][start:end],
-            "actions": episode["actions"][start : end - 1],
+            "observations": episode["observations"].narrow(time_axis, start, end - start),
+            "actions": episode["actions"].narrow(time_axis, start, end - start - 1),
             "episode_ids": episode["episode_ids"],
         }
 

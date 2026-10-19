@@ -10,6 +10,7 @@ from omegaconf.errors import ConfigKeyError
 from torch import Tensor
 from torch.utils.data import DataLoader
 
+from scjepa.data.controlled_vector import recover_parameters
 from scjepa.data.datasets import EpisodeWindows
 from scjepa.data.factory import build_dgp_dataset, register_dgp, resolve_dgp_config
 from scjepa.data.identity import dataset_fingerprint
@@ -55,9 +56,19 @@ def test_graph_variants_share_exogenous_draws_and_realized_map() -> None:
     assert len({dataset.fingerprint for dataset in datasets}) == 3
 
 
-def test_split_streams_and_ids_are_disjoint_but_observation_map_is_shared() -> None:
+@pytest.mark.parametrize("episodes_per_parameter", [1, 2])
+def test_split_streams_and_ids_are_disjoint_but_observation_map_is_shared(
+    episodes_per_parameter: int,
+) -> None:
     datasets = [
-        build_dgp_dataset(DGPConfig(split=split, num_episodes=2, trajectory_length=3))
+        build_dgp_dataset(
+            DGPConfig(
+                split=split,
+                num_episodes=2,
+                trajectory_length=3,
+                episodes_per_parameter=episodes_per_parameter,
+            )
+        )
         for split in SPLITS
     ]
     ids = [int(dataset[i]["episode_ids"]) for dataset in datasets for i in range(2)]
@@ -65,13 +76,23 @@ def test_split_streams_and_ids_are_disjoint_but_observation_map_is_shared() -> N
     assert len({dataset.fingerprint for dataset in datasets}) == 4
     for dataset in datasets[1:]:
         assert not torch.equal(dataset[0]["observations"], datasets[0][0]["observations"])
+        assert not torch.equal(
+            dataset.ground_truth(0)["parameters"], datasets[0].ground_truth(0)["parameters"]
+        )
         torch.testing.assert_close(dataset.observation_matrix, datasets[0].observation_matrix)
     assert episode_id(2**31 - 1, "test", 2**30 - 1) == 2**63 - 1
     assert len({stream_seed(7, "train", 0, s) for s in ("initial", "parameters", "actions")}) == 3
 
 
-def test_data_workers_access_order_and_global_rng_do_not_change_episodes() -> None:
-    dataset = build_dgp_dataset(DGPConfig(num_episodes=4, trajectory_length=4))
+@pytest.mark.parametrize("episodes_per_parameter", [1, 2])
+def test_data_workers_access_order_and_global_rng_do_not_change_episodes(
+    episodes_per_parameter: int,
+) -> None:
+    dataset = build_dgp_dataset(
+        DGPConfig(
+            num_episodes=4, trajectory_length=4, episodes_per_parameter=episodes_per_parameter
+        )
+    )
     rng_before = torch.get_rng_state()
     direct = {int(dataset[i]["episode_ids"]): dataset[i] for i in (3, 1, 0, 2)}
     torch.testing.assert_close(torch.get_rng_state(), rng_before)
@@ -96,6 +117,42 @@ def test_data_workers_access_order_and_global_rng_do_not_change_episodes() -> No
                     rtol=0,
                 )
         assert observed_ids == set(direct)
+
+
+def test_paired_vector_context_recovers_shared_parameter_and_windows_keep_both_views() -> None:
+    config = DGPConfig(
+        parameter_graph="complementary",
+        num_episodes=2,
+        trajectory_length=5,
+        episodes_per_parameter=2,
+    )
+    dataset = build_dgp_dataset(config)
+    item = dataset[0]
+    truth = dataset.ground_truth(0)
+    assert item["observations"].shape == (2, 5, 10)
+    assert item["actions"].shape == (2, 4, 10)
+    assert item["episode_ids"].ndim == 0
+    assert truth["parameters"].shape == (10,)
+    assert truth["valid_transitions"].shape == (2, 4)
+    assert bool(truth["valid_transitions"].all())
+    recovered = recover_parameters(
+        truth["states"][:, 0], truth["states"][:, 1], truth["actions"][:, 0], "complementary"
+    )
+    torch.testing.assert_close(recovered, truth["parameters"].expand(2, 10), rtol=1e-12, atol=1e-12)
+    assert dataset.observation_shape == (10,)
+    assert len(dataset) == config.num_episodes
+    assert (
+        dataset.fingerprint
+        != build_dgp_dataset(replace(config, episodes_per_parameter=1)).fingerprint
+    )
+    windows = EpisodeWindows(dataset, window_length=3, stride=2)
+    for index in range(len(windows)):
+        group, start, end = windows.window_bounds(index)
+        original = dataset[group]
+        window = windows[index]
+        torch.testing.assert_close(window["observations"], original["observations"][:, start:end])
+        torch.testing.assert_close(window["actions"], original["actions"][:, start : end - 1])
+        torch.testing.assert_close(window["episode_ids"], original["episode_ids"])
 
 
 @pytest.mark.parametrize("family", ["controlled_vector", "coupled_springs"])

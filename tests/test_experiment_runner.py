@@ -44,7 +44,7 @@ def _config(directory: Path) -> ExperimentConfig:
         graphs=("complementary",),
         seeds=(3,),
         train_episodes=4,
-        trajectory_length=5,
+        trajectory_length=3,
         validation_every=1,
         model=ModelConfig(
             observation_dim=10,
@@ -198,6 +198,10 @@ def test_real_three_stage_experiment_artifacts_and_resume_are_reproducible(
     changed.train.objective.state_sparsity_weight *= 2
     with pytest.raises(ValueError, match="definition/source changed"):
         run_experiment(changed, resume=True)
+    changed = copy.deepcopy(config)
+    changed.episodes_per_parameter = 1
+    with pytest.raises(ValueError, match="definition/source changed"):
+        run_experiment(changed, resume=True)
     assert [(directory / "last.pt").stat().st_mtime_ns for directory in paths] == modification_times
 
 
@@ -216,6 +220,10 @@ def test_sparse_runs_load_selected_dense_model_with_fresh_training_state(
         stop_requested: Callable[[], bool] | None = None,
     ) -> dict[str, float]:
         condition = Path(trainer.config.out_dir).name
+        assert trainer.dataset is not None
+        sample = trainer.dataset[0]
+        assert sample["observations"].shape == (2, 3, 10)
+        assert sample["actions"].shape == (2, 2, 10)
         callback = validation_callback
         if condition == "dense":
             assert validation_callback is not None
@@ -360,6 +368,24 @@ def test_external_dense_reference_rejects_old_generator_with_unchanged_config(
 
     monkeypatch.setattr(Trainer, "train", forbidden_train)
     with pytest.raises(ValueError, match="external dense reference dataset generator differs"):
+        run_experiment(config)
+    assert not list(Path(config.output_dir).glob("*/seed-*/*/last.pt"))
+
+
+def test_paired_experiment_rejects_single_episode_dense_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = _config(tmp_path / "single-episode")
+    old.episodes_per_parameter = 1
+    run_experiment(old, condition="dense")
+    config = _config(tmp_path / "paired-episodes")
+    config.dense_reference_dir = old.output_dir
+
+    def forbidden_train(*_args: object, **_kwargs: object) -> dict[str, float]:
+        raise AssertionError("single-episode references must fail before paired sparse training")
+
+    monkeypatch.setattr(Trainer, "train", forbidden_train)
+    with pytest.raises(ValueError, match="external dense reference data configuration differs"):
         run_experiment(config)
     assert not list(Path(config.output_dir).glob("*/seed-*/*/last.pt"))
 
@@ -509,6 +535,9 @@ def test_experiment_defaults_use_sigreg_only() -> None:
     assert config.graphs == ("complementary",)
     assert config.seeds == (0,)
     assert config.tau_multiplier == 1.0
+    assert config.episodes_per_parameter == 2
+    assert config.trajectory_length == 3
+    assert config.data_config("complementary").episodes_per_parameter == 2
 
 
 def test_artifact_identity_uses_actual_matrix_and_rejects_mutation(tmp_path: Path) -> None:

@@ -8,12 +8,17 @@ The default command runs **three models, complementary data, seed 0**, sequentia
 | `baseline` | Parameter-to-output gates forced open; other gates learned | State and action paths |
 | `full` | Learned local SPARTAN gates | State, action and parameter paths |
 
-All three use identical training episodes, data order, and observation map.
-Each independent episode has three frames: two context frames and one prediction
-target. The [vector DGP](data_generation.md#controlled-vector-process) modifies the
-paper's coefficients to strengthen state, parameter and action effects while
+All three use identical paired training data, data order, and observation map.
+Each independent parameter draw generates two episodes, A and B, with independent
+initial states and actions. Each episode has three frames: two context frames and
+one prediction target. A's parameter code predicts B's next state, and B's code
+predicts A's next state, always using the target episode's current state and action.
+The pairing is known during training; true parameter values and graphs are not
+model inputs. The [vector DGP](data_generation.md#controlled-vector-process)
+modifies the paper's coefficients to strengthen state, parameter and action effects while
 retaining its graphs and DGP assumptions. Fresh dense training and tau calibration
-are required for this version; earlier DGP checkpoints and bounds are incompatible.
+are required for this version; earlier single-episode checkpoints and bounds are
+incompatible.
 Baseline and full start from the exact dense best checkpoint used to calibrate
 tau, including its online and EMA state encoders, parameter encoder and predictor.
 Each sparse run starts with a fresh optimizer, GECO controller and step counters;
@@ -38,8 +43,8 @@ Set `dense_reference_dir` to an existing experiment root to reuse its selected
 dense checkpoint and original tau in a new output directory. This runs only
 baseline and full; no new dense run is trained. The reference files remain
 untouched. Compatible dense checkpoints from older source versions are accepted
-after checking the DGP version, architecture, data, base objective, calibration batching,
-observation map and checkpoint hash.
+after checking the DGP version and grouping, architecture, data, base objective,
+calibration batching, observation map and checkpoint hash.
 
 Each fresh sparse run prints one startup line comparing dense, deterministic-gate
 and sampled-gate base losses on the calibration split, with differences and tau.
@@ -48,12 +53,15 @@ training RNG, adds no W&B metrics, and is skipped on checkpoint resume or evalua
 
 ## Model and objective
 
-An independent framewise MLP encodes observations `(B,T,10)` into states.
-The context encoder uses the first two states and their transition action to
-produce one attached `(B,10)` parameter tensor, reused for all predictions.
-A one-lag SPARTAN predicts the complete frozen EMA encoder's next-frame latent.
-For `T=3`, predictions and targets are `(B,1,10)`; actions are `(B,2,10)`.
-The state, parameter and action dimensions remain independent in the reusable model.
+An independent framewise MLP encodes observations `(B,2,T,10)` into states,
+where `B` counts independent parameter groups and the second axis indexes A/B.
+The shared context encoder uses each episode's first two states and their action,
+producing attached parameter codes `(B,2,10)`. These codes are swapped across the
+pair before the one-lag SPARTAN predicts the complete frozen EMA encoder's
+next-frame latent. For `T=3`, predictions and targets are `(B,2,1,10)`; actions are
+`(B,2,2,10)`. Prediction MSE averages both directions. No additional consistency
+loss is introduced. The state, parameter and action dimensions remain independent
+in the reusable model; ordinary single-episode inputs remain supported.
 
 SPARTAN now uses content-dependent queries and keys, hard Bernoulli gates from
 `sigmoid(q @ k)`, and masked attention weights from `softmax(q @ k / sqrt(d))`.
@@ -69,8 +77,10 @@ The non-sparsity objective is
 `base = latent_MSE + ws*SIGReg(states) + wp*SIGReg(parameters) + wl*logit_penalty`.
 
 There is no pixel decoder, reconstruction loss, variational KL term or duplicate
-parameter encoder. SIGReg sample axes are unchanged: episodes at each frame for
-states, and one code per distinct episode for parameters.
+parameter encoder. SIGReg is calculated separately for each episode view across
+`B` independent parameter groups, at each frame for states and once per view for
+parameter codes, then averaged over the two views. The two codes of one parameter
+are never treated as independent samples in a `2B` SIGReg batch.
 
 Following the newer SPARTAN paper's loss-constrained optimization, sparse training
 minimizes weighted path counts subject to `E[base] <= tau`. The implemented primal
@@ -82,8 +92,12 @@ accepted optimizer step, averaging accumulation groups and distributed ranks.
 Skipped updates advance neither controller. Full controller state is checkpointed.
 The runner requires `evaluation.batch_size = train.batch_size / world_size` and
 held-out split sizes divisible by that batch size: SIGReg depends on the number
-of episodes in each statistical batch. For distributed runs, explicitly set the
-evaluation batch to the per-rank training batch.
+of independent groups in each statistical batch. For distributed runs, explicitly
+set the evaluation batch to the per-rank training batch. The existing configuration
+counts (`train_episodes` and held-out `*_episodes`) now denote groups: defaults are
+8,192 training, 512 calibration, 256 validation and 512 test groups. Each group
+contains two trajectories; `batch_size=64` therefore processes 128 trajectories
+while each SIGReg statistic still uses 64 independent parameter draws.
 
 The selected dense checkpoint is evaluated on the independent calibration split.
 Its mean **base loss**, not MSE alone, becomes tau. `tau_multiplier=1.0` uses that
@@ -158,14 +172,14 @@ python -u scripts/run_controlled_experiment.py \
   --condition dense \
   train.device=cuda \
   wandb.mode=online \
-  wandb.group=exp4_dense_decay \
-  output_dir=outputs/exp4_dense_decay \
-  2>&1 | tee -a logs/exp4_dense_decay.log
+  wandb.group=exp5_paired_context \
+  output_dir=outputs/exp5_paired_context \
+  2>&1 | tee -a logs/exp5_paired_context.log
 ```
 
 Detach with **Ctrl-b, then d**; return with `tmux attach -t scjepa-geco`.
-This command trains and evaluates only a fresh dense model, with cosine decay,
-then calibrates tau from its selected checkpoint. Inspect prediction and base loss
+This command trains and evaluates only a fresh dense model on paired episodes,
+with cosine decay, then calibrates tau from its selected checkpoint. Inspect prediction and base loss
 on training and validation before proceeding to sparsification. To run baseline
 and full afterward, repeat the same command with `--resume` and remove
 `--condition dense`; the completed dense stage is skipped and both sparse models
@@ -189,10 +203,11 @@ Use a **new output directory** for this protocol. Earlier GECO runs that started
 sparse models from random initialization or learned the baseline parameter gates,
 as well as identity-attention/fixed-weight runs, have different source and model
 provenance and cannot be resumed as this comparison.
-Only a dense checkpoint and calibration record from the same DGP version can be
-reused through `dense_reference_dir`, subject to the remaining compatibility checks.
-The earlier weak-coupling and long-trajectory experiment needs fresh dense training
-and tau for this comparison. Existing outputs, checkpoints and logs are preserved.
+Only a dense checkpoint and calibration record from the same DGP version and
+episode grouping can be reused through `dense_reference_dir`, subject to the
+remaining compatibility checks. Earlier single-episode, weak-coupling and
+long-trajectory experiments need fresh dense training and tau for this comparison.
+Existing outputs, checkpoints and logs are preserved.
 
 A tiny CPU check of all three stages (not a scientific run):
 

@@ -56,7 +56,7 @@ class ControlledVectorDGP:
     def specification(self) -> dict[str, object]:
         """Describe prescribed dynamics and fixed realized observation map."""
         return _common_specification(self.config) | {
-            "generator_version": "controlled-vector-positive-v2",
+            "generator_version": "controlled-vector-positive-paired-v3",
             "family": self.config.family,
             "parameter_graph": self.config.parameter_graph,
             "action_dim": 10,
@@ -64,6 +64,8 @@ class ControlledVectorDGP:
             "minimum_prediction_start": 0,
             "minimum_context_len": 2,
             "observation_shape": [10],
+            "episodes_per_parameter": self.config.episodes_per_parameter,
+            "dataset_item": "one parameter draw with independent initial states and actions",
             "dynamics": {
                 "interaction": "F[i,j]=(1+a[i]**2)*(1+a[j]**3)",
                 "state_self": 0.5,
@@ -115,7 +117,7 @@ class ControlledVectorDGP:
                 "actions": draws.actions,
                 "state_matrices": a_matrix,
                 "parameter_matrices": b_matrix,
-                "valid_transitions": torch.ones(draws.actions.shape[0], dtype=torch.bool),
+                "valid_transitions": torch.ones(draws.actions.shape[:-1], dtype=torch.bool),
             },
         )
 

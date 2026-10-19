@@ -20,29 +20,36 @@ class ExogenousDraws:
 
 
 def sample_controlled_vector(config: DGPConfig, index: int) -> ExogenousDraws:
-    """Draw independent standard Gaussian states/parameters and uniform actions."""
+    """Draw independent initial states/actions, sharing theta within an optional pair."""
     if not 0 <= index < config.num_episodes:
         raise IndexError(index)
-    initial = torch.randn(
-        10,
-        dtype=torch.float64,
-        generator=generator(config.root_seed, config.split, index, "initial_position"),
-    )
+    initial_generator = generator(config.root_seed, config.split, index, "initial_position")
+    action_generator = generator(config.root_seed, config.split, index, "actions")
+    # Draw one trajectory at a time so enabling a pair preserves the first view.
+    initial_views = [
+        torch.randn(10, dtype=torch.float64, generator=initial_generator)
+        for _ in range(config.episodes_per_parameter)
+    ]
     parameters = torch.randn(
         10,
         dtype=torch.float64,
         generator=generator(config.root_seed, config.split, index, "parameters"),
     )
-    actions = (
-        2
-        * torch.rand(
-            config.trajectory_length - 1,
-            10,
-            dtype=torch.float64,
-            generator=generator(config.root_seed, config.split, index, "actions"),
+    action_views = [
+        (
+            2
+            * torch.rand(
+                config.trajectory_length - 1,
+                10,
+                dtype=torch.float64,
+                generator=action_generator,
+            )
+            - 1
         )
-        - 1
-    )
+        for _ in range(config.episodes_per_parameter)
+    ]
+    initial = initial_views[0] if config.episodes_per_parameter == 1 else torch.stack(initial_views)
+    actions = action_views[0] if config.episodes_per_parameter == 1 else torch.stack(action_views)
     return ExogenousDraws(initial, parameters, actions)
 
 

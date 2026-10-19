@@ -25,10 +25,13 @@ identity validation; do not silently change distributions or renderer precision.
 The controlled-vector protocol lives in `scjepa.experiments`; follow
 `docs/controlled_experiment.md`. The default sequence is dense tau calibration,
 baseline, full on complementary data and one seed. The approved vector DGP modifies
-the paper's coefficients and uses independent three-frame episodes (K=2, L=1);
-follow `docs/data_generation.md`. Earlier DGP versions require fresh dense training
-and tau calibration. Baseline forces parameter-source columns to decoded latest-state
-receiver rows open in every SPARTAN layer during training and evaluation, with zero
+the paper's coefficients and uses two three-frame episodes per independent parameter
+draw (K=2, L=1), with independent initial states/actions and prediction across
+episodes in both directions; follow `docs/data_generation.md`. Dataset and batch
+counts denote parameter groups. Apply SIGReg separately to each view across groups,
+without treating two views of the same parameter as independent samples. Earlier
+single-episode DGP versions require fresh dense training and tau calibration.
+Baseline forces parameter-source columns to decoded latest-state receiver rows open in every SPARTAN layer during training and evaluation, with zero
 parameter sparsity weight. Full learns those gates and adds the parameter penalty.
 Both retain learned attention weights, all other learned gates, state/action
 regularization, active logit regularization and GECO. Preserve the shared calibrated

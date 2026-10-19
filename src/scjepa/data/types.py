@@ -38,6 +38,8 @@ class DGPConfig:
     ``dtype`` is the stored/training dtype; simulation and reference ground truth
     use float64. Graph variants never enter sampling seeds. Context length belongs
     to the model configuration; the spring preset supplies eight frames there.
+    ``num_episodes`` counts independent parameter draws; with
+    ``episodes_per_parameter=2``, each dataset item contains two trajectories.
     """
 
     family: str = "controlled_vector"
@@ -45,6 +47,7 @@ class DGPConfig:
     root_seed: int = 0
     split: str = "train"
     num_episodes: int = 8
+    episodes_per_parameter: int = 1
     trajectory_length: int = 16
     dtype: str = "float32"
     observation_seed: int = 1729
@@ -82,6 +85,10 @@ class DGPConfig:
             )
         if not 1 <= self.num_episodes <= 2**30:
             raise ValueError("num_episodes must be in [1,2**30]")
+        if self.episodes_per_parameter not in (1, 2):
+            raise ValueError("episodes_per_parameter must be 1 or 2")
+        if self.episodes_per_parameter == 2 and self.family != "controlled_vector":
+            raise ValueError("paired episodes are supported only for controlled_vector")
         minimum = 3 if self.family == "coupled_springs" else 2
         if self.trajectory_length < minimum:
             raise ValueError(f"trajectory_length must be at least {minimum}")
@@ -138,7 +145,7 @@ class TransitionJacobians:
 
 @dataclass(frozen=True)
 class ScientificEpisode:
-    """One generated episode with a deliberately separate evaluation payload."""
+    """One episode or shared-parameter pair with a separate evaluation payload."""
 
     observations: Tensor
     actions: Tensor

@@ -51,7 +51,8 @@ class ExperimentConfig:
     ``train.objective.parameter_sparsity_weight`` is the full-model weight.
     The baseline sets that weight to zero and forces direct parameter-to-output
     gates open. Model seeds do not change the scientific data seed, observation
-    matrix, or calibration/test splits.
+    matrix, or calibration/test splits. With paired episodes, dataset counts and
+    batch sizes count independent parameter groups, each containing two trajectories.
     """
 
     name: str = "complementary-geco"
@@ -61,6 +62,7 @@ class ExperimentConfig:
     seeds: tuple[int, ...] = (0,)
     train_episodes: int = 8192
     trajectory_length: int = 3
+    episodes_per_parameter: int = 2
     data_seed: int = 0
     observation_seed: int = 1729
     validation_every: int = 1000
@@ -154,6 +156,7 @@ class ExperimentConfig:
             observation_seed=self.observation_seed,
             num_episodes=self.train_episodes,
             trajectory_length=self.trajectory_length,
+            episodes_per_parameter=self.episodes_per_parameter,
         )
 
     def condition_model(self, condition: str) -> ModelConfig:

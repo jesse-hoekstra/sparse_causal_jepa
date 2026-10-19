@@ -12,8 +12,9 @@ RegularizerKind = Literal["none", "sigreg"]
 class RepresentationRegularizer(nn.Module):
     """Regularize independent episodes along axis 1 of ``(groups, B, D)``.
 
-    For state representations each time is a separate group. For time-constant
-    parameters there is exactly one group, never repeated parameter samples.
+    For state representations each time and episode view is a separate group.
+    For time-constant parameters each view is a separate group. The independent
+    sample axis never pools two episodes that share the same true parameter.
     These distributional penalties do not establish injectivity or identifiability.
     """
 

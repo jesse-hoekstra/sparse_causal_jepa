@@ -66,6 +66,36 @@ def test_spring_distributions_initialization_choices_and_unused_action_sampling(
     torch.testing.assert_close(changed.initial_velocity, draws[0].initial_velocity, rtol=0, atol=0)
 
 
+def test_paired_vector_draws_share_parameters_and_preserve_independent_streams() -> None:
+    config = DGPConfig(num_episodes=256, trajectory_length=3, root_seed=19)
+    paired = replace(config, episodes_per_parameter=2)
+    reference = sample_controlled_vector(config, 0)
+    first = sample_controlled_vector(paired, 0)
+    torch.testing.assert_close(first.parameters, reference.parameters, rtol=0, atol=0)
+    torch.testing.assert_close(
+        first.initial_position[0], reference.initial_position, rtol=0, atol=0
+    )
+    torch.testing.assert_close(first.actions[0], reference.actions, rtol=0, atol=0)
+    assert first.initial_position.shape == (2, 10)
+    assert first.actions.shape == (2, 2, 10)
+    draws = [sample_controlled_vector(paired, index) for index in range(config.num_episodes)]
+    states = torch.stack([draw.initial_position for draw in draws])
+    parameters = torch.stack([draw.parameters for draw in draws])
+    actions = torch.stack([draw.actions for draw in draws])
+    assert not torch.equal(states[:, 0], states[:, 1])
+    assert not torch.equal(actions[:, 0], actions[:, 1])
+    assert abs(float((states[:, 0] * states[:, 1]).mean())) < 0.06
+    assert abs(float((states * parameters[:, None]).mean())) < 0.06
+    assert abs(float((actions[:, 0] * actions[:, 1]).mean())) < 0.025
+    for variant in ("dense", "complementary", "diagonal"):
+        repeated = sample_controlled_vector(replace(paired, parameter_graph=variant), 0)
+        torch.testing.assert_close(repeated.parameters, first.parameters, rtol=0, atol=0)
+        torch.testing.assert_close(
+            repeated.initial_position, first.initial_position, rtol=0, atol=0
+        )
+        torch.testing.assert_close(repeated.actions, first.actions, rtol=0, atol=0)
+
+
 def test_stream_addresses_and_configs_reject_invalid_values() -> None:
     for kwargs in (
         {"root_seed": -1},
@@ -79,6 +109,10 @@ def test_stream_addresses_and_configs_reject_invalid_values() -> None:
         DGPConfig(position_mean=1)
     with pytest.raises(ValueError, match="diagonal"):
         DGPConfig(family="coupled_springs", parameter_graph="dense")
+    with pytest.raises(ValueError, match="episodes_per_parameter"):
+        DGPConfig(episodes_per_parameter=3)
+    with pytest.raises(ValueError, match="only for controlled_vector"):
+        DGPConfig(family="coupled_springs", episodes_per_parameter=2)
     with pytest.raises(ValueError, match="address"):
         episode_id(0, "train", 2**30)
     with pytest.raises(ValueError, match="stream"):

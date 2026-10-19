@@ -3,8 +3,8 @@
 The graph structure and spring process follow
 `sources/Parameter_and_State_Identifiability.pdf`, Sections 10.1 and 10.4. The vector
 process below is a user-approved modification of Section 10.2, with stronger
-couplings and three-frame episodes. This layer supplies data, reference calculations
-and structural graphs. Training/evaluation protocols remain separate choices.
+couplings and paired three-frame episodes. This layer supplies data, reference
+calculations and structural graphs. Training/evaluation protocols remain separate choices.
 
 ## Selecting data
 
@@ -17,9 +17,9 @@ from scjepa.data.types import DGPConfig
 vector = build_dgp_dataset(DGPConfig(
     family="controlled_vector", parameter_graph="complementary",
     root_seed=17, observation_seed=1729, split="train",
-    num_episodes=8, trajectory_length=3,
+    num_episodes=8, trajectory_length=3, episodes_per_parameter=2,
 ))
-training_episode = vector[0]       # observations, actions, episode_ids only
+training_pair = vector[0]         # observations, actions, episode_ids only
 references = vector.ground_truth(0)  # explicit evaluation-only access
 ```
 
@@ -28,9 +28,14 @@ references = vector.ground_truth(0)  # explicit evaluation-only access
 | `controlled_vector` | `(10,)` | `10 / 10 / 10` | 1 |
 | `coupled_springs` | `(3,320,64)` | `10 / 10 / 5` | 2 |
 
-Dataset items have observations `(T,*observation_shape)`, actions `(T-1,d_a)`,
-and a scalar int64 `episode_ids`. Latents, parameters, masses, force histories,
-coefficient matrices and `valid_transitions` live only in `ground_truth(index)`.
+Single-episode dataset items have observations `(T,*observation_shape)`, actions
+`(T-1,d_a)`, and a scalar int64 `episode_ids`. With vector
+`episodes_per_parameter=2`, one item is a parameter group: observations `(2,T,10)`,
+actions `(2,T-1,10)`, and one scalar group ID in `episode_ids`. `num_episodes`
+counts groups in this mode, so 8 items contain 16 trajectories. The generic
+`DGPConfig` defaults to one episode; the controlled experiment selects two.
+Latents, parameters, masses, force histories, coefficient matrices and
+`valid_transitions` live only in `ground_truth(index)`.
 Graphs and observation-map assets are separate dataset metadata. None of these
 labels or true graph locations are passed to the model or loss.
 
@@ -45,8 +50,9 @@ settings never select sparsity weights or turn true graphs into predictor masks.
 
 The dimensions `d_z=d_theta=d_a=10`, `L=1`, and graphs match the paper.
 The following coefficients replace its original `epsilon=1/40` construction.
-For every episode, `z0` and `theta` are independent `N(0,I10)` vectors and actions
-are independent `Uniform(-1,1)` coordinates. The same theta is used throughout:
+Each parameter group draws `theta ~ N(0,I10)` once, then independently draws
+`z0 ~ N(0,I10)` and `Uniform(-1,1)` action coordinates for episodes A and B.
+The same theta is used throughout both episodes:
 
 ```
 F[i,j](a) = (1 + a[i]**2) * (1 + a[j]**3)
@@ -59,11 +65,16 @@ z[t+1] = A(a[t]) @ z[t] + B_G(a[t]) @ theta
 Here `*` between matrices denotes elementwise multiplication. Rows index outputs
 and columns index inputs; `F` is not transposed.
 
-The experiment samples independent three-frame episodes `z0 -> z1 -> z2`: the
-first transition provides the two-frame parameter context, and the second is the
-prediction target. This avoids averaging over long trajectories whose current
-state nearly reveals theta. Coupling strengths are initial design choices; they
-do not guarantee a loss margin for every edge under a learned representation.
+Each episode contains three frames `z0 -> z1 -> z2`: the first transition provides
+the two-frame parameter context, and the second is the prediction target. Training
+uses A's context-derived parameter code to predict B's next state, and B's code to
+predict A's next state. The current state and prediction action always come from
+the target episode. This supplies known same-parameter grouping without passing
+true parameter values or graphs to training. Independent initial states/actions
+make shared parameter information useful across episodes; no new consistency
+loss is added. Short trajectories avoid averaging over later states that nearly
+reveal theta. These choices do not guarantee learned parameter separation or a
+loss margin for every edge under a learned representation.
 
 | Parameter variant | G | State / action / parameter union edge counts |
 |---|---|---|
@@ -178,20 +189,24 @@ numerical proofs of identifiability or learned representation quality.
 ## Reproducibility, windows and bundles
 
 Initialization, parameters and actions use independently addressed CPU generators.
-A versioned SHA256 derivation uses root seed, split, episode index and stream label;
-no global RNG, worker number, batch size, access order or graph variant enters.
+A versioned SHA256 derivation uses root seed, split, episode/group index and stream
+label; no global RNG, worker number, batch size, access order or graph variant enters.
 The four splits are `train`, `validation`, `evaluation_calibration`, `test`.
-IDs pack a 31-bit nonnegative root seed, two-bit split, and 30-bit episode index
-injectively into int64. Split addresses are disjoint. Graph variants intentionally
-share original episode IDs and exogenous draws for paired comparisons.
+IDs pack a 31-bit nonnegative root seed, two-bit split, and 30-bit episode/group
+index injectively into int64. For paired vectors, independent initial states and
+actions are drawn successively from their group streams; the parameter stream
+supplies the one shared vector. Split addresses are disjoint and parameter draws
+are independent; training, calibration, validation and test never share groups. Graph variants
+intentionally share original group IDs and exogenous draws for comparisons.
 
 `EpisodeWindows(dataset, window_length, stride)` retains the original ID and
-slices action `t` with source frame `t`. `window_bounds` exposes original frame
-indices and `original_ground_truth` returns full original references. Parameter
-regularization still rejects multiple windows from one episode in a microbatch.
+slices action `t` with source frame `t`, preserving both views for paired vectors.
+`window_bounds` exposes original frame indices and `original_ground_truth` returns full original references. Parameter
+regularization still rejects multiple windows from one episode/group in a microbatch.
 
-Retrieval renders one episode on demand and caches no dataset-sized tensor.
-`save_dataset_bundle` uses the same generator and writes one episode at a time:
+Retrieval renders one episode or parameter group on demand and caches no
+dataset-sized tensor. `save_dataset_bundle` uses the same generator and writes
+one item at a time:
 
 ```
 manifest.json          version, resolved config/specification, graph masks,
@@ -204,7 +219,7 @@ ground_truth/00000000.pt  separate scientific tensors
 Renderer settings are in the manifest. Saves refuse existing destinations and
 publish only after successful staging. Loading uses tensor-only deserialization,
 validates provenance, paths, IDs and checksums, and checks each shard again on read.
-Memory scales with an episode, not all video episodes; checksum verification scans
+Memory scales with one item, not all video episodes; checksum verification scans
 files with bounded memory. Checksums ensure integrity, not cryptographic authorship.
 
 Generated `.fingerprint` identifies the resolved process, masks and realized map.
@@ -224,11 +239,12 @@ used directly. Default CLI models and presets use float32.
 
 ## Commands and extension
 
-Inspect one small episode without writing data:
+Inspect one small vector pair or spring episode without writing data:
 
 ```bash
 python scripts/generate_data.py --config configs/data/controlled_vector.yaml \
-  --diagnostics parameter_graph=complementary num_episodes=1 trajectory_length=3
+  --diagnostics parameter_graph=complementary num_episodes=1 trajectory_length=3 \
+  episodes_per_parameter=2
 python scripts/generate_data.py --config configs/data/coupled_springs.yaml \
   num_episodes=1 trajectory_length=9
 ```

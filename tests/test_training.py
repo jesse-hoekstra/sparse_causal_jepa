@@ -295,6 +295,77 @@ def test_parameter_regularizer_uses_one_sample_per_distinct_episode(
     trainer.save_checkpoint(tmp_path / "regularized.pt")
 
 
+def test_paired_objective_averages_directions_and_regularizes_independent_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = Trainer(
+        tiny_model(),
+        TrainConfig(
+            batch_size=4,
+            out_dir=str(tmp_path),
+            objective=ObjectiveConfig(
+                state_regularizer="sigreg",
+                parameter_regularizer="sigreg",
+                state_regularizer_weight=0.1,
+                parameter_regularizer_weight=0.2,
+                regularizer_num_projections=8,
+            ),
+        ),
+    )
+    state_samples: list[Tensor] = []
+    parameter_samples: list[Tensor] = []
+    state_forward = trainer.objective.state_regularizer.forward
+    parameter_forward = trainer.objective.parameter_regularizer.forward
+
+    def record_states(samples: Tensor) -> Tensor:
+        state_samples.append(samples)
+        return state_forward(samples)
+
+    def record_parameters(samples: Tensor) -> Tensor:
+        parameter_samples.append(samples)
+        return parameter_forward(samples)
+
+    monkeypatch.setattr(trainer.objective.state_regularizer, "forward", record_states)
+    monkeypatch.setattr(trainer.objective.parameter_regularizer, "forward", record_parameters)
+    batch = {
+        "observations": torch.randn(4, 2, 5, 6),
+        "actions": torch.randn(4, 2, 4, 1),
+        "episode_ids": torch.arange(4),
+    }
+    output = trainer.model(batch["observations"], batch["actions"])
+    rng = torch.get_rng_state()
+    loss, terms = trainer.objective(output)
+    expected_prediction = (
+        sum(
+            (output.predictions[:, view] - output.targets[:, view]).square().mean()
+            for view in range(2)
+        )
+        / 2
+    )
+    torch.testing.assert_close(terms["prediction"], expected_prediction)
+    expected_states = torch.stack(
+        [output.online_states[:, view, time] for view in range(2) for time in range(5)]
+    )
+    expected_parameters = torch.stack([output.parameters[:, view] for view in range(2)])
+    assert state_samples[0].shape == (10, 4, 3)
+    assert parameter_samples[0].shape == (2, 4, 2)
+    torch.testing.assert_close(state_samples[0], expected_states)
+    torch.testing.assert_close(parameter_samples[0], expected_parameters)
+    torch.set_rng_state(rng)
+    expected = (
+        expected_prediction
+        + 0.1 * state_forward(expected_states)
+        + 0.2 * parameter_forward(expected_parameters)
+    )
+    torch.testing.assert_close(loss, expected)
+    metrics = trainer.train_step(batch)
+    assert metrics["health/updated"] == 1
+    assert trainer.optimizer_steps == 1
+    batch["episode_ids"] = torch.tensor([0, 1, 1, 2])
+    with pytest.raises(ValueError, match="distinct episodes"):
+        trainer.train_step(batch)
+
+
 class _TensorEpisodes(Dataset[dict[str, Tensor]]):
     def __init__(self, count: int = 12) -> None:
         self.observations = torch.randn(count, 5, 6)
