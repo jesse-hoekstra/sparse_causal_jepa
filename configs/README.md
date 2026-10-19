@@ -1,8 +1,8 @@
 # Configuration
 
 `experiments/controlled_vector.yaml` defines dense calibration and two GECO models on
-complementary data with seed 0 and two three-frame episodes per parameter vector
-(K=2, L=1), with prediction across the two episodes in both directions;
+complementary data with seed 0 and two four-frame episodes per parameter vector
+(K=2, L=1), with two-step autoregressive prediction across the episodes in both directions;
 `experiments/controlled_vector_smoke.yaml` checks its infrastructure with two CPU
 microbatches. Use them with `scripts/run_controlled_experiment.py`, not the generic
 Hydra entrypoint. Both require SIGReg for state and parameter regularization.
@@ -11,12 +11,16 @@ selection, W&B, selectors, and reproducibility rules.
 
 The vector coefficients are an approved modification of the paper's DGP, described
 in [data generation](../docs/data_generation.md). Train a fresh dense reference and
-calibrate tau for this version; earlier single-episode and weak-coupling runs are
+calibrate tau for this version; earlier one-step, teacher-forced, single-episode and weak-coupling runs are
 incompatible. `episodes_per_parameter=2` preserves independent initial states and
 actions within each group. `train_episodes`, evaluation episode counts and batch
 sizes count parameter groups: 8,192 training groups contain 16,384 trajectories,
 and batch size 64 contains 128 trajectories. SIGReg uses each view separately
 across 64 independent groups. No additional consistency-loss weight is needed.
+The experiment sets `model.autoregressive=true`: each rollout keeps the partner's
+parameter code fixed and feeds the first prediction into the second step.
+Prediction loss averages both steps and both directions. Generic model defaults
+retain teacher forcing with `model.autoregressive=false`.
 
 Set `dense_reference_dir` to a compatible experiment root with a new `output_dir`
 to reuse its selected dense checkpoint and original tau. This runs only baseline

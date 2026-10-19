@@ -19,13 +19,14 @@ from scjepa.training import GECOConfig, ObjectiveConfig, TrainConfig, Trainer, T
 from scjepa.training.lagrangian import SparsityLagrangian
 
 
-def tiny_model() -> SCJEPA:
+def tiny_model(autoregressive: bool = False) -> SCJEPA:
     return SCJEPA(
         VectorEncoder(6, 3, (8,)),
         ParameterEncoder(3, 2, action_dim=1, dim=8, num_heads=2, max_history=5),
         Spartan(3, 2, action_dim=1, history_len=2, num_layers=1, embed_dim=8, mlp_hidden_size=8),
         context_len=3,
         ema_decay=0.8,
+        autoregressive=autoregressive,
     )
 
 
@@ -295,11 +296,12 @@ def test_parameter_regularizer_uses_one_sample_per_distinct_episode(
     trainer.save_checkpoint(tmp_path / "regularized.pt")
 
 
+@pytest.mark.parametrize("autoregressive", [False, True])
 def test_paired_objective_averages_directions_and_regularizes_independent_groups(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, autoregressive: bool
 ) -> None:
     trainer = Trainer(
-        tiny_model(),
+        tiny_model(autoregressive=autoregressive),
         TrainConfig(
             batch_size=4,
             out_dir=str(tmp_path),
@@ -333,14 +335,16 @@ def test_paired_objective_averages_directions_and_regularizes_independent_groups
         "episode_ids": torch.arange(4),
     }
     output = trainer.model(batch["observations"], batch["actions"])
+    assert output.predictions.shape == (4, 2, 2, 3)
     rng = torch.get_rng_state()
     loss, terms = trainer.objective(output)
     expected_prediction = (
         sum(
-            (output.predictions[:, view] - output.targets[:, view]).square().mean()
+            (output.predictions[:, view, step] - output.targets[:, view, step]).square().mean()
             for view in range(2)
+            for step in range(2)
         )
-        / 2
+        / 4
     )
     torch.testing.assert_close(terms["prediction"], expected_prediction)
     expected_states = torch.stack(

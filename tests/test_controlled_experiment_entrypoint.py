@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import subprocess
 import sys
@@ -6,6 +7,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+import torch
 
 from scjepa.data.datasets import canonical_fingerprint
 from scjepa.experiments.config import load_experiment_config
@@ -43,10 +45,11 @@ def _invoke(tmp_path: Path, *arguments: str) -> subprocess.CompletedProcess[str]
 @pytest.mark.parametrize("name", ["controlled_vector", "controlled_vector_smoke"])
 def test_shipped_configs_resolve_to_sigreg_only(name: str) -> None:
     config = load_experiment_config(CONFIGS / f"{name}.yaml", ["wandb.mode=disabled"])
-    assert config.trajectory_length == 3
+    assert config.trajectory_length == 4
     assert config.episodes_per_parameter == 2
     assert config.model.context_len == 2
     assert config.model.history_len == 1
+    assert config.model.autoregressive
     assert config.dense_reference_dir is None
     assert config.train.objective.state_regularizer == "sigreg"
     assert config.train.objective.parameter_regularizer == "sigreg"
@@ -149,6 +152,7 @@ def test_tiny_cpu_cli_runs_dense_first_then_resumes_three_stage_comparison(tmp_p
         f"output_dir={output}",
         "wandb.mode=disabled",
         "train.device=cpu",
+        "train.lr_decay_steps=1",
     )
     result = _invoke(tmp_path, *arguments, "--condition", "dense")
     assert result.returncode == 0, result.stderr
@@ -160,8 +164,12 @@ def test_tiny_cpu_cli_runs_dense_first_then_resumes_three_stage_comparison(tmp_p
     assert not (parent / "full").exists()
     assert read_json(output / "summary.json")["completed_runs"] == 1
     dense_training = cast(dict[str, object], read_json(dense / "run_config.json")["train"])
-    assert dense_training["lr_decay_steps"] == 2
+    assert dense_training["lr_decay_steps"] == 1
     assert dense_training["lr_final_ratio"] == 0.1
+    checkpoint = torch.load(dense / "last.pt", weights_only=False)
+    assert checkpoint["model_config"]["autoregressive"] is True
+    assert checkpoint["step"] == checkpoint["optimizer_steps"] == 2
+    assert math.isclose(checkpoint["optimizer"]["param_groups"][0]["lr"], 0.0001)
     dense_checkpoint_mtime = (dense / "last.pt").stat().st_mtime_ns
 
     result = _invoke(tmp_path, *arguments, "--resume")
@@ -184,13 +192,15 @@ def test_tiny_cpu_cli_runs_dense_first_then_resumes_three_stage_comparison(tmp_p
     definition = cast(dict[str, object], manifest["definition"])
     assert definition["seeds"] == [0]
     assert definition["graphs"] == ["complementary"]
-    assert definition["trajectory_length"] == 3
+    assert definition["trajectory_length"] == 4
+    assert cast(dict[str, object], definition["model"])["autoregressive"] is True
     assert definition["episodes_per_parameter"] == 2
     assert "condition" not in definition
     run = read_json(parent / "baseline/run_config.json")
     data = cast(dict[str, object], run["data"])
     assert data["episodes_per_parameter"] == 2
-    assert data["trajectory_length"] == 3
+    assert data["trajectory_length"] == 4
+    assert cast(dict[str, object], run["model"])["autoregressive"] is True
     training = cast(dict[str, object], run["train"])
     assert training["lr_decay_steps"] is None
     full_training = cast(dict[str, object], read_json(parent / "full/run_config.json")["train"])

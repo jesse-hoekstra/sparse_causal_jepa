@@ -1,7 +1,7 @@
 """Controlled vector process with stronger action-dependent coupling.
 
 The graph setup follows the manuscript; the coefficients implement the revised
-three-frame experiment documented in ``docs/data_generation.md``.
+four-frame experiment documented in ``docs/data_generation.md``.
 Rows of every coefficient/Jacobian are output coordinates; columns are inputs.
 Scientific functions use float64, retain autograd, and accept arbitrary batch
 axes. Ground truth and recovery helpers are evaluation-only, never learner input.

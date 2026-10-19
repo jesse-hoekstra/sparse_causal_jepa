@@ -7,7 +7,7 @@ graphs: [complementary]
 seeds: [0]
 # Counts and batch sizes are independent parameter groups (two trajectories each).
 train_episodes: 8192
-trajectory_length: 3
+trajectory_length: 4
 episodes_per_parameter: 2
 data_seed: 0
 observation_seed: 1729
@@ -22,6 +22,7 @@ model:
   action_dim: 10
   context_len: 2
   history_len: 1
+  autoregressive: true
   encoder_hidden_dims: [64, 64]
   parameter_embed_dim: 64
   parameter_heads: 4

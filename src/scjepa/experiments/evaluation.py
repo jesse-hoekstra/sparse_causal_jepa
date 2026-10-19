@@ -434,12 +434,14 @@ def evaluate_model(
                 if base_data.episodes_per_parameter == 2
                 else "same-episode context"
             ),
+            "prediction_mode": "autoregressive" if model.autoregressive else "teacher_forced",
             "shd": "false positives plus false negatives; no reversal discount",
             "graph_aggregation": (
                 "frequency > predeclared threshold over all test transitions; zero means union"
             ),
             "graph_semantics": (
-                "residual-inclusive local value-routing support conditional on inferred "
+                "residual-inclusive local one-step value-routing support at each predictor "
+                "call, without composing paths across rollout steps; conditional on inferred "
                 "parameters; not a causal guarantee"
             ),
             "graph_alignment": (
