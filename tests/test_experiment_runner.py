@@ -14,6 +14,7 @@ from torch import Tensor
 
 import scjepa.models.spartan as spartan_module
 from scjepa.data.identity import training_tensors_fingerprint
+from scjepa.data.processes import ControlledVectorDGP
 from scjepa.experiments import storage
 from scjepa.experiments.config import ExperimentConfig, load_experiment_config
 from scjepa.experiments.evaluation import EvaluationConfig
@@ -329,6 +330,35 @@ def test_external_legacy_dense_reference_is_reused_without_modifying_it(
         stream.write(b"changed")
     with pytest.raises(ValueError, match="provenance|checkpoint"):
         run_experiment(config, resume=True)
+
+
+def test_external_dense_reference_rejects_old_generator_with_unchanged_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = _config(tmp_path / "old-dynamics")
+    specification = ControlledVectorDGP.specification
+
+    def legacy_specification(process: ControlledVectorDGP) -> dict[str, object]:
+        result = specification(process)
+        result.pop("dynamics")
+        result["generator_version"] = "paper-dgps-v1"
+        result["epsilon"] = 1 / 40
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ControlledVectorDGP, "specification", legacy_specification)
+        run_experiment(old, condition="dense")
+    config = _config(tmp_path / "new-dynamics")
+    config.dense_reference_dir = old.output_dir
+    assert config.data_config("complementary") == old.data_config("complementary")
+
+    def forbidden_train(*_args: object, **_kwargs: object) -> dict[str, float]:
+        raise AssertionError("old generator references must fail before sparse training")
+
+    monkeypatch.setattr(Trainer, "train", forbidden_train)
+    with pytest.raises(ValueError, match="external dense reference dataset generator differs"):
+        run_experiment(config)
+    assert not list(Path(config.output_dir).glob("*/seed-*/*/last.pt"))
 
 
 @pytest.mark.parametrize("problem", ["architecture", "data", "batch", "map", "hash", "missing"])

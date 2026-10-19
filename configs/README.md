@@ -1,15 +1,19 @@
 # Configuration
 
 `experiments/controlled_vector.yaml` defines dense calibration and two GECO models on
-complementary data with seed 0;
+complementary data with seed 0 and independent three-frame episodes (K=2, L=1);
 `experiments/controlled_vector_smoke.yaml` checks its infrastructure with two CPU
 microbatches. Use them with `scripts/run_controlled_experiment.py`, not the generic
 Hydra entrypoint. Both require SIGReg for state and parameter regularization.
 See [the experiment guide](../docs/controlled_experiment.md) for configuration,
 selection, W&B, selectors, and reproducibility rules.
 
-Set `dense_reference_dir=outputs/exp1` with a new `output_dir` to reuse that
-experiment's selected dense checkpoint and original tau. This runs only baseline
+The vector coefficients are an approved modification of the paper's DGP, described
+in [data generation](../docs/data_generation.md). Train a fresh dense reference and
+calibrate tau for this version; earlier weak-coupling runs are incompatible.
+
+Set `dense_reference_dir` to a compatible experiment root with a new `output_dir`
+to reuse its selected dense checkpoint and original tau. This runs only baseline
 and full with fresh optimizer/controller state, leaving the reference untouched.
 Omit `--resume` on the initial invocation; add it to the same command after an
 interruption. Without a reference, the default still runs all three stages.
@@ -34,8 +38,9 @@ decoded latest-state receiver rows open in every layer during training and evalu
 Other gates and all attention weights remain learned. Regularizer choices and
 weights are separate fields; see the architecture document for sample axes.
 
-Data groups `data=controlled_vector` and `data=coupled_springs` select lazy paper
-DGPs and compatible interface dimensions, with independent data/loss settings.
+Data groups `data=controlled_vector` and `data=coupled_springs` select the modified
+vector DGP and paper spring DGP with compatible interface dimensions and independent
+data/loss settings.
 `data.parameter_graph` selects the vector graph; `data.split`, `data.root_seed`,
 `data.observation_seed`, count and trajectory length control reproducible data.
 Spring appearance and Gaussian initial-condition choices are explicit.

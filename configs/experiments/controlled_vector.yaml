@@ -1,12 +1,12 @@
 # Dense tau calibration followed by two paired GECO runs. Numeric defaults are untuned.
 name: complementary-geco
 output_dir: outputs/complementary_geco
-# Optional CLI override: dense_reference_dir=outputs/exp1 reuses its dense best/tau
-# and runs only baseline/full in a new output_dir, without modifying exp1.
+# dense_reference_dir may reuse a completed dense run only from the same DGP version.
+# Earlier weak-coupling/long-trajectory runs require fresh dense training and tau.
 graphs: [complementary]
 seeds: [0]
 train_episodes: 8192
-trajectory_length: 16
+trajectory_length: 3
 data_seed: 0
 observation_seed: 1729
 validation_every: 1000

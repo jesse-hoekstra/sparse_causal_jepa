@@ -4,7 +4,7 @@ output_dir: outputs/controlled_vector_smoke
 graphs: [complementary]
 seeds: [0]
 train_episodes: 8
-trajectory_length: 5
+trajectory_length: 3
 validation_every: 1
 model:
   encoder_hidden_dims: [8]

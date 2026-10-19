@@ -108,6 +108,21 @@ def test_labels_cannot_be_injected_into_training_shards(tmp_path: Path) -> None:
         loaded[0]
 
 
+def test_bundle_rejects_old_dynamics_with_unchanged_config(tmp_path: Path) -> None:
+    dataset = build_dgp_dataset(DGPConfig(num_episodes=1, trajectory_length=3))
+    manifest_path = save_dataset_bundle(dataset, tmp_path / "bundle")
+    manifest = read_manifest(manifest_path)
+    descriptor = cast(dict[str, object], manifest["descriptor"])
+    specification = cast(dict[str, object], descriptor["specification"])
+    specification.pop("dynamics")
+    specification["generator_version"] = "paper-dgps-v1"
+    specification["epsilon"] = 1 / 40
+    manifest["fingerprint"] = canonical_fingerprint(descriptor)
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="provenance does not match the registered generator"):
+        load_dataset_bundle(manifest_path)
+
+
 def test_changed_mixing_matrix_is_rejected_even_with_updated_file_checksum(tmp_path: Path) -> None:
     dataset = build_dgp_dataset(DGPConfig(num_episodes=1, trajectory_length=3))
     manifest_path = save_dataset_bundle(dataset, tmp_path / "bundle")

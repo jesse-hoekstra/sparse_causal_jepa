@@ -68,7 +68,7 @@ def test_tiny_native_dgp_cpu_forward_backward_without_ground_truth(
     config = DGPConfig(
         family=family,
         num_episodes=2,
-        trajectory_length=10 if family == "coupled_springs" else 4,
+        trajectory_length=10 if family == "coupled_springs" else 3,
         root_seed=51,
     )
     dataset = build_dgp_dataset(config)
@@ -83,10 +83,13 @@ def test_tiny_native_dgp_cpu_forward_backward_without_ground_truth(
     if family == "coupled_springs":
         assert batch["observations"].shape == (2, 10, 3, 320, 64)
     else:
-        assert batch["observations"].shape == (2, 4, 10)
+        assert batch["observations"].shape == (2, 3, 10)
     model: SCJEPA = trainer.model
     output = model.forward(batch["observations"], batch["actions"])
-    assert output.predictions.shape == output.targets.shape == (2, 2, 4)
+    predictions = 2 if family == "coupled_springs" else 1
+    assert output.predictions.shape == output.targets.shape == (2, predictions, 4)
+    if family == "controlled_vector":
+        assert output.prediction_start == 1
     assert output.parameters.shape == (2, 3)
     assert not output.targets.requires_grad
     loss, _ = TrainingObjective(ObjectiveConfig()).forward(output)
