@@ -35,6 +35,7 @@ class ModelConfig:
     spartan_identity: bool = False
     spartan_parameter_gates_open: bool = False
     ema_decay: float = 0.996
+    autoregressive: bool = False
 
 
 def build_model(config: ModelConfig | DictConfig) -> SCJEPA:
@@ -77,7 +78,14 @@ def build_model(config: ModelConfig | DictConfig) -> SCJEPA:
         identity=cfg.spartan_identity,
         parameter_gates_open=cfg.spartan_parameter_gates_open,
     )
-    return SCJEPA(encoder, parameter_encoder, predictor, cfg.context_len, cfg.ema_decay)
+    return SCJEPA(
+        encoder,
+        parameter_encoder,
+        predictor,
+        cfg.context_len,
+        cfg.ema_decay,
+        autoregressive=cfg.autoregressive,
+    )
 
 
 __all__ = ["ModelConfig", "build_model"]

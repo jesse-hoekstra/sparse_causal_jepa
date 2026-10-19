@@ -44,7 +44,7 @@ def _config(directory: Path) -> ExperimentConfig:
         graphs=("complementary",),
         seeds=(3,),
         train_episodes=4,
-        trajectory_length=3,
+        trajectory_length=4,
         validation_every=1,
         model=ModelConfig(
             observation_dim=10,
@@ -53,6 +53,7 @@ def _config(directory: Path) -> ExperimentConfig:
             action_dim=10,
             context_len=2,
             history_len=1,
+            autoregressive=True,
             encoder_hidden_dims=(8,),
             parameter_embed_dim=8,
             parameter_heads=2,
@@ -143,6 +144,9 @@ def test_real_three_stage_experiment_artifacts_and_resume_are_reproducible(
         assert math.isclose(last["optimizer"]["param_groups"][0]["lr"], expected_lr)
         assert records[index]["model"]["spartan_dense"] == (index == 0)  # pyright: ignore[reportIndexIssue]
         model_record = cast(dict[str, object], records[index]["model"])
+        assert model_record["autoregressive"] is True
+        assert last["model_config"]["autoregressive"] is True
+        assert best["model_config"]["autoregressive"] is True
         assert model_record["spartan_parameter_gates_open"] == (index == 1)
         assert last["model_config"]["spartan_parameter_gates_open"] == (index == 1)
         assert best["model_config"]["spartan_parameter_gates_open"] == (index == 1)
@@ -222,8 +226,8 @@ def test_sparse_runs_load_selected_dense_model_with_fresh_training_state(
         condition = Path(trainer.config.out_dir).name
         assert trainer.dataset is not None
         sample = trainer.dataset[0]
-        assert sample["observations"].shape == (2, 3, 10)
-        assert sample["actions"].shape == (2, 2, 10)
+        assert sample["observations"].shape == (2, 4, 10)
+        assert sample["actions"].shape == (2, 3, 10)
         callback = validation_callback
         if condition == "dense":
             assert validation_callback is not None
@@ -372,20 +376,26 @@ def test_external_dense_reference_rejects_old_generator_with_unchanged_config(
     assert not list(Path(config.output_dir).glob("*/seed-*/*/last.pt"))
 
 
-def test_paired_experiment_rejects_single_episode_dense_reference(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("previous_protocol", ["single_episode", "one_step", "teacher_forced"])
+def test_rollout_experiment_rejects_incompatible_dense_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, previous_protocol: str
 ) -> None:
-    old = _config(tmp_path / "single-episode")
-    old.episodes_per_parameter = 1
+    old = _config(tmp_path / "previous-protocol")
+    if previous_protocol == "single_episode":
+        old.episodes_per_parameter = 1
+    elif previous_protocol == "one_step":
+        old.trajectory_length = 3
+    else:
+        old.model.autoregressive = False
     run_experiment(old, condition="dense")
     config = _config(tmp_path / "paired-episodes")
     config.dense_reference_dir = old.output_dir
 
     def forbidden_train(*_args: object, **_kwargs: object) -> dict[str, float]:
-        raise AssertionError("single-episode references must fail before paired sparse training")
+        raise AssertionError("incompatible references must fail before sparse training")
 
     monkeypatch.setattr(Trainer, "train", forbidden_train)
-    with pytest.raises(ValueError, match="external dense reference data configuration differs"):
+    with pytest.raises(ValueError, match="external dense reference .* differs"):
         run_experiment(config)
     assert not list(Path(config.output_dir).glob("*/seed-*/*/last.pt"))
 
@@ -470,6 +480,16 @@ def test_dense_lr_decay_horizon_counts_optimizer_updates_only(tmp_path: Path) ->
     assert config.train.lr_decay_steps is None
     assert config.definition() == original
 
+    config.train.steps = 100_000
+    config.train.accumulation_steps = 1
+    config.train.lr_decay_steps = 10_000
+    config.validate()
+    dense = config.training_config("dense", 9, tmp_path)
+    assert dense.steps == 100_000
+    assert dense.lr_decay_steps == 10_000
+    for condition in ("baseline", "full"):
+        assert config.training_config(condition, 9, tmp_path, tau=0.3).lr_decay_steps is None
+
 
 @pytest.mark.parametrize(
     "invalid",
@@ -486,7 +506,6 @@ def test_dense_lr_decay_horizon_counts_optimizer_updates_only(tmp_path: Path) ->
         "partial",
         "zero_logit",
         "manual_tau",
-        "manual_lr_decay",
     ],
 )
 def test_experiment_config_rejects_incomparable_conditions(tmp_path: Path, invalid: str) -> None:
@@ -513,8 +532,6 @@ def test_experiment_config_rejects_incomparable_conditions(tmp_path: Path, inval
         config.train.objective.logit_weight = 0
     elif invalid == "manual_tau":
         config.train.geco.tau = 0.3
-    elif invalid == "manual_lr_decay":
-        config.train.lr_decay_steps = 2
     else:
         config.train.accumulation_steps = 3
     with pytest.raises(
@@ -536,7 +553,8 @@ def test_experiment_defaults_use_sigreg_only() -> None:
     assert config.seeds == (0,)
     assert config.tau_multiplier == 1.0
     assert config.episodes_per_parameter == 2
-    assert config.trajectory_length == 3
+    assert config.trajectory_length == 4
+    assert config.model.autoregressive
     assert config.data_config("complementary").episodes_per_parameter == 2
 
 

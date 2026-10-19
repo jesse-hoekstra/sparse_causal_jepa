@@ -53,13 +53,19 @@ class RecordingParameterEncoder(ParameterEncoder):
         return super().forward(states, actions)
 
 
-def make_model(history_len: int = 1, action_dim: int = 0, context_len: int = 3) -> SCJEPA:
+def make_model(
+    history_len: int = 1,
+    action_dim: int = 0,
+    context_len: int = 3,
+    autoregressive: bool = False,
+) -> SCJEPA:
     return SCJEPA(
         VectorEncoder(7, 5, hidden_dims=(12,)),
         RecordingParameterEncoder(action_dim),
         RecordingSpartan(history_len, action_dim),
         context_len=context_len,
         ema_decay=0.8,
+        autoregressive=autoregressive,
     )
 
 
@@ -218,6 +224,77 @@ def test_paired_forward_rejects_incomplete_pairs_and_misaligned_actions() -> Non
         model(torch.randn(3, 2, 3, 7), torch.randn(6, 2, 2))
 
 
+@pytest.mark.parametrize("action_dim", [0, 2])
+def test_paired_two_step_forward_feeds_predictions_and_reuses_other_context(
+    action_dim: int,
+) -> None:
+    model = make_model(action_dim=action_dim, context_len=2, autoregressive=True).eval()
+    observations = torch.randn(3, 2, 4, 7)
+    actions = None if action_dim == 0 else torch.randn(3, 2, 3, action_dim)
+    output = model(observations, actions)
+    assert model.context_len == 2
+    assert model.predictor.history_len == 1
+    assert output.prediction_start == 1
+    assert output.predictions.shape == output.targets.shape == (3, 2, 2, 5)
+    assert len(output.dynamics) == 2
+    assert isinstance(model.parameter_encoder, RecordingParameterEncoder)
+    assert model.parameter_encoder.calls == 1
+    assert isinstance(model.predictor, RecordingSpartan)
+    first, second = model.predictor.calls
+    torch.testing.assert_close(first[0], output.online_states[:, :, 1:2].flatten(0, 1))
+    torch.testing.assert_close(second[0], output.dynamics[0].prediction[:, None])
+    assert not torch.equal(second[0], output.online_states[:, :, 2:3].flatten(0, 1))
+    assert first[1] is second[1]
+    torch.testing.assert_close(first[1], output.parameters.flip(1).flatten(0, 1))
+    for step, call in enumerate((first, second), start=1):
+        if actions is None:
+            assert call[2] is None
+        else:
+            torch.testing.assert_close(call[2], actions[:, :, step : step + 1].flatten(0, 1))
+    expected = model.rollout(
+        first[0],
+        first[1],
+        steps=2,
+        actions=None if actions is None else actions[:, :, 1:].flatten(0, 1),
+    )
+    torch.testing.assert_close(output.predictions.flatten(0, 1), expected)
+    changed = observations.clone()
+    changed[:, :, 2:] += 20
+    changed_output = model(changed, actions)
+    torch.testing.assert_close(output.predictions, changed_output.predictions)
+    torch.testing.assert_close(output.parameters, changed_output.parameters)
+    assert not torch.equal(output.targets, changed_output.targets)
+    assert not output.targets.requires_grad
+
+
+@pytest.mark.parametrize("view", [0, 1])
+def test_second_rollout_step_backpropagates_through_first_prediction_and_other_context(
+    view: int,
+) -> None:
+    torch.manual_seed(7)  # pyright: ignore[reportUnknownMemberType]
+    model = make_model(action_dim=2, context_len=2, autoregressive=True).eval()
+    observations = torch.randn(3, 2, 4, 7, requires_grad=True)
+    actions = torch.randn(3, 2, 3, 2, requires_grad=True)
+    output = model(observations, actions)
+    prediction_grad, observation_grad, action_grad = torch.autograd.grad(
+        output.predictions[:, view, 1].square().mean(),
+        (output.dynamics[0].prediction, observations, actions),
+    )
+    assert prediction_grad[view::2].abs().sum() > 0
+    assert torch.count_nonzero(prediction_grad[1 - view :: 2]) == 0
+    assert observation_grad[:, view, 1].abs().sum() > 0
+    assert torch.count_nonzero(observation_grad[:, view, 0]) == 0
+    assert observation_grad[:, 1 - view, :2].abs().sum() > 0
+    assert torch.count_nonzero(observation_grad[:, :, 2:]) == 0
+    assert action_grad[:, view, 1].abs().sum() > 0
+    assert action_grad[:, view, 2].abs().sum() > 0
+    assert action_grad[:, 1 - view, 0].abs().sum() > 0
+    assert torch.count_nonzero(action_grad[:, view, 0]) == 0
+    assert torch.count_nonzero(action_grad[:, 1 - view, 1:]) == 0
+    assert not output.targets.requires_grad
+    assert all(parameter.grad is None for parameter in model.target_encoder.parameters())
+
+
 @pytest.mark.parametrize("history_len", [1, 3])
 @pytest.mark.parametrize("action_dim", [0, 2])
 def test_rollout_shifts_history_and_reuses_attached_parameters(
@@ -293,8 +370,9 @@ def test_ema_initialization_update_buffers_and_evaluation_mode() -> None:
         torch.testing.assert_close(online_buffer, target_buffer, rtol=0, atol=0)
 
 
-def test_ema_checkpoint_restoration(tmp_path: Path) -> None:
-    model = make_model()
+@pytest.mark.parametrize("autoregressive", [False, True])
+def test_ema_checkpoint_restoration(tmp_path: Path, autoregressive: bool) -> None:
+    model = make_model(autoregressive=autoregressive)
     with torch.no_grad():
         assert isinstance(model.online_encoder, VectorEncoder)
         model.online_encoder.head.weight.add_(1)
@@ -306,6 +384,7 @@ def test_ema_checkpoint_restoration(tmp_path: Path) -> None:
     restored.load_state_dict(torch.load(path, weights_only=True))
     assert restored.ema_decay == 0.8
     assert restored.context_len == 3
+    assert restored.autoregressive is autoregressive
     assert not restored.target_encoder.training
     observations = torch.randn(2, 5, 7)
     torch.testing.assert_close(model(observations).predictions, restored(observations).predictions)
@@ -315,6 +394,12 @@ def test_ema_checkpoint_restoration(tmp_path: Path) -> None:
     ):
         torch.testing.assert_close(original, loaded, rtol=0, atol=0)
         assert not loaded.requires_grad
+
+
+def test_legacy_checkpoint_restores_teacher_forced_prediction_mode() -> None:
+    model = make_model(autoregressive=True)
+    model.set_extra_state({"context_len": 3, "ema_decay": 0.8})
+    assert not model.autoregressive
 
 
 def test_model_and_rollout_shape_guards() -> None:

@@ -4,10 +4,11 @@ output_dir: outputs/controlled_vector_smoke
 graphs: [complementary]
 seeds: [0]
 train_episodes: 8
-trajectory_length: 3
+trajectory_length: 4
 episodes_per_parameter: 2
 validation_every: 1
 model:
+  autoregressive: true
   encoder_hidden_dims: [8]
   parameter_embed_dim: 8
   parameter_heads: 2

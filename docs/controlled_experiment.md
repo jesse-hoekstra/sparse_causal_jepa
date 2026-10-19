@@ -10,15 +10,17 @@ The default command runs **three models, complementary data, seed 0**, sequentia
 
 All three use identical paired training data, data order, and observation map.
 Each independent parameter draw generates two episodes, A and B, with independent
-initial states and actions. Each episode has three frames: two context frames and
-one prediction target. A's parameter code predicts B's next state, and B's code
-predicts A's next state, always using the target episode's current state and action.
+initial states and actions. Each episode has four frames: two context frames and
+two prediction targets. A's parameter code drives B's two-step autoregressive
+rollout, and B's code drives A's rollout. Each starts from its own observed state
+at frame 1, then feeds the first prediction into the second step, with the target
+episode's action at each step and the same partner parameter code throughout.
 The pairing is known during training; true parameter values and graphs are not
 model inputs. The [vector DGP](data_generation.md#controlled-vector-process)
 modifies the paper's coefficients to strengthen state, parameter and action effects while
 retaining its graphs and DGP assumptions. Fresh dense training and tau calibration
-are required for this version; earlier single-episode checkpoints and bounds are
-incompatible.
+are required for this version; earlier one-step, teacher-forced and single-episode
+checkpoints and bounds are incompatible.
 Baseline and full start from the exact dense best checkpoint used to calibrate
 tau, including its online and EMA state encoders, parameter encoder and predictor.
 Each sparse run starts with a fresh optimizer, GECO controller and step counters;
@@ -32,12 +34,13 @@ regularization. The gate override adds no learned tensors or random draws;
 both sparse runs retain identical initial tensors.
 
 Dense training uses cosine learning-rate decay from `train.lr` to
-`train.lr * train.lr_final_ratio` (defaults: 0.001 to 0.0001). The horizon is the
-configured number of optimizer updates, `train.steps / train.accumulation_steps`
-(10,000 by default). Only successful optimizer updates advance the decay; resume
-restores its position and keeps the original horizon. The runner derives
-`train.lr_decay_steps` per condition; do not override it manually. Baseline and full
-retain their constant learning rate and fresh optimizers.
+`train.lr * train.lr_final_ratio` (defaults: 0.001 to 0.0001). By default, the horizon
+is the configured number of optimizer updates, `train.steps / train.accumulation_steps`
+(10,000 by default). Set `train.lr_decay_steps` to choose a shorter horizon; after
+that many successful optimizer updates, the learning rate stays at its final value.
+Only successful optimizer updates advance the decay; resume restores its position
+and keeps the original horizon. Baseline and full retain their constant learning
+rate and fresh optimizers regardless of this dense-only setting.
 
 Set `dense_reference_dir` to an existing experiment root to reuse its selected
 dense checkpoint and original tau in a new output directory. This runs only
@@ -58,9 +61,14 @@ where `B` counts independent parameter groups and the second axis indexes A/B.
 The shared context encoder uses each episode's first two states and their action,
 producing attached parameter codes `(B,2,10)`. These codes are swapped across the
 pair before the one-lag SPARTAN predicts the complete frozen EMA encoder's
-next-frame latent. For `T=3`, predictions and targets are `(B,2,1,10)`; actions are
-`(B,2,2,10)`. Prediction MSE averages both directions. No additional consistency
-loss is introduced. The state, parameter and action dimensions remain independent
+latents for frames 2 and 3. With `T=4`, `K=2`, `L=1` and
+`model.autoregressive=true`, each direction computes
+`pred_z2 = f(z1, a1, partner_parameter)` followed by
+`pred_z3 = f(pred_z2, a2, partner_parameter)`, without detaching `pred_z2`.
+Observed frame 2 is not supplied to the predictor. Predictions and targets are
+`(B,2,2,10)`; actions are `(B,2,3,10)`. Prediction MSE averages both steps and both
+directions, with unchanged loss weights. No additional consistency loss is
+introduced. The state, parameter and action dimensions remain independent
 in the reusable model; ordinary single-episode inputs remain supported.
 
 SPARTAN now uses content-dependent queries and keys, hard Bernoulli gates from
@@ -135,12 +143,17 @@ scores do not enter checkpoint selection. The dashboard retains:
   keep their known order. Lower SHD and higher MCC are better.
 
 SHD compares the union of deterministic local routing paths over every held-out
-transition with the DGP's global graph. Residual paths are included. The optional
+prediction call with the DGP's one-step graph. It does not compose routing paths
+across the rollout's two steps. Sparsity likewise counts each call's direct
+one-step graph, with the same averaging as prediction loss. Residual paths are included. The optional
 `evaluation.graph_support_threshold` instead requires support frequency strictly
 above a predeclared value; its default is zero (union). It is never fitted to graph
 labels. These are attention-routing graphs, not guaranteed Jacobian or causal
 support: content-dependent attention controls also affect outputs. Poor MCC or
-mixing within identifiable groups also limits SHD's interpretation. In particular,
+mixing within identifiable groups also limits SHD's interpretation. State-input
+alignment uses online encodings, while later rollout inputs are predictions
+trained toward EMA encodings; interpreting SHD also relies on these coordinates
+aligning. In particular,
 complementary parameters may remain mixed within pairs under the paper's equivalence
 class; perfect coordinatewise MCC is a stricter criterion than pair recovery.
 For the complementary baseline, parameter SHD is therefore 80 by construction:
@@ -170,18 +183,23 @@ set -o pipefail
 python -u scripts/run_controlled_experiment.py \
   --config configs/experiments/controlled_vector.yaml \
   --condition dense \
+  train.steps=100000 \
+  train.lr_decay_steps=10000 \
   train.device=cuda \
   wandb.mode=online \
-  wandb.group=exp5_paired_context \
-  output_dir=outputs/exp5_paired_context \
-  2>&1 | tee -a logs/exp5_paired_context.log
+  wandb.group=exp7_two_step_100k \
+  output_dir=outputs/exp7_two_step_100k \
+  2>&1 | tee -a logs/exp7_two_step_100k.log
 ```
 
 Detach with **Ctrl-b, then d**; return with `tmux attach -t scjepa-geco`.
-This command trains and evaluates only a fresh dense model on paired episodes,
-with cosine decay, then calibrates tau from its selected checkpoint. Inspect prediction and base loss
-on training and validation before proceeding to sparsification. To run baseline
-and full afterward, repeat the same command with `--resume` and remove
+This command trains and evaluates only a fresh dense model on paired four-frame
+episodes with two-step autoregressive rollouts, for 100,000 steps. Its learning
+rate decays from 0.001 to 0.0001 over the first
+10,000 optimizer updates and then stays at 0.0001. Tau is calibrated from its selected
+checkpoint. Inspect prediction and base loss on training and validation before
+proceeding to sparsification. To run baseline and full afterward, repeat the same
+command with `--resume` and remove
 `--condition dense`; the completed dense stage is skipped and both sparse models
 start from its selected checkpoint, including EMA weights. The numeric optimizer,
 logit coefficient and GECO controller defaults
@@ -204,9 +222,10 @@ sparse models from random initialization or learned the baseline parameter gates
 as well as identity-attention/fixed-weight runs, have different source and model
 provenance and cannot be resumed as this comparison.
 Only a dense checkpoint and calibration record from the same DGP version and
-episode grouping can be reused through `dense_reference_dir`, subject to the
-remaining compatibility checks. Earlier single-episode, weak-coupling and
-long-trajectory experiments need fresh dense training and tau for this comparison.
+episode grouping, trajectory length and autoregressive setting can be reused
+through `dense_reference_dir`, subject to the remaining compatibility checks.
+Earlier one-step, teacher-forced, single-episode, weak-coupling and long-trajectory
+experiments need fresh dense training and tau for this comparison.
 Existing outputs, checkpoints and logs are preserved.
 
 A tiny CPU check of all three stages (not a scientific run):

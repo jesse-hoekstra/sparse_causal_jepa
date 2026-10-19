@@ -12,7 +12,7 @@ from scjepa.models.spartan import Spartan, SpartanOutput
 
 
 class ModelOutput(NamedTuple):
-    """Teacher-forced predictions and explicit inputs for configurable objectives."""
+    """Sequence predictions and explicit inputs for configurable objectives."""
 
     predictions: Tensor
     """Predicted next states, ``(B, W, d_z)`` or paired ``(B, 2, W, d_z)``."""
@@ -38,6 +38,7 @@ class SCJEPA(nn.Module):
         predictor: Spartan,
         context_len: int,
         ema_decay: float = 0.996,
+        autoregressive: bool = False,
     ) -> None:
         """Copy and freeze the complete encoder, including its output head."""
         super().__init__()
@@ -64,6 +65,7 @@ class SCJEPA(nn.Module):
         self.predictor = predictor
         self.context_len = context_len
         self.ema_decay = ema_decay
+        self.autoregressive = autoregressive
 
     def train(self, mode: bool = True) -> Self:
         """Train online modules while keeping the target encoder in evaluation mode."""
@@ -71,17 +73,22 @@ class SCJEPA(nn.Module):
         self.target_encoder.eval()
         return self
 
-    def get_extra_state(self) -> dict[str, float | int]:
-        """Checkpoint EMA decay and permitted context along with encoder weights."""
-        return {"ema_decay": self.ema_decay, "context_len": self.context_len}
+    def get_extra_state(self) -> dict[str, float | int | bool]:
+        """Checkpoint EMA decay, context and prediction mode with encoder weights."""
+        return {
+            "ema_decay": self.ema_decay,
+            "context_len": self.context_len,
+            "autoregressive": self.autoregressive,
+        }
 
-    def set_extra_state(self, state: dict[str, float | int]) -> None:
-        """Restore the EMA and context configuration from a state dictionary."""
+    def set_extra_state(self, state: dict[str, float | int | bool]) -> None:
+        """Restore configuration; older checkpoints used observed state histories."""
         decay, context = float(state["ema_decay"]), int(state["context_len"])
         if not 0 <= decay < 1 or not 1 <= context <= self.parameter_encoder.max_history:
             raise ValueError("invalid checkpoint EMA decay or context length")
         self.ema_decay = decay
         self.context_len = context
+        self.autoregressive = bool(state.get("autoregressive", False))
         self.target_encoder.requires_grad_(False)
         self.target_encoder.eval()
 
@@ -110,13 +117,16 @@ class SCJEPA(nn.Module):
         actions: Tensor | None = None,
         prediction_start: int | None = None,
     ) -> ModelOutput:
-        """Predict from observed histories using one parameter inference per episode.
+        """Predict future states using one parameter inference per episode.
 
         Observations are ``(B,T,*observation_shape)``. Actions are ``(B,T-1,d_a)``:
         action ``a_t`` advances ``x_t`` to ``x_{t+1}``. Parameter inference sees
         only states ``[:K]`` and actions ``[:K-1]``. A source index ``t`` uses
         states/actions ``[t-L+1:t+1]`` and predicts target state ``t+1``.
         The first source defaults to ``max(K,L)-1`` and the last is ``T-2``.
+        Autoregressive mode initializes the history from observed states at the
+        first source, then appends attached predictions instead of observations.
+        Known actions remain aligned to each transition in either mode.
 
         Paired observations/actions add a size-two axis after the batch axis.
         Each episode uses the other episode's attached parameter code while
@@ -161,14 +171,16 @@ class SCJEPA(nn.Module):
         with torch.no_grad():
             targets = self.target_encoder.encode_sequence(observations[:, start + 1 :])
         transitions: list[SpartanOutput] = []
+        history = online_states[:, start - self.predictor.history_len + 1 : start + 1]
         for source in range(start, length - 1):
             first = source - self.predictor.history_len + 1
             history_actions = None if actions is None else actions[:, first : source + 1]
-            transitions.append(
-                self.predictor(
-                    online_states[:, first : source + 1], predictor_parameters, history_actions
-                )
-            )
+            if not self.autoregressive:
+                history = online_states[:, first : source + 1]
+            transition = self.predictor(history, predictor_parameters, history_actions)
+            transitions.append(transition)
+            if self.autoregressive:
+                history = torch.cat((history[:, 1:], transition.prediction[:, None]), dim=1)
         predictions = torch.stack([step.prediction for step in transitions], dim=1)
         if paired:
             predictions = predictions.reshape(

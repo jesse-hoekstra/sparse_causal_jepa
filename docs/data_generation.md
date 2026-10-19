@@ -3,7 +3,7 @@
 The graph structure and spring process follow
 `sources/Parameter_and_State_Identifiability.pdf`, Sections 10.1 and 10.4. The vector
 process below is a user-approved modification of Section 10.2, with stronger
-couplings and paired three-frame episodes. This layer supplies data, reference
+couplings and paired four-frame episodes. This layer supplies data, reference
 calculations and structural graphs. Training/evaluation protocols remain separate choices.
 
 ## Selecting data
@@ -17,7 +17,7 @@ from scjepa.data.types import DGPConfig
 vector = build_dgp_dataset(DGPConfig(
     family="controlled_vector", parameter_graph="complementary",
     root_seed=17, observation_seed=1729, split="train",
-    num_episodes=8, trajectory_length=3, episodes_per_parameter=2,
+    num_episodes=8, trajectory_length=4, episodes_per_parameter=2,
 ))
 training_pair = vector[0]         # observations, actions, episode_ids only
 references = vector.ground_truth(0)  # explicit evaluation-only access
@@ -41,9 +41,10 @@ labels or true graph locations are passed to the model or loss.
 
 Hydra presets `data=controlled_vector` and `data=coupled_springs` compose data
 settings with compatible model interface defaults. The spring preset uses the
-paper's eight-frame parameter context. Vector presets use `context_len=2` and
-trajectory length 3; the generic preset's dataset size 8 and seeds remain small
-interface defaults. `model.context_len` remains independently configurable. Data
+paper's eight-frame parameter context. The generic vector preset uses
+`context_len=2` and trajectory length 3; its dataset size 8 and seeds remain small
+interface defaults. The controlled experiment uses four-frame paired episodes.
+`model.context_len` remains independently configurable. Data
 settings never select sparsity weights or turn true graphs into predictor masks.
 
 ## Controlled vector process
@@ -65,15 +66,18 @@ z[t+1] = A(a[t]) @ z[t] + B_G(a[t]) @ theta
 Here `*` between matrices denotes elementwise multiplication. Rows index outputs
 and columns index inputs; `F` is not transposed.
 
-Each episode contains three frames `z0 -> z1 -> z2`: the first transition provides
-the two-frame parameter context, and the second is the prediction target. Training
-uses A's context-derived parameter code to predict B's next state, and B's code to
-predict A's next state. The current state and prediction action always come from
-the target episode. This supplies known same-parameter grouping without passing
+The controlled experiment uses four frames `z0 -> z1 -> z2 -> z3`: the first
+transition provides the two-frame parameter context, and the next two are
+prediction targets. Training uses A's context-derived parameter code for B's
+two-step rollout, and B's code for A's rollout. With one state lag, the predictor
+starts from the target episode's encoded `z1`, then uses its own prediction of
+`z2` to predict `z3`; each step uses the target episode's action and the same
+partner parameter code. Loss averages both steps and both directions. This
+supplies known same-parameter grouping without passing
 true parameter values or graphs to training. Independent initial states/actions
 make shared parameter information useful across episodes; no new consistency
-loss is added. Short trajectories avoid averaging over later states that nearly
-reveal theta. These choices do not guarantee learned parameter separation or a
+loss is added. The second prediction does not receive an observed later state
+that could reveal more about theta. These choices do not guarantee learned parameter separation or a
 loss margin for every edge under a learned representation.
 
 | Parameter variant | G | State / action / parameter union edge counts |

@@ -41,7 +41,7 @@ from scjepa.training.factory import ModelConfig, build_model
 from scjepa.training.loop import ObjectiveConfig, TrainingObjective
 
 
-def _model(*, dense: bool = False) -> SCJEPA:
+def _model(*, dense: bool = False, autoregressive: bool = True) -> SCJEPA:
     return build_model(
         ModelConfig(
             observation_dim=10,
@@ -50,6 +50,7 @@ def _model(*, dense: bool = False) -> SCJEPA:
             action_dim=10,
             history_len=1,
             context_len=2,
+            autoregressive=autoregressive,
             encoder_hidden_dims=(8,),
             parameter_embed_dim=8,
             parameter_heads=2,
@@ -203,6 +204,37 @@ def test_tau_uses_calibration_only_and_handles_last_singleton(
     assert _batch_sizes(3, 2) == [3]
     assert _batch_sizes(5, 2) == [2, 3]
     assert _batch_sizes(4, 2) == [2, 2]
+
+
+def test_paired_two_step_tau_matches_training_objective() -> None:
+    model, matrix = _model(dense=True), VectorObservationMap().matrix
+    data = _data(episodes_per_parameter=2)
+    config = replace(_config(), calibration_episodes=4, batch_size=4)
+    process = ControlledVectorDGP(replace(data, split="evaluation_calibration", num_episodes=4))
+    process.restore_observation_matrix(matrix)
+    episodes = [process.generate(index) for index in range(4)]
+    with _evaluation_context(model, config.seed):
+        output = model(
+            torch.stack([episode.observations for episode in episodes]),
+            torch.stack([episode.actions for episode in episodes]),
+        )
+        assert output.predictions.shape == output.targets.shape == (4, 2, 2, 10)
+        _, terms = TrainingObjective(_objective())(output)
+        prediction = torch.stack(
+            [
+                (output.predictions[:, view, step] - output.targets[:, view, step]).square().mean()
+                for view in range(2)
+                for step in range(2)
+            ]
+        ).mean()
+        torch.testing.assert_close(terms["prediction"], prediction)
+    calibrated = calibrate_tau(model, data, matrix, config, objective=_objective())
+    assert math.isclose(
+        calibrated["calibration/prediction_mse"], float(prediction.detach()), rel_tol=1e-6
+    )
+    assert math.isclose(
+        calibrated["calibration/base_loss"], float(terms["base"].detach()), rel_tol=1e-6
+    )
 
 
 def test_sampled_calibration_preserves_model_rng_and_modes(
@@ -398,6 +430,7 @@ def test_final_evaluation_has_only_core_metrics_and_frozen_separate_calibration_
     assert protocol["calibration_data"]["split"] == "evaluation_calibration"
     assert protocol["test_data"]["split"] == "test"
     assert protocol["observation_matrix_sha256"] == VectorObservationMap(matrix=matrix).fingerprint
+    assert protocol["prediction_mode"] == "autoregressive"
     refs = cast(
         dict[str, object], torch.load(tmp_path / "evaluation_references.pt", weights_only=True)
     )
