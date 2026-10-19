@@ -73,6 +73,27 @@ def test_bundle_rejects_overwrite_and_detects_shard_changes_before_and_after_loa
         loaded[0]
 
 
+def test_paired_bundle_roundtrip_preserves_group_shape_and_shared_truth(tmp_path: Path) -> None:
+    dataset = build_dgp_dataset(
+        DGPConfig(num_episodes=2, trajectory_length=3, episodes_per_parameter=2)
+    )
+    manifest_path = save_dataset_bundle(dataset, tmp_path / "paired_bundle")
+    saved = load_dataset_bundle(manifest_path)
+    assert len(saved) == 2
+    assert saved.fingerprint == dataset.fingerprint
+    assert saved.observation_shape == (10,)
+    assert saved.specification["episodes_per_parameter"] == 2
+    for index in range(len(saved)):
+        torch.testing.assert_close(saved[index], dataset[index], rtol=0, atol=0)
+        torch.testing.assert_close(saved.ground_truth(index), dataset.ground_truth(index))
+        assert saved[index]["observations"].shape == (2, 3, 10)
+        assert saved[index]["actions"].shape == (2, 2, 10)
+        assert saved.ground_truth(index)["parameters"].shape == (10,)
+    torch.testing.assert_close(
+        EpisodeWindows(saved, 2)[0]["observations"], saved[0]["observations"][:, :2]
+    )
+
+
 @pytest.mark.parametrize("change", ["version", "fingerprint", "provenance", "missing_checksum"])
 def test_invalid_manifest_is_rejected(tmp_path: Path, change: str) -> None:
     dataset = build_dgp_dataset(DGPConfig(num_episodes=1, trajectory_length=3))

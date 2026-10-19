@@ -24,21 +24,29 @@ def validate_model_dataset(model: SCJEPA, dataset: Dataset[dict[str, Tensor]]) -
         raise ValueError("training items require observations")
     observations = item["observations"]
     encoder = model.online_encoder
-    if observations.ndim != encoder.observation_ndim + 1:
+    paired = observations.ndim == encoder.observation_ndim + 2
+    if observations.ndim != encoder.observation_ndim + 1 and not paired:
         raise ValueError("dataset observation rank is incompatible with the encoder")
+    if paired and (not isinstance(encoder, VectorEncoder) or observations.shape[0] != 2):
+        raise ValueError("paired observations require two vector episodes")
     if isinstance(encoder, VectorEncoder) and observations.shape[-1] != encoder.observation_dim:
         raise ValueError("dataset observation dimension is incompatible with the vector encoder")
     if isinstance(encoder, ImageEncoder) and observations.shape[1] != encoder.in_channels:
         raise ValueError("dataset channel count is incompatible with the image encoder")
     if observations.dtype != next(encoder.parameters()).dtype:
         raise ValueError("dataset observation dtype must match model dtype before training")
-    length = observations.shape[0]
+    length = observations.shape[1 if paired else 0]
     if length <= max(model.context_len, model.predictor.history_len):
         raise ValueError("trajectory must contain context/history plus a prediction target")
     actions = item.get("actions")
     if model.predictor.action_dim:
-        if actions is None or actions.shape != (length - 1, model.predictor.action_dim):
-            raise ValueError("dataset actions must match (T-1, model.action_dim)")
+        expected_actions = (length - 1, model.predictor.action_dim)
+        if paired:
+            expected_actions = (2, *expected_actions)
+        if actions is None or actions.shape != expected_actions:
+            raise ValueError(
+                "dataset actions must match the episode/time axes and model.action_dim"
+            )
         if actions.dtype != observations.dtype:
             raise ValueError("dataset action dtype must match observation dtype")
     elif actions is not None:

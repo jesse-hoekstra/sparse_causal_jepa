@@ -142,6 +142,82 @@ def test_future_frames_and_actions_do_not_leak_into_context_or_first_prediction(
     torch.testing.assert_close(out.parameters, model(observations, changed_actions).parameters)
 
 
+@pytest.mark.parametrize("image", [False, True])
+@pytest.mark.parametrize("action_dim", [0, 2])
+def test_paired_prediction_uses_other_context_and_own_state_actions_and_target(
+    image: bool, action_dim: int
+) -> None:
+    model = make_model(action_dim=action_dim, context_len=2).eval()
+    if image:
+        model = SCJEPA(
+            ImageEncoder(3, 5, channels=(8, 8)),
+            RecordingParameterEncoder(action_dim),
+            RecordingSpartan(1, action_dim),
+            context_len=2,
+        ).eval()
+    observations = torch.randn((3, 2, 3, 3, 12, 12) if image else (3, 2, 3, 7))
+    actions = None if action_dim == 0 else torch.randn(3, 2, 2, action_dim)
+    output = model(observations, actions)
+    assert output.predictions.shape == output.targets.shape == (3, 2, 1, 5)
+    assert output.online_states.shape == (3, 2, 3, 5)
+    assert output.parameters.shape == (3, 2, 3)
+    assert output.prediction_start == 1
+    assert isinstance(model.parameter_encoder, RecordingParameterEncoder)
+    assert model.parameter_encoder.calls == 1
+    assert isinstance(model.predictor, RecordingSpartan)
+    states, used_parameters, used_actions = model.predictor.calls[0]
+    torch.testing.assert_close(states, output.online_states[:, :, 1:2].flatten(0, 1))
+    torch.testing.assert_close(used_parameters, output.parameters.flip(1).flatten(0, 1))
+    if actions is not None:
+        torch.testing.assert_close(used_actions, actions[:, :, 1:2].flatten(0, 1))
+    for view in range(2):
+        own_actions = None if actions is None else actions[:, view]
+        own = model(observations[:, view], own_actions)
+        torch.testing.assert_close(output.parameters[:, view], own.parameters)
+        torch.testing.assert_close(output.targets[:, view], own.targets)
+        expected = model.predictor(
+            own.online_states[:, 1:2],
+            output.parameters[:, 1 - view],
+            None if own_actions is None else own_actions[:, 1:2],
+        ).prediction
+        torch.testing.assert_close(output.predictions[:, view, 0], expected)
+
+
+@pytest.mark.parametrize("view", [0, 1])
+def test_paired_prediction_gradients_use_other_context_without_future_leakage(view: int) -> None:
+    torch.manual_seed(7)  # pyright: ignore[reportUnknownMemberType]
+    model = make_model(action_dim=2, context_len=2).eval()
+    observations = torch.randn(3, 2, 3, 7, requires_grad=True)
+    actions = torch.randn(3, 2, 2, 2, requires_grad=True)
+    output = model(observations, actions)
+    assert not output.targets.requires_grad
+    observation_grad, action_grad = torch.autograd.grad(
+        output.predictions[:, view].square().mean(), (observations, actions)
+    )
+    assert observation_grad[:, view, 1].abs().sum() > 0
+    assert torch.count_nonzero(observation_grad[:, view, 0]) == 0
+    assert observation_grad[:, 1 - view, 0].abs().sum() > 0
+    assert observation_grad[:, 1 - view, 1].abs().sum() > 0
+    assert torch.count_nonzero(observation_grad[:, :, 2]) == 0
+    assert action_grad[:, view, 1].abs().sum() > 0
+    assert action_grad[:, 1 - view, 0].abs().sum() > 0
+    assert torch.count_nonzero(action_grad[:, view, 0]) == 0
+    assert torch.count_nonzero(action_grad[:, 1 - view, 1]) == 0
+    changed = observations.detach().clone()
+    changed[:, :, 2] += 20
+    changed_output = model(changed, actions)
+    torch.testing.assert_close(output.parameters, changed_output.parameters)
+    torch.testing.assert_close(output.predictions, changed_output.predictions)
+
+
+def test_paired_forward_rejects_incomplete_pairs_and_misaligned_actions() -> None:
+    model = make_model(action_dim=2, context_len=2)
+    with pytest.raises(ValueError, match="exactly two"):
+        model(torch.randn(3, 1, 3, 7), torch.randn(3, 1, 2, 2))
+    with pytest.raises(ValueError, match="paired actions"):
+        model(torch.randn(3, 2, 3, 7), torch.randn(6, 2, 2))
+
+
 @pytest.mark.parametrize("history_len", [1, 3])
 @pytest.mark.parametrize("action_dim", [0, 2])
 def test_rollout_shifts_history_and_reuses_attached_parameters(

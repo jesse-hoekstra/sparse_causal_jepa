@@ -5,8 +5,10 @@ output_dir: outputs/complementary_geco
 # Earlier weak-coupling/long-trajectory runs require fresh dense training and tau.
 graphs: [complementary]
 seeds: [0]
+# Counts and batch sizes are independent parameter groups (two trajectories each).
 train_episodes: 8192
 trajectory_length: 3
+episodes_per_parameter: 2
 data_seed: 0
 observation_seed: 1729
 validation_every: 1000

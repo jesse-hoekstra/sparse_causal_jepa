@@ -71,8 +71,13 @@ def _config() -> EvaluationConfig:
     )
 
 
-def _data() -> DGPConfig:
-    return DGPConfig(trajectory_length=4, parameter_graph="complementary", root_seed=51)
+def _data(episodes_per_parameter: int = 1) -> DGPConfig:
+    return DGPConfig(
+        trajectory_length=4,
+        parameter_graph="complementary",
+        root_seed=51,
+        episodes_per_parameter=episodes_per_parameter,
+    )
 
 
 def _objective() -> ObjectiveConfig:
@@ -173,8 +178,9 @@ def test_validation_preserves_modes_and_rng_on_failure(monkeypatch: pytest.Monke
     torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("episodes_per_parameter", [1, 2])
 def test_tau_uses_calibration_only_and_handles_last_singleton(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, episodes_per_parameter: int
 ) -> None:
     seen: list[str] = []
     generate = ControlledVectorDGP.generate
@@ -186,7 +192,11 @@ def test_tau_uses_calibration_only_and_handles_last_singleton(
     monkeypatch.setattr(ControlledVectorDGP, "generate", checked_generate)
     config = replace(_config(), calibration_episodes=3)
     result = calibrate_tau(
-        _model(), _data(), VectorObservationMap().matrix, config, objective=_objective()
+        _model(),
+        _data(episodes_per_parameter),
+        VectorObservationMap().matrix,
+        config,
+        objective=_objective(),
     )
     assert result["calibration/base_loss"] > result["calibration/prediction_mse"] >= 0
     assert seen == ["evaluation_calibration"] * 3
@@ -240,17 +250,20 @@ def test_sampled_calibration_preserves_model_rng_and_modes(
     assert pickle.dumps(np.random.get_state()) == numpy_state  # noqa: NPY002
 
 
-def test_dense_calibration_unchanged_with_training_gates() -> None:
+@pytest.mark.parametrize("episodes_per_parameter", [1, 2])
+def test_dense_calibration_unchanged_with_training_gates(episodes_per_parameter: int) -> None:
     model, matrix = _model(dense=True), VectorObservationMap().matrix
-    ordinary = calibrate_tau(model, _data(), matrix, _config(), objective=_objective())
+    data = _data(episodes_per_parameter)
+    ordinary = calibrate_tau(model, data, matrix, _config(), objective=_objective())
     sampled = calibrate_tau(
-        model, _data(), matrix, _config(), objective=_objective(), training_gates=True
+        model, data, matrix, _config(), objective=_objective(), training_gates=True
     )
     assert ordinary == sampled
 
 
+@pytest.mark.parametrize("episodes_per_parameter", [1, 2])
 def test_sampled_calibration_keeps_sigreg_projection_rng(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, episodes_per_parameter: int
 ) -> None:
     model, matrix = _model(), VectorObservationMap().matrix
     states: list[Tensor] = []
@@ -263,10 +276,11 @@ def test_sampled_calibration_keeps_sigreg_projection_rng(
         return objective_forward(objective, output)
 
     monkeypatch.setattr(TrainingObjective, "forward", checked_objective)
-    calibrate_tau(model, _data(), matrix, _config(), objective=_objective())
+    data = _data(episodes_per_parameter)
+    calibrate_tau(model, data, matrix, _config(), objective=_objective())
     ordinary_states = states.copy()
     states.clear()
-    calibrate_tau(model, _data(), matrix, _config(), objective=_objective(), training_gates=True)
+    calibrate_tau(model, data, matrix, _config(), objective=_objective(), training_gates=True)
     assert len(states) == 4
     for ordinary, sampled in zip(ordinary_states, states, strict=True):
         torch.testing.assert_close(ordinary, sampled, rtol=0, atol=0)
@@ -310,8 +324,9 @@ def test_graph_alignment_permutates_output_and_latent_inputs_but_not_actions_or_
             )
 
 
+@pytest.mark.parametrize("episodes_per_parameter", [1, 2])
 def test_local_graph_aggregation_includes_every_batch_and_transition(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, episodes_per_parameter: int
 ) -> None:
     model = _model().eval()
     forward = model.predictor.forward
@@ -324,15 +339,22 @@ def test_local_graph_aggregation_includes_every_batch_and_transition(
         result = forward(states, parameters, actions)
         graph = GraphBlocks(*(torch.zeros_like(block) for block in result.graphs))
         graph.state[:, :, 0, :] = torch.eye(10)
-        graph.parameter[:, 0, 1] = float(calls == 3)
+        graph.parameter[::episodes_per_parameter, 0, 1] = float(calls == 3)
         calls += 1
         return result._replace(graphs=graph)
 
     monkeypatch.setattr(model.predictor, "forward", local_graph)
     with _evaluation_context(model):
-        result = _collect(model, _data(), VectorObservationMap().matrix, _config(), "test", 4)
+        result = _collect(
+            model,
+            _data(episodes_per_parameter),
+            VectorObservationMap().matrix,
+            _config(),
+            "test",
+            4,
+        )
     assert calls == 4
-    assert result.graph_frequencies["parameter"][0, 1] == 0.25
+    assert result.graph_frequencies["parameter"][0, 1] == 0.25 / episodes_per_parameter
     assert result.graph_frequencies["state"].sum() == 10
     matched = _aligned_support(
         result.graph_frequencies,
@@ -344,11 +366,13 @@ def test_local_graph_aggregation_includes_every_batch_and_transition(
 
 
 @pytest.mark.parametrize("variant", ["dense", "complementary", "diagonal"])
+@pytest.mark.parametrize("episodes_per_parameter", [1, 2])
 def test_final_evaluation_has_only_core_metrics_and_frozen_separate_calibration_artifacts(
-    variant: str, tmp_path: Path
+    variant: str, episodes_per_parameter: int, tmp_path: Path
 ) -> None:
     model, config = _model(), _config()
-    data, matrix = replace(_data(), parameter_graph=variant), VectorObservationMap(seed=194).matrix
+    data = replace(_data(episodes_per_parameter), parameter_graph=variant)
+    matrix = VectorObservationMap(seed=194).matrix
     state, rng = copy.deepcopy(model.state_dict()), torch.get_rng_state().clone()
     metrics = evaluate_model(model, data, matrix, config, tmp_path, objective=_objective())
     assert set(metrics) == {
@@ -380,11 +404,15 @@ def test_final_evaluation_has_only_core_metrics_and_frozen_separate_calibration_
     torch.testing.assert_close(cast(Tensor, refs["matrix"]), matrix, rtol=0, atol=0)
     torch.testing.assert_close(
         cast(Tensor, refs["calibration_episode_ids"]),
-        torch.tensor([episode_id(data.root_seed, "evaluation_calibration", i) for i in range(8)]),
+        torch.tensor(
+            [episode_id(data.root_seed, "evaluation_calibration", i) for i in range(8)]
+        ).repeat_interleave(episodes_per_parameter),
     )
     torch.testing.assert_close(
         cast(Tensor, refs["test_episode_ids"]),
-        torch.tensor([episode_id(data.root_seed, "test", i) for i in range(4)]),
+        torch.tensor([episode_id(data.root_seed, "test", i) for i in range(4)]).repeat_interleave(
+            episodes_per_parameter
+        ),
     )
     frequencies = cast(dict[str, Tensor], refs["routing_frequencies"])
     assert bool((frequencies["state"][:, 0].diagonal() == 1).all())

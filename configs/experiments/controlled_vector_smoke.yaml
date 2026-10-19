@@ -5,6 +5,7 @@ graphs: [complementary]
 seeds: [0]
 train_episodes: 8
 trajectory_length: 3
+episodes_per_parameter: 2
 validation_every: 1
 model:
   encoder_hidden_dims: [8]

@@ -92,6 +92,8 @@ class TrainingObjective(nn.Module):
 
     Representation statistics use the local batch on each distributed rank.
     State samples have shape ``(T, B, d_z)``; parameter samples ``(1, B, d_theta)``.
+    Paired episodes use ``(2T, B, d_z)`` and ``(2, B, d_theta)``: each view has
+    one sample per independent parameter group, rather than pooling both views.
     Parameter regularization requires unique episode IDs, validated by Trainer
     across all ranks. It never counts repeated times as new parameter samples.
     """
@@ -144,13 +146,15 @@ class TrainingObjective(nn.Module):
         if config.logit_weight:
             base = base + config.logit_weight * terms["logit"]
         if config.state_regularizer_weight:
-            terms["state_regularizer"] = self.state_regularizer(
-                output.online_states.transpose(0, 1)
-            )
+            states = output.online_states
+            if states.ndim == 4:
+                states = states.flatten(1, 2)
+            terms["state_regularizer"] = self.state_regularizer(states.transpose(0, 1))
             base = base + config.state_regularizer_weight * terms["state_regularizer"]
         if config.parameter_regularizer_weight:
+            parameters = output.parameters
             terms["parameter_regularizer"] = self.parameter_regularizer(
-                output.parameters.unsqueeze(0)
+                parameters.transpose(0, 1) if parameters.ndim == 3 else parameters.unsqueeze(0)
             )
             base = base + config.parameter_regularizer_weight * terms["parameter_regularizer"]
         terms["base"] = base
@@ -181,7 +185,8 @@ class TrainConfig:
     """Optimizer and run-health settings, independent of scientific protocols.
 
     ``steps`` counts consumed microbatches. ``batch_size`` is the total number
-    of episodes per microbatch over all distributed ranks. Updates average
+    of independent episodes or parameter groups per microbatch over all
+    distributed ranks. Paired groups keep both episodes together. Updates average
     ``accumulation_steps`` equal-sized microbatches. Optional cosine decay uses
     ``lr_decay_steps`` successful updates and ends at ``lr * lr_final_ratio``.
     """

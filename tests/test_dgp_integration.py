@@ -11,6 +11,7 @@ from torch.utils.data import Dataset
 
 from scjepa.data import TensorEpisodes
 from scjepa.data.bundle import load_dataset_bundle, save_dataset_bundle
+from scjepa.data.compatibility import validate_model_dataset
 from scjepa.data.factory import build_dgp_dataset
 from scjepa.data.types import DGPConfig
 from scjepa.models.model import SCJEPA
@@ -124,6 +125,17 @@ def test_checkpoint_accepts_identical_lazy_dataset(tmp_path: Path) -> None:
     actual_batch = _batch(lazy)
     torch.testing.assert_close(actual_batch, _batch(dataset), rtol=0, atol=0)
     assert resumed.train_step(actual_batch)["health/updated"] == 1
+
+
+def test_paired_vector_dataset_validates_observed_shapes_before_training() -> None:
+    dataset = build_dgp_dataset(
+        DGPConfig(num_episodes=2, trajectory_length=3, episodes_per_parameter=2)
+    )
+    validate_model_dataset(build_model(_model_config()), dataset)
+    incompatible = _model_config()
+    incompatible.action_dim = 5
+    with pytest.raises(ValueError, match="actions must match"):
+        validate_model_dataset(build_model(incompatible), dataset)
 
 
 def test_stored_bundle_resume_binds_content_and_rejects_generated_source(tmp_path: Path) -> None:
