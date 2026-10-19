@@ -37,10 +37,22 @@ def tiny_batch() -> dict[str, Tensor]:
     }
 
 
-def tiny_trainer(tmp_path: Path, accumulation_steps: int = 1) -> Trainer:
+def tiny_trainer(
+    tmp_path: Path,
+    accumulation_steps: int = 1,
+    *,
+    lr_decay_steps: int | None = None,
+    lr_final_ratio: float = 0.1,
+) -> Trainer:
     return Trainer(
         tiny_model(),
-        TrainConfig(batch_size=4, accumulation_steps=accumulation_steps, out_dir=str(tmp_path)),
+        TrainConfig(
+            batch_size=4,
+            accumulation_steps=accumulation_steps,
+            lr_decay_steps=lr_decay_steps,
+            lr_final_ratio=lr_final_ratio,
+            out_dir=str(tmp_path),
+        ),
         model_config={"test": "tiny"},
     )
 
@@ -96,11 +108,36 @@ def test_accumulation_updates_optimizer_and_ema_exactly_once(tmp_path: Path) -> 
         torch.testing.assert_close(value, expected)
 
 
+@pytest.mark.parametrize("lr_decay_steps", [None, 2])
+def test_learning_rate_follows_accepted_updates_and_stays_at_final_rate(
+    tmp_path: Path, lr_decay_steps: int | None
+) -> None:
+    trainer = tiny_trainer(tmp_path, accumulation_steps=2, lr_decay_steps=lr_decay_steps)
+    previous_rate = 1e-3
+    assert trainer.optimizer.param_groups[0]["lr"] == previous_rate
+    expected_rates = [5.5e-4, 1e-4, 1e-4] if lr_decay_steps else [1e-3] * 3
+    for update, expected_rate in enumerate(expected_rates, start=1):
+        pending = trainer.train_step(tiny_batch())
+        assert pending["health/updated"] == 0
+        assert math.isclose(pending["train/lr"], previous_rate)
+        assert math.isclose(trainer.optimizer.param_groups[0]["lr"], previous_rate)
+        accepted = trainer.train_step(tiny_batch())
+        assert accepted["health/updated"] == 1
+        assert trainer.optimizer_steps == update
+        assert math.isclose(accepted["train/lr"], expected_rate)
+        assert math.isclose(trainer.optimizer.param_groups[0]["lr"], expected_rate)
+        previous_rate = expected_rate
+
+
+@pytest.mark.parametrize("lr_decay_steps", [None, 2])
 @pytest.mark.parametrize("rejection", ["loss", "gradient", "threshold"])
 def test_rejected_group_discards_accumulation_without_ema(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rejection: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rejection: str,
+    lr_decay_steps: int | None,
 ) -> None:
-    trainer = tiny_trainer(tmp_path, accumulation_steps=2)
+    trainer = tiny_trainer(tmp_path, accumulation_steps=2, lr_decay_steps=lr_decay_steps)
     before = copy.deepcopy(trainer.model.state_dict())
     trainer.train_step(tiny_batch())
     original_forward = trainer.objective.forward
@@ -126,6 +163,7 @@ def test_rejected_group_discards_accumulation_without_ema(
     assert trainer.optimizer_steps == 0
     assert trainer.pending_microbatches == 0
     assert trainer.total_skips == 1
+    assert metrics["train/lr"] == trainer.optimizer.param_groups[0]["lr"] == trainer.config.lr
     assert not trainer.optimizer.state
     assert all(parameter.grad is None for parameter in trainer.model.parameters())
     torch.testing.assert_close(trainer.model.state_dict(), before, rtol=0, atol=0)
@@ -139,10 +177,12 @@ def test_rejected_group_discards_accumulation_without_ema(
     assert trainer.consecutive_skips == 0
 
 
+@pytest.mark.parametrize("lr_decay_steps", [None, 4])
 def test_checkpoint_restores_ema_config_rng_optimizer_and_exact_continuation(
-    tmp_path: Path,
+    tmp_path: Path, lr_decay_steps: int | None
 ) -> None:
-    trainer = tiny_trainer(tmp_path)
+    trainer = tiny_trainer(tmp_path, lr_decay_steps=lr_decay_steps, lr_final_ratio=0.2)
+    trainer.config.steps = 4
     trainer.config.objective.state_sparsity_weight = 0.02
     trainer.train_step(tiny_batch())
     next_batch = tiny_batch()
@@ -152,11 +192,15 @@ def test_checkpoint_restores_ema_config_rng_optimizer_and_exact_continuation(
     expected_model = copy.deepcopy(trainer.model.state_dict())
     expected_optimizer = copy.deepcopy(trainer.optimizer.state_dict())
     expected_rng = torch.get_rng_state().clone()
-    resumed = tiny_trainer(tmp_path)
+    resumed = tiny_trainer(tmp_path, lr_decay_steps=8)
+    resumed.config.steps = 10
     resumed.model.ema_decay = 0.2
     resumed.load_checkpoint(checkpoint)
     assert resumed.model.ema_decay == 0.8
     assert resumed.config.objective.state_sparsity_weight == 0.02
+    assert resumed.config.steps == 10
+    assert resumed.config.lr_decay_steps == lr_decay_steps
+    assert resumed.config.lr_final_ratio == 0.2
     assert resumed.step == resumed.optimizer_steps == 1
     actual_metrics = resumed.train_step(next_batch)
     assert actual_metrics == metrics
@@ -167,6 +211,22 @@ def test_checkpoint_restores_ema_config_rng_optimizer_and_exact_continuation(
     assert all(
         not parameter.requires_grad for parameter in resumed.model.target_encoder.parameters()
     )
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"lr_decay_steps": 0},
+        {"lr_decay_steps": -1},
+        {"lr_final_ratio": 0.0},
+        {"lr_final_ratio": 1.1},
+        {"lr_final_ratio": float("nan")},
+        {"lr_final_ratio": float("inf")},
+    ],
+)
+def test_learning_rate_decay_rejects_invalid_configuration(settings: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="lr"):
+        TrainConfig(**settings)
 
 
 def test_separate_sparsity_weights_change_only_the_selected_loss_block() -> None:

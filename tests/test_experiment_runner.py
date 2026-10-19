@@ -138,6 +138,9 @@ def test_real_three_stage_experiment_artifacts_and_resume_are_reproducible(
         )
         assert last["train_config"]["geco"]["enabled"] == (index != 0)
         assert last["train_config"]["geco"]["tau"] == (tau["tau"] if index else None)
+        assert last["train_config"]["lr_decay_steps"] == (None if index else 2)
+        expected_lr = config.train.lr * (1.0 if index else config.train.lr_final_ratio)
+        assert math.isclose(last["optimizer"]["param_groups"][0]["lr"], expected_lr)
         assert records[index]["model"]["spartan_dense"] == (index == 0)  # pyright: ignore[reportIndexIssue]
         model_record = cast(dict[str, object], records[index]["model"])
         assert model_record["spartan_parameter_gates_open"] == (index == 1)
@@ -409,6 +412,7 @@ def test_paired_train_configs_differ_only_in_parameter_penalty(tmp_path: Path) -
     assert baseline.geco.enabled
     assert full.geco.enabled
     assert baseline.geco.tau == full.geco.tau == 0.3
+    assert baseline.lr_decay_steps is full.lr_decay_steps is None
     assert config.condition_model("dense").spartan_dense
     assert not config.condition_model("baseline").spartan_dense
     baseline_model, full_model = config.condition_model("baseline"), config.condition_model("full")
@@ -422,6 +426,23 @@ def test_paired_train_configs_differ_only_in_parameter_penalty(tmp_path: Path) -
         config.training_config("baseline", 9, tmp_path)
     with pytest.raises(ValueError, match="condition"):
         config.training_config("unknown", 9, tmp_path)
+
+
+def test_dense_lr_decay_horizon_counts_optimizer_updates_only(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.train.steps = 12
+    config.train.accumulation_steps = 3
+    config.train.lr_final_ratio = 0.2
+    config.validate()
+    original = config.definition()
+    dense = config.training_config("dense", 9, tmp_path)
+    assert dense.lr_decay_steps == 4
+    assert dense.lr_final_ratio == 0.2
+    assert dense.lr == config.train.lr
+    for condition in ("baseline", "full"):
+        assert config.training_config(condition, 9, tmp_path, tau=0.3).lr_decay_steps is None
+    assert config.train.lr_decay_steps is None
+    assert config.definition() == original
 
 
 @pytest.mark.parametrize(
@@ -439,6 +460,7 @@ def test_paired_train_configs_differ_only_in_parameter_penalty(tmp_path: Path) -
         "partial",
         "zero_logit",
         "manual_tau",
+        "manual_lr_decay",
     ],
 )
 def test_experiment_config_rejects_incomparable_conditions(tmp_path: Path, invalid: str) -> None:
@@ -465,10 +487,12 @@ def test_experiment_config_rejects_incomparable_conditions(tmp_path: Path, inval
         config.train.objective.logit_weight = 0
     elif invalid == "manual_tau":
         config.train.geco.tau = 0.3
+    elif invalid == "manual_lr_decay":
+        config.train.lr_decay_steps = 2
     else:
         config.train.accumulation_steps = 3
     with pytest.raises(
-        ValueError, match="[Ss][Ii][Gg][Rr]eg|comparison|penalt|distinct|boundary|tau"
+        ValueError, match="[Ss][Ii][Gg][Rr]eg|comparison|penalt|distinct|boundary|tau|derived"
     ):
         config.validate()
 
@@ -819,6 +843,7 @@ def test_experiment_logger_keeps_objective_geco_and_recovery_scores_only() -> No
         "recovery/state_mcc": 0.8,
         "graph/parameter_shd": 3.0,
         "health/skipped_steps": 0.0,
+        "train/lr": 0.0001,
     }
     logger.log(4, {**visible, "attention/gate_entropy": 0.1, "grad/parameter_encoder": 2.0})
     assert captured == [(4, visible)]

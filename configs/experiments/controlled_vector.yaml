@@ -36,6 +36,8 @@ train:
   accumulation_steps: 1
   device: cpu
   lr: 0.001
+  # Dense only: cosine decay to 10% of lr; baseline/full keep constant lr.
+  lr_final_ratio: 0.1
   weight_decay: 0.0
   grad_clip: 1.0
   checkpoint_every: 250
