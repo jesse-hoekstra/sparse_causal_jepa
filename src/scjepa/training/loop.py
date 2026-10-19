@@ -182,12 +182,15 @@ class TrainConfig:
 
     ``steps`` counts consumed microbatches. ``batch_size`` is the total number
     of episodes per microbatch over all distributed ranks. Updates average
-    ``accumulation_steps`` equal-sized microbatches.
+    ``accumulation_steps`` equal-sized microbatches. Optional cosine decay uses
+    ``lr_decay_steps`` successful updates and ends at ``lr * lr_final_ratio``.
     """
 
     steps: int = 1
     batch_size: int = 8
     lr: float = 1e-3
+    lr_decay_steps: int | None = None
+    lr_final_ratio: float = 0.1
     weight_decay: float = 0.0
     grad_clip: float = 1.0
     grad_skip_threshold: float = math.inf
@@ -223,6 +226,10 @@ class TrainConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        if self.lr_decay_steps is not None and self.lr_decay_steps < 1:
+            raise ValueError("lr_decay_steps must be positive when supplied")
+        if not math.isfinite(self.lr_final_ratio) or not 0 < self.lr_final_ratio <= 1:
+            raise ValueError("lr_final_ratio must lie in (0, 1]")
         if not math.isfinite(self.weight_decay) or self.weight_decay < 0:
             raise ValueError("weight_decay must be finite and non-negative")
         if math.isnan(self.grad_skip_threshold) or self.grad_skip_threshold < 0:
@@ -430,6 +437,12 @@ class Trainer:
                             mean_tensor(self._accumulated_base_loss / self._accumulated)
                         )
                     self.optimizer_steps += 1
+                    if self.config.lr_decay_steps is not None:
+                        progress = min(self.optimizer_steps / self.config.lr_decay_steps, 1.0)
+                        ratio = self.config.lr_final_ratio
+                        factor = ratio + (1 - ratio) * (1 + math.cos(math.pi * progress)) / 2
+                        for group in self.optimizer.param_groups:
+                            group["lr"] = self.config.lr * factor
                     self.consecutive_skips = 0
                     self._accumulated = 0
                     self._accumulation_batch_size = None
@@ -440,6 +453,7 @@ class Trainer:
                 self._skip()
         metrics = {f"loss/{name}": float(value.detach()) for name, value in terms.items()} | {
             "loss/total": float(total.detach()),
+            "train/lr": float(self.optimizer.param_groups[0]["lr"]),
             "health/grad_norm": float(grad_norm),
             "health/skipped": float(rejected),
             "health/skipped_steps": float(self.total_skips),

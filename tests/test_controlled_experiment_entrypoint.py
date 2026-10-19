@@ -140,24 +140,38 @@ def test_aggregate_only_requires_existing_manifest_and_creates_nothing(tmp_path:
     assert not (tmp_path / "wandb").exists()
 
 
-def test_tiny_cpu_cli_produces_complete_three_stage_comparison(tmp_path: Path) -> None:
+def test_tiny_cpu_cli_runs_dense_first_then_resumes_three_stage_comparison(tmp_path: Path) -> None:
     output = tmp_path / "cpu-smoke"
-    result = _invoke(
-        tmp_path,
+    arguments = (
         "--config",
         str(CONFIGS / "controlled_vector_smoke.yaml"),
         f"output_dir={output}",
         "wandb.mode=disabled",
         "train.device=cpu",
     )
+    result = _invoke(tmp_path, *arguments, "--condition", "dense")
     assert result.returncode == 0, result.stderr
+    parent = output / "complementary/seed-0"
+    dense = parent / "dense"
+    assert read_json(dense / "status.json")["status"] == "completed"
+    assert (dense / "tau.json").is_file()
+    assert not (parent / "baseline").exists()
+    assert not (parent / "full").exists()
+    assert read_json(output / "summary.json")["completed_runs"] == 1
+    dense_training = cast(dict[str, object], read_json(dense / "run_config.json")["train"])
+    assert dense_training["lr_decay_steps"] == 2
+    assert dense_training["lr_final_ratio"] == 0.1
+    dense_checkpoint_mtime = (dense / "last.pt").stat().st_mtime_ns
+
+    result = _invoke(tmp_path, *arguments, "--resume")
+    assert result.returncode == 0, result.stderr
+    assert (dense / "last.pt").stat().st_mtime_ns == dense_checkpoint_mtime
     assert not (tmp_path / "wandb").exists()
     summary = read_json(output / "summary.json")
     assert summary["completed_runs"] == 3
     assert summary["expected_runs"] == 3
     assert summary["complete"] is True
     assert summary["missing_runs"] == []
-    parent = output / "complementary/seed-0"
     for condition in ("dense", "baseline", "full"):
         directory = parent / condition
         assert read_json(directory / "status.json")["status"] == "completed"
@@ -173,6 +187,9 @@ def test_tiny_cpu_cli_produces_complete_three_stage_comparison(tmp_path: Path) -
     assert "condition" not in definition
     run = read_json(parent / "baseline/run_config.json")
     training = cast(dict[str, object], run["train"])
+    assert training["lr_decay_steps"] is None
+    full_training = cast(dict[str, object], read_json(parent / "full/run_config.json")["train"])
+    assert full_training["lr_decay_steps"] is None
     objective = cast(dict[str, object], training["objective"])
     assert objective["parameter_sparsity_weight"] == 0.0
     assert objective["state_regularizer"] == "sigreg"

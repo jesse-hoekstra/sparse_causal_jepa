@@ -61,6 +61,7 @@ class ExperimentLogger:
                 "loss/prediction",
                 "loss/base",
                 "loss/sparsity",
+                "train/lr",
                 "geco/tau",
                 "geco/constraint",
                 "geco/sparsity_weight",

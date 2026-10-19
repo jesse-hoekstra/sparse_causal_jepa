@@ -26,6 +26,14 @@ other learned gates, the parameter encoder and parameter inputs, and state/actio
 regularization. The gate override adds no learned tensors or random draws;
 both sparse runs retain identical initial tensors.
 
+Dense training uses cosine learning-rate decay from `train.lr` to
+`train.lr * train.lr_final_ratio` (defaults: 0.001 to 0.0001). The horizon is the
+configured number of optimizer updates, `train.steps / train.accumulation_steps`
+(10,000 by default). Only successful optimizer updates advance the decay; resume
+restores its position and keeps the original horizon. The runner derives
+`train.lr_decay_steps` per condition; do not override it manually. Baseline and full
+retain their constant learning rate and fresh optimizers.
+
 Set `dense_reference_dir` to an existing experiment root to reuse its selected
 dense checkpoint and original tau in a new output directory. This runs only
 baseline and full; no new dense run is trained. The reference files remain
@@ -101,6 +109,7 @@ test set. Calibration matching is refitted per evaluated checkpoint; recovery
 scores do not enter checkpoint selection. The dashboard retains:
 
 - Prediction MSE, base loss and weighted sparsity loss.
+- `train/lr`: the learning rate for the next optimizer update.
 - Tau, constraint violation and effective sparsity weight for GECO.
 - Validation/test feasibility and the count of skipped updates.
 - `recovery/state_mcc` and `recovery/parameter_mcc`: held-out mean absolute Pearson
@@ -142,19 +151,26 @@ source .venv/bin/activate
 python -m pip install -e '.[dev,logging]'
 export WANDB_PROJECT=sparse_causal_jepa
 export WANDB_ENTITY=jesse-hoekstra-university-of-oxford
+mkdir -p logs
+set -o pipefail
 python -u scripts/run_controlled_experiment.py \
   --config configs/experiments/controlled_vector.yaml \
+  --condition dense \
   train.device=cuda \
   wandb.mode=online \
-  wandb.group=exp3_three_frame \
-  output_dir=outputs/exp3_three_frame
+  wandb.group=exp4_dense_decay \
+  output_dir=outputs/exp4_dense_decay \
+  2>&1 | tee -a logs/exp4_dense_decay.log
 ```
 
 Detach with **Ctrl-b, then d**; return with `tmux attach -t scjepa-geco`.
-This command trains a fresh dense model, calibrates tau, then starts baseline/full
-from that dense checkpoint including its EMA weights. Do not add `--resume` or an
-older `dense_reference_dir` on this initial invocation. It launches no other seed
-or graph. The numeric optimizer, logit coefficient and GECO controller defaults
+This command trains and evaluates only a fresh dense model, with cosine decay,
+then calibrates tau from its selected checkpoint. Inspect prediction and base loss
+on training and validation before proceeding to sparsification. To run baseline
+and full afterward, repeat the same command with `--resume` and remove
+`--condition dense`; the completed dense stage is skipped and both sparse models
+start from its selected checkpoint, including EMA weights. The numeric optimizer,
+logit coefficient and GECO controller defaults
 are explicit starting choices, not
 validated scientific hyperparameters. Use `--dry-run` to print the selected stages
 without starting W&B.

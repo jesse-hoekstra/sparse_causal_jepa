@@ -82,6 +82,8 @@ class ExperimentConfig:
             raise ValueError("set experiment seeds rather than the derived train.seed")
         if self.train.geco.enabled or self.train.geco.tau is not None:
             raise ValueError("GECO is enabled per sparse condition; tau comes from the dense run")
+        if self.train.lr_decay_steps is not None:
+            raise ValueError("train.lr_decay_steps is derived per condition")
         if not 1.0 <= self.tau_multiplier < float("inf"):
             raise ValueError("tau_multiplier must be finite and at least one")
         if not self.name or not self.output_dir:
@@ -182,7 +184,16 @@ class ExperimentConfig:
             else 0.0,
         )
         geco: GECOConfig = replace(self.train.geco, enabled=condition != "dense", tau=tau)
-        return replace(self.train, seed=seed, out_dir=str(out_dir), objective=objective, geco=geco)
+        return replace(
+            self.train,
+            seed=seed,
+            out_dir=str(out_dir),
+            objective=objective,
+            geco=geco,
+            lr_decay_steps=self.train.steps // self.train.accumulation_steps
+            if condition == "dense"
+            else None,
+        )
 
     def definition(self) -> dict[str, object]:
         """Return scientific identity, excluding execution/logging destinations."""
