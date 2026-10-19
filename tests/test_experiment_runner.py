@@ -887,6 +887,8 @@ def test_experiment_logger_keeps_objective_geco_and_recovery_scores_only() -> No
         "geco/constraint": -0.05,
         "geco/sparsity_weight": 0.001,
         "validation/base_loss": 0.32,
+        "validation/target_variance": 0.5,
+        "validation/normalized_prediction_mse": 0.4,
         "recovery/state_mcc": 0.8,
         "graph/parameter_shd": 3.0,
         "health/skipped_steps": 0.0,
