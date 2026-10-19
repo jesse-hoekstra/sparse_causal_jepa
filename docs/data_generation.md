@@ -1,8 +1,10 @@
 # Reproducible scientific data
 
-The authoritative source is `sources/Parameter_and_State_Identifiability.pdf`,
-Sections 10.1, 10.2 and 10.4. This layer supplies data, reference calculations and
-structural graphs. Training/evaluation protocols remain separate choices.
+The graph structure and spring process follow
+`sources/Parameter_and_State_Identifiability.pdf`, Sections 10.1 and 10.4. The vector
+process below is a user-approved modification of Section 10.2, with stronger
+couplings and three-frame episodes. This layer supplies data, reference calculations
+and structural graphs. Training/evaluation protocols remain separate choices.
 
 ## Selecting data
 
@@ -15,7 +17,7 @@ from scjepa.data.types import DGPConfig
 vector = build_dgp_dataset(DGPConfig(
     family="controlled_vector", parameter_graph="complementary",
     root_seed=17, observation_seed=1729, split="train",
-    num_episodes=8, trajectory_length=16,
+    num_episodes=8, trajectory_length=3,
 ))
 training_episode = vector[0]       # observations, actions, episode_ids only
 references = vector.ground_truth(0)  # explicit evaluation-only access
@@ -34,33 +36,49 @@ labels or true graph locations are passed to the model or loss.
 
 Hydra presets `data=controlled_vector` and `data=coupled_springs` compose data
 settings with compatible model interface defaults. The spring preset uses the
-paper's eight-frame parameter context. Vector `context_len=2`, dataset size 8,
-trajectory length 16, and seeds are small interface defaults, not a scientific
-protocol. `model.context_len` remains independently configurable. Data settings
-never select sparsity weights or turn true graphs into predictor masks.
+paper's eight-frame parameter context. Vector presets use `context_len=2` and
+trajectory length 3; the generic preset's dataset size 8 and seeds remain small
+interface defaults. `model.context_len` remains independently configurable. Data
+settings never select sparsity weights or turn true graphs into predictor masks.
 
 ## Controlled vector process
 
-Paper-prescribed values are `d_z=d_theta=d_a=10`, `L=1`, and `epsilon=1/40`.
+The dimensions `d_z=d_theta=d_a=10`, `L=1`, and graphs match the paper.
+The following coefficients replace its original `epsilon=1/40` construction.
 For every episode, `z0` and `theta` are independent `N(0,I10)` vectors and actions
 are independent `Uniform(-1,1)` coordinates. The same theta is used throughout:
 
 ```
-F[i,j](a) = a[i] * a[j]**2
+F[i,j](a) = (1 + a[i]**2) * (1 + a[j]**3)
 H = diag(J5, J5)
-A(a) = 0.5 I + epsilon * (H * F(a))
-B_G(a) = (1 + epsilon * sum(a)) I + epsilon * (G * F(a))
+A(a) = 0.5 I + 0.1 * (H * F(a))
+B_G(a) = exp(sum(a) / sqrt(10)) I + 0.25 * (G * F(a))
 z[t+1] = A(a[t]) @ z[t] + B_G(a[t]) @ theta
 ```
 
 Here `*` between matrices denotes elementwise multiplication. Rows index outputs
 and columns index inputs; `F` is not transposed.
 
+The experiment samples independent three-frame episodes `z0 -> z1 -> z2`: the
+first transition provides the two-frame parameter context, and the second is the
+prediction target. This avoids averaging over long trajectories whose current
+state nearly reveals theta. Coupling strengths are initial design choices; they
+do not guarantee a loss margin for every edge under a learned representation.
+
 | Parameter variant | G | State / action / parameter union edge counts |
 |---|---|---|
 | `dense` | `J10` | `50 / 100 / 100` |
 | `complementary` | `[[I5,I5],[I5,I5]]` | `50 / 100 / 20` |
 | `diagonal` | `I10` | `50 / 100 / 10` |
+
+Both coefficient matrices are invertible for every allowed action: each masked
+block is a positive scalar identity plus a positive rank-one update. One transition
+therefore recovers theta smoothly, and invertible state propagation preserves full
+conditional state support. Distinct monomials `a[i]**2 * a[j]**3` span every allowed
+matrix entry; the exponential term cannot cancel a polynomial on an open set.
+Since `DF(0)=0`, each action derivative at zero is `theta / sqrt(10)`. These facts
+retain the paper's fixed-output sufficient-influence arguments. They establish DGP
+properties, not injectivity or identifiability of the learned encoders.
 
 Observations use `x=psi(W @ z)`, `psi(u)=u+0.1*u**3`. A dedicated observation seed
 realizes one dense orthogonal W through float64 QR with a fixed sign convention.
@@ -147,13 +165,14 @@ Masks express structural dependencies even when a derivative vanishes at a sampl
 Both families expose analytic Jacobians and tests compare them with autodiff and
 independent float64 transition references.
 
-Controlled-vector diagnostics check Eqs. (96), (98), (99), matrix spans and fixed
-outputs with explicit SVD tolerances `atol=1e-10, rtol=1e-9`. Tests attain state
+Controlled-vector diagnostics use the fixed-output constructions of Eqs. (96),
+(98), with the modified zero-action derivative `theta / sqrt(10)`. They check matrix
+spans and fixed outputs with explicit SVD tolerances `atol=1e-10, rtol=1e-9`. Tests attain state
 rank 50, parameter ranks 100/20/10, and action-column rank 10. Spring checks
 combine the two state-lag spans (10 each) to rank 20, check action-child rank 2,
 and parameter rank 10, with fixed-output constructions and rank tolerance `1e-12`.
 These are small
-implementation diagnostics alongside the paper's analytical arguments, not
+implementation diagnostics alongside the analytical arguments above, not
 numerical proofs of identifiability or learned representation quality.
 
 ## Reproducibility, windows and bundles
@@ -209,7 +228,7 @@ Inspect one small episode without writing data:
 
 ```bash
 python scripts/generate_data.py --config configs/data/controlled_vector.yaml \
-  --diagnostics parameter_graph=complementary num_episodes=1 trajectory_length=4
+  --diagnostics parameter_graph=complementary num_episodes=1 trajectory_length=3
 python scripts/generate_data.py --config configs/data/coupled_springs.yaml \
   num_episodes=1 trajectory_length=9
 ```

@@ -23,8 +23,11 @@ utilities outside training items. Preserve addressable sampling and dataset
 identity validation; do not silently change distributions or renderer precision.
 
 The controlled-vector protocol lives in `scjepa.experiments`; follow
-`docs/controlled_experiment.md`. The default sequence is dense tau calibration, baseline, full on complementary
-data and one seed. Baseline forces parameter-source columns to decoded latest-state
+`docs/controlled_experiment.md`. The default sequence is dense tau calibration,
+baseline, full on complementary data and one seed. The approved vector DGP modifies
+the paper's coefficients and uses independent three-frame episodes (K=2, L=1);
+follow `docs/data_generation.md`. Earlier DGP versions require fresh dense training
+and tau calibration. Baseline forces parameter-source columns to decoded latest-state
 receiver rows open in every SPARTAN layer during training and evaluation, with zero
 parameter sparsity weight. Full learns those gates and adds the parameter penalty.
 Both retain learned attention weights, all other learned gates, state/action
@@ -38,7 +41,7 @@ output directory because source/configuration provenance differs. An optional
 checkpoint and original tau, running only baseline/full in the new output.
 Keep the reference read-only and verify architecture, data, base objective,
 calibration batching, observation map and checkpoint hash before reuse; older
-source versions are allowed when these checks pass.
+source versions are allowed when these checks pass and the DGP version matches.
 Report MCC and aligned routing-support SHD; keep the dashboard concise.
 Use SIGReg only. Keep calibration, validation and test separate, preserve paired
 initialization/data and fixed observation maps, and validate checkpoint/run

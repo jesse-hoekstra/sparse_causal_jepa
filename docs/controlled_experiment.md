@@ -9,6 +9,11 @@ The default command runs **three models, complementary data, seed 0**, sequentia
 | `full` | Learned local SPARTAN gates | State, action and parameter paths |
 
 All three use identical training episodes, data order, and observation map.
+Each independent episode has three frames: two context frames and one prediction
+target. The [vector DGP](data_generation.md#controlled-vector-process) modifies the
+paper's coefficients to strengthen state, parameter and action effects while
+retaining its graphs and DGP assumptions. Fresh dense training and tau calibration
+are required for this version; earlier DGP checkpoints and bounds are incompatible.
 Baseline and full start from the exact dense best checkpoint used to calibrate
 tau, including its online and EMA state encoders, parameter encoder and predictor.
 Each sparse run starts with a fresh optimizer, GECO controller and step counters;
@@ -25,7 +30,7 @@ Set `dense_reference_dir` to an existing experiment root to reuse its selected
 dense checkpoint and original tau in a new output directory. This runs only
 baseline and full; no new dense run is trained. The reference files remain
 untouched. Compatible dense checkpoints from older source versions are accepted
-after checking architecture, data, base objective, calibration batching,
+after checking the DGP version, architecture, data, base objective, calibration batching,
 observation map and checkpoint hash.
 
 Each fresh sparse run prints one startup line comparing dense, deterministic-gate
@@ -39,7 +44,7 @@ An independent framewise MLP encodes observations `(B,T,10)` into states.
 The context encoder uses the first two states and their transition action to
 produce one attached `(B,10)` parameter tensor, reused for all predictions.
 A one-lag SPARTAN predicts the complete frozen EMA encoder's next-frame latent.
-For `T=16`, predictions and targets are `(B,14,10)`; actions are `(B,15,10)`.
+For `T=3`, predictions and targets are `(B,1,10)`; actions are `(B,2,10)`.
 The state, parameter and action dimensions remain independent in the reusable model.
 
 SPARTAN now uses content-dependent queries and keys, hard Bernoulli gates from
@@ -141,19 +146,16 @@ python -u scripts/run_controlled_experiment.py \
   --config configs/experiments/controlled_vector.yaml \
   train.device=cuda \
   wandb.mode=online \
-  wandb.group=exp2_dense_warmstart \
-  output_dir=outputs/exp2_dense_warmstart \
-  dense_reference_dir=outputs/exp1
+  wandb.group=exp3_three_frame \
+  output_dir=outputs/exp3_three_frame
 ```
 
 Detach with **Ctrl-b, then d**; return with `tmux attach -t scjepa-geco`.
-This command reads the completed dense run from `outputs/exp1` and starts fresh
-baseline/full runs in `outputs/exp2_dense_warmstart`, including the dense EMA
-weights and using the original calibrated tau. Do not add `--resume` on this
-initial invocation. Omit `dense_reference_dir` to train all three stages in a new
-output directory, completing dense calibration before baseline and full.
-Neither command launches another seed or graph. The numeric optimizer, logit
-coefficient and GECO controller defaults are explicit starting choices, not
+This command trains a fresh dense model, calibrates tau, then starts baseline/full
+from that dense checkpoint including its EMA weights. Do not add `--resume` or an
+older `dense_reference_dir` on this initial invocation. It launches no other seed
+or graph. The numeric optimizer, logit coefficient and GECO controller defaults
+are explicit starting choices, not
 validated scientific hyperparameters. Use `--dry-run` to print the selected stages
 without starting W&B.
 
@@ -171,10 +173,10 @@ Use a **new output directory** for this protocol. Earlier GECO runs that started
 sparse models from random initialization or learned the baseline parameter gates,
 as well as identity-attention/fixed-weight runs, have different source and model
 provenance and cannot be resumed as this comparison.
-Their compatible selected dense checkpoint and original calibration record can
-still be reused through `dense_reference_dir`; dense retraining is unnecessary
-when the compatibility checks pass. Existing outputs, checkpoints and logs are
-preserved.
+Only a dense checkpoint and calibration record from the same DGP version can be
+reused through `dense_reference_dir`, subject to the remaining compatibility checks.
+The earlier weak-coupling and long-trajectory experiment needs fresh dense training
+and tau for this comparison. Existing outputs, checkpoints and logs are preserved.
 
 A tiny CPU check of all three stages (not a scientific run):
 

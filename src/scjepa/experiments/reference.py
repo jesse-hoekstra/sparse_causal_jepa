@@ -9,6 +9,7 @@ from torch import Tensor
 
 from scjepa.data.controlled_vector import VectorObservationMap
 from scjepa.data.datasets import canonical_fingerprint
+from scjepa.data.factory import build_dgp_dataset
 from scjepa.experiments.config import ExperimentConfig
 from scjepa.experiments.storage import json_safe, read_json
 
@@ -121,4 +122,7 @@ def external_dense_manifest(
         item.get("observation_fingerprint") != fingerprint for item in (manifest, current_manifest)
     ):
         raise ValueError("external dense reference observation map differs")
+    expected_dataset = build_dgp_dataset(config.data_config(graph), observation_matrix=matrix)
+    if dataset_identity != expected_dataset.fingerprint:
+        raise ValueError("external dense reference dataset generator differs")
     return manifest

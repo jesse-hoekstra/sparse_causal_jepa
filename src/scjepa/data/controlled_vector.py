@@ -1,5 +1,7 @@
-"""Controlled vector process from manuscript Sections 10.1-10.2.
+"""Controlled vector process with stronger action-dependent coupling.
 
+The graph setup follows the manuscript; the coefficients implement the revised
+three-frame experiment documented in ``docs/data_generation.md``.
 Rows of every coefficient/Jacobian are output coordinates; columns are inputs.
 Scientific functions use float64, retain autograd, and accept arbitrary batch
 axes. Ground truth and recovery helpers are evaluation-only, never learner input.
@@ -17,18 +19,15 @@ from scjepa.data.types import GraphMasks, TransitionJacobians
 
 ParameterGraph = Literal["dense", "complementary", "diagonal"]
 DIMENSION = 10
-EPSILON = 1 / 40
+STATE_COUPLING = 0.1
+PARAMETER_COUPLING = 0.25
+ACTION_SCALE = 1 / sqrt(DIMENSION)
 
 
 def _coordinates(value: Tensor, name: str) -> Tensor:
     if value.ndim < 1 or value.shape[-1] != DIMENSION or not value.is_floating_point():
         raise ValueError(f"{name} must be floating point with final dimension {DIMENSION}")
     return value.to(dtype=torch.float64)
-
-
-def _epsilon(value: float) -> None:
-    if not isfinite(value) or value <= 0:
-        raise ValueError("epsilon must be positive and finite")
 
 
 def _solve(matrix: Tensor, values: Tensor) -> Tensor:
@@ -69,21 +68,20 @@ def graphs(variant: ParameterGraph) -> GraphMasks:
     )
 
 
-def coefficient_matrices(
-    actions: Tensor, variant: ParameterGraph, epsilon: float = EPSILON
-) -> tuple[Tensor, Tensor]:
+def coefficient_matrices(actions: Tensor, variant: ParameterGraph) -> tuple[Tensor, Tensor]:
     """Build A(a) and B_G(a) for actions ``(...,10)`` in float64.
 
-    In particular ``F[i,j] = a[i] * a[j]**2``; the two axes must not
-    be interchanged. The output matrices have shape ``(...,10,10)``.
+    ``F[i,j] = (1 + a[i]**2) * (1 + a[j]**3)`` and the positive parameter
+    gain is ``exp(sum(a) / sqrt(10))``. Outputs have shape ``(...,10,10)``.
     """
-    _epsilon(epsilon)
     action = _coordinates(actions, "actions")
     identity = torch.eye(DIMENSION, dtype=action.dtype, device=action.device)
-    monomials = action.unsqueeze(-1) * action.square().unsqueeze(-2)
-    state = 0.5 * identity + epsilon * (state_mask(device=action.device) * monomials)
-    parameter = (1 + epsilon * action.sum(-1))[..., None, None] * identity
-    parameter = parameter + epsilon * (parameter_mask(variant, device=action.device) * monomials)
+    interactions = (1 + action.square()).unsqueeze(-1) * (1 + action.pow(3)).unsqueeze(-2)
+    state = 0.5 * identity + STATE_COUPLING * (state_mask(device=action.device) * interactions)
+    parameter = (ACTION_SCALE * action.sum(-1)).exp()[..., None, None] * identity
+    parameter = parameter + PARAMETER_COUPLING * (
+        parameter_mask(variant, device=action.device) * interactions
+    )
     return state, parameter
 
 
@@ -92,12 +90,11 @@ def transition(
     parameters: Tensor,
     actions: Tensor,
     variant: ParameterGraph,
-    epsilon: float = EPSILON,
 ) -> Tensor:
     """Apply one deterministic transition to broadcastable ``(...,10)`` inputs."""
     states = _coordinates(states, "states")
     parameters = _coordinates(parameters, "parameters")
-    state_matrix, parameter_matrix = coefficient_matrices(actions, variant, epsilon)
+    state_matrix, parameter_matrix = coefficient_matrices(actions, variant)
     return (state_matrix @ states.unsqueeze(-1)).squeeze(-1) + (
         parameter_matrix @ parameters.unsqueeze(-1)
     ).squeeze(-1)
@@ -108,7 +105,6 @@ def simulate(
     parameters: Tensor,
     actions: Tensor,
     variant: ParameterGraph,
-    epsilon: float = EPSILON,
 ) -> Tensor:
     """Return ``(...,T,10)`` from initial states and ``(...,T-1,10)`` actions.
 
@@ -120,7 +116,6 @@ def simulate(
     actions = _coordinates(actions, "actions")
     if actions.ndim < 2:
         raise ValueError("actions require a time axis: (...,T-1,10)")
-    _epsilon(epsilon)
     parameter_mask(variant)
     batch_shape = cast(
         torch.Size,
@@ -131,7 +126,7 @@ def simulate(
     state = initial_state.expand(*batch_shape, DIMENSION)
     history = [state]
     for index in range(actions.shape[-2]):
-        state = transition(state, parameters, actions[..., index, :], variant, epsilon)
+        state = transition(state, parameters, actions[..., index, :], variant)
         history.append(state)
     return torch.stack(history, dim=-2)
 
@@ -202,7 +197,6 @@ def recover_parameters(
     next_states: Tensor,
     actions: Tensor,
     variant: ParameterGraph,
-    epsilon: float = EPSILON,
 ) -> Tensor:
     """Recover theta from one noiseless transition by Eq. (94), using a solve.
 
@@ -211,7 +205,7 @@ def recover_parameters(
     """
     states = _coordinates(states, "states")
     next_states = _coordinates(next_states, "next_states")
-    state_matrix, parameter_matrix = coefficient_matrices(actions, variant, epsilon)
+    state_matrix, parameter_matrix = coefficient_matrices(actions, variant)
     residual = next_states.unsqueeze(-1) - state_matrix @ states.unsqueeze(-1)
     return _solve(parameter_matrix, residual).squeeze(-1)
 
@@ -221,7 +215,6 @@ def analytic_jacobians(
     parameters: Tensor,
     actions: Tensor,
     variant: ParameterGraph,
-    epsilon: float = EPSILON,
 ) -> TransitionJacobians:
     """Return exact first derivatives without invoking automatic differentiation.
 
@@ -237,18 +230,18 @@ def analytic_jacobians(
             _coordinates(actions, "actions"),
         ),
     )
-    state_matrix, parameter_matrix = coefficient_matrices(actions, variant, epsilon)
+    state_matrix, parameter_matrix = coefficient_matrices(actions, variant)
     mask_state = state_mask(device=actions.device).to(dtype=actions.dtype)
     mask_parameter = parameter_mask(variant, device=actions.device).to(dtype=actions.dtype)
-    # C[i,j] = H[i,j]*z[j] + G[i,j]*theta[j], so cubic term i is
-    # epsilon*a[i]*sum_j(C[i,j]*a[j]**2).
-    weighted = mask_state * states.unsqueeze(-2) + mask_parameter * parameters.unsqueeze(-2)
-    self_derivative = (weighted * actions.square().unsqueeze(-2)).sum(-1)
-    action_jacobian = parameters.unsqueeze(-1).expand(*parameters.shape, DIMENSION)
-    action_jacobian = epsilon * (
-        action_jacobian
+    # Interaction i is (1+a[i]**2) * sum_j(C[i,j] * (1+a[j]**3)).
+    weighted = STATE_COUPLING * mask_state * states.unsqueeze(-2)
+    weighted = weighted + PARAMETER_COUPLING * mask_parameter * parameters.unsqueeze(-2)
+    self_derivative = 2 * actions * (weighted * (1 + actions.pow(3)).unsqueeze(-2)).sum(-1)
+    gain = (ACTION_SCALE * actions.sum(-1)).exp()
+    action_jacobian = (
+        (ACTION_SCALE * gain[..., None] * parameters).unsqueeze(-1)
         + torch.diag_embed(self_derivative)
-        + 2 * actions.unsqueeze(-1) * weighted * actions.unsqueeze(-2)
+        + 3 * (1 + actions.square()).unsqueeze(-1) * weighted * actions.square().unsqueeze(-2)
     )
     return TransitionJacobians(
         state=state_matrix.unsqueeze(-2),
@@ -290,7 +283,7 @@ def sufficient_influence_diagnostics(
     atol: float = 1e-10,
     rtol: float = 1e-9,
 ) -> InfluenceDiagnostics:
-    """Check sampled coefficient spans and Eqs. (96), (98), and (99).
+    """Check coefficient spans using the paper's fixed-output constructions.
 
     Float64 SVD ranks use explicit absolute/relative tolerances. Inputs come
     from a private deterministic stream, so diagnostics do not affect datasets.
@@ -317,10 +310,13 @@ def sufficient_influence_diagnostics(
     parameter_residual = float(
         (transition(varying_state, parameters, actions, variant) - output).abs().max()
     )
-    # Eq. (99): each action-derivative column spans R^10 as theta varies.
+    # At a=0, interaction derivatives vanish and each action column is theta/sqrt(10).
     parameter_basis = torch.eye(DIMENSION, dtype=torch.float64)
     zero_actions = torch.zeros_like(parameter_basis)
-    action_states = 2 * (output - parameter_basis)
+    zero_state_matrix, zero_parameter_matrix = coefficient_matrices(zero_actions, variant)
+    action_states = _solve(
+        zero_state_matrix, output[:, None] - zero_parameter_matrix @ parameter_basis[:, :, None]
+    ).squeeze(-1)
     action_derivatives = analytic_jacobians(
         action_states, parameter_basis, zero_actions, variant
     ).action.squeeze(-2)
@@ -328,7 +324,7 @@ def sufficient_influence_diagnostics(
         (transition(action_states, parameter_basis, zero_actions, variant) - output).abs().max()
     )
     derivative_residual = float(
-        (action_derivatives - EPSILON * parameter_basis[:, :, None]).abs().max()
+        (action_derivatives - ACTION_SCALE * parameter_basis[:, :, None]).abs().max()
     )
     state_rank = int(_matrix_rank(state_matrix[:, state_mask()], atol=atol, rtol=rtol))
     parameter_rank = int(

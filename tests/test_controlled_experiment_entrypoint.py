@@ -43,6 +43,10 @@ def _invoke(tmp_path: Path, *arguments: str) -> subprocess.CompletedProcess[str]
 @pytest.mark.parametrize("name", ["controlled_vector", "controlled_vector_smoke"])
 def test_shipped_configs_resolve_to_sigreg_only(name: str) -> None:
     config = load_experiment_config(CONFIGS / f"{name}.yaml", ["wandb.mode=disabled"])
+    assert config.trajectory_length == 3
+    assert config.model.context_len == 2
+    assert config.model.history_len == 1
+    assert config.dense_reference_dir is None
     assert config.train.objective.state_regularizer == "sigreg"
     assert config.train.objective.parameter_regularizer == "sigreg"
     assert config.train.objective.state_regularizer_weight > 0
@@ -79,7 +83,7 @@ def test_external_reference_dry_run_reports_only_sparse_stages(tmp_path: Path) -
     ]
     rejected = _invoke(tmp_path, "--dry-run", "--condition", "dense", *overrides)
     assert rejected.returncode != 0
-    assert "dense" in rejected.stderr
+    assert "condition must be one of ('baseline', 'full')" in rejected.stderr
     same_directory = _invoke(
         tmp_path, "--dry-run", f"output_dir={reference}", f"dense_reference_dir={reference}"
     )
@@ -165,6 +169,7 @@ def test_tiny_cpu_cli_produces_complete_three_stage_comparison(tmp_path: Path) -
     definition = cast(dict[str, object], manifest["definition"])
     assert definition["seeds"] == [0]
     assert definition["graphs"] == ["complementary"]
+    assert definition["trajectory_length"] == 3
     assert "condition" not in definition
     run = read_json(parent / "baseline/run_config.json")
     training = cast(dict[str, object], run["train"])

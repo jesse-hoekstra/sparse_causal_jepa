@@ -36,7 +36,7 @@ def _common_specification(config: DGPConfig) -> dict[str, object]:
 
 
 class ControlledVectorDGP:
-    """Polynomial controlled dynamics with a fixed nonlinear orthogonal observation map."""
+    """Positive action-dependent coupling with a fixed nonlinear observation map."""
 
     def __init__(self, config: DGPConfig) -> None:
         """Freeze this process's configuration and realize the separate observation map."""
@@ -56,6 +56,7 @@ class ControlledVectorDGP:
     def specification(self) -> dict[str, object]:
         """Describe prescribed dynamics and fixed realized observation map."""
         return _common_specification(self.config) | {
+            "generator_version": "controlled-vector-positive-v2",
             "family": self.config.family,
             "parameter_graph": self.config.parameter_graph,
             "action_dim": 10,
@@ -63,7 +64,14 @@ class ControlledVectorDGP:
             "minimum_prediction_start": 0,
             "minimum_context_len": 2,
             "observation_shape": [10],
-            "epsilon": 1 / 40,
+            "dynamics": {
+                "interaction": "F[i,j]=(1+a[i]**2)*(1+a[j]**3)",
+                "state_self": 0.5,
+                "state_coupling": controlled_vector.STATE_COUPLING,
+                "parameter_coupling": controlled_vector.PARAMETER_COUPLING,
+                "parameter_gain": "exp(sum(a)/sqrt(10))",
+                "action_scale": controlled_vector.ACTION_SCALE,
+            },
             "initial_distribution": "independent N(0,I10) z0 and theta",
             "action_distribution": "independent Uniform(-1,1)",
             "observation_map": {

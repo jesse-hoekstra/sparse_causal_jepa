@@ -60,7 +60,7 @@ class ExperimentConfig:
     graphs: tuple[str, ...] = ("complementary",)
     seeds: tuple[int, ...] = (0,)
     train_episodes: int = 8192
-    trajectory_length: int = 16
+    trajectory_length: int = 3
     data_seed: int = 0
     observation_seed: int = 1729
     validation_every: int = 1000

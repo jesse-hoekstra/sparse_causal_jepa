@@ -1,5 +1,6 @@
-"""Independent scientific checks for manuscript equations (87)-(99)."""
+"""Independent scientific checks for the positive-coupling controlled-vector process."""
 
+from math import exp, sqrt
 from typing import cast
 
 import pytest
@@ -38,7 +39,7 @@ def _reference_matrices(actions: Tensor, variant: ParameterGraph) -> tuple[Tenso
     action_sum = sum(float(actions[k]) for k in range(10))
     for output in range(10):
         for source in range(10):
-            monomial = float(actions[output]) * float(actions[source]) ** 2
+            factor = (1 + float(actions[output]) ** 2) * (1 + float(actions[source]) ** 3)
             diagonal = int(output == source)
             state_edge = output // 5 == source // 5
             parameter_edge = (
@@ -46,9 +47,9 @@ def _reference_matrices(actions: Tensor, variant: ParameterGraph) -> tuple[Tenso
                 or (variant == "complementary" and output % 5 == source % 5)
                 or (variant == "diagonal" and output == source)
             )
-            state_matrix[output, source] = diagonal / 2 + state_edge * monomial / 40
+            state_matrix[output, source] = diagonal / 2 + 0.1 * state_edge * factor
             parameter_matrix[output, source] = (
-                diagonal * (1 + action_sum / 40) + parameter_edge * monomial / 40
+                diagonal * exp(action_sum / sqrt(10)) + 0.25 * parameter_edge * factor
             )
     return state_matrix, parameter_matrix
 
@@ -72,8 +73,40 @@ def test_transition_and_coefficients_independent_float64_reference(variant: Para
         dtype=torch.float64,
     )
     torch.testing.assert_close(transition(state, parameters, actions, variant), expected)
-    # A non-symmetric pair of actions catches transposing F_ij = a_i*a_j^2.
+    # A non-symmetric pair catches transposing F_ij = (1+a_i^2)*(1+a_j^3).
     assert not torch.isclose(actual_a[0, 1], actual_a[1, 0])
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_extreme_actions_preserve_positive_support_invertibility_and_recovery(
+    variant: ParameterGraph,
+) -> None:
+    state, parameters, _ = _inputs()
+    edge = 1 - 1e-6
+    actions = torch.stack(
+        (
+            torch.full((10,), edge, dtype=torch.float64),
+            torch.full((10,), -edge, dtype=torch.float64),
+            torch.tensor([edge, -edge] * 5, dtype=torch.float64),
+            torch.linspace(-edge, edge, 10, dtype=torch.float64),
+        )
+    )
+    matrix_a, matrix_b = coefficient_matrices(actions, variant)
+    for matrix, mask in ((matrix_a, state_mask()), (matrix_b, parameter_mask(variant))):
+        assert torch.equal(matrix > 0, mask.expand_as(matrix))
+        determinants = cast(Tensor, torch.linalg.det(matrix))  # pyright: ignore[reportUnknownMemberType]
+        assert torch.isfinite(determinants).all()
+        assert (determinants > 0).all()
+    expected_next = torch.stack(
+        [
+            reference_a @ state + reference_b @ parameters
+            for reference_a, reference_b in (
+                _reference_matrices(action, variant) for action in actions
+            )
+        ]
+    )
+    recovered = recover_parameters(state, expected_next, actions, variant)
+    torch.testing.assert_close(recovered, parameters.expand_as(recovered), atol=1e-13, rtol=1e-13)
 
 
 @pytest.mark.parametrize(
@@ -171,6 +204,13 @@ def test_analytic_jacobians_match_autodiff_and_structural_support(variant: Param
     assert batched.state.shape == batched.action.shape == (2, 10, 1, 10)
     assert batched.parameter.shape == (2, 10, 10)
     torch.testing.assert_close(batched.action[1], analytic.action)
+    # At a=0, the product factors have zero derivative; every action enters
+    # only through exp(sum(a)/sqrt(10))*theta, independently of the graph.
+    zero_action = analytic_jacobians(state, parameters, torch.zeros_like(actions), variant)
+    expected_action = (parameters / sqrt(10)).unsqueeze(-1).expand(10, 10)
+    torch.testing.assert_close(
+        zero_action.action.squeeze(1), expected_action, rtol=1e-14, atol=1e-15
+    )
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
@@ -266,7 +306,7 @@ def test_sufficient_influence_constructions_with_explicit_tolerances(
     assert report.state_fixed_point_residual < 1e-13
     assert report.parameter_fixed_output_residual < 1e-13
     assert report.action_fixed_output_residual < 1e-13
-    assert report.action_derivative_residual == 0
+    assert report.action_derivative_residual < 1e-14
     assert sufficient_influence_diagnostics(variant, samples=2).passed is False
 
 
@@ -275,8 +315,6 @@ def test_invalid_inputs_fail_explicitly() -> None:
         parameter_mask(cast(ParameterGraph, "wrong"))
     with pytest.raises(ValueError, match="final dimension"):
         coefficient_matrices(torch.zeros(5), "dense")
-    with pytest.raises(ValueError, match="positive and finite"):
-        coefficient_matrices(torch.zeros(10), "dense", epsilon=0)
     with pytest.raises(ValueError, match="time axis"):
         simulate(torch.zeros(10), torch.zeros(10), torch.zeros(10), "dense")
     with pytest.raises(ValueError, match="orthogonal"):
