@@ -121,12 +121,18 @@ value exactly; any relaxation must be an explicit configuration change. The save
 Both sparse models use exactly the same record. This is a prediction/regularization
 loss constraint, not an edge-count budget.
 
-Validation selects the dense checkpoint with the lowest base loss. For sparse
+Validation selects `best.pt`: the dense checkpoint with the lowest base loss. For sparse
 models it first prefers checkpoints with `validation/base_loss <= tau`, then the
 lowest weighted path count among those. If none is feasible, it selects the lowest
 base loss and reports infeasibility. The internal selection score encodes this
-ordering monotonically; it is excluded from the dashboard. Test data never select
-checkpoints or calibrate tau.
+ordering monotonically; it is excluded from the dashboard. Dense `best.pt` remains
+the reference for tau calibration and sparse-run initialization; sparse `best.pt`
+remains a validation diagnostic. Final held-out test evaluation uses `last.pt`
+for every condition, including dense, regardless of validation selection or
+feasibility. Test data never select checkpoints or calibrate tau.
+`evaluation/evaluated_step` and `evaluation/evaluated_checkpoint.json` record the
+tested final checkpoint's step, with its path and hash in the JSON record.
+`evaluation/selected_step` retains the validation-selected step as a diagnostic.
 
 ## What to observe
 
@@ -134,8 +140,9 @@ The default sequence has three named W&B runs: `complementary-dense-seed0`,
 `complementary-baseline-seed0`, and `complementary-full-seed0`.
 With `dense_reference_dir`, only the latter two are created in the new group.
 MCC and SHD are logged at each validation interval and on the final held-out
-test set. Calibration matching is refitted per evaluated checkpoint; recovery
-scores do not enter checkpoint selection. The dashboard retains:
+test set using the final `last.pt` checkpoint. Calibration matching is refitted
+per evaluated checkpoint; recovery scores do not enter checkpoint selection.
+The dashboard retains:
 
 - Prediction MSE, base loss and weighted sparsity loss.
 - `validation/target_variance`: population variance of EMA targets across all
@@ -226,8 +233,9 @@ checkpoint, optimizer and controller state.
 Completed stages are skipped. To select a stage, add `--condition dense`,
 `--condition baseline`, or `--condition full`; sparse-only execution requires an
 already completed, compatible dense calibration. `--condition dense` is incompatible
-with `dense_reference_dir`. `--evaluate-only` recomputes the selected checkpoint's
-metrics without training. `--aggregate-only` refreshes local
+with `dense_reference_dir`. `--evaluate-only` recomputes held-out test metrics from
+each condition's existing `last.pt` without training. Dense tau calibration
+continues to use `best.pt`. `--aggregate-only` refreshes local
 `results.csv` and `summary.json`.
 
 Use a **new output directory** for this protocol. Earlier GECO runs that started

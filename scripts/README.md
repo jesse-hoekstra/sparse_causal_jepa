@@ -3,6 +3,8 @@
 - `run_controlled_experiment.py`: dense calibration followed by two GECO-sparse comparisons, validation,
   best checkpoints, held-out evaluation, W&B, safe resume and aggregation. See
   [the experiment guide](../docs/controlled_experiment.md) for tmux/server commands.
+  The separate [independent Gaussian preset](../docs/independent_gaussian_experiment.md)
+  uses this same entrypoint with three context frames and two forecast targets.
 
 - `smoke.py`: CPU forward/backward check using random image and vector tensors.
 - `generate_data.py`: inspect small deterministic episodes or stream a versioned

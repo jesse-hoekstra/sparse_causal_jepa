@@ -27,7 +27,7 @@ def main() -> None:
         "--aggregate-only", action="store_true", help="refresh summaries of existing runs"
     )
     action.add_argument(
-        "--evaluate-only", action="store_true", help="evaluate existing best checkpoints"
+        "--evaluate-only", action="store_true", help="evaluate existing final (last.pt) checkpoints"
     )
     parser.add_argument(
         "--resume", action="store_true", help="resume interrupted runs; skip completed runs"

@@ -26,10 +26,11 @@ references = vector.ground_truth(0)  # explicit evaluation-only access
 | Family | Observation shape per frame | True state / parameter / action dimensions | History |
 |---|---|---|---|
 | `controlled_vector` | `(10,)` | `10 / 10 / 10` | 1 |
+| `independent_gaussian` | `(10,)` | `10 / 10 / 10` | 1 |
 | `coupled_springs` | `(3,320,64)` | `10 / 10 / 5` | 2 |
 
 Single-episode dataset items have observations `(T,*observation_shape)`, actions
-`(T-1,d_a)`, and a scalar int64 `episode_ids`. With vector
+`(T-1,d_a)`, and a scalar int64 `episode_ids`. With either vector family and
 `episodes_per_parameter=2`, one item is a parameter group: observations `(2,T,10)`,
 actions `(2,T-1,10)`, and one scalar group ID in `episode_ids`. `num_episodes`
 counts groups in this mode, so 8 items contain 16 trajectories. The generic
@@ -110,6 +111,39 @@ and the orthogonal inverse of W. `recover_parameters` implements Eq. (94) with a
 `solve(B_G(a), z_next - A(a) @ z)`. These reference utilities are evaluation-only.
 Choose another graph with `dataclasses.replace(config, parameter_graph=...)` to
 reuse exactly the same exogenous draws and W; only the parameter mask changes.
+
+## Independent Gaussian vector process
+
+`family="independent_gaussian"` selects the separate two-reflection and radial-rotation
+construction. It supports the complementary graph only, with the same 50 state,
+100 action and 20 parameter edges. Initial states, parameters and actions are
+independent standard Gaussians; paired episodes share only their parameter draw.
+Its separate generator version and resolved family enter dataset fingerprints.
+The old controlled-vector sampler and coefficients remain unchanged.
+
+The process uses raw action coordinates to construct two orthogonal block mixers.
+Each mixed state is paired with a densely mixed Gaussian action and rotated by an
+angle depending on its radius and the two permitted parameters. This preserves
+`z_t | theta ~ N(0,I10)` exactly in the mathematical model. See the
+[complete equations and run protocol](independent_gaussian_experiment.md).
+
+The generic preset is `data=independent_gaussian`. The experiment preset uses five
+frames and two episodes per parameter: the first three frames and two actions
+form the recovery context, followed by two cross-episode autoregressive targets.
+The declared minimum recovery context is three; compatibility checks reject a
+two-frame model. Training items contain only observations, actions and group IDs.
+Ground-truth states and parameters stay in the evaluation-only sidecar.
+Observations reuse `VectorObservationMap`, including the persisted realization of W.
+
+This family does not provide the older process's `state_matrices` and
+`parameter_matrices`: its transition is nonlinear. Use its derivative utilities
+for mechanism checks rather than treating it as a linear coefficient model.
+Generate ordinary samples without the controlled-vector-only `--diagnostics` flag:
+
+```bash
+python scripts/generate_data.py --config configs/data/independent_gaussian.yaml \
+  num_episodes=1
+```
 
 ## Coupled springs and action indexing
 

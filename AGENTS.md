@@ -41,8 +41,11 @@ Both retain learned attention weights, all other learned gates, state/action
 regularization, active logit regularization and GECO. Preserve the shared calibrated
 bound, paired tensor initialization and controller resume. Both sparse runs start
 from the exact dense best checkpoint bound to tau, including its EMA encoder,
-with fresh optimizer, GECO controller and step counters. Resume restores each
-sparse run's own checkpoint and training state. Older protocols require a new
+with fresh optimizer, GECO controller and step counters. Final held-out test
+evaluation and `--evaluate-only` use each condition's `last.pt`, including dense.
+Validation-selected `best.pt` remains for dense calibration/warm starts and
+validation diagnostics. Resume restores each sparse run's own checkpoint and
+training state. Older protocols require a new
 output directory because source/configuration provenance differs. An optional
 `dense_reference_dir` reuses a compatible previous experiment's selected dense
 checkpoint and original tau, running only baseline/full in the new output.
@@ -54,3 +57,10 @@ Use SIGReg only. Keep calibration, validation and test separate, preserve paired
 initialization/data and fixed observation maps, and validate checkpoint/run
 provenance. An ordinary MLP plus empirical probes does not guarantee injectivity.
 Use tiny CPU or offline-W&B checks; do not launch full scientific runs implicitly.
+
+The explicitly selected `independent_gaussian` experiment is a separate approved
+DGP; follow `docs/independent_gaussian_experiment.md`. Use the nonlinear two-reflection
+and radius-dependent rotation, raw Gaussian action coordinates, complementary
+graphs only, K=3, T=5, L=1 and paired episodes with independent initial states/actions.
+Keep the existing controlled-vector definitions intact. This DGP needs fresh dense
+training and calibration; do not reuse an older family's checkpoint or tau.

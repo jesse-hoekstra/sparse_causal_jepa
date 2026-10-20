@@ -48,6 +48,10 @@ def external_dense_manifest(
 
     directory = dense_directory(config, graph, seed)
     record = read_json(directory / "run_config.json")
+    if _mapping(record.get("data"), "data configuration").get("family") != config.data_family:
+        raise ValueError(
+            "external dense reference data family differs; train a new dense reference"
+        )
     tau = read_json(directory / "tau.json")
     checkpoint = _mapping(
         torch.load(directory / "best.pt", map_location="cpu", weights_only=False), "checkpoint"

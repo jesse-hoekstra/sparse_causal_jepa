@@ -1,4 +1,4 @@
-"""Typed, reproducible settings for the controlled-vector comparison."""
+"""Typed, reproducible settings for registered vector DGP comparisons."""
 
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -59,6 +59,7 @@ class ExperimentConfig:
     name: str = "complementary-geco"
     output_dir: str = "outputs/complementary_geco"
     dense_reference_dir: str | None = None
+    data_family: str = "controlled_vector"
     graphs: tuple[str, ...] = ("complementary",)
     seeds: tuple[int, ...] = (0,)
     train_episodes: int = 8192
@@ -89,6 +90,8 @@ class ExperimentConfig:
             raise ValueError("tau_multiplier must be finite and at least one")
         if not self.name or not self.output_dir:
             raise ValueError("experiment name and output_dir must be nonempty")
+        if self.data_family not in {"controlled_vector", "independent_gaussian"}:
+            raise ValueError("data_family must be controlled_vector or independent_gaussian")
         if self.dense_reference_dir is not None:
             if not self.dense_reference_dir.strip():
                 raise ValueError("dense_reference_dir must be nonempty when supplied")
@@ -99,7 +102,7 @@ class ExperimentConfig:
             or len(set(self.graphs)) != len(self.graphs)
             or any(graph not in {"dense", "complementary", "diagonal"} for graph in self.graphs)
         ):
-            raise ValueError("graphs must be distinct named controlled-vector variants")
+            raise ValueError("graphs must be distinct named vector variants")
         if (
             not self.seeds
             or len(set(self.seeds)) != len(self.seeds)
@@ -119,6 +122,17 @@ class ExperimentConfig:
             raise ValueError("controlled comparison requires vector 10/10/10/10, L=1 and K>=2")
         if model.spartan_dense or model.spartan_identity or model.spartan_parameter_gates_open:
             raise ValueError("comparison sets gate modes per condition")
+        if self.data_family == "independent_gaussian" and (
+            tuple(self.graphs) != ("complementary",)
+            or model.context_len != 3
+            or self.trajectory_length != 5
+            or self.episodes_per_parameter != 2
+            or not model.autoregressive
+        ):
+            raise ValueError(
+                "independent_gaussian comparison requires complementary graphs, K=3, "
+                "five frames, paired episodes and two-step autoregressive prediction"
+            )
         objective = self.train.objective
         if objective.state_regularizer != "sigreg" or objective.parameter_regularizer != "sigreg":
             raise ValueError("use SIGReg for both representations; zero weights disable it")
@@ -145,7 +159,7 @@ class ExperimentConfig:
     def data_config(self, graph: str) -> DGPConfig:
         """Resolve the training data definition without using model random seeds."""
         return DGPConfig(
-            family="controlled_vector",
+            family=self.data_family,
             parameter_graph=graph,
             root_seed=self.data_seed,
             observation_seed=self.observation_seed,
@@ -201,6 +215,10 @@ class ExperimentConfig:
         result.pop("output_dir")
         result.pop("wandb")
         result.pop("upload_evaluation_artifacts")
+        # Preserve definitions written before explicit family selection existed.
+        # New families remain explicit and cannot share a legacy experiment identity.
+        if self.data_family == "controlled_vector":
+            result.pop("data_family")
         training = cast(dict[str, object], result["train"])
         for field_name in ("out_dir", "device", "num_workers", "prefetch_factor", "log_every"):
             training.pop(field_name)

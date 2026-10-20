@@ -7,10 +7,14 @@ from typing import cast
 import torch
 from torch import Tensor
 
-from scjepa.data import controlled_vector, coupled_springs
+from scjepa.data import controlled_vector, coupled_springs, independent_gaussian
 from scjepa.data.random import STREAM_VERSION, episode_id
 from scjepa.data.renderer import SpringRenderer
-from scjepa.data.sampling import sample_controlled_vector, sample_coupled_springs
+from scjepa.data.sampling import (
+    sample_controlled_vector,
+    sample_coupled_springs,
+    sample_independent_gaussian,
+)
 from scjepa.data.types import DGPConfig, GraphMasks, ScientificEpisode
 
 GENERATOR_VERSION = "paper-dgps-v1"
@@ -200,10 +204,97 @@ class CoupledSpringsDGP:
         )
 
 
+class IndependentGaussianDGP:
+    """Raw-action reflection/radial dynamics with independent Gaussian state marginals."""
+
+    def __init__(self, config: DGPConfig) -> None:
+        """Bind the new family and reuse the fixed vector observation-map interface."""
+        if config.family != "independent_gaussian":
+            raise ValueError("IndependentGaussianDGP requires family=independent_gaussian")
+        self.config = config
+        self.observation_map = controlled_vector.VectorObservationMap(seed=config.observation_seed)
+        self.observation_matrix: Tensor | None = self.observation_map.matrix.clone()
+
+    def restore_observation_matrix(self, matrix: Tensor) -> None:
+        """Restore the authoritative realized observation map for another split."""
+        self.observation_map = controlled_vector.VectorObservationMap(
+            seed=self.config.observation_seed, matrix=matrix
+        )
+        self.observation_matrix = self.observation_map.matrix.clone()
+
+    def specification(self) -> dict[str, object]:
+        """Bind exact dynamics, Gaussian sampling, context and observation provenance."""
+        return _common_specification(self.config) | {
+            "generator_version": independent_gaussian.GENERATOR_VERSION,
+            "family": self.config.family,
+            "parameter_graph": "complementary",
+            "action_dim": 10,
+            "history_len": 1,
+            "minimum_prediction_start": 0,
+            "minimum_context_len": 3,
+            "recommended_trajectory_length": 5,
+            "observation_shape": [10],
+            "episodes_per_parameter": self.config.episodes_per_parameter,
+            "dataset_item": "one parameter draw with independent initial states and actions",
+            "dynamics": {
+                "householder": "H(v)=I5-2*v*v.T/(v.T*v)",
+                "state_rotation": "U(a)=diag(H(v1)H(Dv1),H(v2)H(Dv2))",
+                "state_rotation_vectors": ["v1=(1,a[0:4])", "v2=(1,a[4:8])"],
+                "reflection_diagonal": [1, 2, 3, 4, 5],
+                "action_rotation": "V=I10-0.2*J10",
+                "rotated_inputs": "b=U(a)z;c=Va",
+                "parameter_scale": independent_gaussian.DELTA,
+                "parameter_transform": "alpha=0.1*tanh(theta)",
+                "radial_scale": independent_gaussian.KAPPA,
+                "radial_weight": "r2=b*b+c*c;h=0.5*r2/(1+r2)",
+                "parameter_mate": "(i+5)%10",
+                "phase": "phi[i]=alpha[i]+h[i]*alpha[(i+5)%10]",
+                "transition": "g=b*cos(phi)+c*sin(phi)",
+            },
+            "initial_distribution": "independent N(0,I10) z0 and theta",
+            "parameter_distribution": "N(0,I10), shared within each parameter group",
+            "action_distribution": "independent N(0,I10) at every transition and view",
+            "sampling": "unconditional; no filtering, clipping, rejection, or resampling",
+            "state_marginal": "z[t]|theta is N(0,I10); independence is at the same time",
+            "observation_map": {
+                "kind": "orthogonal_cubic",
+                "formula": "psi(W z), psi(u)=u+0.1*u^3",
+                "seed": self.config.observation_seed,
+                "matrix_fingerprint": self.observation_map.fingerprint,
+            },
+            "initialization": "z0 supplied; all action transitions valid",
+        }
+
+    def graphs(self) -> GraphMasks:
+        """Return the fixed complementary graph independently of sampled values."""
+        return independent_gaussian.graphs()
+
+    def generate(self, episode_index: int) -> ScientificEpisode:
+        """Generate one parameter group, exposing labels only in the truth payload."""
+        draws = sample_independent_gaussian(self.config, episode_index)
+        states = independent_gaussian.simulate(
+            draws.initial_position, draws.parameters, draws.actions
+        )
+        dtype = torch.float32 if self.config.dtype == "float32" else torch.float64
+        return ScientificEpisode(
+            self.observation_map.forward(states).to(dtype=dtype),
+            draws.actions.to(dtype=dtype),
+            episode_id(self.config.root_seed, self.config.split, episode_index),
+            {
+                "states": states,
+                "parameters": draws.parameters,
+                "initial_state": draws.initial_position,
+                "actions": draws.actions,
+                "valid_transitions": torch.ones(draws.actions.shape[:-1], dtype=torch.bool),
+            },
+        )
+
+
 @cache
 def register_builtin_processes() -> None:
-    """Register the two implementations lazily, keeping the registry lightweight."""
+    """Register built-in implementations lazily, keeping the registry lightweight."""
     from scjepa.data.factory import register_dgp
 
     register_dgp("controlled_vector", ControlledVectorDGP)
     register_dgp("coupled_springs", CoupledSpringsDGP)
+    register_dgp("independent_gaussian", IndependentGaussianDGP)

@@ -12,6 +12,11 @@ tmux/W&B server commands, validation, recovery metrics, and resume. The scientif
 protocol lives separately from the reusable model/trainer. See
 [data generation](docs/data_generation.md) for equations and storage.
 
+The [independent Gaussian experiment](docs/independent_gaussian_experiment.md)
+uses the verified two-reflection and radial-rotation DGP, Gaussian actions,
+three context frames and two forecast targets. Its separate preset preserves the
+older controlled-vector experiment and requires fresh dense calibration.
+
 ## Model and batch interface
 
 ```python

@@ -168,8 +168,7 @@ def test_paired_configs_only_change_parameter_penalty_and_enforce_sigreg(tmp_pat
         config.validate()
     config.train.objective.state_regularizer = "sigreg"
     config.train.objective.parameter_regularizer_weight = 0.0
-    with pytest.raises(ValueError, match="(?i)sigreg"):
-        config.validate()
+    config.validate()  # Zero weight disables SIGReg; its configured kind remains SIGReg.
 
 
 def test_manifest_restores_actual_matrix_without_regenerating_seed(

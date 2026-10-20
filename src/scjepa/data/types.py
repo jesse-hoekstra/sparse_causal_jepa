@@ -63,14 +63,18 @@ class DGPConfig:
         if not self.family:
             raise ValueError("family must be nonempty")
         if self.parameter_graph is None:
-            object.__setattr__(
-                self, "parameter_graph", "diagonal" if self.family == "coupled_springs" else "dense"
-            )
+            default_graph = {
+                "coupled_springs": "diagonal",
+                "independent_gaussian": "complementary",
+            }.get(self.family, "dense")
+            object.__setattr__(self, "parameter_graph", default_graph)
         if self.parameter_graph not in {"dense", "complementary", "diagonal"}:
             raise ValueError("unknown parameter_graph")
         if self.family == "coupled_springs" and self.parameter_graph != "diagonal":
             raise ValueError("coupled_springs has the paper's diagonal parameter graph")
-        if self.family == "controlled_vector" and (
+        if self.family == "independent_gaussian" and self.parameter_graph != "complementary":
+            raise ValueError("independent_gaussian requires the complementary parameter graph")
+        if self.family in {"controlled_vector", "independent_gaussian"} and (
             self.position_mean,
             self.position_std,
             self.velocity_mean,
@@ -87,9 +91,14 @@ class DGPConfig:
             raise ValueError("num_episodes must be in [1,2**30]")
         if self.episodes_per_parameter not in (1, 2):
             raise ValueError("episodes_per_parameter must be 1 or 2")
-        if self.episodes_per_parameter == 2 and self.family != "controlled_vector":
-            raise ValueError("paired episodes are supported only for controlled_vector")
-        minimum = 3 if self.family == "coupled_springs" else 2
+        if self.episodes_per_parameter == 2 and self.family not in {
+            "controlled_vector",
+            "independent_gaussian",
+        }:
+            raise ValueError(
+                "paired episodes are supported only for controlled_vector and independent_gaussian"
+            )
+        minimum = 3 if self.family in {"coupled_springs", "independent_gaussian"} else 2
         if self.trajectory_length < minimum:
             raise ValueError(f"trajectory_length must be at least {minimum}")
         if self.dtype not in {"float32", "float64"}:

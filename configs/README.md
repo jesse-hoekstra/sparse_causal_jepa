@@ -1,5 +1,12 @@
 # Configuration
 
+`experiments/independent_gaussian.yaml` runs the nonlinear Gaussian-preserving
+DGP with the complementary graph, K=3, T=5, paired episodes, SIGReg and 100,000
+steps per stage at constant learning rate 0.001. Its companion
+`experiments/independent_gaussian_smoke.yaml` runs a tiny CPU check. See
+[the server guide](../docs/independent_gaussian_experiment.md). Both use the existing
+experiment entrypoint with the explicit `data_family=independent_gaussian` selector.
+
 `experiments/controlled_vector.yaml` defines dense calibration and two GECO models on
 complementary data with seed 0 and two four-frame episodes per parameter vector
 (K=2, L=1), with two-step autoregressive prediction across the episodes in both directions;
