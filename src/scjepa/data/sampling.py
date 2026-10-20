@@ -53,6 +53,37 @@ def sample_controlled_vector(config: DGPConfig, index: int) -> ExogenousDraws:
     return ExogenousDraws(initial, parameters, actions)
 
 
+def sample_independent_gaussian(config: DGPConfig, index: int) -> ExogenousDraws:
+    """Draw independent N(0,I10) states/actions and one parameter per group.
+
+    Reuse the existing independently addressed streams. Drawing each view
+    successively preserves the first view when a second episode is enabled.
+    There is no filtering or conditioning on the sampled parameter or trajectory.
+    """
+    if not 0 <= index < config.num_episodes:
+        raise IndexError(index)
+    initial_generator = generator(config.root_seed, config.split, index, "initial_position")
+    action_generator = generator(config.root_seed, config.split, index, "actions")
+    initial_views = [
+        torch.randn(10, dtype=torch.float64, generator=initial_generator)
+        for _ in range(config.episodes_per_parameter)
+    ]
+    parameters = torch.randn(
+        10,
+        dtype=torch.float64,
+        generator=generator(config.root_seed, config.split, index, "parameters"),
+    )
+    action_views = [
+        torch.randn(
+            config.trajectory_length - 1, 10, dtype=torch.float64, generator=action_generator
+        )
+        for _ in range(config.episodes_per_parameter)
+    ]
+    initial = initial_views[0] if config.episodes_per_parameter == 1 else torch.stack(initial_views)
+    actions = action_views[0] if config.episodes_per_parameter == 1 else torch.stack(action_views)
+    return ExogenousDraws(initial, parameters, actions)
+
+
 def sample_coupled_springs(config: DGPConfig, index: int) -> ExogenousDraws:
     """Draw independent inverse masses, Gaussian history, and pair actions.
 

@@ -1,4 +1,4 @@
-"""Calibration-frozen MCC and graph SHD for the controlled-vector experiment.
+"""Calibration-frozen MCC and graph SHD for registered vector DGP experiments.
 
 MCC uses absolute Pearson correlation and a Hungarian assignment, following
 Lachapelle et al.'s mechanism-sparsity implementation. We fit that assignment on
@@ -19,9 +19,9 @@ from typing import cast
 import torch
 from torch import Tensor
 
-from scjepa.data.controlled_vector import ParameterGraph, VectorObservationMap, graphs
-from scjepa.data.processes import ControlledVectorDGP
-from scjepa.data.types import DGPConfig
+from scjepa.data.controlled_vector import VectorObservationMap
+from scjepa.data.factory import build_dgp_dataset
+from scjepa.data.types import DGPConfig, GraphMasks
 from scjepa.eval.recovery import (
     CoordinateMatch,
     fit_coordinate_match,
@@ -65,6 +65,7 @@ class EvaluationConfig:
 @dataclass(frozen=True)
 class _EncodedSplit:
     config: DGPConfig
+    reference_graphs: GraphMasks
     ids: Tensor
     states: Tensor
     parameters: Tensor
@@ -97,8 +98,8 @@ def _evaluation_context(model: SCJEPA, seed: int = 42) -> Generator[None]:
 
 
 def _check_model(model: SCJEPA, data: DGPConfig) -> None:
-    if data.family != "controlled_vector":
-        raise ValueError("this experiment evaluates only controlled_vector data")
+    if data.family not in {"controlled_vector", "independent_gaussian"}:
+        raise ValueError("this experiment evaluates controlled_vector or independent_gaussian data")
     predictor = model.predictor
     if (
         model.online_encoder.observation_ndim != 1
@@ -111,6 +112,8 @@ def _check_model(model: SCJEPA, data: DGPConfig) -> None:
         raise ValueError("vector experiment requires dimensions 10/10/10, L=1, K>=2")
     if data.trajectory_length <= model.context_len:
         raise ValueError("trajectory_length must include a target after the context")
+    if data.family == "independent_gaussian" and model.context_len < 3:
+        raise ValueError("independent_gaussian evaluation requires K>=3")
 
 
 def _batch_sizes(count: int, batch_size: int) -> list[int]:
@@ -134,8 +137,7 @@ def _collect(
     isolate_gate_rng: bool = False,
 ) -> _EncodedSplit:
     data = replace(base, split=split, num_episodes=count)
-    process = ControlledVectorDGP(data)
-    process.restore_observation_matrix(matrix)
+    process = build_dgp_dataset(data, observation_matrix=matrix).process
     reference = next(model.online_encoder.parameters())
     criterion = TrainingObjective(objective or ObjectiveConfig()).to(reference)
     buckets: dict[str, list[Tensor]] = {
@@ -200,6 +202,7 @@ def _collect(
         raise FloatingPointError("nonfinite evaluation encodings")
     return _EncodedSplit(
         data,
+        reference_graphs=process.graphs(),
         **values,
         graph_frequencies={key: value / transition_count for key, value in graph_counts.items()},
         prediction_mse=prediction_sum / count,
@@ -351,7 +354,7 @@ def _recovery_metrics(
         threshold,
         target_match=matches["target"],
     )
-    truth = graphs(cast(ParameterGraph, scored.config.parameter_graph))
+    truth = scored.reference_graphs
     for name, predicted in support.items():
         target = cast(Tensor, getattr(truth, name))
         metrics[f"{name}_shd"] = float((predicted != target).sum())
@@ -407,7 +410,7 @@ def evaluate_model(
         for name, value in diagnostics.items():
             prefix = "recovery" if name.endswith("_mcc") else "graph"
             metrics[f"{prefix}/{name}"] = value
-        truth = graphs(cast(ParameterGraph, base_data.parameter_graph))
+        truth = test.reference_graphs
         torch.save(
             {
                 "matrix": observation_matrix.detach().cpu(),

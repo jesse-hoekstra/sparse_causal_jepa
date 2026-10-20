@@ -163,8 +163,9 @@ def _status(directory: Path, status: str, identity: str, **details: object) -> N
     )
 
 
-def _selected_checkpoint(path: Path, trainer: Trainer, identity: str) -> dict[str, object]:
-    """Verify selected weights against the current run and its selection record."""
+def _run_checkpoint(path: Path, trainer: Trainer, identity: str) -> dict[str, object]:
+    """Verify checkpoint provenance and scientific settings against this run."""
+    label = path.stem
     payload = cast(dict[str, object], torch.load(path, map_location="cpu", weights_only=False))
     if (
         payload.get("format_version") != 1
@@ -172,23 +173,29 @@ def _selected_checkpoint(path: Path, trainer: Trainer, identity: str) -> dict[st
         or payload.get("model_config") != trainer.model_config
         or payload.get("world_size") != world_size()
     ):
-        raise ValueError("best checkpoint provenance differs from this experiment run")
+        raise ValueError(f"{label} checkpoint provenance differs from this experiment run")
     metadata = payload.get("run_metadata")
     if (
         not isinstance(metadata, dict)
         or cast(dict[str, object], metadata).get("experiment_run_identity") != identity
     ):
-        raise ValueError("best checkpoint belongs to a different experiment run")
+        raise ValueError(f"{label} checkpoint belongs to a different experiment run")
     saved_config = payload.get("train_config")
     if not isinstance(saved_config, dict):
-        raise ValueError("best checkpoint lacks its training configuration")
+        raise ValueError(f"{label} checkpoint lacks its training configuration")
     saved_config = cast(dict[str, object], saved_config)
     expected = asdict(trainer.config)
     runtime_keys = {"out_dir", "device", "num_workers", "prefetch_factor", "log_every"}
     if any(
         saved_config.get(key) != value for key, value in expected.items() if key not in runtime_keys
     ):
-        raise ValueError("best checkpoint training configuration differs")
+        raise ValueError(f"{label} checkpoint training configuration differs")
+    return payload
+
+
+def _selected_checkpoint(path: Path, trainer: Trainer, identity: str) -> dict[str, object]:
+    """Verify selected weights against the current run and its selection record."""
+    payload = _run_checkpoint(path, trainer, identity)
     selection = payload.get("validation_state")
     current = trainer.validation_state
     if not isinstance(selection, dict) or any(
@@ -211,15 +218,43 @@ def _selected_checkpoint(path: Path, trainer: Trainer, identity: str) -> dict[st
     return payload
 
 
+def _final_checkpoint(path: Path, trainer: Trainer, identity: str) -> dict[str, object]:
+    """Require the final training step, retaining best selection only as metadata."""
+    payload = _run_checkpoint(path, trainer, identity)
+    selection = payload.get("validation_state")
+    score = trainer.validation_state.get("best_score")
+    best_step = trainer.validation_state.get("best_step")
+    if (
+        payload.get("step") != trainer.step
+        or trainer.step != trainer.config.steps
+        or not isinstance(selection, dict)
+        or selection != trainer.validation_state
+        or cast(dict[str, object], selection).get("last_step") != trainer.step
+        or not isinstance(best_step, int)
+        or not 0 <= best_step <= trainer.step
+        or not isinstance(score, int | float)
+        or not math.isfinite(score)
+        or trainer.validation_state.get("selection_metric")
+        != ("validation/selection_score" if trainer.config.geco.enabled else "validation/base_loss")
+    ):
+        raise ValueError("last checkpoint is not the completed run's final validated step")
+    return payload
+
+
 def _checkpoint_hash(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def _load_tau(
-    config: ExperimentConfig, manifest: dict[str, object], graph: str, seed: int
+    config: ExperimentConfig,
+    manifest: dict[str, object],
+    graph: str,
+    seed: int,
+    *,
+    require_completed: bool = True,
 ) -> dict[str, object]:
-    """Require the completed dense reference and verify the bound's provenance."""
+    """Verify bound provenance, requiring completion for consumers of the reference."""
     directory = dense_directory(config, graph, seed)
     if not (directory / "tau.json").is_file():
         raise ValueError(f"dense tau calibration is missing at {directory}")
@@ -234,7 +269,7 @@ def _load_tau(
     if (
         record.get("dense_run_identity") != identity
         or record.get("experiment_identity") != reference_manifest["identity"]
-        or status.get("status") != "completed"
+        or (require_completed and status.get("status") != "completed")
         or status.get("run_identity") != identity
         or record.get("checkpoint_sha256") != _checkpoint_hash(directory / "best.pt")
         or record.get("tau_multiplier") != config.tau_multiplier
@@ -274,11 +309,13 @@ def _run_one(
     directory = Path(str(task["directory"]))
     identity = canonical_fingerprint([manifest["identity"], graph, seed, condition])
     logger: WandbLogger | None = None
+    saved_dense_calibration: dict[str, object] | None = None
     exit_code = 1
     with ExitStack() as ownership:
         _rank_zero(lambda: ownership.enter_context(file_lock(directory / ".run.lock")), device)
 
         def check_existing() -> bool:
+            nonlocal saved_dense_calibration
             status_path = directory / "status.json"
             if status_path.exists():
                 status = read_json(status_path)
@@ -305,8 +342,15 @@ def _run_one(
                 (directory / name).exists() for name in ("last.pt", "best.pt", "run_config.json")
             ):
                 raise ValueError("run artifacts exist without a status record")
-            if evaluate_only and not (directory / "best.pt").exists():
-                raise ValueError("--evaluate-only requires a selected best.pt checkpoint")
+            if evaluate_only and not (directory / "last.pt").exists():
+                raise ValueError("--evaluate-only requires the final last.pt checkpoint")
+            if evaluate_only and condition == "dense" and (directory / "tau.json").exists():
+                # A failed prior re-evaluation can leave a transient status.
+                # Reuse the bound after validating its identity and checkpoint;
+                # sparse consumers still require a completed dense reference.
+                saved_dense_calibration = _load_tau(
+                    config, manifest, graph, seed, require_completed=False
+                )
             return False
 
         skip = _rank_zero(check_existing, device)
@@ -349,7 +393,9 @@ def _run_one(
                 device=str(device),
             )
             trainer = Trainer(model, training, data, model_config=asdict(model_config))
-            checkpoint = directory / ("last.pt" if (directory / "last.pt").exists() else "best.pt")
+            checkpoint = directory / (
+                "last.pt" if evaluate_only or (directory / "last.pt").exists() else "best.pt"
+            )
             restoring = (resume or evaluate_only) and checkpoint.exists()
             if restoring:
                 trainer.load_checkpoint(checkpoint)
@@ -499,48 +545,62 @@ def _run_one(
                 return True
 
             def final_evaluation() -> None:
-                best_path = directory / "best.pt"
-                if not best_path.exists():
-                    raise ValueError("training finished without a finite selected checkpoint")
-                payload = _selected_checkpoint(best_path, trainer, identity)
-                selected = build_model(model_config).to(device)
-                selected.load_state_dict(cast(dict[str, object], payload["model"]))
+                final_path = directory / "last.pt"
+                if not final_path.exists():
+                    raise ValueError("training finished without a final last.pt checkpoint")
+                payload = _final_checkpoint(final_path, trainer, identity)
+                final_model = build_model(model_config).to(device)
+                final_model.load_state_dict(cast(dict[str, object], payload["model"]))
                 metrics = evaluate_model(
-                    selected,
+                    final_model,
                     data_config,
                     matrix,
                     config.evaluation,
                     directory / "evaluation",
                     objective=training.objective,
                 )
-                metrics["evaluation/selected_step"] = float(cast(int, payload["step"]))
+                metrics["evaluation/evaluated_step"] = float(cast(int, payload["step"]))
+                metrics["evaluation/selected_step"] = float(
+                    cast(int, trainer.validation_state["best_step"])
+                )
                 metrics["evaluation/selection_score"] = float(
                     cast(float, trainer.validation_state["best_score"])
                 )
-                checkpoint_fingerprint = _checkpoint_hash(best_path)
+                checkpoint_fingerprint = _checkpoint_hash(final_path)
                 if condition == "dense":
-                    bound = calibrate_tau(
-                        selected,
-                        data_config,
-                        matrix,
-                        config.evaluation,
-                        objective=training.objective,
-                    )
-                    tau = bound["calibration/base_loss"] * config.tau_multiplier
-                    if not math.isfinite(tau) or tau <= 0:
-                        raise ValueError("dense calibration must produce a finite positive tau")
-                    write_json(
-                        directory / "tau.json",
-                        {
-                            "experiment_identity": manifest["identity"],
-                            "dense_run_identity": identity,
-                            "checkpoint_sha256": checkpoint_fingerprint,
-                            "selected_step": payload["step"],
-                            "tau_multiplier": config.tau_multiplier,
-                            "tau": tau,
-                            **bound,
-                        },
-                    )
+                    if saved_dense_calibration is not None:
+                        tau = float(cast(float, saved_dense_calibration["tau"]))
+                    else:
+                        best_path = directory / "best.pt"
+                        if not best_path.exists():
+                            raise ValueError(
+                                "dense calibration requires a selected best.pt checkpoint"
+                            )
+                        selected_payload = _selected_checkpoint(best_path, trainer, identity)
+                        selected = build_model(model_config).to(device)
+                        selected.load_state_dict(cast(dict[str, object], selected_payload["model"]))
+                        bound = calibrate_tau(
+                            selected,
+                            data_config,
+                            matrix,
+                            config.evaluation,
+                            objective=training.objective,
+                        )
+                        tau = bound["calibration/base_loss"] * config.tau_multiplier
+                        if not math.isfinite(tau) or tau <= 0:
+                            raise ValueError("dense calibration must produce a finite positive tau")
+                        write_json(
+                            directory / "tau.json",
+                            {
+                                "experiment_identity": manifest["identity"],
+                                "dense_run_identity": identity,
+                                "checkpoint_sha256": _checkpoint_hash(best_path),
+                                "selected_step": selected_payload["step"],
+                                "tau_multiplier": config.tau_multiplier,
+                                "tau": tau,
+                                **bound,
+                            },
+                        )
                     metrics["geco/tau"] = tau
                 elif calibration is not None:
                     metrics["geco/tau"] = float(cast(float, calibration["tau"]))
@@ -548,11 +608,13 @@ def _run_one(
                         metrics["test/base_loss"] <= metrics["geco/tau"]
                     )
                 write_json(
-                    directory / "evaluation" / "selected_checkpoint.json",
+                    directory / "evaluation" / "evaluated_checkpoint.json",
                     {
                         "run_identity": identity,
+                        "checkpoint_path": final_path.name,
                         "checkpoint_sha256": checkpoint_fingerprint,
-                        "selected_step": payload["step"],
+                        "evaluated_step": payload["step"],
+                        "selected_step": trainer.validation_state["best_step"],
                         "selection_metric": trainer.validation_state["selection_metric"],
                         "selection_score": trainer.validation_state["best_score"],
                     },
@@ -564,7 +626,7 @@ def _run_one(
                     {
                         key: value
                         for key, value in metrics.items()
-                        if not key.startswith("evaluation/")
+                        if not key.startswith("evaluation/") or key == "evaluation/evaluated_step"
                     },
                 )
                 if config.upload_evaluation_artifacts:
@@ -577,7 +639,9 @@ def _run_one(
                     "completed",
                     identity,
                     step=trainer.step,
-                    selected_step=payload["step"],
+                    evaluated_step=payload["step"],
+                    evaluated_checkpoint=final_path.name,
+                    selected_step=trainer.validation_state["best_step"],
                 )
 
             _rank_zero(final_evaluation, device)

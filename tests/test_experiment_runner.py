@@ -12,14 +12,17 @@ import pytest
 import torch
 from torch import Tensor
 
+import scjepa.experiments.runner as runner_module
 import scjepa.models.spartan as spartan_module
 from scjepa.data.identity import training_tensors_fingerprint
 from scjepa.data.processes import ControlledVectorDGP
+from scjepa.data.types import DGPConfig
 from scjepa.experiments import storage
 from scjepa.experiments.config import ExperimentConfig, load_experiment_config
 from scjepa.experiments.evaluation import EvaluationConfig
 from scjepa.experiments.runner import (
     ExperimentLogger,
+    _final_checkpoint,  # pyright: ignore[reportPrivateUsage]
     _selected_checkpoint,  # pyright: ignore[reportPrivateUsage]
     _sparse_selection_score,  # pyright: ignore[reportPrivateUsage]
     experiment_plan,
@@ -37,6 +40,7 @@ from scjepa.models.model import SCJEPA
 from scjepa.training import Trainer
 from scjepa.training.factory import ModelConfig, build_model
 from scjepa.training.logging import WandbLogger
+from scjepa.training.loop import ObjectiveConfig
 
 
 def _config(directory: Path) -> ExperimentConfig:
@@ -182,7 +186,7 @@ def test_real_three_stage_experiment_artifacts_and_resume_are_reproducible(
         for artifact in (
             "evaluation_references.pt",
             "protocol.json",
-            "selected_checkpoint.json",
+            "evaluated_checkpoint.json",
         ):
             assert (evaluation / artifact).is_file()
         references = torch.load(evaluation / "evaluation_references.pt", weights_only=True)
@@ -812,7 +816,7 @@ def test_selected_checkpoint_rejects_changed_provenance(tmp_path: Path, field: s
         _selected_checkpoint(path, trainer, "baseline-run")
 
 
-def test_evaluate_only_reproduces_selected_results_without_training_or_checkpoint_writes(
+def test_evaluate_only_reproduces_final_results_without_training_or_checkpoint_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -825,6 +829,7 @@ def test_evaluate_only_reproduces_selected_results_without_training_or_checkpoin
     checkpoint_times = [(directory / name).stat().st_mtime_ns for name in ("last.pt", "best.pt")]
     selected = cast(dict[str, object], torch.load(directory / "best.pt", weights_only=False))
     selection = cast(dict[str, object], selected["validation_state"])
+    assert metrics["evaluation/evaluated_step"] == config.train.steps
     assert metrics["evaluation/selected_step"] == selected["step"]
     assert metrics["evaluation/selection_score"] == selection["best_score"]
 
@@ -840,6 +845,214 @@ def test_evaluate_only_reproduces_selected_results_without_training_or_checkpoin
         (directory / name).stat().st_mtime_ns for name in ("last.pt", "best.pt")
     ] == checkpoint_times
     assert read_json(directory / "status.json")["status"] == "completed"
+
+
+def test_final_evaluation_uses_last_while_dense_tau_uses_best(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    original_train = Trainer.train
+    original_evaluate = runner_module.evaluate_model
+    original_calibrate = runner_module.calibrate_tau
+    evaluated: list[str] = []
+    calibrated: list[int] = []
+
+    def select_first(
+        trainer: Trainer,
+        validation_callback: Callable[[SCJEPA], dict[str, float]] | None = None,
+        validation_every: int | None = None,
+        selection_metric: str = "validation/base_loss",
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> dict[str, float]:
+        assert validation_callback is not None
+
+        def validation(model: SCJEPA) -> dict[str, float]:
+            assert validation_callback is not None
+            scores = validation_callback(model)
+            scores[selection_metric] = float(trainer.step)
+            return scores
+
+        return original_train(
+            trainer, validation, validation_every, selection_metric, stop_requested
+        )
+
+    def inspect_evaluation(
+        model: SCJEPA,
+        base_data: DGPConfig,
+        observation_matrix: Tensor,
+        evaluation: EvaluationConfig,
+        artifact_dir: Path,
+        *,
+        objective: ObjectiveConfig | None = None,
+    ) -> dict[str, float]:
+        directory = artifact_dir.parent
+        best = torch.load(directory / "best.pt", weights_only=False)
+        last = torch.load(directory / "last.pt", weights_only=False)
+        assert best["step"] == 1
+        assert last["step"] == 2
+        torch.testing.assert_close(model.state_dict(), last["model"], rtol=0, atol=0)
+        assert any(
+            not torch.equal(value, best["model"][name])
+            for name, value in model.state_dict().items()
+            if isinstance(value, Tensor)
+        )
+        evaluated.append(directory.name)
+        return original_evaluate(
+            model, base_data, observation_matrix, evaluation, artifact_dir, objective=objective
+        )
+
+    def inspect_calibration(
+        model: SCJEPA,
+        base_data: DGPConfig,
+        observation_matrix: Tensor,
+        evaluation: EvaluationConfig,
+        *,
+        objective: ObjectiveConfig | None = None,
+        training_gates: bool = False,
+    ) -> dict[str, float]:
+        if model.predictor.dense:
+            path = tmp_path / "complementary" / "seed-3" / "dense" / "best.pt"
+            best = torch.load(path, weights_only=False)
+            torch.testing.assert_close(model.state_dict(), best["model"], rtol=0, atol=0)
+            calibrated.append(best["step"])
+        return original_calibrate(
+            model,
+            base_data,
+            observation_matrix,
+            evaluation,
+            objective=objective,
+            training_gates=training_gates,
+        )
+
+    monkeypatch.setattr(Trainer, "train", select_first)
+    monkeypatch.setattr(runner_module, "evaluate_model", inspect_evaluation)
+    monkeypatch.setattr(runner_module, "calibrate_tau", inspect_calibration)
+    assert run_experiment(config)["complete"] is True
+    assert evaluated == ["dense", "baseline", "full"]
+    assert calibrated == [1]
+    for condition in evaluated:
+        directory = tmp_path / "complementary" / "seed-3" / condition
+        metrics = read_json(directory / "evaluation" / "metrics.json")
+        provenance = read_json(directory / "evaluation" / "evaluated_checkpoint.json")
+        assert metrics["evaluation/evaluated_step"] == provenance["evaluated_step"] == 2
+        assert metrics["evaluation/selected_step"] == provenance["selected_step"] == 1
+        assert provenance["checkpoint_path"] == "last.pt"
+        assert (
+            provenance["checkpoint_sha256"]
+            == hashlib.sha256((directory / "last.pt").read_bytes()).hexdigest()
+        )
+        status = read_json(directory / "status.json")
+        assert status["evaluated_step"] == 2
+        assert status["selected_step"] == 1
+    dense = tmp_path / "complementary" / "seed-3" / "dense"
+    tau = read_json(dense / "tau.json")
+    assert tau["selected_step"] == 1
+    assert tau["checkpoint_sha256"] == hashlib.sha256((dense / "best.pt").read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("condition", ["dense", "baseline", "full"])
+def test_evaluate_only_requires_last_checkpoint(tmp_path: Path, condition: str) -> None:
+    config = _config(tmp_path)
+    run_experiment(config)
+    directory = tmp_path / "complementary" / "seed-3" / condition
+    (directory / "last.pt").unlink()
+    assert (directory / "best.pt").exists()
+    with pytest.raises(ValueError, match="final last.pt"):
+        run_experiment(config, condition=condition, evaluate_only=True)
+
+
+def test_sparse_evaluate_only_does_not_require_best_checkpoint(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    run_experiment(config)
+    directory = tmp_path / "complementary" / "seed-3" / "full"
+    previous = read_json(directory / "evaluation" / "metrics.json")
+    (directory / "best.pt").unlink()
+    run_experiment(config, condition="full", evaluate_only=True)
+    assert read_json(directory / "evaluation" / "metrics.json") == previous
+
+
+def test_dense_evaluate_only_preserves_existing_tau(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    run_experiment(config)
+    directory = tmp_path / "complementary" / "seed-3" / "dense"
+    tau_path = directory / "tau.json"
+    original = tau_path.read_bytes(), tau_path.stat().st_mtime_ns
+
+    def forbidden_calibration(*_args: object, **_kwargs: object) -> dict[str, float]:
+        raise AssertionError("evaluation-only must retain the original dense calibration")
+
+    monkeypatch.setattr(runner_module, "calibrate_tau", forbidden_calibration)
+    run_experiment(config, condition="dense", evaluate_only=True)
+    assert (tau_path.read_bytes(), tau_path.stat().st_mtime_ns) == original
+    assert run_experiment(config, resume=True)["complete"] is True
+
+
+def test_dense_evaluate_only_can_retry_failure_without_recalibrating_tau(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    run_experiment(config)
+    directory = tmp_path / "complementary" / "seed-3" / "dense"
+    tau_path = directory / "tau.json"
+    original_tau = tau_path.read_bytes(), tau_path.stat().st_mtime_ns
+    original_evaluate = runner_module.evaluate_model
+    attempts = 0
+
+    def fail_once(
+        model: SCJEPA,
+        base_data: DGPConfig,
+        observation_matrix: Tensor,
+        evaluation: EvaluationConfig,
+        artifact_dir: Path,
+        *,
+        objective: ObjectiveConfig | None = None,
+    ) -> dict[str, float]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary evaluation failure")
+        return original_evaluate(
+            model, base_data, observation_matrix, evaluation, artifact_dir, objective=objective
+        )
+
+    def forbidden_calibration(*_args: object, **_kwargs: object) -> dict[str, float]:
+        raise AssertionError("retry must preserve the original dense calibration")
+
+    monkeypatch.setattr(runner_module, "evaluate_model", fail_once)
+    monkeypatch.setattr(runner_module, "calibrate_tau", forbidden_calibration)
+    with pytest.raises(RuntimeError, match="temporary evaluation failure"):
+        run_experiment(config, condition="dense", evaluate_only=True)
+    assert read_json(directory / "status.json")["status"] == "failed"
+    with pytest.raises(ValueError, match="dense tau calibration provenance"):
+        run_experiment(config, condition="full", evaluate_only=True)
+    assert (tau_path.read_bytes(), tau_path.stat().st_mtime_ns) == original_tau
+
+    run_experiment(config, condition="dense", evaluate_only=True)
+    assert attempts == 2
+    assert read_json(directory / "status.json")["status"] == "completed"
+    assert (tau_path.read_bytes(), tau_path.stat().st_mtime_ns) == original_tau
+
+
+def test_final_checkpoint_rejects_an_earlier_same_run_checkpoint(tmp_path: Path) -> None:
+    trainer, path, _ = _selected_checkpoint_fixture(tmp_path)
+    with pytest.raises(ValueError, match="final validated step"):
+        _final_checkpoint(path, trainer, "baseline-run")
+
+
+@pytest.mark.parametrize(
+    "field", ["dataset_identity", "model_config", "world_size", "format_version"]
+)
+def test_final_checkpoint_rejects_changed_provenance(tmp_path: Path, field: str) -> None:
+    trainer, _, _ = _selected_checkpoint_fixture(tmp_path)
+    path = tmp_path / "last.pt"
+    trainer.save_checkpoint(path)
+    payload = torch.load(path, weights_only=False)
+    payload[field] = "different" if field in {"dataset_identity", "model_config"} else 9
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="provenance differs"):
+        _final_checkpoint(path, trainer, "baseline-run")
 
 
 @pytest.mark.parametrize("condition", ["baseline", "full"])
