@@ -19,6 +19,7 @@ def tiny(
     identity: bool = False,
     layers: int = 2,
     parameter_gates_open: bool = False,
+    action_gates_open: bool = False,
 ) -> Spartan:
     """Construct a small model with independently chosen coordinate dimensions."""
     torch.manual_seed(0)  # pyright: ignore[reportUnknownMemberType]
@@ -34,6 +35,7 @@ def tiny(
         dense=dense,
         identity=identity,
         parameter_gates_open=parameter_gates_open,
+        action_gates_open=action_gates_open,
     )
 
 
@@ -216,10 +218,78 @@ def test_baseline_opens_only_parameter_routes_in_every_layer(
     torch.testing.assert_close(output.graphs.action, closed.graphs.action)
 
 
-def test_forced_parameter_gates_have_no_straight_through_gradient(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("history", [1, 3])
+@pytest.mark.parametrize("action_dim", [0, DA])
+@pytest.mark.parametrize("parameter_gates_open", [False, True])
+def test_action_override_opens_every_lag_in_every_layer_with_closed_logits(
+    training: bool, history: int, action_dim: int, parameter_gates_open: bool
 ) -> None:
-    model = tiny(history=2, actions=DA, parameter_gates_open=True)
+    model = tiny(
+        history=history,
+        actions=action_dim,
+        layers=3,
+        parameter_gates_open=parameter_gates_open,
+        action_gates_open=True,
+    ).train(training)
+    # All actual gate logits are -1600, closing both sampled and thresholded
+    # unforced gates. This exercises the real sampling and normalization code.
+    with torch.no_grad():
+        for layer in model.layers:
+            assert isinstance(layer, SpartanLayer)
+            layer.norm.weight.zero_()
+            layer.norm.bias.fill_(1)
+            layer.project_q.weight.copy_(torch.eye(DIM))
+            layer.project_k.weight.copy_(-100 * torch.eye(DIM))
+    unforced = tiny(
+        history=history,
+        actions=action_dim,
+        layers=3,
+        parameter_gates_open=parameter_gates_open,
+    ).train(training)
+    unforced.load_state_dict(model.state_dict())
+    adjacencies: list[Tensor] = []
+
+    def capture_layer(
+        _module: torch.nn.Module, _inputs: tuple[object, ...], output: object
+    ) -> None:
+        adjacencies.append(cast(tuple[Tensor, ...], output)[1].detach())
+
+    handles = [layer.register_forward_hook(capture_layer) for layer in model.layers]
+    states, parameters = torch.randn(2, history, DZ), torch.randn(2, DP)
+    actions = torch.randn(2, history, action_dim) if action_dim else None
+    output = model(states, parameters, actions)
+    for handle in handles:
+        handle.remove()
+    closed = unforced(states, parameters, actions)
+    expected = torch.zeros(2, model.num_tokens, model.num_tokens)
+    state_end = history * DZ
+    expected[:, state_end - DZ : state_end, state_end : state_end + history * action_dim] = 1
+    if parameter_gates_open:
+        expected[:, state_end - DZ : state_end, -DP:] = 1
+    assert len(adjacencies) == 3
+    for adjacency in adjacencies:
+        torch.testing.assert_close(adjacency, expected, rtol=0, atol=0)
+    identity = torch.eye(model.num_tokens).expand(2, -1, -1)
+    torch.testing.assert_close(output.path_matrix, (expected + identity).matrix_power(3))
+    assert (output.graphs.action > 0).all()
+    assert not closed.graphs.action.any()
+    torch.testing.assert_close(output.graphs.state, closed.graphs.state)
+    torch.testing.assert_close(output.graphs.parameter, closed.graphs.parameter)
+    assert torch.isfinite(output.prediction).all()
+
+
+@pytest.mark.parametrize("action_gates_open", [False, True])
+def test_forced_source_gates_have_no_straight_through_gradient(
+    monkeypatch: pytest.MonkeyPatch,
+    action_gates_open: bool,
+) -> None:
+    model = tiny(
+        history=2,
+        actions=DA,
+        parameter_gates_open=True,
+        action_gates_open=action_gates_open,
+    )
     sampled: list[Tensor] = []
 
     def closed_straight_through(logits: Tensor, _temperature: float, _training: bool) -> Tensor:
@@ -233,6 +303,8 @@ def test_forced_parameter_gates_have_no_straight_through_gradient(
     output.path_matrix.sum().backward()  # pyright: ignore[reportUnknownMemberType]
     forced = torch.zeros(model.num_tokens, model.num_tokens, dtype=torch.bool)
     forced[DZ : 2 * DZ, -DP:] = True
+    if action_gates_open:
+        forced[DZ : 2 * DZ, 2 * DZ : 2 * (DZ + DA)] = True
     assert len(sampled) == len(model.layers)
     for adjacency in sampled:
         assert adjacency.grad is not None
@@ -263,14 +335,47 @@ def test_open_parameter_routes_still_learn_attention_and_parameter_values(
         assert projection.weight.grad.abs().sum() > 0
 
 
-def test_fixed_parameter_gate_diagnostics_report_probability_one_and_zero_entropy() -> None:
-    model = tiny(history=2, actions=DA, parameter_gates_open=True)
+def test_open_action_routes_still_learn_attention_and_input_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tiny(history=3, actions=DA, layers=1, action_gates_open=True)
+
+    def closed_adjacency(logits: Tensor, _temperature: float, _training: bool) -> Tensor:
+        return torch.zeros_like(logits)
+
+    monkeypatch.setattr(spartan_module, "_sample_hard_adjacency", closed_adjacency)
+    states = torch.randn(2, 3, DZ, requires_grad=True)
+    actions = torch.randn(2, 3, DA, requires_grad=True)
+    output = model(states, torch.randn(2, DP), actions)
+    output.prediction.square().mean().backward()  # pyright: ignore[reportUnknownMemberType]
+    assert states.grad is not None
+    assert states.grad[:, -1].abs().sum() > 0
+    assert actions.grad is not None
+    assert (actions.grad.abs().sum(dim=(0, 2)) > 0).all()
+    layer = model.layers[0]
+    assert isinstance(layer, SpartanLayer)
+    for projection in (layer.project_q, layer.project_k, layer.project_v):
+        assert projection.weight.grad is not None
+        assert torch.isfinite(projection.weight.grad).all()
+        assert projection.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("action_gates_open", [False, True])
+def test_fixed_gate_diagnostics_report_probability_one_and_zero_entropy(
+    action_gates_open: bool,
+) -> None:
+    model = tiny(
+        history=2,
+        actions=DA,
+        parameter_gates_open=True,
+        action_gates_open=action_gates_open,
+    )
     with torch.no_grad():
         for layer in model.layers:
             assert isinstance(layer, SpartanLayer)
             layer.project_q.weight.zero_()
     output = model(torch.randn(2, 2, DZ), torch.randn(2, DP), torch.randn(2, 2, DA))
-    fixed_fraction = DZ * DP / model.num_tokens**2
+    fixed_fraction = DZ * (DP + 2 * DA * action_gates_open) / model.num_tokens**2
     torch.testing.assert_close(
         output.mean_gate_probability, torch.tensor(0.5 + 0.5 * fixed_fraction)
     )
@@ -334,10 +439,27 @@ def test_dense_mode_deterministic_without_gate_sampling() -> None:
 
 def test_dense_and_sparse_predictors_have_identical_initial_parameters() -> None:
     sparse_state = tiny(actions=DA).state_dict()
-    for model in (tiny(actions=DA, dense=True), tiny(actions=DA, parameter_gates_open=True)):
+    for model in (
+        tiny(actions=DA, dense=True),
+        tiny(actions=DA, parameter_gates_open=True),
+        tiny(actions=DA, action_gates_open=True),
+        tiny(actions=DA, parameter_gates_open=True, action_gates_open=True),
+    ):
         assert sparse_state.keys() == model.state_dict().keys()
         for name, value in model.state_dict().items():
             torch.testing.assert_close(value, sparse_state[name], rtol=0, atol=0)
+
+
+def test_dense_predictions_are_unchanged_by_action_and_parameter_overrides() -> None:
+    dense = tiny(history=3, actions=DA, dense=True)
+    overridden = tiny(
+        history=3, actions=DA, dense=True, parameter_gates_open=True, action_gates_open=True
+    )
+    states, parameters, actions = torch.randn(2, 3, DZ), torch.randn(2, DP), torch.randn(2, 3, DA)
+    expected, actual = dense(states, parameters, actions), overridden(states, parameters, actions)
+    torch.testing.assert_close(actual.prediction, expected.prediction, rtol=0, atol=0)
+    torch.testing.assert_close(actual.path_matrix, expected.path_matrix, rtol=0, atol=0)
+    torch.testing.assert_close(actual.logit_penalty, expected.logit_penalty, rtol=0, atol=0)
 
 
 def test_sparse_evaluation_deterministic_training_resamples() -> None:
@@ -449,6 +571,8 @@ def test_input_guards() -> None:
         tiny(dense=True, identity=True)
     with pytest.raises(ValueError, match="identity"):
         tiny(identity=True, parameter_gates_open=True)
+    with pytest.raises(ValueError, match="identity"):
+        tiny(identity=True, actions=DA, action_gates_open=True)
     with pytest.raises(ValueError, match="temperature"):
         Spartan(state_dim=DZ, param_dim=DP, temperature=0)
     with pytest.raises(ValueError, match="path_matrix"):

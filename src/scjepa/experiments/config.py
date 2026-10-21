@@ -90,8 +90,14 @@ class ExperimentConfig:
             raise ValueError("tau_multiplier must be finite and at least one")
         if not self.name or not self.output_dir:
             raise ValueError("experiment name and output_dir must be nonempty")
-        if self.data_family not in {"controlled_vector", "independent_gaussian"}:
-            raise ValueError("data_family must be controlled_vector or independent_gaussian")
+        if self.data_family not in {
+            "controlled_vector",
+            "independent_gaussian",
+            "simplified_gaussian",
+        }:
+            raise ValueError(
+                "data_family must be controlled_vector, independent_gaussian or simplified_gaussian"
+            )
         if self.dense_reference_dir is not None:
             if not self.dense_reference_dir.strip():
                 raise ValueError("dense_reference_dir must be nonempty when supplied")
@@ -112,27 +118,45 @@ class ExperimentConfig:
         if self.train_episodes < self.train.batch_size or self.validation_every < 1:
             raise ValueError("need at least a full training batch and positive validation_every")
         model = self.model
+        dimensions = (
+            (6, 6, 6, 16) if self.data_family == "simplified_gaussian" else (10, 10, 10, 10)
+        )
         if (
             model.observation_kind != "vector"
             or (model.observation_dim, model.state_dim, model.param_dim, model.action_dim)
-            != (10, 10, 10, 10)
+            != dimensions
             or model.history_len != 1
             or not 2 <= model.context_len < self.trajectory_length
         ):
-            raise ValueError("controlled comparison requires vector 10/10/10/10, L=1 and K>=2")
-        if model.spartan_dense or model.spartan_identity or model.spartan_parameter_gates_open:
-            raise ValueError("comparison sets gate modes per condition")
-        if self.data_family == "independent_gaussian" and (
-            tuple(self.graphs) != ("complementary",)
-            or model.context_len != 3
-            or self.trajectory_length != 5
-            or self.episodes_per_parameter != 2
-            or not model.autoregressive
-        ):
             raise ValueError(
-                "independent_gaussian comparison requires complementary graphs, K=3, "
-                "five frames, paired episodes and two-step autoregressive prediction"
+                f"{self.data_family} controlled comparison requires vector "
+                f"{'/'.join(str(value) for value in dimensions)}, L=1 and K>=2"
             )
+        if (
+            model.spartan_dense
+            or model.spartan_identity
+            or model.spartan_parameter_gates_open
+            or model.spartan_action_gates_open
+        ):
+            raise ValueError("comparison sets gate modes per condition")
+        if self.data_family in {"independent_gaussian", "simplified_gaussian"}:
+            valid_context = (
+                model.context_len == 3
+                if self.data_family == "independent_gaussian"
+                else model.context_len >= 3
+            )
+            if (
+                tuple(self.graphs) != ("complementary",)
+                or not valid_context
+                or self.trajectory_length != model.context_len + 2
+                or self.episodes_per_parameter != 2
+                or not model.autoregressive
+            ):
+                context_rule = "K=3" if self.data_family == "independent_gaussian" else "K>=3"
+                raise ValueError(
+                    f"{self.data_family} comparison requires complementary graphs, "
+                    f"{context_rule}, T=K+2, paired episodes and two-step autoregressive prediction"
+                )
         objective = self.train.objective
         if objective.state_regularizer != "sigreg" or objective.parameter_regularizer != "sigreg":
             raise ValueError("use SIGReg for both representations; zero weights disable it")
@@ -144,7 +168,10 @@ class ExperimentConfig:
             )
             <= 0
         ):
-            raise ValueError("specify positive state/action and full-model parameter penalties")
+            raise ValueError(
+                f"{self.data_family}: specify positive state/action "
+                "and full-model parameter penalties"
+            )
         if objective.logit_weight <= 0:
             raise ValueError("SPARTAN comparison requires positive attention-logit regularization")
         if self.train.steps % self.train.accumulation_steps:
@@ -176,6 +203,7 @@ class ExperimentConfig:
             self.model,
             spartan_dense=condition == "dense",
             spartan_parameter_gates_open=condition == "baseline",
+            spartan_action_gates_open=False,
         )
 
     def training_config(

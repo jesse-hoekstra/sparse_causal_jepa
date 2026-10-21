@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from scjepa.data import simplified_gaussian
 from scjepa.data.random import generator
 from scjepa.data.types import DGPConfig
 
@@ -118,3 +119,55 @@ def sample_coupled_springs(config: DGPConfig, index: int) -> ExogenousDraws:
         - 1
     )
     return ExogenousDraws(initial, parameters, actions, velocity)
+
+
+def sample_simplified_gaussian(config: DGPConfig, index: int) -> ExogenousDraws:
+    """Sample uniform system parameters and independently mixed Gaussian/uniform controls.
+
+    Family-specific stream labels keep these new scientific draws isolated from
+    older families. Successive per-view draws preserve the first view when paired.
+    """
+    if not 0 <= index < config.num_episodes:
+        raise IndexError(index)
+    initial_generator = generator(
+        config.root_seed, config.split, index, "simplified_gaussian/initial_position"
+    )
+    action_generator = generator(
+        config.root_seed, config.split, index, "simplified_gaussian/actions"
+    )
+    parameters = simplified_gaussian.PARAMETER_BOUND * (
+        2
+        * torch.rand(
+            simplified_gaussian.DIMENSION,
+            dtype=torch.float64,
+            generator=generator(
+                config.root_seed, config.split, index, "simplified_gaussian/parameters"
+            ),
+        )
+        - 1
+    )
+    initial_views = [
+        torch.randn(simplified_gaussian.DIMENSION, dtype=torch.float64, generator=initial_generator)
+        for _ in range(config.episodes_per_parameter)
+    ]
+    action_views: list[Tensor] = []
+    for _ in range(config.episodes_per_parameter):
+        gaussian = torch.randn(
+            config.trajectory_length - 1, 10, dtype=torch.float64, generator=action_generator
+        )
+        coupling = (
+            2
+            * torch.rand(
+                config.trajectory_length - 1,
+                simplified_gaussian.DIMENSION,
+                dtype=torch.float64,
+                generator=action_generator,
+            )
+            - 1
+        )
+        action_views.append(
+            simplified_gaussian.encode_controls(torch.cat((gaussian, coupling), dim=-1))
+        )
+    initial = initial_views[0] if config.episodes_per_parameter == 1 else torch.stack(initial_views)
+    actions = action_views[0] if config.episodes_per_parameter == 1 else torch.stack(action_views)
+    return ExogenousDraws(initial, parameters, actions)

@@ -7,13 +7,19 @@ from typing import cast
 import torch
 from torch import Tensor
 
-from scjepa.data import controlled_vector, coupled_springs, independent_gaussian
+from scjepa.data import (
+    controlled_vector,
+    coupled_springs,
+    independent_gaussian,
+    simplified_gaussian,
+)
 from scjepa.data.random import STREAM_VERSION, episode_id
 from scjepa.data.renderer import SpringRenderer
 from scjepa.data.sampling import (
     sample_controlled_vector,
     sample_coupled_springs,
     sample_independent_gaussian,
+    sample_simplified_gaussian,
 )
 from scjepa.data.types import DGPConfig, GraphMasks, ScientificEpisode
 
@@ -290,6 +296,101 @@ class IndependentGaussianDGP:
         )
 
 
+class SimplifiedGaussianDGP:
+    """Six-state complementary dynamics with densely mixed exogenous control coordinates."""
+
+    def __init__(self, config: DGPConfig) -> None:
+        """Realize the new family's six-dimensional observation map independently of data."""
+        if config.family != "simplified_gaussian":
+            raise ValueError("SimplifiedGaussianDGP requires family=simplified_gaussian")
+        self.config = config
+        self.observation_map = controlled_vector.VectorObservationMap(
+            seed=config.observation_seed, dimension=simplified_gaussian.DIMENSION
+        )
+        self.observation_matrix: Tensor | None = self.observation_map.matrix.clone()
+
+    def restore_observation_matrix(self, matrix: Tensor) -> None:
+        """Restore the realized W6 rather than relying on platform-specific seeded QR."""
+        self.observation_map = controlled_vector.VectorObservationMap(
+            seed=self.config.observation_seed,
+            matrix=matrix,
+            dimension=simplified_gaussian.DIMENSION,
+        )
+        self.observation_matrix = self.observation_map.matrix.clone()
+
+    def specification(self) -> dict[str, object]:
+        """Bind exact equations, distribution, dimensions and map to dataset identity."""
+        return _common_specification(self.config) | {
+            "generator_version": simplified_gaussian.GENERATOR_VERSION,
+            "family": self.config.family,
+            "parameter_graph": "complementary",
+            "state_dim": simplified_gaussian.DIMENSION,
+            "param_dim": simplified_gaussian.DIMENSION,
+            "action_dim": simplified_gaussian.ACTION_DIMENSION,
+            "history_len": 1,
+            "minimum_prediction_start": 0,
+            "minimum_context_len": 3,
+            "recommended_trajectory_length": 5,
+            "observation_shape": [simplified_gaussian.DIMENSION],
+            "episodes_per_parameter": self.config.episodes_per_parameter,
+            "dataset_item": "one parameter draw with independent initial states and actions",
+            "stream_labels": [
+                "simplified_gaussian/initial_position",
+                "simplified_gaussian/parameters",
+                "simplified_gaussian/actions",
+            ],
+            "dynamics": {
+                "householder": "H(v)=I3-2*v*v.T/(v.T*v)",
+                "control_order": "gamma1[0:2],gamma2[2:4],c[4:10],u[10:16]",
+                "action_mixing": "a=V*xi;xi=V*a;V=I16-J16/8",
+                "state_rotation": "U=diag(H(v1)H(Dv1),H(v2)H(Dv2))",
+                "state_rotation_vectors": ["v1=(1,gamma1)", "v2=(1,gamma2)"],
+                "reflection_diagonal": [1, 2, 3],
+                "parameter_bound": simplified_gaussian.PARAMETER_BOUND,
+                "parameter_mate": "(i+3)%6",
+                "phase": "phi[i]=theta[i]+u[i]*theta[(i+3)%6]",
+                "transition": "b=U*z;g=b*cos(phi)+c*sin(phi)",
+            },
+            "initial_distribution": "N(0,I6), independent of parameters and actions",
+            "parameter_distribution": "independent Uniform(-0.75,0.75), shared across views",
+            "action_distribution": "a=V*xi;xi[:10] iid N(0,1);xi[10:] iid Uniform(-1,1)",
+            "sampling": "unconditional; no filtering, clipping, rejection, or resampling",
+            "state_marginal": "z[t]|theta is N(0,I6); independence is at the same time",
+            "observation_map": {
+                "kind": "orthogonal_cubic",
+                "formula": "psi(W z), psi(u)=u+0.1*u^3",
+                "seed": self.config.observation_seed,
+                "matrix_fingerprint": self.observation_map.fingerprint,
+            },
+            "initialization": "z0 supplied; all action transitions valid",
+        }
+
+    def graphs(self) -> GraphMasks:
+        """Return the fixed complementary graph independently of realized draws."""
+        return simplified_gaussian.graphs()
+
+    def generate(self, episode_index: int) -> ScientificEpisode:
+        """Generate a parameter group; expose only observations and mixed actions to training."""
+        draws = sample_simplified_gaussian(self.config, episode_index)
+        states = simplified_gaussian.simulate(
+            draws.initial_position, draws.parameters, draws.actions
+        )
+        dtype = torch.float32 if self.config.dtype == "float32" else torch.float64
+        return ScientificEpisode(
+            self.observation_map.forward(states).to(dtype=dtype),
+            draws.actions.to(dtype=dtype),
+            episode_id(self.config.root_seed, self.config.split, episode_index),
+            {
+                "states": states,
+                "parameters": draws.parameters,
+                "initial_state": draws.initial_position,
+                "actions": draws.actions,
+                "controls": simplified_gaussian.decode_actions(draws.actions),
+                "valid_transitions": torch.ones(draws.actions.shape[:-1], dtype=torch.bool),
+            },
+        )
+
+
 @cache
 def register_builtin_processes() -> None:
     """Register built-in implementations lazily, keeping the registry lightweight."""
@@ -298,3 +399,4 @@ def register_builtin_processes() -> None:
     register_dgp("controlled_vector", ControlledVectorDGP)
     register_dgp("coupled_springs", CoupledSpringsDGP)
     register_dgp("independent_gaussian", IndependentGaussianDGP)
+    register_dgp("simplified_gaussian", SimplifiedGaussianDGP)
