@@ -115,3 +115,80 @@ OMP_NUM_THREADS=1 python scripts/run_controlled_experiment.py \
   --config configs/experiments/simplified_gaussian_smoke.yaml \
   wandb.mode=disabled output_dir=/tmp/scjepa-simplified-gaussian-k10-action-smoke
 ```
+
+## Longer-context experiment: K=50
+
+The question is whether more observed transitions let the parameter encoder
+produce more consistent codes for independent episodes with the same theta.
+The existing K=10 checkpoint did not become more invariant when evaluated at
+K=2,5,7,10. This experiment trains with the longer context from initialization.
+
+`configs/experiments/simplified_gaussian_k50.yaml` changes the context to 50
+frames and the total episode length to 52. Frames 0--49 and actions 0--48 infer
+one parameter code. Each opposite episode uses that code to predict frames
+50 and 51, with actions 49 and 50. The existing maximum context capacity of 64
+already accommodates K=50. Network widths, parameter count, initial seed,
+DGP, optimizer, batch size, SIGReg weights and two-step forecast horizon match
+the K=10 preset. The training budget remains 100,000 updates, so this compares
+equal update counts rather than equal computation or observed frames.
+
+Start with the dense condition, matching the current K=10 dense run. Use a fresh
+output directory and fresh model initialization; a K=10 checkpoint is not the
+starting point. Copy the new YAML to the server's existing checkout and run:
+
+```bash
+source .venv/bin/activate
+export WANDB_PROJECT=sparse_causal_jepa
+export WANDB_ENTITY=jesse-hoekstra-university-of-oxford
+
+python -u scripts/run_controlled_experiment.py \
+  --config configs/experiments/simplified_gaussian_k50.yaml \
+  --condition dense \
+  train.device=cuda wandb.mode=online
+```
+
+The preset sets W&B group `simplified_gaussian_m3_k50_action_100k` and output
+directory `outputs/simplified_gaussian_m3_k50_action_100k`. Run in tmux if needed.
+After an interruption, repeat this command with `--resume`. Keep training source,
+configuration and Python/PyTorch versions fixed for resume. The new YAML and
+standalone diagnostic do not change the training source fingerprint.
+
+Compare the K=10 and K=50 dense runs at matching update counts. During training,
+inspect `validation/parameter_within_theta_variance_ratio` together with total
+parameter-code variance and normalized prediction MSE. Final evaluation also
+reports `test/shuffled_parameter_prediction_mse_delta`: a positive increase
+when using another system's code is evidence that the correct code helps
+prediction. A lower context-variance ratio with retained total variance and
+better predictive use would support the longer-context hypothesis. A reduction
+in raw code variance alone is insufficient. Compare normalized prediction error
+carefully because each run learns its own state representation.
+
+The sampling law, parameter draws and observation map are matched by seed;
+individual action trajectories are not matched prefixes across training runs
+with different total lengths. This single-seed experiment tests a practical
+training change; it does not establish a general context-length scaling law.
+
+After training, copy `diagnostics/evaluate_context_variance.py` to the server
+and measure multiple independent contexts per theta. This reads `last.pt`, its
+adjacent `run_config.json`, and the experiment's persisted observation map:
+
+```bash
+python diagnostics/evaluate_context_variance.py \
+  --checkpoint outputs/simplified_gaussian_m3_k50_action_100k/complementary/seed-0/dense/last.pt \
+  --output-dir outputs/context_variance_k50 \
+  --context-lengths 2 5 7 10 20 30 50
+```
+
+The diagnostic defaults to 512 parameter draws and 16 independent contexts per
+draw, freezes the saved model, and uses nested trajectory prefixes. It saves
+raw codes and variance estimates, including the noise-corrected variance
+between theta groups. Its shorter-context results test that frozen K=50 model;
+compare each separately trained model at its own training length for the main
+K=10 versus K=50 comparison. K=2 is below the DGP's stated minimum recovery
+context, and shorter lengths were not used during training.
+
+For the same check on the K=10 checkpoint, substitute its checkpoint path,
+use `--output-dir outputs/context_variance_k10`, and set
+`--context-lengths 2 5 7 10`. These two diagnostics use the same seed and theta
+draws but different maximum lengths, so their action prefixes are not paired.
+Neither diagnostic changes the running experiment or writes to W&B.

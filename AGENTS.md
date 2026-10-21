@@ -76,3 +76,10 @@ parameter gates open; full additionally learns and sparsifies parameter paths.
 Dense keeps every gate open and applies no sparsity penalties. Preserve the
 other families and require fresh dense calibration for the longer context;
 the earlier K=3/open-action protocol cannot be resumed into this comparison.
+
+The optional `simplified_gaussian_k50.yaml` preset tests longer parameter
+context: K=50, T=52, the same two forecast targets and existing 64-frame model
+capacity. Start a fresh dense run for comparison with K=10 at equal update
+counts; use its own dense calibration for any later sparse stages. Preserve
+the K=10 preset and all training semantics. The standalone context-variance
+diagnostic lives under `diagnostics/`, outside the training source fingerprint.

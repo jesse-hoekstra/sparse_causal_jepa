@@ -6,7 +6,9 @@
   The separate [independent Gaussian preset](../docs/independent_gaussian_experiment.md)
   uses this same entrypoint with three context frames and two forecast targets.
   The [simplified m=3 preset](../docs/simplified_gaussian_experiment.md) uses six
-  states/parameters, sixteen mixed actions, and fixed-open action gates.
+  states/parameters, sixteen mixed actions, and learned action gates in both
+  sparse conditions. Its optional K=50 preset keeps two forecast targets and
+  starts with a fresh dense run to test longer parameter-inference context.
 
 - `smoke.py`: CPU forward/backward check using random image and vector tensors.
 - `generate_data.py`: inspect small deterministic episodes or stream a versioned
