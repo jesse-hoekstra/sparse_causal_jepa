@@ -17,6 +17,11 @@ uses the verified two-reflection and radial-rotation DGP, Gaussian actions,
 three context frames and two forecast targets. Its separate preset preserves the
 older controlled-vector experiment and requires fresh dense calibration.
 
+The [simplified m=3 experiment](docs/simplified_gaussian_experiment.md) uses six
+states, six uniform parameters and sixteen densely mixed observed actions. It
+uses ten context frames and two forecast targets, comparing state/action sparsity
+with state/action/parameter sparsity. Its preset requires fresh dense calibration.
+
 ## Model and batch interface
 
 ```python

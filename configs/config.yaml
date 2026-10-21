@@ -27,6 +27,7 @@ model:
   spartan_dense: false
   spartan_identity: false
   spartan_parameter_gates_open: false
+  spartan_action_gates_open: false
   ema_decay: 0.996
 
 # Choose a lazy DGP with data=controlled_vector or data=coupled_springs,

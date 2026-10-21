@@ -64,3 +64,15 @@ and radius-dependent rotation, raw Gaussian action coordinates, complementary
 graphs only, K=3, T=5, L=1 and paired episodes with independent initial states/actions.
 Keep the existing controlled-vector definitions intact. This DGP needs fresh dense
 training and calibration; do not reuse an older family's checkpoint or tau.
+
+The explicitly selected `simplified_gaussian` family implements the approved
+six-state (m=3) experiment in `docs/simplified_gaussian_experiment.md`. It has six
+uniform parameters and sixteen observed actions obtained by densely mixing the
+independent Gaussian/uniform controls. The approved preset uses K=10, T=12, L=1
+and paired episodes, retaining two forecast targets. This family permits K>=3
+with T=K+2; three frames remain the theoretical minimum recovery context.
+Baseline and full both learn and sparsify state/action paths. Baseline keeps
+parameter gates open; full additionally learns and sparsifies parameter paths.
+Dense keeps every gate open and applies no sparsity penalties. Preserve the
+other families and require fresh dense calibration for the longer context;
+the earlier K=3/open-action protocol cannot be resumed into this comparison.

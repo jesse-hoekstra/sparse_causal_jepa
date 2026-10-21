@@ -32,7 +32,7 @@ def external_dense_manifest(
 
     Source versions and optimizer schedules may differ. The observation map,
     architecture and calibrated base-loss statistic must retain their meaning.
-    Only the formerly absent parameter-gate option receives a legacy default.
+    Formerly absent gate-open options receive their legacy false defaults.
     """
     if config.dense_reference_dir is None:
         raise ValueError("external dense reference directory is not configured")
@@ -87,6 +87,7 @@ def external_dense_manifest(
     for value in (record.get("model"), checkpoint.get("model_config")):
         model = dict(_mapping(value, "model configuration"))
         model.setdefault("spartan_parameter_gates_open", False)
+        model.setdefault("spartan_action_gates_open", False)
         if canonical_fingerprint(model) != expected_model:
             raise ValueError("external dense reference architecture differs")
     if canonical_fingerprint(record.get("data")) != canonical_fingerprint(
@@ -121,7 +122,9 @@ def external_dense_manifest(
     matrix = observation.get("matrix")
     if not isinstance(matrix, Tensor):
         raise ValueError("external dense reference observation map lacks its matrix")
-    fingerprint = VectorObservationMap(matrix=matrix).fingerprint
+    fingerprint = VectorObservationMap(
+        matrix=matrix, dimension=config.model.observation_dim
+    ).fingerprint
     if any(
         item.get("observation_fingerprint") != fingerprint for item in (manifest, current_manifest)
     ):

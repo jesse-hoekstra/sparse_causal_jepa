@@ -14,9 +14,10 @@ different input may change the gates, and the context-to-parameter inference
 path is outside this predictor.
 Sparse gates use straight-through binary sampling in training and deterministic
 thresholding in evaluation. Dense and token-local reference modes share the same
-modules. An optional parameter-gate override keeps every parameter-to-decoded-state
-gate open in every layer while attention weights remain learned. Stable masked
-normalization and residual path accounting are retained from the previous implementation.
+modules. Optional action- and parameter-gate overrides keep the corresponding
+source-to-decoded-state gates open in every layer while attention weights remain
+learned. Stable masked normalization and residual path accounting are retained
+from the previous implementation.
 """
 
 import math
@@ -206,6 +207,7 @@ class Spartan(nn.Module):
     """Predict a state vector from finite state/action history and one parameter vector."""
 
     parameter_gate_mask: Tensor | None
+    action_gate_mask: Tensor | None
 
     def __init__(
         self,
@@ -221,6 +223,7 @@ class Spartan(nn.Module):
         dense: bool = False,
         identity: bool = False,
         parameter_gates_open: bool = False,
+        action_gates_open: bool = False,
     ) -> None:
         """Configure independent coordinate counts and the finite input-history length.
 
@@ -229,6 +232,8 @@ class Spartan(nn.Module):
         ``parameter_gates_open`` fixes all parameter-to-latest-state gates to one
         in every layer during training and evaluation; other sparse gates and all
         attention weights remain learned. Residual paths preserve parameter reachability.
+        ``action_gates_open`` does the same for every action coordinate at every
+        supplied lag. Both overrides can be enabled together.
         """
         super().__init__()
         if state_dim <= 0 or param_dim <= 0 or history_len <= 0 or num_layers <= 0:
@@ -239,6 +244,8 @@ class Spartan(nn.Module):
             raise ValueError("dense and identity are mutually exclusive")
         if identity and parameter_gates_open:
             raise ValueError("identity and parameter_gates_open are mutually exclusive")
+        if identity and action_gates_open:
+            raise ValueError("identity and action_gates_open are mutually exclusive")
         self.state_dim = state_dim
         self.param_dim = param_dim
         self.action_dim = action_dim
@@ -248,15 +255,21 @@ class Spartan(nn.Module):
         self.dense = dense
         self.identity = identity
         self.parameter_gates_open = parameter_gates_open
+        self.action_gates_open = action_gates_open
+        state_end = history_len * state_dim
+        action_end = state_end + history_len * action_dim
         parameter_gate_mask = None
         if parameter_gates_open:
             parameter_gate_mask = torch.zeros(self.num_tokens, self.num_tokens, dtype=torch.bool)
-            state_end = history_len * state_dim
-            parameter_start = state_end + history_len * action_dim
-            parameter_gate_mask[state_end - state_dim : state_end, parameter_start:] = True
+            parameter_gate_mask[state_end - state_dim : state_end, action_end:] = True
+        action_gate_mask = None
+        if action_gates_open and action_dim:
+            action_gate_mask = torch.zeros(self.num_tokens, self.num_tokens, dtype=torch.bool)
+            action_gate_mask[state_end - state_dim : state_end, state_end:action_end] = True
         # Derived from configuration, not learned state: move with the model while
         # keeping paired initialization fingerprints and checkpoint tensors identical.
         self.register_buffer("parameter_gate_mask", parameter_gate_mask, persistent=False)
+        self.register_buffer("action_gate_mask", action_gate_mask, persistent=False)
         self.state_project = nn.Linear(1, embed_dim)
         self.action_project = nn.Linear(1, embed_dim) if action_dim else None
         self.param_project = nn.Linear(1, embed_dim)
@@ -344,9 +357,16 @@ class Spartan(nn.Module):
         mean_abs_logits: list[Tensor] = []
         mean_gate_probabilities: list[Tensor] = []
         gate_entropies: list[Tensor] = []
+        open_gate_mask = self.parameter_gate_mask
+        if self.action_gate_mask is not None:
+            open_gate_mask = (
+                self.action_gate_mask
+                if open_gate_mask is None
+                else open_gate_mask | self.action_gate_mask
+            )
         for layer in self.layers:
             tokens, adjacency, penalty, abs_logit, gate_prob, entropy = layer(
-                tokens, self.parameter_gate_mask
+                tokens, open_gate_mask
             )
             adjacencies.append(adjacency)
             logit_penalties.append(penalty)

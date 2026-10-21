@@ -27,12 +27,13 @@ references = vector.ground_truth(0)  # explicit evaluation-only access
 |---|---|---|---|
 | `controlled_vector` | `(10,)` | `10 / 10 / 10` | 1 |
 | `independent_gaussian` | `(10,)` | `10 / 10 / 10` | 1 |
+| `simplified_gaussian` | `(6,)` | `6 / 6 / 16` | 1 |
 | `coupled_springs` | `(3,320,64)` | `10 / 10 / 5` | 2 |
 
 Single-episode dataset items have observations `(T,*observation_shape)`, actions
-`(T-1,d_a)`, and a scalar int64 `episode_ids`. With either vector family and
-`episodes_per_parameter=2`, one item is a parameter group: observations `(2,T,10)`,
-actions `(2,T-1,10)`, and one scalar group ID in `episode_ids`. `num_episodes`
+`(T-1,d_a)`, and a scalar int64 `episode_ids`. With a vector family and
+`episodes_per_parameter=2`, one item is a parameter group: observations `(2,T,d_x)`,
+actions `(2,T-1,d_a)`, and one scalar group ID in `episode_ids`. `num_episodes`
 counts groups in this mode, so 8 items contain 16 trajectories. The generic
 `DGPConfig` defaults to one episode; the controlled experiment selects two.
 Latents, parameters, masses, force histories, coefficient matrices and
@@ -47,6 +48,14 @@ paper's eight-frame parameter context. The generic vector preset uses
 interface defaults. The controlled experiment uses four-frame paired episodes.
 `model.context_len` remains independently configurable. Data
 settings never select sparsity weights or turn true graphs into predictor masks.
+
+The `data=simplified_gaussian` preset selects the six-state m=3 construction with
+six uniform parameters, sixteen mixed action coordinates and a persisted 6x6 W.
+It requires at least three context frames; the preset and experiment use two
+paired twelve-frame episodes, ten context frames and two forecast targets.
+See the [equations and comparison](simplified_gaussian_experiment.md)
+for the action mixing, graph supports and server command. This family has a
+separate generator identity and leaves the older processes unchanged.
 
 ## Controlled vector process
 

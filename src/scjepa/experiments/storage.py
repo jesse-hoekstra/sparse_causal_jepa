@@ -139,13 +139,15 @@ def prepare_experiment(config: ExperimentConfig) -> tuple[dict[str, object], Ten
             matrix = cast(dict[str, object], payload).get("matrix")
             if not isinstance(matrix, Tensor):
                 raise ValueError("persisted observation matrix is missing")
-            observer = VectorObservationMap(matrix=matrix)
+            observer = VectorObservationMap(matrix=matrix, dimension=config.model.observation_dim)
             if manifest.get("observation_fingerprint") != observer.fingerprint:
                 raise ValueError("persisted observation map changed")
             return manifest, observer.matrix
         if matrix_path.exists():
             raise ValueError("observation map exists without its experiment manifest")
-        observer = VectorObservationMap(seed=config.observation_seed)
+        observer = VectorObservationMap(
+            seed=config.observation_seed, dimension=config.model.observation_dim
+        )
         manifest: dict[str, object] = {
             "format_version": 1,
             "config_fingerprint": config_identity,

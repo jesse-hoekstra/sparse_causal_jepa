@@ -21,13 +21,15 @@ from torch import Tensor
 
 from scjepa.data.controlled_vector import VectorObservationMap
 from scjepa.data.factory import build_dgp_dataset
+from scjepa.data.simplified_gaussian import PARAMETER_BOUND
 from scjepa.data.types import DGPConfig, GraphMasks
 from scjepa.eval.recovery import (
     CoordinateMatch,
     fit_coordinate_match,
     mean_correlation_coefficient,
 )
-from scjepa.models.model import SCJEPA
+from scjepa.eval.state_probes import fit_state_probe, state_probe_metrics
+from scjepa.models.model import SCJEPA, ModelOutput
 from scjepa.training.loop import ObjectiveConfig, TrainingObjective
 from scjepa.training.rng import preserve_rng
 
@@ -77,6 +79,7 @@ class _EncodedSplit:
     prediction_mse: float
     base_loss: float
     sparsity: float
+    shuffled_prediction_mse: float | None = None
 
 
 @contextmanager
@@ -98,22 +101,29 @@ def _evaluation_context(model: SCJEPA, seed: int = 42) -> Generator[None]:
 
 
 def _check_model(model: SCJEPA, data: DGPConfig) -> None:
-    if data.family not in {"controlled_vector", "independent_gaussian"}:
-        raise ValueError("this experiment evaluates controlled_vector or independent_gaussian data")
+    if data.family not in {"controlled_vector", "independent_gaussian", "simplified_gaussian"}:
+        raise ValueError(
+            "this experiment evaluates controlled_vector, independent_gaussian "
+            "or simplified_gaussian data"
+        )
+    specification = build_dgp_dataset(data).specification
+    dimensions = tuple(specification[name] for name in ("state_dim", "param_dim", "action_dim"))
     predictor = model.predictor
     if (
         model.online_encoder.observation_ndim != 1
-        or predictor.state_dim != 10
-        or predictor.param_dim != 10
-        or predictor.action_dim != 10
+        or (predictor.state_dim, predictor.param_dim, predictor.action_dim) != dimensions
         or predictor.history_len != 1
         or model.context_len < 2
     ):
-        raise ValueError("vector experiment requires dimensions 10/10/10, L=1, K>=2")
+        label = "/".join(str(value) for value in dimensions)
+        raise ValueError(f"vector experiment requires dimensions {label}, L=1, K>=2")
     if data.trajectory_length <= model.context_len:
         raise ValueError("trajectory_length must include a target after the context")
-    if data.family == "independent_gaussian" and model.context_len < 3:
-        raise ValueError("independent_gaussian evaluation requires K>=3")
+    minimum_context = cast(int, specification["minimum_context_len"])
+    if model.context_len < minimum_context:
+        raise ValueError(f"{data.family} evaluation requires K>={minimum_context}")
+    if data.family == "simplified_gaussian" and data.episodes_per_parameter != 2:
+        raise ValueError("simplified_gaussian evaluation requires paired episodes")
 
 
 def _batch_sizes(count: int, batch_size: int) -> list[int]:
@@ -122,6 +132,29 @@ def _batch_sizes(count: int, batch_size: int) -> list[int]:
         tail = sizes.pop()
         sizes[-1] += tail
     return sizes
+
+
+@torch.no_grad()
+def _shuffled_code_prediction_mse(model: SCJEPA, result: ModelOutput, actions: Tensor) -> float:
+    """Derange parameter groups and recompute the complete autoregressive predictor.
+
+    A cyclic shift ensures every donor has a different theta; flipping the view
+    axis retains the normal opposite-view donor convention. Gates and attention
+    are recomputed from the modified inputs at every prediction step.
+    """
+    if result.parameters.ndim != 3 or result.parameters.shape[0] < 2 or not model.autoregressive:
+        raise ValueError("code shuffling requires at least two paired groups and autoregression")
+    start = result.prediction_start
+    first = start - model.predictor.history_len + 1
+    codes = result.parameters.roll(1, dims=0).flip(1).flatten(0, 1)
+    history = result.online_states[:, :, first : start + 1].flatten(0, 1)
+    predictions = model.rollout(
+        history,
+        codes,
+        result.targets.shape[-2],
+        actions[:, :, first:].flatten(0, 1),
+    )
+    return float((predictions - result.targets.flatten(0, 1)).square().mean())
 
 
 @torch.no_grad()
@@ -135,6 +168,7 @@ def _collect(
     objective: ObjectiveConfig | None = None,
     *,
     isolate_gate_rng: bool = False,
+    shuffle_parameters: bool = False,
 ) -> _EncodedSplit:
     data = replace(base, split=split, num_episodes=count)
     process = build_dgp_dataset(data, observation_matrix=matrix).process
@@ -146,7 +180,7 @@ def _collect(
     }
     graph_counts: dict[str, Tensor] = {}
     transition_count = 0
-    prediction_sum = base_sum = sparsity_sum = 0.0
+    prediction_sum = base_sum = sparsity_sum = shuffled_sum = 0.0
     begin = 0
     for batch_index, size in enumerate(_batch_sizes(count, config.batch_size)):
         episodes = [process.generate(index) for index in range(begin, begin + size)]
@@ -168,6 +202,8 @@ def _collect(
         prediction_sum += float(terms["prediction"]) * size
         base_sum += float(terms["base"]) * size
         sparsity_sum += float(terms["sparsity"]) * size
+        if shuffle_parameters:
+            shuffled_sum += _shuffled_code_prediction_mse(model, result, actions) * size
         ids = torch.tensor([item.episode_id for item in episodes], dtype=torch.int64)
         states = torch.stack([item.ground_truth["states"] for item in episodes])
         parameters = torch.stack([item.ground_truth["parameters"] for item in episodes])
@@ -208,6 +244,7 @@ def _collect(
         prediction_mse=prediction_sum / count,
         base_loss=base_sum / count,
         sparsity=sparsity_sum / count,
+        shuffled_prediction_mse=shuffled_sum / count if shuffle_parameters else None,
     )
 
 
@@ -322,6 +359,88 @@ def _aligned_support(
     }
 
 
+def _gaussianized_parameters(parameters: Tensor) -> Tensor:
+    """Map the known uniform reference distribution to coordinatewise N(0,1)."""
+    probability = (parameters.double() / PARAMETER_BOUND + 1) / 2
+    epsilon = torch.finfo(torch.float64).eps
+    return math.sqrt(2) * torch.erfinv(2 * probability.clamp(epsilon, 1 - epsilon) - 1)
+
+
+def _group_linear_r2(
+    calibration_features: Tensor,
+    calibration_truth: Tensor,
+    scored_features: Tensor,
+    scored_truth: Tensor,
+    groups: tuple[tuple[int, ...], ...],
+    match: CoordinateMatch,
+) -> float:
+    """Average held-out linear R² across calibration-assigned coordinate groups."""
+    scores: list[float] = []
+    for group in groups:
+        columns = [match.columns[index] for index in group]
+        truth_columns = list(group)
+        probe = fit_state_probe(
+            calibration_features[:, columns], calibration_truth[:, truth_columns], ridge=1e-3
+        )
+        scores.append(
+            state_probe_metrics(
+                probe.predict(scored_features[:, columns]), scored_truth[:, truth_columns]
+            )["r2"]
+        )
+    return sum(scores) / len(scores)
+
+
+def _paired_code_variance(codes: Tensor) -> dict[str, float]:
+    """Estimate within-theta variation from two independent contexts per test theta."""
+    paired = codes.double().reshape(-1, 2, codes.shape[-1])
+    within = float((paired[:, 0] - paired[:, 1]).square().mean() / 2)
+    # Estimate marginal variance across independent groups separately for each view.
+    total = float(paired.var(dim=0, correction=1).mean())
+    return {
+        "parameter_within_theta_variance": within,
+        "parameter_total_variance": total,
+        "parameter_within_theta_variance_ratio": within / max(total, 1e-12),
+    }
+
+
+def _simplified_recovery_metrics(
+    calibration: _EncodedSplit,
+    scored: _EncodedSplit,
+    matches: dict[str, CoordinateMatch],
+) -> dict[str, float]:
+    """Add inexpensive group and context diagnostics for the approved new family."""
+    width = scored.states.shape[-1] // 2
+    rows = (tuple(range(width)), tuple(range(width, 2 * width)))
+    pairs = tuple((index, index + width) for index in range(width))
+    gaussian_calibration = _gaussianized_parameters(calibration.parameters)
+    gaussian_scored = _gaussianized_parameters(scored.parameters)
+    matches["parameter_gaussianized"] = fit_coordinate_match(
+        calibration.codes, gaussian_calibration, method="pearson"
+    )
+    return {
+        "state_row_block_linear_r2": _group_linear_r2(
+            calibration.online.flatten(0, 1),
+            calibration.states.flatten(0, 1),
+            scored.online.flatten(0, 1),
+            scored.states.flatten(0, 1),
+            rows,
+            matches["state"],
+        ),
+        "parameter_column_pair_linear_r2": _group_linear_r2(
+            calibration.codes,
+            calibration.parameters,
+            scored.codes,
+            scored.parameters,
+            pairs,
+            matches["parameter"],
+        ),
+        "parameter_gaussianized_mcc": mean_correlation_coefficient(
+            matches["parameter_gaussianized"], scored.codes, gaussian_scored
+        ),
+        **_paired_code_variance(scored.codes),
+    }
+
+
 def _recovery_metrics(
     calibration: _EncodedSplit, scored: _EncodedSplit, threshold: float
 ) -> tuple[dict[str, float], dict[str, CoordinateMatch], dict[str, Tensor]]:
@@ -358,6 +477,11 @@ def _recovery_metrics(
     for name, predicted in support.items():
         target = cast(Tensor, getattr(truth, name))
         metrics[f"{name}_shd"] = float((predicted != target).sum())
+        if scored.config.family == "simplified_gaussian":
+            metrics[f"{name}_false_positives"] = float((predicted & ~target).sum())
+            metrics[f"{name}_false_negatives"] = float((~predicted & target).sum())
+    if scored.config.family == "simplified_gaussian":
+        metrics.update(_simplified_recovery_metrics(calibration, scored, matches))
     return metrics, matches, support
 
 
@@ -402,14 +526,24 @@ def evaluate_model(
                 "test",
                 config.test_episodes,
                 objective,
+                shuffle_parameters=base_data.family == "simplified_gaussian",
             )
         diagnostics, matches, support = _recovery_metrics(
             calibration, test, config.graph_support_threshold
         )
         metrics = _loss_metrics(test, "test")
         for name, value in diagnostics.items():
-            prefix = "recovery" if name.endswith("_mcc") else "graph"
+            prefix = (
+                "graph"
+                if name.endswith(("_shd", "_false_positives", "_false_negatives"))
+                else "recovery"
+            )
             metrics[f"{prefix}/{name}"] = value
+        if test.shuffled_prediction_mse is not None:
+            metrics["test/shuffled_parameter_prediction_mse"] = test.shuffled_prediction_mse
+            metrics["test/shuffled_parameter_prediction_mse_delta"] = (
+                test.shuffled_prediction_mse - test.prediction_mse
+            )
         truth = test.reference_graphs
         torch.save(
             {
@@ -429,7 +563,7 @@ def evaluate_model(
             "calibration_data": asdict(calibration.config),
             "test_data": asdict(test.config),
             "observation_matrix_sha256": VectorObservationMap(
-                matrix=observation_matrix
+                matrix=observation_matrix, dimension=observation_matrix.shape[0]
             ).fingerprint,
             "mcc": "mean absolute Pearson correlation with calibration-only Hungarian assignment",
             "matching_reference": "https://github.com/slachapelle/disentanglement_via_mechanism_sparsity/blob/7fd50ded090a51a7527520f07d933450aa5b872a/metrics.py",
@@ -464,6 +598,30 @@ def evaluate_model(
                 "prevents causal interpretation of routing SHD"
             ),
         }
+        if base_data.family == "simplified_gaussian":
+            metadata["additional_diagnostics"] = {
+                "group_recovery": (
+                    "linear ridge R2, ridge=0.001; two state row blocks and parameter column "
+                    "pairs; feature subsets selected by calibration-only coordinate matches; "
+                    "fit only on calibration, score held-out groups; nonlinear within-group "
+                    "changes and failed coordinate matching can lower these scores"
+                ),
+                "parameter_gaussianized_mcc": (
+                    "known Uniform(-0.75,0.75) CDF followed by the standard Gaussian inverse "
+                    "CDF; independent calibration-only assignment; raw MCC retained"
+                ),
+                "parameter_context_variance": (
+                    "two independently initialized test views per shared theta; mean squared "
+                    "code difference / 2, normalized by marginal variance across groups "
+                    "averaged over views; denominator floored at 1e-12; inspect total "
+                    "variance because constant codes also have zero within-theta variance"
+                ),
+                "parameter_shuffle": (
+                    "cyclic one-group shift within each test batch, never the same theta; "
+                    "opposite-view donor retained; autoregressive prediction and input-dependent "
+                    "gates recomputed; report MSE and delta from unchanged-code test MSE"
+                ),
+            }
         (artifact_dir / "protocol.json").write_text(
             json.dumps(metadata, indent=2, allow_nan=False) + "\n"
         )

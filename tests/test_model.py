@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from torch import Tensor
 
 from scjepa.models import (
@@ -13,6 +14,27 @@ from scjepa.models import (
     SpartanOutput,
     VectorEncoder,
 )
+from scjepa.training.factory import ModelConfig, build_model
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_factory_applies_independent_action_and_parameter_gate_overrides(structured: bool) -> None:
+    config = ModelConfig(
+        observation_dim=6,
+        state_dim=6,
+        param_dim=6,
+        action_dim=16,
+        context_len=3,
+        history_len=1,
+        spartan_action_gates_open=True,
+        spartan_parameter_gates_open=True,
+    )
+    model = build_model(OmegaConf.structured(config) if structured else config)
+    assert model.predictor.action_gates_open
+    assert model.predictor.parameter_gates_open
+    assert model.predictor.action_gate_mask is not None
+    assert model.predictor.action_gate_mask.sum().item() == 6 * 16
+    assert not ModelConfig().spartan_action_gates_open
 
 
 class RecordingSpartan(Spartan):

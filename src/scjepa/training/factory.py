@@ -34,6 +34,7 @@ class ModelConfig:
     spartan_dense: bool = False
     spartan_identity: bool = False
     spartan_parameter_gates_open: bool = False
+    spartan_action_gates_open: bool = False
     ema_decay: float = 0.996
     autoregressive: bool = False
 
@@ -77,6 +78,7 @@ def build_model(config: ModelConfig | DictConfig) -> SCJEPA:
         dense=cfg.spartan_dense,
         identity=cfg.spartan_identity,
         parameter_gates_open=cfg.spartan_parameter_gates_open,
+        action_gates_open=cfg.spartan_action_gates_open,
     )
     return SCJEPA(
         encoder,

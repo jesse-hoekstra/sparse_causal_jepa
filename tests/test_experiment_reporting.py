@@ -180,9 +180,11 @@ def test_manifest_restores_actual_matrix_without_regenerating_seed(
     before_manifest = (tmp_path / "experiment.json").read_bytes()
     before_matrix = (tmp_path / "observation_map.pt").read_bytes()
 
-    def require_saved(*, seed: int = 1729, matrix: Tensor | None = None) -> VectorObservationMap:
+    def require_saved(
+        *, seed: int = 1729, matrix: Tensor | None = None, dimension: int = 10
+    ) -> VectorObservationMap:
         assert matrix is not None, "resumption must restore the saved realization of W"
-        return VectorObservationMap(seed=seed, matrix=matrix)
+        return VectorObservationMap(seed=seed, matrix=matrix, dimension=dimension)
 
     monkeypatch.setattr(storage, "VectorObservationMap", require_saved)
     restored, restored_matrix = prepare_experiment(config)
