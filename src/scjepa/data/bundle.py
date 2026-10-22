@@ -216,7 +216,8 @@ class BundleEpisodes(Dataset[dict[str, Tensor]]):
             mapping["episode_ids"],
         )
         dtype = torch.float32 if self.config.dtype == "float32" else torch.float64
-        pair_shape = (2,) if self.config.episodes_per_parameter == 2 else ()
+        views = self.config.episodes_per_parameter
+        pair_shape = (views,) if views > 1 else ()
         if (
             observations.shape != (*pair_shape, self.trajectory_length, *self.observation_shape)
             or actions.shape != (*pair_shape, self.trajectory_length - 1, self.action_dim)

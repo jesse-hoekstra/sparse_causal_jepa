@@ -1,0 +1,83 @@
+# Optional R=10 transition-encoder and parameter-consistency comparison.
+# Each forecast uses one other episode code; codes are never averaged.
+# Baseline/full learn and penalize action paths; dense has all gates open.
+# Fresh dense calibration, followed by baseline/full on the Gaussian-preserving DGP.
+# K=10 context frames and two forecast targets require fresh dense calibration.
+name: simplified-gaussian-m3-k10-r10-consistency-geco
+output_dir: outputs/simplified_gaussian_m3_k10_r10_consistency_100k
+data_family: simplified_gaussian
+graphs: [complementary]
+seeds: [0]
+# Counts and batch sizes are independent parameter groups, with ten episode views (640 episodes per training batch).
+train_episodes: 8192
+trajectory_length: 12
+episodes_per_parameter: 10
+data_seed: 0
+observation_seed: 1729
+validation_every: 1000
+tau_multiplier: 1.0
+upload_evaluation_artifacts: false
+model:
+  observation_kind: vector
+  observation_dim: 6
+  state_dim: 6
+  param_dim: 6
+  action_dim: 16
+  context_len: 10
+  history_len: 1
+  autoregressive: true
+  encoder_hidden_dims: [64, 64]
+  parameter_encoder_kind: transition
+  parameter_embed_dim: 64
+  parameter_heads: 4
+  spartan_layers: 2
+  spartan_embed_dim: 64
+  spartan_mlp_hidden: 64
+  spartan_mlp_layers: 3
+  spartan_parameter_gates_open: false
+  ema_decay: 0.996
+train:
+  steps: 100000
+  batch_size: 64
+  accumulation_steps: 1
+  device: cpu
+  lr: 0.001
+  # A ratio of one keeps the dense scheduler and both sparse runs at constant lr.
+  lr_final_ratio: 1.0
+  weight_decay: 0.0
+  grad_clip: 1.0
+  checkpoint_every: 250
+  log_every: 100
+  geco:
+    enabled: false
+    tau: null
+    step_size: 0.1
+    momentum: 0.99
+    lambda_init: 1000.0
+    log_lambda_min: -12.0
+    log_lambda_max: 12.0
+  objective:
+    state_sparsity_weight: 1.0
+    action_sparsity_weight: 1.0
+    parameter_sparsity_weight: 1.0
+    logit_weight: 0.0001
+    state_regularizer: sigreg
+    state_regularizer_weight: 0.1
+    parameter_regularizer: sigreg
+    parameter_regularizer_weight: 0.1
+    parameter_consistency_weight: 1.0
+    regularizer_num_projections: 256
+evaluation:
+  calibration_episodes: 512
+  validation_episodes: 256
+  test_episodes: 512
+  batch_size: 64
+  seed: 42
+  graph_support_threshold: 0.0
+wandb:
+  mode: ${oc.env:WANDB_MODE,online}
+  project: ${oc.env:WANDB_PROJECT,null}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  group: simplified-gaussian-m3-k10-r10-consistency-geco
+  job_type: simplified-gaussian-m3-experiment
+  tags: [simplified-gaussian-m3, complementary, geco, r10, transition, consistency]

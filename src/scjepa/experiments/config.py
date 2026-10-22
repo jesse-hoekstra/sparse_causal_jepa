@@ -52,8 +52,8 @@ class ExperimentConfig:
     ``train.objective.parameter_sparsity_weight`` is the full-model weight.
     The baseline sets that weight to zero and forces direct parameter-to-output
     gates open. Model seeds do not change the scientific data seed, observation
-    matrix, or calibration/test splits. With paired episodes, dataset counts and
-    batch sizes count independent parameter groups, each containing two trajectories.
+    matrix, or calibration/test splits. With grouped episodes, dataset counts and
+    batch sizes count independent parameter groups, each containing R trajectories.
     """
 
     name: str = "complementary-geco"
@@ -145,17 +145,27 @@ class ExperimentConfig:
                 if self.data_family == "independent_gaussian"
                 else model.context_len >= 3
             )
+            valid_views = (
+                self.episodes_per_parameter == 2
+                if self.data_family == "independent_gaussian"
+                else self.episodes_per_parameter >= 2
+            )
             if (
                 tuple(self.graphs) != ("complementary",)
                 or not valid_context
                 or self.trajectory_length != model.context_len + 2
-                or self.episodes_per_parameter != 2
+                or not valid_views
                 or not model.autoregressive
             ):
                 context_rule = "K=3" if self.data_family == "independent_gaussian" else "K>=3"
+                view_rule = (
+                    "paired episodes"
+                    if self.data_family == "independent_gaussian"
+                    else "at least two episodes per parameter"
+                )
                 raise ValueError(
                     f"{self.data_family} comparison requires complementary graphs, "
-                    f"{context_rule}, T=K+2, paired episodes and two-step autoregressive prediction"
+                    f"{context_rule}, T=K+2, {view_rule} and two-step autoregressive prediction"
                 )
         objective = self.train.objective
         if objective.state_regularizer != "sigreg" or objective.parameter_regularizer != "sigreg":

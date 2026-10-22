@@ -59,6 +59,7 @@ class ExperimentLogger:
             if key
             in {
                 "loss/prediction",
+                "loss/parameter_consistency",
                 "loss/base",
                 "loss/sparsity",
                 "train/lr",

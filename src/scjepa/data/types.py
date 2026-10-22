@@ -39,7 +39,7 @@ class DGPConfig:
     use float64. Graph variants never enter sampling seeds. Context length belongs
     to the model configuration; the spring preset supplies eight frames there.
     ``num_episodes`` counts independent parameter draws; with
-    ``episodes_per_parameter=2``, each dataset item contains two trajectories.
+    ``episodes_per_parameter=R``, each grouped dataset item contains R trajectories.
     """
 
     family: str = "controlled_vector"
@@ -92,9 +92,12 @@ class DGPConfig:
             )
         if not 1 <= self.num_episodes <= 2**30:
             raise ValueError("num_episodes must be in [1,2**30]")
-        if self.episodes_per_parameter not in (1, 2):
-            raise ValueError("episodes_per_parameter must be 1 or 2")
-        if self.episodes_per_parameter == 2 and self.family not in {
+        if self.family == "simplified_gaussian":
+            if type(self.episodes_per_parameter) is not int or self.episodes_per_parameter < 1:
+                raise ValueError("episodes_per_parameter must be a positive integer")
+        elif self.episodes_per_parameter not in (1, 2):
+            raise ValueError("episodes_per_parameter must be 1 or 2 for this family")
+        if self.episodes_per_parameter > 1 and self.family not in {
             "controlled_vector",
             "independent_gaussian",
             "simplified_gaussian",
