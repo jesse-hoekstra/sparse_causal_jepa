@@ -192,3 +192,30 @@ use `--output-dir outputs/context_variance_k10`, and set
 `--context-lengths 2 5 7 10`. These two diagnostics use the same seed and theta
 draws but different maximum lengths, so their action prefixes are not paired.
 Neither diagnostic changes the running experiment or writes to W&B.
+
+## Optional ten-episode consistency comparison
+
+`configs/experiments/simplified_gaussian_r10_consistency.yaml` keeps K=10, T=12
+and the existing state/action/parameter sparsity comparison, but uses ten
+independent episodes per theta, the transition parameter encoder, and parameter
+consistency weight 1. The shared transition MLP encodes each within-context
+`[state_t, action_t, state_next]` tuple and averages transition features before
+its output head. It does not average parameter codes from different episodes.
+
+Agreement is the mean squared difference over all distinct pairs of context
+codes, equivalently twice their unbiased within-theta sample variance. It is
+part of the calibrated base objective in dense, baseline and full. Training
+assigns each recipient one different context's attached code by a random nonzero
+cyclic shift; that code stays fixed through its two predictions. Evaluation uses
+a deterministic shift by one. Every recovery/variance diagnostic scores the
+individual context codes, and the shuffle test changes donor theta without
+changing the recipient history, actions or targets.
+
+A batch of 64 parameter groups now contains 640 episodes. SIGReg still operates
+separately per view across 64 independent theta groups; the 640 episodes are not
+treated as independent parameter samples. Equal update counts therefore cost
+more than the original two-episode preset. This option needs a fresh output
+directory, fresh dense training and its own calibration; neither the changed
+encoder nor the changed base objective can reuse the original dense reference.
+Select the new preset with the same runner command above. The original preset
+retains its attention encoder, two episodes and zero consistency weight.

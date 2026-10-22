@@ -94,4 +94,56 @@ class ParameterEncoder(nn.Module):
         return self.head(self.temporal_block(query, pooled)).squeeze(1)
 
 
-__all__ = ["ParameterEncoder"]
+class TransitionParameterEncoder(nn.Module):
+    """Encode complete context transitions and pool their features within one episode."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        param_dim: int,
+        action_dim: int = 0,
+        max_history: int = 64,
+    ) -> None:
+        """Use the tested 128-wide transition MLP and two-hidden-layer output head."""
+        super().__init__()
+        if min(state_dim, param_dim) < 1 or action_dim < 0 or max_history < 2:
+            raise ValueError("positive dimensions and max_history>=2 are required")
+        self.state_dim = state_dim
+        self.param_dim = param_dim
+        self.action_dim = action_dim
+        self.max_history = max_history
+        self.transition = nn.Sequential(
+            nn.Linear(2 * state_dim + action_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, 128),
+            nn.GELU(),
+            nn.Linear(128, 128),
+            nn.GELU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(128, 128),
+            nn.GELU(),
+            nn.Linear(128, 128),
+            nn.GELU(),
+            nn.Linear(128, param_dim),
+        )
+
+    def forward(self, states: Tensor, actions: Tensor | None = None) -> Tensor:
+        """Pool features of ``(z_t,a_t,z_{t+1})`` from the permitted context only."""
+        if states.ndim != 3 or states.shape[-1] != self.state_dim:
+            raise ValueError(f"expected states (B, K, {self.state_dim})")
+        batch, history, _ = states.shape
+        if batch < 1 or not 2 <= history <= self.max_history:
+            raise ValueError(f"context length must lie in [2, {self.max_history}]")
+        if self.action_dim:
+            if actions is None or actions.shape != (batch, history - 1, self.action_dim):
+                raise ValueError(f"expected actions (B, K-1, {self.action_dim})")
+            transitions = torch.cat((states[:, :-1], actions, states[:, 1:]), dim=-1)
+        else:
+            if actions is not None:
+                raise ValueError("actions must be None when action_dim=0")
+            transitions = torch.cat((states[:, :-1], states[:, 1:]), dim=-1)
+        return self.head(self.transition(transitions).mean(dim=1))
+
+
+__all__ = ["ParameterEncoder", "TransitionParameterEncoder"]

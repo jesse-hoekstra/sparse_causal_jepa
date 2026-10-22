@@ -27,8 +27,8 @@ def validate_model_dataset(model: SCJEPA, dataset: Dataset[dict[str, Tensor]]) -
     paired = observations.ndim == encoder.observation_ndim + 2
     if observations.ndim != encoder.observation_ndim + 1 and not paired:
         raise ValueError("dataset observation rank is incompatible with the encoder")
-    if paired and (not isinstance(encoder, VectorEncoder) or observations.shape[0] != 2):
-        raise ValueError("paired observations require two vector episodes")
+    if paired and (not isinstance(encoder, VectorEncoder) or observations.shape[0] < 2):
+        raise ValueError("paired observations require at least two vector episodes")
     if isinstance(encoder, VectorEncoder) and observations.shape[-1] != encoder.observation_dim:
         raise ValueError("dataset observation dimension is incompatible with the vector encoder")
     if isinstance(encoder, ImageEncoder) and observations.shape[1] != encoder.in_channels:
@@ -42,7 +42,7 @@ def validate_model_dataset(model: SCJEPA, dataset: Dataset[dict[str, Tensor]]) -
     if model.predictor.action_dim:
         expected_actions = (length - 1, model.predictor.action_dim)
         if paired:
-            expected_actions = (2, *expected_actions)
+            expected_actions = (observations.shape[0], *expected_actions)
         if actions is None or actions.shape != expected_actions:
             raise ValueError(
                 "dataset actions must match the episode/time axes and model.action_dim"

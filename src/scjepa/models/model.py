@@ -7,21 +7,38 @@ import torch
 from torch import Tensor, nn
 
 from scjepa.models.encoders import FramewiseEncoder
-from scjepa.models.parameter_encoder import ParameterEncoder
+from scjepa.models.parameter_encoder import ParameterEncoder, TransitionParameterEncoder
 from scjepa.models.spartan import Spartan, SpartanOutput
+
+
+def cross_episode_parameters(parameters: Tensor, *, training: bool = False) -> Tensor:
+    """Assign a different episode's attached code to every recipient in each group.
+
+    Training draws one nonzero cyclic shift per call for R>2; evaluation uses
+    shift one. R=2 retains the exact previous swap without consuming RNG state.
+    """
+    if parameters.ndim != 3 or parameters.shape[1] < 2:
+        raise ValueError("cross-episode codes require shape (B, R>=2, d_theta)")
+    views = parameters.shape[1]
+    shift = (
+        int(torch.randint(1, views, (), device=parameters.device).item())
+        if training and views > 2
+        else 1
+    )
+    return parameters.roll(shift, dims=1)
 
 
 class ModelOutput(NamedTuple):
     """Sequence predictions and explicit inputs for configurable objectives."""
 
     predictions: Tensor
-    """Predicted next states, ``(B, W, d_z)`` or paired ``(B, 2, W, d_z)``."""
+    """Predicted next states, ``(B, W, d_z)`` or grouped ``(B, R, W, d_z)``."""
     targets: Tensor
     """Stopped-gradient EMA next states with the same shape as predictions."""
     online_states: Tensor
-    """Independent frame encodings, ``(B, T, d_z)`` or ``(B, 2, T, d_z)``."""
+    """Independent frame encodings, ``(B, T, d_z)`` or ``(B, R, T, d_z)``."""
     parameters: Tensor
-    """Own-context codes, ``(B, d_theta)`` or paired ``(B, 2, d_theta)``."""
+    """Own-context codes, ``(B, d_theta)`` or grouped ``(B, R, d_theta)``."""
     dynamics: tuple[SpartanOutput, ...]
     """One predictor result per transition; paired graphs flatten the first two axes."""
     prediction_start: int
@@ -34,7 +51,7 @@ class SCJEPA(nn.Module):
     def __init__(
         self,
         encoder: FramewiseEncoder,
-        parameter_encoder: ParameterEncoder,
+        parameter_encoder: ParameterEncoder | TransitionParameterEncoder,
         predictor: Spartan,
         context_len: int,
         ema_decay: float = 0.996,
@@ -46,6 +63,8 @@ class SCJEPA(nn.Module):
             raise ValueError("ema_decay must lie in [0, 1)")
         if not 1 <= context_len <= parameter_encoder.max_history:
             raise ValueError("context_len must lie in [1, parameter_encoder.max_history]")
+        if isinstance(parameter_encoder, TransitionParameterEncoder) and context_len < 2:
+            raise ValueError("transition parameter encoder requires context_len>=2")
         if (
             encoder.state_dim != parameter_encoder.state_dim
             or encoder.state_dim != predictor.state_dim
@@ -86,6 +105,8 @@ class SCJEPA(nn.Module):
         decay, context = float(state["ema_decay"]), int(state["context_len"])
         if not 0 <= decay < 1 or not 1 <= context <= self.parameter_encoder.max_history:
             raise ValueError("invalid checkpoint EMA decay or context length")
+        if isinstance(self.parameter_encoder, TransitionParameterEncoder) and context < 2:
+            raise ValueError("transition parameter encoder requires context_len>=2")
         self.ema_decay = decay
         self.context_len = context
         self.autoregressive = bool(state.get("autoregressive", False))
@@ -128,27 +149,28 @@ class SCJEPA(nn.Module):
         first source, then appends attached predictions instead of observations.
         Known actions remain aligned to each transition in either mode.
 
-        Paired observations/actions add a size-two axis after the batch axis.
-        Each episode uses the other episode's attached parameter code while
+        Grouped observations/actions add an R>=2 episode axis after the batch axis.
+        Each episode uses a distinct episode's attached parameter code while
         retaining its own state history, actions and target. The returned codes
-        still correspond to their own contexts; both directions share one loss.
+        still correspond to their own contexts; all recipients share one mean loss.
         """
         paired = observations.ndim == self.online_encoder.observation_ndim + 3
         groups = 0
+        views = 1
         if paired:
-            groups = observations.shape[0]
-            if observations.shape[1] != 2:
-                raise ValueError("paired observations must contain exactly two episodes")
+            groups, views = observations.shape[:2]
+            if views < 2:
+                raise ValueError("paired observations must contain at least two episodes")
             if actions is not None:
-                expected = (groups, 2, observations.shape[2] - 1, self.predictor.action_dim)
+                expected = (groups, views, observations.shape[2] - 1, self.predictor.action_dim)
                 if actions.shape != expected:
-                    raise ValueError("paired actions must have shape (B, 2, T-1, action_dim)")
+                    raise ValueError("paired actions must have shape (B, R, T-1, action_dim)")
                 actions = actions.flatten(0, 1)
             observations = observations.flatten(0, 1)
         elif observations.ndim != self.online_encoder.observation_ndim + 2:
             raise ValueError(
                 "observations must have shape (B, T, *observation_shape) "
-                "or (B, 2, T, *observation_shape)"
+                "or (B, R, T, *observation_shape)"
             )
         batch, length = observations.shape[:2]
         minimum_start = max(self.context_len, self.predictor.history_len) - 1
@@ -164,7 +186,9 @@ class SCJEPA(nn.Module):
         context_actions = None if actions is None else actions[:, : self.context_len - 1]
         parameters = self.parameter_encoder(online_states[:, : self.context_len], context_actions)
         predictor_parameters = (
-            parameters.reshape(groups, 2, self.predictor.param_dim).flip(1).flatten(0, 1)
+            cross_episode_parameters(
+                parameters.reshape(groups, views, self.predictor.param_dim), training=self.training
+            ).flatten(0, 1)
             if paired
             else parameters
         )
@@ -184,11 +208,11 @@ class SCJEPA(nn.Module):
         predictions = torch.stack([step.prediction for step in transitions], dim=1)
         if paired:
             predictions = predictions.reshape(
-                groups, 2, length - start - 1, self.predictor.state_dim
+                groups, views, length - start - 1, self.predictor.state_dim
             )
-            targets = targets.reshape(groups, 2, length - start - 1, self.predictor.state_dim)
-            online_states = online_states.reshape(groups, 2, length, self.predictor.state_dim)
-            parameters = parameters.reshape(groups, 2, self.predictor.param_dim)
+            targets = targets.reshape(groups, views, length - start - 1, self.predictor.state_dim)
+            online_states = online_states.reshape(groups, views, length, self.predictor.state_dim)
+            parameters = parameters.reshape(groups, views, self.predictor.param_dim)
         return ModelOutput(
             predictions, targets, online_states, parameters, tuple(transitions), start
         )
@@ -238,4 +262,4 @@ class SCJEPA(nn.Module):
         return torch.stack(predictions, dim=1)
 
 
-__all__ = ["SCJEPA", "ModelOutput"]
+__all__ = ["SCJEPA", "ModelOutput", "cross_episode_parameters"]

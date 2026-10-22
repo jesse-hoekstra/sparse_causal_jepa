@@ -68,6 +68,7 @@ class ObjectiveConfig:
     parameter_regularizer: str = "none"
     state_regularizer_weight: float = 0.0
     parameter_regularizer_weight: float = 0.0
+    parameter_consistency_weight: float = 0.0
     regularizer_num_projections: int = 256
 
     def __post_init__(self) -> None:
@@ -92,8 +93,8 @@ class TrainingObjective(nn.Module):
 
     Representation statistics use the local batch on each distributed rank.
     State samples have shape ``(T, B, d_z)``; parameter samples ``(1, B, d_theta)``.
-    Paired episodes use ``(2T, B, d_z)`` and ``(2, B, d_theta)``: each view has
-    one sample per independent parameter group, rather than pooling both views.
+    Grouped episodes use ``(RT, B, d_z)`` and ``(R, B, d_theta)``: each view has
+    one sample per independent parameter group, rather than pooling the views.
     Parameter regularization requires unique episode IDs, validated by Trainer
     across all ranks. It never counts repeated times as new parameter samples.
     """
@@ -157,6 +158,14 @@ class TrainingObjective(nn.Module):
                 parameters.transpose(0, 1) if parameters.ndim == 3 else parameters.unsqueeze(0)
             )
             base = base + config.parameter_regularizer_weight * terms["parameter_regularizer"]
+        if config.parameter_consistency_weight:
+            parameters = output.parameters
+            if parameters.ndim != 3 or parameters.shape[1] < 2:
+                raise ValueError("parameter consistency requires at least two grouped episodes")
+            # Equal to mean squared disagreement across all distinct episode pairs.
+            # At R=2 this is exactly mean((code_0-code_1)**2), with the same gradients.
+            terms["parameter_consistency"] = 2 * parameters.var(dim=1, correction=1).mean()
+            base = base + config.parameter_consistency_weight * terms["parameter_consistency"]
         terms["base"] = base
         terms["sparsity"] = sparsity
         weight = self.geco.penalty_weight if self.geco is not None else base.new_ones(())
@@ -278,7 +287,9 @@ class Trainer:
         self.config = config
         self.device = torch.device(config.device)
         self.model = model.to(self.device)
-        self.model_config = dict(model_config) if model_config is not None else None
+        self.model_config: dict[str, object] | None = (
+            dict(model_config) if model_config is not None else None
+        )
         self.dataset = dataset
         self.logger: MetricLogger = logger if logger is not None else NoopLogger()
         if config.batch_size % world_size():
@@ -713,8 +724,14 @@ class Trainer:
         if saved_config["batch_size"] != self.config.batch_size:
             raise ValueError("exact training resume requires the checkpoint's batch_size")
         saved_model_config = cast(dict[str, object] | None, payload["model_config"])
-        if self.model_config is not None and self.model_config != saved_model_config:
-            raise ValueError("model_config differs from checkpoint")
+        if self.model_config is not None:
+            current_model_config = dict(self.model_config)
+            current_model_config.setdefault("parameter_encoder_kind", "attention")
+            if saved_model_config is not None:
+                saved_model_config = dict(saved_model_config)
+                saved_model_config.setdefault("parameter_encoder_kind", "attention")
+            if current_model_config != saved_model_config:
+                raise ValueError("model_config differs from checkpoint")
         saved_run_metadata = payload.get("run_metadata", {})
         if not isinstance(saved_run_metadata, dict):
             raise ValueError("checkpoint run_metadata must be a mapping")

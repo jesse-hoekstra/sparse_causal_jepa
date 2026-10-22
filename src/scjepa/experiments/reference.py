@@ -32,7 +32,8 @@ def external_dense_manifest(
 
     Source versions and optimizer schedules may differ. The observation map,
     architecture and calibrated base-loss statistic must retain their meaning.
-    Formerly absent gate-open options receive their legacy false defaults.
+    Formerly absent options receive their legacy defaults only for semantic
+    compatibility checks; stored identity/hash verification remains unchanged.
     """
     if config.dense_reference_dir is None:
         raise ValueError("external dense reference directory is not configured")
@@ -88,6 +89,7 @@ def external_dense_manifest(
         model = dict(_mapping(value, "model configuration"))
         model.setdefault("spartan_parameter_gates_open", False)
         model.setdefault("spartan_action_gates_open", False)
+        model.setdefault("parameter_encoder_kind", "attention")
         if canonical_fingerprint(model) != expected_model:
             raise ValueError("external dense reference architecture differs")
     if canonical_fingerprint(record.get("data")) != canonical_fingerprint(
@@ -106,6 +108,7 @@ def external_dense_manifest(
         base_objective = {
             key: value for key, value in objective.items() if not key.endswith("_sparsity_weight")
         }
+        base_objective.setdefault("parameter_consistency_weight", 0.0)
         if base_objective != expected_objective:
             raise ValueError("external dense reference base objective differs")
     evaluation = _mapping(record.get("evaluation"), "calibration configuration")

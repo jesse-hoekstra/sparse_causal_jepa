@@ -29,7 +29,7 @@ from scjepa.eval.recovery import (
     mean_correlation_coefficient,
 )
 from scjepa.eval.state_probes import fit_state_probe, state_probe_metrics
-from scjepa.models.model import SCJEPA, ModelOutput
+from scjepa.models.model import SCJEPA, ModelOutput, cross_episode_parameters
 from scjepa.training.loop import ObjectiveConfig, TrainingObjective
 from scjepa.training.rng import preserve_rng
 
@@ -38,8 +38,8 @@ from scjepa.training.rng import preserve_rng
 class EvaluationConfig:
     """Held-out independent-group counts and predeclared routing aggregation.
 
-    When the DGP pairs episodes, each item/batch unit contains two trajectories
-    sharing one parameter. Both prediction directions contribute equally.
+    Each grouped item/batch unit contains R independent trajectories sharing one
+    parameter. Every recipient uses one other context's code, with equal weight.
     """
 
     calibration_episodes: int = 512
@@ -122,8 +122,8 @@ def _check_model(model: SCJEPA, data: DGPConfig) -> None:
     minimum_context = cast(int, specification["minimum_context_len"])
     if model.context_len < minimum_context:
         raise ValueError(f"{data.family} evaluation requires K>={minimum_context}")
-    if data.family == "simplified_gaussian" and data.episodes_per_parameter != 2:
-        raise ValueError("simplified_gaussian evaluation requires paired episodes")
+    if data.family == "simplified_gaussian" and data.episodes_per_parameter < 2:
+        raise ValueError("simplified_gaussian evaluation requires at least two episodes per theta")
 
 
 def _batch_sizes(count: int, batch_size: int) -> list[int]:
@@ -138,15 +138,15 @@ def _batch_sizes(count: int, batch_size: int) -> list[int]:
 def _shuffled_code_prediction_mse(model: SCJEPA, result: ModelOutput, actions: Tensor) -> float:
     """Derange parameter groups and recompute the complete autoregressive predictor.
 
-    A cyclic shift ensures every donor has a different theta; flipping the view
-    axis retains the normal opposite-view donor convention. Gates and attention
+    A cyclic group shift ensures every donor has a different theta; the view
+    shift retains the normal single-context donor convention. Gates and attention
     are recomputed from the modified inputs at every prediction step.
     """
     if result.parameters.ndim != 3 or result.parameters.shape[0] < 2 or not model.autoregressive:
-        raise ValueError("code shuffling requires at least two paired groups and autoregression")
+        raise ValueError("code shuffling requires at least two parameter groups and autoregression")
     start = result.prediction_start
     first = start - model.predictor.history_len + 1
-    codes = result.parameters.roll(1, dims=0).flip(1).flatten(0, 1)
+    codes = cross_episode_parameters(result.parameters.roll(1, dims=0)).flatten(0, 1)
     history = result.online_states[:, :, first : start + 1].flatten(0, 1)
     predictions = model.rollout(
         history,
@@ -212,14 +212,14 @@ def _collect(
             result.targets.cpu(),
             result.parameters.cpu(),
         )
-        if data.episodes_per_parameter == 2:
+        if data.episodes_per_parameter >= 2:
             # Recovery scores each context code against its shared theta. Only
             # diagnostics flatten views; the objective above keeps groups independent.
-            ids = ids.repeat_interleave(2)
+            ids = ids.repeat_interleave(data.episodes_per_parameter)
             states, online, target, codes = (
                 value.flatten(0, 1) for value in (states, online, target, codes)
             )
-            parameters = parameters.repeat_interleave(2, dim=0)
+            parameters = parameters.repeat_interleave(data.episodes_per_parameter, dim=0)
         buckets["ids"].append(ids)
         buckets["states"].append(states)
         buckets["parameters"].append(parameters)
@@ -269,8 +269,8 @@ def validate_model(
 ) -> dict[str, float]:
     """Score validation loss and calibration-aligned MCC/SHD without test data.
 
-    Base loss is MSE plus weighted state/parameter SIGReg and logit regularization,
-    excluding every structural sparsity term. Random projections and evaluation
+    Base loss includes MSE, weighted state/parameter SIGReg, parameter consistency
+    and logit regularization, excluding structural sparsity. Projections and evaluation
     batching are fixed by ``config`` and do not advance the training RNG.
     Label-based recovery diagnostics do not enter the loss or checkpoint selector.
     """
@@ -390,10 +390,25 @@ def _group_linear_r2(
     return sum(scores) / len(scores)
 
 
-def _paired_code_variance(codes: Tensor) -> dict[str, float]:
-    """Estimate within-theta variation from two independent contexts per test theta."""
-    paired = codes.double().reshape(-1, 2, codes.shape[-1])
-    within = float((paired[:, 0] - paired[:, 1]).square().mean() / 2)
+def _paired_code_variance(codes: Tensor, episodes_per_parameter: int = 2) -> dict[str, float]:
+    """Score individual context codes, using every available view per test theta."""
+    if (
+        codes.ndim != 2
+        or episodes_per_parameter < 2
+        or codes.shape[0] % episodes_per_parameter
+        or codes.shape[0] < 2 * episodes_per_parameter
+    ):
+        raise ValueError(
+            "code variance requires complete groups with at least two views and groups"
+        )
+    paired = codes.double().reshape(-1, episodes_per_parameter, codes.shape[-1])
+    # Retain the exact legacy two-view calculation; for R>2 this is the same
+    # unbiased within-group variance, not the variance of an averaged code.
+    within = (
+        float((paired[:, 0] - paired[:, 1]).square().mean() / 2)
+        if episodes_per_parameter == 2
+        else float(paired.var(dim=1, correction=1).mean())
+    )
     # Estimate marginal variance across independent groups separately for each view.
     total = float(paired.var(dim=0, correction=1).mean())
     return {
@@ -437,7 +452,7 @@ def _simplified_recovery_metrics(
         "parameter_gaussianized_mcc": mean_correlation_coefficient(
             matches["parameter_gaussianized"], scored.codes, gaussian_scored
         ),
-        **_paired_code_variance(scored.codes),
+        **_paired_code_variance(scored.codes, scored.config.episodes_per_parameter),
     }
 
 
@@ -568,15 +583,20 @@ def evaluate_model(
             "mcc": "mean absolute Pearson correlation with calibration-only Hungarian assignment",
             "matching_reference": "https://github.com/slachapelle/disentanglement_via_mechanism_sparsity/blob/7fd50ded090a51a7527520f07d933450aa5b872a/metrics.py",
             "state_rows": (
-                "all frames from both views; parameters have one row per context code "
+                "all frames from every view; parameters have one row per context code "
                 "with shared truth repeated; episode IDs identify independent parameter groups"
-                if base_data.episodes_per_parameter == 2
+                if base_data.episodes_per_parameter >= 2
                 else "all frames; parameters have one row per distinct episode"
             ),
             "prediction_context": (
                 "paired episodes: opposite episode's code in both directions"
                 if base_data.episodes_per_parameter == 2
-                else "same-episode context"
+                else (
+                    "grouped episodes: cyclic view shift by one; one donor context code "
+                    "per recipient, without averaging codes"
+                    if base_data.episodes_per_parameter > 2
+                    else "same-episode context"
+                )
             ),
             "prediction_mode": "autoregressive" if model.autoregressive else "teacher_forced",
             "shd": "false positives plus false negatives; no reversal discount",
@@ -611,14 +631,16 @@ def evaluate_model(
                     "CDF; independent calibration-only assignment; raw MCC retained"
                 ),
                 "parameter_context_variance": (
-                    "two independently initialized test views per shared theta; mean squared "
-                    "code difference / 2, normalized by marginal variance across groups "
+                    "all independently initialized test views per shared theta; unbiased "
+                    "within-group sample variance of individual codes (R=2: squared difference "
+                    "/ 2), normalized by marginal variance across groups "
                     "averaged over views; denominator floored at 1e-12; inspect total "
                     "variance because constant codes also have zero within-theta variance"
                 ),
                 "parameter_shuffle": (
                     "cyclic one-group shift within each test batch, never the same theta; "
-                    "opposite-view donor retained; autoregressive prediction and input-dependent "
+                    "single-context cyclic-view donor retained; autoregressive prediction and "
+                    "input-dependent "
                     "gates recomputed; report MSE and delta from unchanged-code test MSE"
                 ),
             }
