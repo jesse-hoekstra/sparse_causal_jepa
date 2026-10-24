@@ -242,6 +242,7 @@ def test_separate_sparsity_weights_change_only_the_selected_loss_block() -> None
         torch.testing.assert_close(total, baseline + 0.7 * terms[f"{block}_sparsity"])
     # Parameter-conditioned predictive gradients exist with parameter sparsity off.
     baseline.backward()
+    assert isinstance(model.parameter_encoder, ParameterEncoder)
     gradient = model.parameter_encoder.head.weight.grad
     assert gradient is not None
     assert gradient.abs().sum() > 0

@@ -182,9 +182,14 @@ class _LossForward(nn.Module):
         self.objective = objective
 
     def forward(
-        self, observations: Tensor, actions: Tensor | None
+        self,
+        observations: Tensor,
+        actions: Tensor | None,
+        oracle_parameters: Tensor | None = None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        output = cast(ModelOutput, self.model(observations, actions))
+        output = cast(
+            ModelOutput, self.model(observations, actions, oracle_parameters=oracle_parameters)
+        )
         total, terms = self.objective.forward(output)
         return total, {name: value.detach() for name, value in terms.items()}
 
@@ -271,6 +276,13 @@ class Trainer:
         """
         if dataset_identity is not None and not dataset_identity:
             raise ValueError("dataset_identity must be a nonempty string when supplied")
+        if model.parameter_source == "oracle" and (
+            config.objective.parameter_regularizer_weight
+            or config.objective.parameter_consistency_weight
+        ):
+            raise ValueError(
+                "oracle parameters require zero parameter regularizer/consistency weights"
+            )
         if dataset is not None:
             validate_model_dataset(model, dataset)
             inferred_identity = dataset_fingerprint(dataset)
@@ -387,7 +399,13 @@ class Trainer:
         actions = batch.get("actions")
         if actions is not None:
             actions = actions.to(self.device, non_blocking=True)
-        return cast(tuple[Tensor, dict[str, Tensor]], self._forward_model(observations, actions))
+        oracle_parameters = batch.get("oracle_parameters")
+        if oracle_parameters is not None:
+            oracle_parameters = oracle_parameters.to(self.device, non_blocking=True)
+        return cast(
+            tuple[Tensor, dict[str, Tensor]],
+            self._forward_model(observations, actions, oracle_parameters),
+        )
 
     def discard_accumulation(self) -> None:
         """Explicitly discard a partial accumulation group without an EMA update."""
@@ -727,9 +745,11 @@ class Trainer:
         if self.model_config is not None:
             current_model_config = dict(self.model_config)
             current_model_config.setdefault("parameter_encoder_kind", "attention")
+            current_model_config.setdefault("parameter_source", "learned")
             if saved_model_config is not None:
                 saved_model_config = dict(saved_model_config)
                 saved_model_config.setdefault("parameter_encoder_kind", "attention")
+                saved_model_config.setdefault("parameter_source", "learned")
             if current_model_config != saved_model_config:
                 raise ValueError("model_config differs from checkpoint")
         saved_run_metadata = payload.get("run_metadata", {})

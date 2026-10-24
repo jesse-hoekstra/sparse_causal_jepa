@@ -3,6 +3,7 @@
 from collections.abc import Sized
 from typing import cast
 
+import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
@@ -12,13 +13,16 @@ from scjepa.models import SCJEPA, ImageEncoder, VectorEncoder
 def validate_model_dataset(model: SCJEPA, dataset: Dataset[dict[str, Tensor]]) -> None:
     """Check shapes, action alignment, dtype, and declared minimum memory/context.
 
-    Latent dimensions remain model choices. Ground-truth states, graph locations,
-    parameters, and recovery utilities never enter the model or its objective.
+    Latent dimensions remain model choices. Only explicit oracle mode accepts
+    raw parameter values; state labels, graph labels and metadata remain excluded.
     """
     if len(cast(Sized, dataset)) < 1:
         raise ValueError("dataset must contain at least one episode")
     item = dataset[0]
-    if set(item) - {"observations", "actions", "episode_ids"}:
+    allowed = {"observations", "actions", "episode_ids"}
+    if model.parameter_source == "oracle":
+        allowed.add("oracle_parameters")
+    if set(item) - allowed:
         raise ValueError("training items must not contain ground-truth or metadata keys")
     if "observations" not in item:
         raise ValueError("training items require observations")
@@ -35,6 +39,20 @@ def validate_model_dataset(model: SCJEPA, dataset: Dataset[dict[str, Tensor]]) -
         raise ValueError("dataset channel count is incompatible with the image encoder")
     if observations.dtype != next(encoder.parameters()).dtype:
         raise ValueError("dataset observation dtype must match model dtype before training")
+    if model.parameter_source == "oracle":
+        parameters = item.get("oracle_parameters")
+        if parameters is None or parameters.shape != (model.predictor.param_dim,):
+            raise ValueError(
+                "oracle training items require oracle_parameters with shape (param_dim,)"
+            )
+        if (
+            not parameters.is_floating_point()
+            or parameters.dtype != observations.dtype
+            or parameters.device != observations.device
+        ):
+            raise ValueError("oracle_parameters must match the observation dtype and device")
+        if not bool(torch.isfinite(parameters).all()):
+            raise ValueError("oracle_parameters must be finite")
     length = observations.shape[1 if paired else 0]
     if length <= max(model.context_len, model.predictor.history_len):
         raise ValueError("trajectory must contain context/history plus a prediction target")

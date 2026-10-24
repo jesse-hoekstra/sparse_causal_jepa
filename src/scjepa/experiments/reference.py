@@ -11,6 +11,7 @@ from scjepa.data.controlled_vector import VectorObservationMap
 from scjepa.data.datasets import canonical_fingerprint
 from scjepa.data.factory import build_dgp_dataset
 from scjepa.experiments.config import ExperimentConfig
+from scjepa.experiments.oracle import OracleParameterEpisodes
 from scjepa.experiments.storage import json_safe, read_json
 
 
@@ -90,6 +91,7 @@ def external_dense_manifest(
         model.setdefault("spartan_parameter_gates_open", False)
         model.setdefault("spartan_action_gates_open", False)
         model.setdefault("parameter_encoder_kind", "attention")
+        model.setdefault("parameter_source", "learned")
         if canonical_fingerprint(model) != expected_model:
             raise ValueError("external dense reference architecture differs")
     if canonical_fingerprint(record.get("data")) != canonical_fingerprint(
@@ -133,6 +135,8 @@ def external_dense_manifest(
     ):
         raise ValueError("external dense reference observation map differs")
     expected_dataset = build_dgp_dataset(config.data_config(graph), observation_matrix=matrix)
+    if config.model.parameter_source == "oracle":
+        expected_dataset = OracleParameterEpisodes(expected_dataset)
     if dataset_identity != expected_dataset.fingerprint:
         raise ValueError("external dense reference dataset generator differs")
     return manifest

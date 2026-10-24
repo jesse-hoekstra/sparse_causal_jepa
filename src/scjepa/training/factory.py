@@ -31,6 +31,7 @@ class ModelConfig:
     context_len: int = 4
     history_len: int = 2
     parameter_encoder_kind: str = "attention"
+    parameter_source: str = "learned"
     parameter_embed_dim: int = 64
     parameter_heads: int = 4
     max_context_len: int = 64
@@ -103,6 +104,7 @@ def build_model(config: ModelConfig | DictConfig) -> SCJEPA:
         cfg.context_len,
         cfg.ema_decay,
         autoregressive=cfg.autoregressive,
+        parameter_source=cfg.parameter_source,
     )
 
 
