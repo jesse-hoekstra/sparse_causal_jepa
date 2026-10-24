@@ -244,14 +244,23 @@ def code_identity() -> str:
     return digest.hexdigest()
 
 
-def run(config: Config, *, resume: bool = False) -> dict[str, float]:
-    """Train only the predictor, preserving checkpoints, histories and final test results."""
-    torch.set_num_threads(config.threads)
-    device = torch.device(config.device)
+def resolve_device(requested: str) -> torch.device:
+    """Resolve bare CUDA to the current visible GPU before selecting it."""
+    device = torch.device(requested)
     if device.type == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but unavailable")
+        # Torch's stub omits None, but torch.device("cuda").index is None at runtime.
+        if device.index is None:  # pyright: ignore[reportUnnecessaryComparison]
+            device = torch.device("cuda", torch.cuda.current_device())
         torch.cuda.set_device(device)
+    return device
+
+
+def run(config: Config, *, resume: bool = False) -> dict[str, float]:
+    """Train only the predictor, preserving checkpoints, histories and final test results."""
+    torch.set_num_threads(config.threads)
+    device = resolve_device(config.device)
     out = Path(config.output_dir)
     checkpoint_path = out / "last.pt"
     if resume and not checkpoint_path.is_file():

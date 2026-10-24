@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 import torch
 
-from diagnostics.oracle_state_predictor.run import Config, GroupSampler, run
+from diagnostics.oracle_state_predictor.run import Config, GroupSampler, resolve_device, run
 
 
 def _config(path: Path, steps: int) -> Config:
@@ -74,3 +74,38 @@ def test_group_sampler_restarts_without_repeating_groups_within_batch() -> None:
         actual = sampler.next()
         assert len({int(value) for value in actual}) == 2
         torch.testing.assert_close(restored.next(), actual, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(("requested", "expected"), [("cuda", "cuda:3"), ("cuda:1", "cuda:1")])
+def test_cuda_selection_always_receives_an_explicit_index(
+    monkeypatch: pytest.MonkeyPatch, requested: str, expected: str
+) -> None:
+    """Bare CUDA uses the current visible GPU; an explicit choice remains unchanged."""
+    selected: list[torch.device] = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+
+    def select(device: torch.device) -> None:
+        assert device.index is not None
+        selected.append(device)
+
+    monkeypatch.setattr(torch.cuda, "set_device", select)
+    assert resolve_device(requested) == torch.device(expected)
+    assert selected == [torch.device(expected)]
+
+
+def test_cpu_selection_does_not_access_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CPU-only verification must not initialize or inspect the CUDA runtime."""
+
+    def fail_cuda() -> bool:
+        raise AssertionError("CPU selection accessed CUDA")
+
+    monkeypatch.setattr(torch.cuda, "is_available", fail_cuda)
+    assert resolve_device("cpu") == torch.device("cpu")
+
+
+def test_cuda_unavailable_fails_before_selecting_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Retain the useful availability error when a CUDA run cannot start."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA requested but unavailable"):
+        resolve_device("cuda")
