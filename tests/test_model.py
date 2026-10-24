@@ -240,7 +240,7 @@ def test_paired_prediction_gradients_use_other_context_without_future_leakage(vi
 
 def test_paired_forward_rejects_incomplete_pairs_and_misaligned_actions() -> None:
     model = make_model(action_dim=2, context_len=2)
-    with pytest.raises(ValueError, match="exactly two"):
+    with pytest.raises(ValueError, match="at least two"):
         model(torch.randn(3, 1, 3, 7), torch.randn(3, 1, 2, 2))
     with pytest.raises(ValueError, match="paired actions"):
         model(torch.randn(3, 2, 3, 7), torch.randn(6, 2, 2))

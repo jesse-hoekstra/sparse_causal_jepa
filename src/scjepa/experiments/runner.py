@@ -20,6 +20,7 @@ from scjepa.data.factory import build_dgp_dataset
 from scjepa.data.identity import training_tensors_fingerprint
 from scjepa.experiments.config import ExperimentConfig
 from scjepa.experiments.evaluation import calibrate_tau, evaluate_model, validate_model
+from scjepa.experiments.oracle import OracleParameterEpisodes
 from scjepa.experiments.reference import dense_directory, external_dense_manifest
 from scjepa.experiments.reporting import aggregate_results
 from scjepa.experiments.storage import (
@@ -363,6 +364,8 @@ def _run_one(
             data_config = config.data_config(graph)
             data = build_dgp_dataset(data_config, observation_matrix=matrix)
             model_config = config.condition_model(condition)
+            if model_config.parameter_source == "oracle":
+                data = OracleParameterEpisodes(data)
             model = build_model(model_config)
             calibration: dict[str, object] | None = None
             if condition != "dense":

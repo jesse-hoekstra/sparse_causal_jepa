@@ -5,7 +5,8 @@ Lachapelle et al.'s mechanism-sparsity implementation. We fit that assignment on
 calibration episodes and score independent test episodes. Graph SHD counts false
 positives plus false negatives after applying those same assignments. Local
 SPARTAN graphs describe residual-inclusive value-routing support, conditional on
-inferred parameters, rather than an identified causal graph.
+learned codes or explicitly provided oracle parameters, rather than an identified
+causal graph.
 """
 
 import json
@@ -139,8 +140,10 @@ def _shuffled_code_prediction_mse(model: SCJEPA, result: ModelOutput, actions: T
     """Derange parameter groups and recompute the complete autoregressive predictor.
 
     A cyclic group shift ensures every donor has a different theta; the view
-    shift retains the normal single-context donor convention. Gates and attention
-    are recomputed from the modified inputs at every prediction step.
+    shift retains the normal single-context donor convention. In oracle mode,
+    every view already contains the group's provided raw theta, so this shifts
+    true parameters between groups. Gates and attention are recomputed from the
+    modified inputs at every prediction step.
     """
     if result.parameters.ndim != 3 or result.parameters.shape[0] < 2 or not model.autoregressive:
         raise ValueError("code shuffling requires at least two parameter groups and autoregression")
@@ -187,6 +190,12 @@ def _collect(
         begin += size
         observations = torch.stack([item.observations for item in episodes]).to(reference)
         actions = torch.stack([item.actions for item in episodes]).to(reference)
+        parameters = torch.stack([item.ground_truth["parameters"] for item in episodes])
+        forward_arguments = (
+            {"oracle_parameters": parameters.to(reference)}
+            if model.parameter_source == "oracle"
+            else {}
+        )
         if isolate_gate_rng:
             # Gate draws must not change the SIGReg projection sequence below.
             with preserve_rng(reference.device):
@@ -195,9 +204,9 @@ def _collect(
                 if reference.device.type == "cuda":
                     with torch.cuda.device(reference.device):
                         torch.cuda.manual_seed(gate_seed)
-                result = model(observations, actions)
+                result = model(observations, actions, **forward_arguments)
         else:
-            result = model(observations, actions)
+            result = model(observations, actions, **forward_arguments)
         _, terms = criterion.forward(result)
         prediction_sum += float(terms["prediction"]) * size
         base_sum += float(terms["base"]) * size
@@ -206,7 +215,6 @@ def _collect(
             shuffled_sum += _shuffled_code_prediction_mse(model, result, actions) * size
         ids = torch.tensor([item.episode_id for item in episodes], dtype=torch.int64)
         states = torch.stack([item.ground_truth["states"] for item in episodes])
-        parameters = torch.stack([item.ground_truth["parameters"] for item in episodes])
         online, target, codes = (
             result.online_states.cpu(),
             result.targets.cpu(),
@@ -319,8 +327,10 @@ def calibrate_tau(
 ) -> dict[str, float]:
     """Measure a selected dense model on the independent calibration split.
 
-    No labels or coordinate matching enter this loss. The caller persists the
-    measured base loss as the shared GECO threshold for both sparse conditions.
+    No evaluation labels or coordinate matching enter this loss, except for the
+    raw theta input explicitly provided by the oracle-parameter control. The
+    caller persists the measured base loss as the shared GECO threshold for both
+    sparse conditions.
     ``training_gates`` samples predictor gates for a startup loss comparison while
     keeping encoders in evaluation mode and retaining the same SIGReg projections.
     """
@@ -581,6 +591,14 @@ def evaluate_model(
                 matrix=observation_matrix, dimension=observation_matrix.shape[0]
             ).fingerprint,
             "mcc": "mean absolute Pearson correlation with calibration-only Hungarian assignment",
+            "parameter_source": model.parameter_source,
+            "parameter_recovery_interpretation": (
+                "provided raw-theta reference scores, not learned parameter recovery; "
+                "raw MCC and column-pair linear R2 should be approximately one, and "
+                "within-theta variance zero; Gaussianized-reference MCC need not equal one"
+                if model.parameter_source == "oracle"
+                else "recovery of learned individual context-derived parameter codes"
+            ),
             "matching_reference": "https://github.com/slachapelle/disentanglement_via_mechanism_sparsity/blob/7fd50ded090a51a7527520f07d933450aa5b872a/metrics.py",
             "state_rows": (
                 "all frames from every view; parameters have one row per context code "
@@ -618,6 +636,16 @@ def evaluate_model(
                 "prevents causal interpretation of routing SHD"
             ),
         }
+        if model.parameter_source == "oracle":
+            metadata["prediction_context"] = (
+                "provided raw ground-truth theta per independent parameter group; shared "
+                "unchanged across its views and prediction steps; parameter encoder bypassed"
+            )
+            metadata["graph_semantics"] = (
+                "residual-inclusive local one-step value-routing support at each predictor "
+                "call, without composing paths across rollout steps; conditional on provided "
+                "raw ground-truth parameters; not a causal guarantee"
+            )
         if base_data.family == "simplified_gaussian":
             metadata["additional_diagnostics"] = {
                 "group_recovery": (
@@ -639,8 +667,12 @@ def evaluate_model(
                 ),
                 "parameter_shuffle": (
                     "cyclic one-group shift within each test batch, never the same theta; "
-                    "single-context cyclic-view donor retained; autoregressive prediction and "
-                    "input-dependent "
+                    + (
+                        "provided raw theta shifted between groups and repeated across views; "
+                        if model.parameter_source == "oracle"
+                        else "single-context cyclic-view donor retained; "
+                    )
+                    + "autoregressive prediction and input-dependent "
                     "gates recomputed; report MSE and delta from unchanged-code test MSE"
                 ),
             }

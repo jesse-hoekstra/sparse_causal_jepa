@@ -22,6 +22,11 @@ states, six uniform parameters and sixteen densely mixed observed actions. It
 uses ten context frames and two forecast targets, comparing state/action sparsity
 with state/action/parameter sparsity. Its preset requires fresh dense calibration.
 
+The [oracle-parameter control](docs/oracle_parameter_control.md) supplies the six
+true system parameters to the predictor, bypassing parameter inference. Its
+separate batch-16 preset runs dense, baseline and full with state SIGReg 0.4 and
+fresh calibration; parameter SIGReg and consistency are disabled.
+
 ## Model and batch interface
 
 ```python

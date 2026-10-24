@@ -83,3 +83,13 @@ capacity. Start a fresh dense run for comparison with K=10 at equal update
 counts; use its own dense calibration for any later sparse stages. Preserve
 the K=10 preset and all training semantics. The standalone context-variance
 diagnostic lives under `diagnostics/`, outside the training source fingerprint.
+
+The explicitly selected oracle-parameter control is documented in
+`docs/oracle_parameter_control.md`. `model.parameter_source=oracle` permits only
+the raw true parameter vector as an additional training input for
+`simplified_gaussian`; ordinary datasets remain label-free. The separate oracle
+adapter must never expose states, graphs or inverse observations. Bypass and
+freeze the parameter encoder, disable parameter SIGReg/consistency, retain state
+SIGReg, and use a fresh oracle dense calibration with paired baseline/full warm
+starts. Parameter recovery scores are provided-reference checks, not learned
+recovery. Keep learned/oracle checkpoint and dense-reference modes incompatible.

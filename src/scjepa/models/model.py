@@ -38,7 +38,7 @@ class ModelOutput(NamedTuple):
     online_states: Tensor
     """Independent frame encodings, ``(B, T, d_z)`` or ``(B, R, T, d_z)``."""
     parameters: Tensor
-    """Own-context codes, ``(B, d_theta)`` or grouped ``(B, R, d_theta)``."""
+    """Own-context codes or raw oracle values, ``(B, d_theta)`` or ``(B, R, d_theta)``."""
     dynamics: tuple[SpartanOutput, ...]
     """One predictor result per transition; paired graphs flatten the first two axes."""
     prediction_start: int
@@ -56,9 +56,12 @@ class SCJEPA(nn.Module):
         context_len: int,
         ema_decay: float = 0.996,
         autoregressive: bool = False,
+        parameter_source: str = "learned",
     ) -> None:
         """Copy and freeze the complete encoder, including its output head."""
         super().__init__()
+        if parameter_source not in {"learned", "oracle"}:
+            raise ValueError("parameter_source must be learned or oracle")
         if not 0 <= ema_decay < 1:
             raise ValueError("ema_decay must lie in [0, 1)")
         if not 1 <= context_len <= parameter_encoder.max_history:
@@ -81,6 +84,10 @@ class SCJEPA(nn.Module):
         self.target_encoder.requires_grad_(False)
         self.target_encoder.eval()
         self.parameter_encoder = parameter_encoder
+        self.parameter_source = parameter_source
+        if self.parameter_source == "oracle":
+            self.parameter_encoder.requires_grad_(False)
+            self.parameter_encoder.eval()
         self.predictor = predictor
         self.context_len = context_len
         self.ema_decay = ema_decay
@@ -90,6 +97,8 @@ class SCJEPA(nn.Module):
         """Train online modules while keeping the target encoder in evaluation mode."""
         super().train(mode)
         self.target_encoder.eval()
+        if self.parameter_source == "oracle":
+            self.parameter_encoder.eval()
         return self
 
     def get_extra_state(self) -> dict[str, float | int | bool]:
@@ -98,10 +107,13 @@ class SCJEPA(nn.Module):
             "ema_decay": self.ema_decay,
             "context_len": self.context_len,
             "autoregressive": self.autoregressive,
+            "oracle_parameters": self.parameter_source == "oracle",
         }
 
     def set_extra_state(self, state: dict[str, float | int | bool]) -> None:
         """Restore configuration; older checkpoints used observed state histories."""
+        if state.get("oracle_parameters", False) != (self.parameter_source == "oracle"):
+            raise ValueError("checkpoint parameter_source differs from the model")
         decay, context = float(state["ema_decay"]), int(state["context_len"])
         if not 0 <= decay < 1 or not 1 <= context <= self.parameter_encoder.max_history:
             raise ValueError("invalid checkpoint EMA decay or context length")
@@ -112,6 +124,9 @@ class SCJEPA(nn.Module):
         self.autoregressive = bool(state.get("autoregressive", False))
         self.target_encoder.requires_grad_(False)
         self.target_encoder.eval()
+        if self.parameter_source == "oracle":
+            self.parameter_encoder.requires_grad_(False)
+            self.parameter_encoder.eval()
 
     @torch.no_grad()
     def update_target(self) -> None:
@@ -137,6 +152,8 @@ class SCJEPA(nn.Module):
         observations: Tensor,
         actions: Tensor | None = None,
         prediction_start: int | None = None,
+        *,
+        oracle_parameters: Tensor | None = None,
     ) -> ModelOutput:
         """Predict future states using one parameter inference per episode.
 
@@ -153,7 +170,13 @@ class SCJEPA(nn.Module):
         Each episode uses a distinct episode's attached parameter code while
         retaining its own state history, actions and target. The returned codes
         still correspond to their own contexts; all recipients share one mean loss.
+        Explicit oracle mode instead requires raw ``(B, d_theta)`` parameters,
+        detached and reused across every view and forecast step of each group.
         """
+        if self.parameter_source == "learned" and oracle_parameters is not None:
+            raise ValueError("learned parameter_source cannot consume oracle_parameters")
+        if self.parameter_source == "oracle" and oracle_parameters is None:
+            raise ValueError("oracle parameter_source requires oracle_parameters")
         paired = observations.ndim == self.online_encoder.observation_ndim + 3
         groups = 0
         views = 1
@@ -183,15 +206,36 @@ class SCJEPA(nn.Module):
         elif actions is not None:
             raise ValueError("actions must be None when action_dim=0")
         online_states = self.online_encoder.encode_sequence(observations)
-        context_actions = None if actions is None else actions[:, : self.context_len - 1]
-        parameters = self.parameter_encoder(online_states[:, : self.context_len], context_actions)
-        predictor_parameters = (
-            cross_episode_parameters(
-                parameters.reshape(groups, views, self.predictor.param_dim), training=self.training
-            ).flatten(0, 1)
-            if paired
-            else parameters
-        )
+        if self.parameter_source == "oracle":
+            assert oracle_parameters is not None
+            expected = (groups if paired else batch, self.predictor.param_dim)
+            if oracle_parameters.shape != expected:
+                raise ValueError(f"oracle_parameters must have shape {expected}")
+            if (
+                not oracle_parameters.is_floating_point()
+                or oracle_parameters.dtype != online_states.dtype
+                or oracle_parameters.device != online_states.device
+            ):
+                raise ValueError("oracle_parameters must match the state dtype and device")
+            if not bool(torch.isfinite(oracle_parameters).all()):
+                raise ValueError("oracle_parameters must be finite")
+            parameters = oracle_parameters.detach()
+            if paired:
+                parameters = parameters[:, None].expand(-1, views, -1).reshape(batch, -1)
+            predictor_parameters = parameters
+        else:
+            context_actions = None if actions is None else actions[:, : self.context_len - 1]
+            parameters = self.parameter_encoder(
+                online_states[:, : self.context_len], context_actions
+            )
+            predictor_parameters = (
+                cross_episode_parameters(
+                    parameters.reshape(groups, views, self.predictor.param_dim),
+                    training=self.training,
+                ).flatten(0, 1)
+                if paired
+                else parameters
+            )
         with torch.no_grad():
             targets = self.target_encoder.encode_sequence(observations[:, start + 1 :])
         transitions: list[SpartanOutput] = []

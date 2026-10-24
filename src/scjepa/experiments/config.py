@@ -118,6 +118,19 @@ class ExperimentConfig:
         if self.train_episodes < self.train.batch_size or self.validation_every < 1:
             raise ValueError("need at least a full training batch and positive validation_every")
         model = self.model
+        if model.parameter_source not in {"learned", "oracle"}:
+            raise ValueError("parameter_source must be learned or oracle")
+        if model.parameter_source == "oracle":
+            if self.data_family != "simplified_gaussian":
+                raise ValueError("oracle parameters currently require simplified_gaussian")
+            if (
+                self.train.objective.parameter_regularizer_weight
+                or self.train.objective.parameter_consistency_weight
+            ):
+                raise ValueError(
+                    "oracle parameters require zero parameter_regularizer_weight and "
+                    "parameter_consistency_weight; the supplied parameters are fixed inputs"
+                )
         dimensions = (
             (6, 6, 6, 16) if self.data_family == "simplified_gaussian" else (10, 10, 10, 10)
         )
