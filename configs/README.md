@@ -1,5 +1,16 @@
 # Configuration
 
+`experiments/simplified_gaussian_r10_transition_attention.yaml` compares a
+transition-attention parameter encoder against the learned-parameter B16,
+SIGReg 0.4 experiment. It retains K=10, T=12, ten episode views, consistency
+weight 1, batch size 16 for training/evaluation, and 100,000 steps per stage at
+constant learning rate 0.001. The encoder uses 128-wide complete transition
+tokens, two residual attention blocks with four heads, and learned attention
+pooling with a mean residual. The DGP, losses, state encoder and SPARTAN settings
+are unchanged. It starts a fresh dense run and calibration, then paired baseline
+and full runs in a separate output directory; older MLP checkpoints and tau are
+incompatible. See [the server command](../docs/simplified_gaussian_experiment.md#transition-attention-comparison-against-b16-sigreg-04).
+
 `experiments/independent_gaussian.yaml` runs the nonlinear Gaussian-preserving
 DGP with the complementary graph, K=3, T=5, paired episodes, SIGReg and 100,000
 steps per stage at constant learning rate 0.001. Its companion

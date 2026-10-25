@@ -1,7 +1,6 @@
 """Infer one attached, time-constant parameter vector from permitted context.
 
-Attention, post-normalization blocks, positional embeddings, and learned-query
-temporal pooling summarize whole latent state/action observations. Contextual
+Encoders summarize either observations or complete transition tuples. Contextual
 coordinate mixing is confined to parameter inference: SPARTAN's coordinate graph
 describes predictor dependencies conditional on the inferred parameters.
 """
@@ -146,4 +145,102 @@ class TransitionParameterEncoder(nn.Module):
         return self.head(self.transition(transitions).mean(dim=1))
 
 
-__all__ = ["ParameterEncoder", "TransitionParameterEncoder"]
+class _PreNormTransitionBlock(nn.Module):
+    """Exchange evidence between transitions while retaining unnormalized residuals."""
+
+    def __init__(self, dim: int, num_heads: int) -> None:
+        super().__init__()
+        self.norm_attn = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=0.0, batch_first=True)
+        self.norm_ffn = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        normalized = self.norm_attn(tokens)
+        attended, _ = self.attn(normalized, normalized, normalized, need_weights=False)
+        tokens = tokens + attended
+        return tokens + self.ffn(self.norm_ffn(tokens))
+
+
+class TransitionAttentionParameterEncoder(nn.Module):
+    """Interact complete transitions before pooling into one unconstrained parameter code.
+
+    Two residual attention blocks combine evidence across transitions within each
+    episode. No position embeddings are needed: each token already contains an
+    ordered source/action/destination tuple for the stationary dynamics. This
+    architecture makes no guarantee of parameter identifiability or injectivity.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        param_dim: int,
+        action_dim: int = 0,
+        dim: int = 128,
+        num_heads: int = 4,
+        max_history: int = 64,
+    ) -> None:
+        """Configure transition embeddings, two attention blocks, and residual pooling."""
+        super().__init__()
+        if min(state_dim, param_dim, dim, num_heads) < 1 or action_dim < 0 or max_history < 2:
+            raise ValueError("positive dimensions and max_history>=2 are required")
+        if dim % num_heads != 0:
+            raise ValueError(f"num_heads={num_heads} must divide dim={dim}")
+        self.state_dim = state_dim
+        self.param_dim = param_dim
+        self.action_dim = action_dim
+        self.max_history = max_history
+        self.transition = nn.Sequential(
+            nn.Linear(2 * state_dim + action_dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, param_dim),
+        )
+        # At dim=128, preserve the transition MLP/head and downstream CPU RNG
+        # initialization of TransitionParameterEncoder for controlled comparisons.
+        with torch.random.fork_rng(devices=[]):  # pyright: ignore[reportUnknownMemberType]
+            # Avoid reusing the exact random values that initialize the predictor.
+            extra_seed = int(torch.randint(0, 2**63 - 1, ()).item())
+            torch.default_generator.manual_seed(extra_seed)
+            self.context_blocks = nn.Sequential(
+                _PreNormTransitionBlock(dim, num_heads),
+                _PreNormTransitionBlock(dim, num_heads),
+            )
+            self.pool_query = nn.Parameter(torch.empty(1, 1, dim))
+            nn.init.normal_(self.pool_query, std=dim**-0.5)
+            self.pool_attn = nn.MultiheadAttention(dim, num_heads, dropout=0.0, batch_first=True)
+
+    def forward(self, states: Tensor, actions: Tensor | None = None) -> Tensor:
+        """Use only supplied ``(B,K,d_z)`` states and ``(B,K-1,d_a)`` context actions."""
+        if states.ndim != 3 or states.shape[-1] != self.state_dim:
+            raise ValueError(f"expected states (B, K, {self.state_dim})")
+        batch, history, _ = states.shape
+        if batch < 1 or not 2 <= history <= self.max_history:
+            raise ValueError(
+                f"batch must be nonempty and context length in [2, {self.max_history}]"
+            )
+        if self.action_dim:
+            if actions is None or actions.shape != (batch, history - 1, self.action_dim):
+                raise ValueError(f"expected actions (B, K-1, {self.action_dim})")
+            transitions = torch.cat((states[:, :-1], actions, states[:, 1:]), dim=-1)
+        else:
+            if actions is not None:
+                raise ValueError("actions must be None when action_dim=0")
+            transitions = torch.cat((states[:, :-1], states[:, 1:]), dim=-1)
+        tokens = self.context_blocks(self.transition(transitions))
+        query = self.pool_query.expand(batch, -1, -1)
+        pooled, _ = self.pool_attn(query, tokens, tokens, need_weights=False)
+        # Keep absolute feature information alongside the learned aggregation.
+        return self.head(tokens.mean(dim=1) + pooled.squeeze(1))
+
+
+__all__ = ["ParameterEncoder", "TransitionAttentionParameterEncoder", "TransitionParameterEncoder"]

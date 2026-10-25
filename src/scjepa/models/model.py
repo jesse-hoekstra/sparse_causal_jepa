@@ -7,7 +7,11 @@ import torch
 from torch import Tensor, nn
 
 from scjepa.models.encoders import FramewiseEncoder
-from scjepa.models.parameter_encoder import ParameterEncoder, TransitionParameterEncoder
+from scjepa.models.parameter_encoder import (
+    ParameterEncoder,
+    TransitionAttentionParameterEncoder,
+    TransitionParameterEncoder,
+)
 from scjepa.models.spartan import Spartan, SpartanOutput
 
 
@@ -51,7 +55,9 @@ class SCJEPA(nn.Module):
     def __init__(
         self,
         encoder: FramewiseEncoder,
-        parameter_encoder: ParameterEncoder | TransitionParameterEncoder,
+        parameter_encoder: (
+            ParameterEncoder | TransitionParameterEncoder | TransitionAttentionParameterEncoder
+        ),
         predictor: Spartan,
         context_len: int,
         ema_decay: float = 0.996,
@@ -66,7 +72,12 @@ class SCJEPA(nn.Module):
             raise ValueError("ema_decay must lie in [0, 1)")
         if not 1 <= context_len <= parameter_encoder.max_history:
             raise ValueError("context_len must lie in [1, parameter_encoder.max_history]")
-        if isinstance(parameter_encoder, TransitionParameterEncoder) and context_len < 2:
+        if (
+            isinstance(
+                parameter_encoder, TransitionParameterEncoder | TransitionAttentionParameterEncoder
+            )
+            and context_len < 2
+        ):
             raise ValueError("transition parameter encoder requires context_len>=2")
         if (
             encoder.state_dim != parameter_encoder.state_dim
@@ -117,7 +128,13 @@ class SCJEPA(nn.Module):
         decay, context = float(state["ema_decay"]), int(state["context_len"])
         if not 0 <= decay < 1 or not 1 <= context <= self.parameter_encoder.max_history:
             raise ValueError("invalid checkpoint EMA decay or context length")
-        if isinstance(self.parameter_encoder, TransitionParameterEncoder) and context < 2:
+        if (
+            isinstance(
+                self.parameter_encoder,
+                TransitionParameterEncoder | TransitionAttentionParameterEncoder,
+            )
+            and context < 2
+        ):
             raise ValueError("transition parameter encoder requires context_len>=2")
         self.ema_decay = decay
         self.context_len = context

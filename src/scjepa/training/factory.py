@@ -10,6 +10,7 @@ from scjepa.models import (
     ImageEncoder,
     ParameterEncoder,
     Spartan,
+    TransitionAttentionParameterEncoder,
     TransitionParameterEncoder,
     VectorEncoder,
 )
@@ -66,7 +67,9 @@ def build_model(config: ModelConfig | DictConfig) -> SCJEPA:
         )
     else:
         raise ValueError("observation_kind must be vector or image")
-    parameter_encoder: ParameterEncoder | TransitionParameterEncoder
+    parameter_encoder: (
+        ParameterEncoder | TransitionParameterEncoder | TransitionAttentionParameterEncoder
+    )
     if cfg.parameter_encoder_kind == "attention":
         parameter_encoder = ParameterEncoder(
             state_dim=cfg.state_dim,
@@ -80,8 +83,19 @@ def build_model(config: ModelConfig | DictConfig) -> SCJEPA:
         parameter_encoder = TransitionParameterEncoder(
             cfg.state_dim, cfg.param_dim, cfg.action_dim, cfg.max_context_len
         )
+    elif cfg.parameter_encoder_kind == "transition_attention":
+        parameter_encoder = TransitionAttentionParameterEncoder(
+            state_dim=cfg.state_dim,
+            param_dim=cfg.param_dim,
+            action_dim=cfg.action_dim,
+            dim=cfg.parameter_embed_dim,
+            num_heads=cfg.parameter_heads,
+            max_history=cfg.max_context_len,
+        )
     else:
-        raise ValueError("parameter_encoder_kind must be attention or transition")
+        raise ValueError(
+            "parameter_encoder_kind must be attention, transition or transition_attention"
+        )
     predictor = Spartan(
         state_dim=cfg.state_dim,
         param_dim=cfg.param_dim,

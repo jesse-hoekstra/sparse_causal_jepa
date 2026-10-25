@@ -2,7 +2,11 @@
 
 from scjepa.models.encoders import FramewiseEncoder, ImageEncoder, VectorEncoder
 from scjepa.models.model import SCJEPA, ModelOutput
-from scjepa.models.parameter_encoder import ParameterEncoder, TransitionParameterEncoder
+from scjepa.models.parameter_encoder import (
+    ParameterEncoder,
+    TransitionAttentionParameterEncoder,
+    TransitionParameterEncoder,
+)
 from scjepa.models.spartan import Spartan, SpartanLayer, SpartanOutput
 
 __all__ = [
@@ -14,6 +18,7 @@ __all__ = [
     "Spartan",
     "SpartanLayer",
     "SpartanOutput",
+    "TransitionAttentionParameterEncoder",
     "TransitionParameterEncoder",
     "VectorEncoder",
 ]
