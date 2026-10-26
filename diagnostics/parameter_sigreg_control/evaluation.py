@@ -1,6 +1,6 @@
 """Compare information and predictive use while monitoring code rescaling.
 
-Every checkpoint is scored at all three parameter SIGReg weights with consistency
+Every checkpoint is scored at all five parameter SIGReg weights with consistency
 fixed at one. Training with weight zero never uses the diagnostic SIGReg value.
 Single-context probes use calibration-only centering and a common scalar rescale
 to avoid mistaking uniform code shrinkage for lost information.
@@ -29,13 +29,13 @@ from scjepa.models.model import SCJEPA
 from scjepa.training.loop import ObjectiveConfig
 from scjepa.training.rng import preserve_rng
 
-WEIGHTS = (0.4, 0.1, 0.0)
+WEIGHTS = (0.4, 0.1, 0.0, 0.8, 1.6)
 
 
 def weight_name(weight: float) -> str:
-    """Give the three requested coefficients stable JSON and W&B keys."""
+    """Give the supported coefficients stable JSON and W&B keys."""
     if weight not in WEIGHTS:
-        raise ValueError("Parameter SIGReg weight must be 0.4, 0.1 or 0")
+        raise ValueError("Parameter SIGReg weight must be 0.4, 0.1, 0, 0.8 or 1.6")
     return "sigreg_" + format(weight, "g").replace(".", "p")
 
 
@@ -124,7 +124,7 @@ def objective_scores(reference: dict[str, Any], training_weight: float) -> dict[
     result["consistency_weight"] = 1.0
     result["training_parameter_sigreg_weight"] = training_weight
     result["interpretation"] = (
-        "Each checkpoint is evaluated under all three parameter SIGReg coefficients, "
+        "Each checkpoint is evaluated under all five parameter SIGReg coefficients, "
         "including the same frozen-state SIGReg constant and consistency weight one. "
         "Different training-objective totals must not be compared as the same objective."
     )

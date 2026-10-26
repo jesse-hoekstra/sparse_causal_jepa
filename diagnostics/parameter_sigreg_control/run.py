@@ -30,7 +30,14 @@ from diagnostics.multiquery_control.run import (
     scalar_metrics,
     sha,
 )
-from diagnostics.parameter_sigreg_control.evaluation import code_scale_diagnostics, evaluate
+from diagnostics.parameter_sigreg_control.evaluation import (
+    WEIGHTS as SUPPORTED_PARAMETER_SIGREG_WEIGHTS,
+)
+from diagnostics.parameter_sigreg_control.evaluation import (
+    code_scale_diagnostics,
+    evaluate,
+    weight_name,
+)
 from scjepa.data.datasets import canonical_fingerprint
 from scjepa.experiments.storage import file_lock, read_json, source_fingerprint, write_json
 from scjepa.models.parameter_encoder import TransitionParameterEncoder
@@ -44,11 +51,8 @@ PARAMETER_SIGREG_WEIGHTS = (0.4, 0.1, 0.0)
 
 
 def condition_name(weight: float) -> str:
-    """Name the three authorized parameter-SIGReg settings without float ambiguity."""
-    names = {0.4: "sigreg_0p4", 0.1: "sigreg_0p1", 0.0: "sigreg_0"}
-    if weight not in names:
-        raise ValueError("parameter SIGReg weight must be 0.4, 0.1 or 0")
-    return names[weight]
+    """Name an authorized parameter-SIGReg setting without float ambiguity."""
+    return weight_name(weight)
 
 
 @dataclass(frozen=True)
@@ -527,7 +531,7 @@ def main() -> None:
         "--parameter-sigreg-weights",
         nargs="+",
         type=float,
-        choices=list(PARAMETER_SIGREG_WEIGHTS),
+        choices=list(SUPPORTED_PARAMETER_SIGREG_WEIGHTS),
         default=list(PARAMETER_SIGREG_WEIGHTS),
     )
     for name, default in (

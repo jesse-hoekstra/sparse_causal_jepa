@@ -77,7 +77,8 @@ def test_only_parameter_sigreg_weight_changes_loss_and_gradient() -> None:
     losses: dict[float, Tensor] = {}
     gradients: dict[float, Tensor] = {}
     components: dict[float, dict[str, Tensor]] = {}
-    for weight in (0.4, 0.1, 0.0):
+    assert isinstance(model.parameter_encoder, TransitionParameterEncoder)
+    for weight in (0.4, 0.1, 0.0, 0.8, 1.6):
         torch.default_generator.manual_seed(948)
         losses[weight], components[weight] = FrozenStateFastObjective(
             objective_config(weight)
@@ -92,15 +93,12 @@ def test_only_parameter_sigreg_weight_changes_loss_and_gradient() -> None:
             atol=0,
         )
     assert "parameter_regularizer" not in components[0.0]
-    torch.testing.assert_close(
-        components[0.4]["parameter_regularizer"],
-        components[0.1]["parameter_regularizer"],
-        rtol=0,
-        atol=0,
-    )
     regularizer = components[0.4]["parameter_regularizer"]
     regularizer_gradient = torch.autograd.grad(regularizer, output.parameters)[0]
-    for weight in (0.4, 0.1):
+    for weight in (0.4, 0.1, 0.8, 1.6):
+        torch.testing.assert_close(
+            components[weight]["parameter_regularizer"], regularizer, rtol=0, atol=0
+        )
         torch.testing.assert_close(
             losses[weight] - losses[0.0], weight * regularizer, rtol=1e-12, atol=1e-12
         )
@@ -114,7 +112,7 @@ def test_only_parameter_sigreg_weight_changes_loss_and_gradient() -> None:
     assert not any(parameter.requires_grad for parameter in model.target_encoder.parameters())
 
 
-@pytest.mark.parametrize("weight", [0.4, 0.1, 0.0])
+@pytest.mark.parametrize("weight", [0.4, 0.1, 0.0, 0.8, 1.6])
 def test_fast_objective_only_omits_constant_frozen_state_sigreg(weight: float) -> None:
     model, batch = tiny_model_and_batch()
     output = cached_multiquery_forward(model, batch, queries=1, shift=1)
@@ -226,8 +224,48 @@ def test_config_and_cli_select_three_weights_one_seed_without_executing(
     ]
     with pytest.raises(ValueError, match="distinct"):
         runner.Config("source.pt", "comparison", parameter_sigreg_weights=(0.4, 0.4))
-    with pytest.raises(ValueError, match="0.4, 0.1 or 0"):
+    with pytest.raises(ValueError, match="[Pp]arameter SIGReg weight"):
         runner.Config("source.pt", "comparison", parameter_sigreg_weights=(0.2,))
+
+
+def test_cli_selects_only_two_requested_upper_weights_without_executing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocations: list[tuple[runner.Config, bool]] = []
+
+    def capture(config: runner.Config, *, resume: bool = False) -> dict[str, Any]:
+        invocations.append((config, resume))
+        return {}
+
+    monkeypatch.setattr(runner, "run", capture)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run",
+            "--checkpoint",
+            "source.pt",
+            "--output-dir",
+            "upper_comparison",
+            "--parameter-sigreg-weights",
+            "0.8",
+            "1.6",
+            "--device",
+            "cuda:0",
+        ],
+    )
+    runner.main()
+    assert len(invocations) == 1
+    config, resume = invocations[0]
+    assert not resume
+    assert config.parameter_sigreg_weights == (0.8, 1.6)
+    assert [runner.condition_name(weight) for weight in config.parameter_sigreg_weights] == [
+        "sigreg_0p8",
+        "sigreg_1p6",
+    ]
+    reference = runner.Config(config.checkpoint, config.output_dir, device="cuda:0")
+    expected = dict(asdict(reference), parameter_sigreg_weights=(0.8, 1.6))
+    assert asdict(config) == expected
 
 
 def test_arm_configs_only_change_parameter_weight_and_fix_consistency() -> None:
@@ -235,7 +273,7 @@ def test_arm_configs_only_change_parameter_weight_and_fix_consistency() -> None:
     source.parameter_consistency_weight = 0.2
     protocol: dict[str, Any] = {"objective_config": asdict(source)}
     original = copy.deepcopy(protocol)
-    for weight in (0.4, 0.1, 0.0):
+    for weight in (0.4, 0.1, 0.0, 0.8, 1.6):
         arm = runner.arm_objective(protocol, weight)
         expected = dict(asdict(source), parameter_regularizer_weight=weight)
         expected["parameter_consistency_weight"] = 1.0
@@ -263,7 +301,7 @@ def reference_objective() -> dict[str, Any]:
     }
 
 
-@pytest.mark.parametrize("weight", [0.4, 0.1, 0.0])
+@pytest.mark.parametrize("weight", [0.4, 0.1, 0.0, 0.8, 1.6])
 def test_objectives_are_scored_under_all_common_coefficients(weight: float) -> None:
     reference = reference_objective()
     saved = copy.deepcopy(reference)
@@ -272,6 +310,8 @@ def test_objectives_are_scored_under_all_common_coefficients(weight: float) -> N
         assert math.isclose(row["total_at_sigreg_0p4"], 20.0)
         assert math.isclose(row["total_at_sigreg_0p1"], 19.4)
         assert math.isclose(row["total_at_sigreg_0"], 19.2)
+        assert math.isclose(row["total_at_sigreg_0p8"], 20.8)
+        assert math.isclose(row["total_at_sigreg_1p6"], 22.4)
         assert math.isclose(row["total_at_training_parameter_sigreg"], 20.0 + (weight - 0.4) * 2.0)
         assert row["parameter_consistency"] == 4.0
         assert row["state_regularizer"] == 3.0
@@ -332,7 +372,7 @@ def test_constant_probe_codes_do_not_divide_by_zero() -> None:
     assert all(torch.equal(value, torch.zeros_like(value)) for value in normalized.values())
 
 
-@pytest.mark.parametrize("weight", [0.4, 0.1, 0.0])
+@pytest.mark.parametrize("weight", [0.4, 0.1, 0.0, 0.8, 1.6])
 def test_evaluator_uses_reference_sigreg_even_for_zero_training_weight(
     monkeypatch: pytest.MonkeyPatch, weight: float
 ) -> None:
@@ -384,7 +424,13 @@ def test_evaluator_uses_reference_sigreg_even_for_zero_training_weight(
     assert result["raw_consistency"] == 4.0
     assert math.isclose(result["total_at_training_parameter_sigreg"], 20.0 + (weight - 0.4) * 2.0)
     totals = cast(dict[str, float], result["totals_at_parameter_sigreg"])
-    for name, expected in {"sigreg_0p4": 20.0, "sigreg_0p1": 19.4, "sigreg_0": 19.2}.items():
+    for name, expected in {
+        "sigreg_0p4": 20.0,
+        "sigreg_0p1": 19.4,
+        "sigreg_0": 19.2,
+        "sigreg_0p8": 20.8,
+        "sigreg_1p6": 22.4,
+    }.items():
         assert math.isclose(totals[name], expected)
     assert model.training
     assert not model.online_encoder.training
