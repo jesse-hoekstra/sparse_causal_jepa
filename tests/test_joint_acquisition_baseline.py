@@ -57,6 +57,27 @@ def test_response_report_excludes_test_and_preserves_attached_two_step_chain() -
     assert all(parameter.grad is None for parameter in model.parameters())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_cuda_matched_queries_reconstruct_cpu_cached_inputs() -> None:
+    model = tiny_model()
+    data, _ = tiny_data(model)
+    data["validation"] = data.pop("test")
+    selection = DiagnosticSelection((0, 1), (0, 1), (0, 2), 4, 5)
+    expected = build_matched_batch(model, data, selection, "validation")
+    gpu_model = copy.deepcopy(model).cuda()
+    batch = build_matched_batch(gpu_model, data, selection, "validation")
+    assert data["validation"]["states_online"].device.type == "cpu"
+    assert batch.history.device.type == "cuda"
+    torch.testing.assert_close(batch.history.cpu(), expected.history, rtol=1e-10, atol=1e-10)
+    torch.testing.assert_close(batch.targets.cpu(), expected.targets, rtol=1e-10, atol=1e-10)
+    output = predict_matched(gpu_model, batch)
+    report, _ = response_report(
+        output.predictions, output.changed_predictions, batch, bootstrap_samples=16
+    )
+    assert len(report["per_parameter"]) == 6
+    assert batch.reconstruction_error < 2e-5
+
+
 def test_zero_response_has_unit_error_and_zero_benefit() -> None:
     model = tiny_model()
     data, _ = tiny_data(model)
