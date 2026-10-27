@@ -26,7 +26,12 @@ from diagnostics.table_settling_control.run import (
     run,
     train_update,
 )
-from diagnostics.table_settling_control.source import load_inputs, model_fingerprint
+from diagnostics.table_settling_control.source import (
+    fixed_encoder_fingerprint,
+    load_inputs,
+    model_fingerprint,
+    validated_predictor_optimizer,
+)
 from scjepa.data.datasets import canonical_fingerprint, tensor_fingerprint
 from scjepa.experiments.storage import read_json, write_json
 from scjepa.models.model import SCJEPA
@@ -212,9 +217,13 @@ def test_paired_bootstrap_uses_system_pairs() -> None:
     assert result["ci95"] == [[-0.5, -0.5], [-0.5, -0.5]]
 
 
+@pytest.mark.parametrize("train_predictor", [False, True])
+@pytest.mark.parametrize("arm", ["original", "without_parameter_sigreg"])
 def test_resume_freeze_source_integrity_and_evaluation_separation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    train_predictor: bool,
+    arm: ObjectiveArm,
 ) -> None:
     curriculum, audit = fixture_sources(tmp_path)
     inputs = load_inputs(curriculum, audit, verification=True, groups=4, selection_seed=13)
@@ -236,6 +245,8 @@ def test_resume_freeze_source_integrity_and_evaluation_separation(
         groups=4,
         bootstrap_samples=16,
         verification=True,
+        train_predictor=train_predictor,
+        objective_arm=arm,
     )
 
     # Tiny partitions have one validation/test group; forecast evaluation remains real.
@@ -254,6 +265,8 @@ def test_resume_freeze_source_integrity_and_evaluation_separation(
         batch: TensorSplit,
         indices: Tensor,
         objective: PredictiveSupervisionObjective,
+        *,
+        predictor_optimizer: torch.optim.Adam | None = None,
     ) -> dict[str, float]:
         nonlocal calls
         assert set(batch) == {"online", "target", "actions"}
@@ -265,7 +278,15 @@ def test_resume_freeze_source_integrity_and_evaluation_separation(
         calls += 1
         if calls == 2:
             raise RuntimeError("interrupt")
-        return original(model, table, optimizer, batch, indices, objective)
+        return original(
+            model,
+            table,
+            optimizer,
+            batch,
+            indices,
+            objective,
+            predictor_optimizer=predictor_optimizer,
+        )
 
     monkeypatch.setattr(runner, "train_update", interrupted)
     resumed_config = replace(config, output_dir=str(tmp_path / "resumed"))
@@ -279,29 +300,46 @@ def test_resume_freeze_source_integrity_and_evaluation_separation(
     torch.testing.assert_close(first["table"], last["table"], rtol=0, atol=0)
     torch.testing.assert_close(first["optimizer"], last["optimizer"], rtol=0, atol=0)
     assert last["optimizer"]["state"][0]["step"] == 5
+    if train_predictor:
+        torch.testing.assert_close(first["predictor"], last["predictor"], rtol=0, atol=0)
+        torch.testing.assert_close(
+            first["predictor_optimizer"], last["predictor_optimizer"], rtol=0, atol=0
+        )
+        assert all(
+            float(state["step"]) == 5 for state in last["predictor_optimizer"]["state"].values()
+        )
+        assert any(
+            not torch.equal(value, teacher["model"]["predictor." + name])
+            for name, value in last["predictor"].items()
+        )
+    else:
+        assert last["predictor"] is None
+        assert last["predictor_optimizer"] is None
     assert all(sha(Path(name)) == expected for name, expected in source_hashes.items())
     assert run(resumed_config, resume=True) == resumed
+    other_arm: ObjectiveArm = "without_parameter_sigreg" if arm == "original" else "original"
     omission_config = replace(
         config,
         output_dir=str(tmp_path / "omission"),
-        objective_arm="without_parameter_sigreg",
+        objective_arm=other_arm,
     )
     omission = run(omission_config)
     assert omission["identity"] != full["identity"]
-    assert omission["objective_arm"] == "without_parameter_sigreg"
+    assert omission["objective_arm"] == other_arm
     assert omission["records"][0] == full["records"][0]
     first_evaluation = torch.load(tmp_path / "full/evaluation_only.pt", weights_only=False)
     omission_evaluation = torch.load(tmp_path / "omission/evaluation_only.pt", weights_only=False)
     for key in ("group_indices", "new_episodes", "theta_evaluation_only"):
         torch.testing.assert_close(first_evaluation[key], omission_evaluation[key], rtol=0, atol=0)
-    assert (
-        read_json(tmp_path / "omission/protocol.json")["effective_parameter_regularizer_weight"]
-        == 0
-    )
+    assert read_json(tmp_path / "omission/protocol.json")[
+        "effective_parameter_regularizer_weight"
+    ] == (0 if other_arm == "without_parameter_sigreg" else 0.4)
     with pytest.raises(ValueError, match="Resume settings"):
-        run(replace(resumed_config, objective_arm="without_parameter_sigreg"), resume=True)
+        run(replace(resumed_config, objective_arm=other_arm), resume=True)
     with pytest.raises(ValueError, match="Resume settings"):
         run(replace(resumed_config, seed=14), resume=True)
+    with pytest.raises(ValueError, match="Resume settings"):
+        run(replace(resumed_config, train_predictor=not train_predictor), resume=True)
     eval_path = tmp_path / "resumed/evaluation_only.pt"
     payload = cast(dict[str, Any], torch.load(eval_path, weights_only=False))
     payload["new_episodes"]["actions"] += 1
@@ -333,3 +371,66 @@ def test_fresh_curriculum_and_audit_authenticate_extra_initialization(tmp_path: 
     inputs = load_inputs(curriculum, audit, verification=True, groups=4)
     assert any(path.endswith("initial_seed_7.pt") for path in inputs.file_hashes)
     assert inputs.curriculum["config"]["initialization"] == "fresh_zero"
+
+
+@pytest.mark.parametrize("arm", ["original", "without_parameter_sigreg"])
+def test_joint_update_matches_restored_adam_and_one_global_clip(arm: ObjectiveArm) -> None:
+    model = make_model().requires_grad_(False)
+    model.predictor.requires_grad_(True)
+    _, batch = make_batch(model)
+    batch["target"] = batch["target"] * 100
+    fixed = fixed_encoder_fingerprint(model)
+    table = nn.Embedding.from_pretrained(  # pyright: ignore[reportUnknownMemberType]
+        torch.randn(4, 6, dtype=torch.float64), freeze=False, sparse=True
+    )
+    sparse = torch.optim.SparseAdam(table.parameters(), lr=0.01)
+    dense = torch.optim.Adam(model.predictor.parameters(), lr=0.001)
+    objective = TableSettlingObjective(objective_config(), arm)
+    indices = torch.tensor([0, 2])
+    train_update(model, table, sparse, batch, indices, objective, predictor_optimizer=dense)
+    before = copy.deepcopy(model.predictor.state_dict())
+    expected_model, expected_table = copy.deepcopy(model), copy.deepcopy(table)
+    expected_dense = torch.optim.Adam(expected_model.predictor.parameters(), lr=0.001)
+    expected_sparse = torch.optim.SparseAdam(expected_table.parameters(), lr=0.01)
+    expected_dense.load_state_dict(copy.deepcopy(dense.state_dict()))
+    expected_sparse.load_state_dict(copy.deepcopy(sparse.state_dict()))
+    expected_dense.zero_grad(set_to_none=True)
+    expected_sparse.zero_grad(set_to_none=True)
+    torch.manual_seed(719)  # pyright: ignore[reportUnknownMemberType]
+    loss, _ = objective(group_teacher_forward(expected_model, batch, expected_table(indices)))
+    loss.backward()  # pyright: ignore[reportUnknownMemberType]
+    assert expected_table.weight.grad is not None
+    expected_table.weight.grad = expected_table.weight.grad.coalesce()
+    gradients = [expected_table.weight.grad.values()]
+    gradients.extend(p.grad for p in expected_model.predictor.parameters() if p.grad is not None)
+    norm = sum(float(gradient.double().square().sum()) for gradient in gradients) ** 0.5
+    assert norm > 1
+    with torch.no_grad():
+        for gradient in gradients:
+            gradient.mul_(min(1.0, 1.0 / (norm + 1e-6)))
+    expected_sparse.step()  # pyright: ignore[reportUnknownMemberType]
+    expected_dense.step()  # pyright: ignore[reportUnknownMemberType]
+    expected_rng = torch.get_rng_state().clone()
+    torch.manual_seed(719)  # pyright: ignore[reportUnknownMemberType]
+    result = train_update(
+        model, table, sparse, batch, indices, objective, predictor_optimizer=dense
+    )
+    assert abs(result["gradient_norm"] - norm) < 1e-10
+    assert torch.equal(torch.get_rng_state(), expected_rng)
+    torch.testing.assert_close(model.state_dict(), expected_model.state_dict(), rtol=0, atol=0)
+    torch.testing.assert_close(table.weight, expected_table.weight, rtol=0, atol=0)
+    torch.testing.assert_close(dense.state_dict(), expected_dense.state_dict(), rtol=0, atol=0)
+    torch.testing.assert_close(sparse.state_dict(), expected_sparse.state_dict(), rtol=0, atol=0)
+    assert fixed_encoder_fingerprint(model) == fixed
+    assert any(
+        not torch.equal(value, before[name]) for name, value in model.predictor.state_dict().items()
+    )
+    validated_predictor_optimizer(model, dense.state_dict(), 2)
+    wrong = copy.deepcopy(dense.state_dict())
+    wrong["param_groups"][0]["params"] = list(reversed(wrong["param_groups"][0]["params"]))
+    with pytest.raises(ValueError, match="parameter order"):
+        validated_predictor_optimizer(model, wrong, 2)
+    wrong = copy.deepcopy(dense.state_dict())
+    wrong["state"][0]["step"] += 1
+    with pytest.raises(ValueError, match="step differs"):
+        validated_predictor_optimizer(model, wrong, 2)

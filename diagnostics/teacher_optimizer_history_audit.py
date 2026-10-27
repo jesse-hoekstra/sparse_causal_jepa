@@ -261,6 +261,8 @@ def run(
     )
     protocol = cast(dict[str, Any], read_json(settling_dir / "protocol.json"))
     settings = protocol["config"]
+    if settings.get("train_predictor", False):
+        raise ValueError("Optimizer-history audit requires a fixed predictor endpoint")
     if (
         settings["objective_arm"] != "without_parameter_sigreg"
         or bool(settings["verification"]) != verification

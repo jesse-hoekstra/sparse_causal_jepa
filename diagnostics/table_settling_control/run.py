@@ -1,4 +1,4 @@
-"""Fit only selected TRAIN-system codes under a fixed teacher predictor."""
+"""Fit selected TRAIN-system codes with a fixed or jointly continued teacher predictor."""
 
 import argparse
 import hashlib
@@ -24,7 +24,11 @@ from diagnostics.table_settling_control.evaluation import (
     paired_change,
     readout,
 )
-from diagnostics.table_settling_control.source import load_inputs, model_fingerprint
+from diagnostics.table_settling_control.source import (
+    fixed_encoder_fingerprint,
+    load_inputs,
+    model_fingerprint,
+)
 from scjepa.data.datasets import canonical_fingerprint, tensor_fingerprint
 from scjepa.experiments.storage import file_lock, read_json, write_json
 from scjepa.models.model import SCJEPA, ModelOutput
@@ -68,7 +72,7 @@ class TableSettlingObjective(PredictiveSupervisionObjective):
 
 @dataclass(frozen=True)
 class Config:
-    """One bounded teacher-settling arm; no model updates or label-supervised loss."""
+    """One bounded label-free teacher-settling arm with optional predictor continuation."""
 
     curriculum_dir: str
     audit_dir: str
@@ -80,6 +84,7 @@ class Config:
     bootstrap_samples: int = 1000
     threads: int = 1
     objective_arm: ObjectiveArm = "original"
+    train_predictor: bool = False
     verification: bool = False
     wandb_mode: str = "disabled"
     wandb_project: str = "sparse_causal_jepa"
@@ -111,10 +116,31 @@ def train_update(
     batch: TensorSplit,
     indices: Tensor,
     objective: PredictiveSupervisionObjective,
+    *,
+    predictor_optimizer: torch.optim.Adam | None = None,
 ) -> dict[str, float]:
-    """Receive only cached state/action tensors; all learned model weights stay fixed."""
-    if any(parameter.requires_grad for parameter in model.parameters()):
+    """Train selected codes and optionally P; state and parameter encoders remain fixed."""
+    if predictor_optimizer is None and any(
+        parameter.requires_grad for parameter in model.parameters()
+    ):
         raise ValueError("All predictor and encoder weights must be frozen")
+    if predictor_optimizer is not None:
+        if any(
+            parameter.requires_grad
+            for module in (model.online_encoder, model.target_encoder, model.parameter_encoder)
+            for parameter in module.parameters()
+        ):
+            raise ValueError("All three encoders must remain frozen")
+        predictor_parameters = list(model.predictor.parameters())
+        optimized = [
+            parameter for group in predictor_optimizer.param_groups for parameter in group["params"]
+        ]
+        if not all(parameter.requires_grad for parameter in predictor_parameters) or (
+            [id(parameter) for parameter in optimized]
+            != [id(parameter) for parameter in predictor_parameters]
+        ):
+            raise ValueError("Joint optimizer must update exactly the predictor parameters")
+        predictor_optimizer.zero_grad(set_to_none=True)
     if set(batch) != {"online", "target", "actions"}:
         raise ValueError("Optimization accepts label-free training tensors only")
     model.train()
@@ -127,13 +153,17 @@ def train_update(
     if not bool(torch.isfinite(loss)):
         raise FloatingPointError("Nonfinite table objective")
     loss.backward()  # pyright: ignore[reportUnknownMemberType]
-    norm = clip_teacher_gradients((), table, 1.0)
+    norm = clip_teacher_gradients(
+        model.predictor.parameters() if predictor_optimizer is not None else (), table, 1.0
+    )
     optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+    if predictor_optimizer is not None:
+        predictor_optimizer.step()  # pyright: ignore[reportUnknownMemberType]
     return {**{key: float(value.detach()) for key, value in terms.items()}, "gradient_norm": norm}
 
 
 def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
-    """Optimize one fixed-budget table copy, preserving all source and model bytes."""
+    """Continue selected codes and optional P while preserving sources and all encoders."""
     inputs = load_inputs(
         Path(config.curriculum_dir),
         Path(config.audit_dir),
@@ -156,6 +186,12 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
         with file_lock(out / ".lock"):
             model = inputs.model.to(device).requires_grad_(False)
             frozen = model_fingerprint(model)
+            frozen_encoders = fixed_encoder_fingerprint(model)
+            predictor_optimizer = None
+            if config.train_predictor:
+                model.predictor.requires_grad_(True)
+                predictor_optimizer = torch.optim.Adam(model.predictor.parameters(), lr=0.001)
+                predictor_optimizer.load_state_dict(inputs.predictor_optimizer)
             selected = inputs.group_indices
             train = {key: value[selected].clone() for key, value in inputs.bundle.train.items()}
             table = nn.Embedding.from_pretrained(  # pyright: ignore[reportUnknownMemberType]
@@ -187,7 +223,12 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                 "settings": settings,
                 "source_hashes": inputs.file_hashes,
                 "selected_group_ids": selected.tolist(),  # pyright: ignore[reportUnknownMemberType]
-                "frozen_model_hash": frozen,
+                "frozen_model_hash": None if config.train_predictor else frozen,
+                "initial_model_hash": frozen,
+                "fixed_encoder_hash": frozen_encoders,
+                "predictor_parameter_order": [
+                    name for name, _ in model.predictor.named_parameters()
+                ],
                 "initial_table_hash": tensor_fingerprint(initial_table),
                 "episode_seed": episode_seed,
                 "code_identity": digest.hexdigest(),
@@ -199,14 +240,21 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                 **evidence,
                 "config": asdict(config),
                 "hypothesis": (
-                    "Free train-group codes are under-settled relative to the fixed predictor."
+                    "Joint code/predictor plasticity enables transfer unavailable under fixed P."
+                    if config.train_predictor
+                    else "Free train-group codes are under-settled relative to the fixed predictor."
                     if config.objective_arm == "original"
                     else "Parameter SIGReg impedes transferable settling under the fixed predictor."
                 ),
                 "controlled_change": (
-                    "Only selected train-code rows receive additional "
+                    "Selected train-code rows receive additional "
                     "SparseAdam .01 updates with source moment rows and global step retained; "
-                    "global clip1; all model weights fixed. "
+                    + (
+                        "predictor Adam .001 also continues original moments/global step; "
+                        "one combined predictor/table gradient clip1; all encoders fixed. "
+                        if config.train_predictor
+                        else "global clip1; all model weights fixed. "
+                    )
                     + (
                         "Optimize the original objective unchanged."
                         if config.objective_arm == "original"
@@ -231,7 +279,7 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                 else list(range(config.steps + 1)),
                 "evaluation": (
                     "New episodes from a domain-separated persisted seed never enter "
-                    "optimization; no model/encoder training or early selection."
+                    "optimization; no encoder training or early selection."
                 ),
                 "objective": inputs.bundle.protocol["objective_config"],
                 "effective_parameter_regularizer_weight": (
@@ -307,6 +355,19 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                     raise ValueError("Checkpoint source/evaluation mismatch")
                 table.load_state_dict(checkpoint["table"], strict=True)
                 optimizer.load_state_dict(checkpoint["optimizer"])
+                if predictor_optimizer is not None:
+                    if (
+                        checkpoint.get("predictor") is None
+                        or checkpoint.get("predictor_optimizer") is None
+                    ):
+                        raise ValueError("Joint checkpoint lacks predictor or Adam state")
+                    model.predictor.load_state_dict(checkpoint["predictor"], strict=True)
+                    predictor_optimizer.load_state_dict(checkpoint["predictor_optimizer"])
+                elif (
+                    checkpoint.get("predictor") is not None
+                    or checkpoint.get("predictor_optimizer") is not None
+                ):
+                    raise ValueError("Frozen control cannot resume a joint checkpoint")
                 start, records, raw = checkpoint["step"], checkpoint["records"], checkpoint["raw"]
                 tracking = checkpoint["tracking"]
                 _restore_rng(checkpoint["rng"], device)
@@ -334,7 +395,9 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                 raise ValueError("Scientific protocol requires B16")
 
             def save(step: int) -> None:
-                if model_fingerprint(model) != frozen:
+                if fixed_encoder_fingerprint(model) != frozen_encoders:
+                    raise RuntimeError("Frozen encoders or rollout flags changed")
+                if not config.train_predictor and model_fingerprint(model) != frozen:
                     raise RuntimeError("Frozen model changed")
                 atomic_save(
                     out / "last.pt",
@@ -343,6 +406,12 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                         "step": step,
                         "table": table.state_dict(),
                         "optimizer": optimizer.state_dict(),
+                        "predictor": model.predictor.state_dict()
+                        if config.train_predictor
+                        else None,
+                        "predictor_optimizer": predictor_optimizer.state_dict()
+                        if predictor_optimizer is not None
+                        else None,
                         "records": records,
                         "raw": raw,
                         "rng": _rng(device),
@@ -408,7 +477,19 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                         key: value[batches[position]].to(device) for key, value in train.items()
                     }
                     torch.manual_seed(config.seed * 100000 + step)  # pyright: ignore[reportUnknownMemberType]
-                    terms = train_update(model, table, optimizer, batch, indices, objective)
+                    terms = train_update(
+                        model,
+                        table,
+                        optimizer,
+                        batch,
+                        indices,
+                        objective,
+                        **(
+                            {"predictor_optimizer": predictor_optimizer}
+                            if predictor_optimizer is not None
+                            else {}
+                        ),
+                    )
                     if step == 1 or step % 100 == 0 or step == config.steps:
                         logger.log(step, {f"train/{key}": value for key, value in terms.items()})
                     if step in protocol["milestones"]:
@@ -423,6 +504,7 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                 result = {
                     "identity": identity,
                     "objective_arm": config.objective_arm,
+                    "train_predictor": config.train_predictor,
                     "step": step,
                     "scope": protocol["scope"],
                     "records": records,
@@ -491,6 +573,7 @@ def main() -> None:
     parser.add_argument("--wandb-project", default="sparse_causal_jepa")
     parser.add_argument("--wandb-entity")
     parser.add_argument("--verification", action="store_true")
+    parser.add_argument("--train-predictor", action="store_true")
     parser.add_argument("--resume", action="store_true")
     args = vars(parser.parse_args())
     resume = bool(args.pop("resume"))

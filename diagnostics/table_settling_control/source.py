@@ -26,6 +26,7 @@ class Inputs:
     model: SCJEPA
     table: Tensor
     latent_optimizer: dict[str, Any]
+    predictor_optimizer: dict[str, Any]
     group_indices: Tensor
     theta_evaluation_only: Tensor
     curriculum: dict[str, Any]
@@ -58,6 +59,56 @@ def model_fingerprint(model: SCJEPA) -> str:
             "flags": model.get_extra_state(),
         }
     )
+
+
+def fixed_encoder_fingerprint(model: SCJEPA) -> str:
+    """Bind the three fixed encoders and rollout flags even when predictor weights train."""
+    return canonical_fingerprint(
+        {
+            "modules": {
+                name: module_fingerprint(getattr(model, name))
+                for name in ("online_encoder", "target_encoder", "parameter_encoder")
+            },
+            "flags": model.get_extra_state(),
+        }
+    )
+
+
+def validated_predictor_optimizer(
+    model: SCJEPA, state: dict[str, Any], step: int
+) -> dict[str, Any]:
+    """Validate teacher Adam's original predictor-only parameter traversal and moments."""
+    parameters = list(model.predictor.named_parameters())
+    group = state["param_groups"]
+    expected_ids = list(range(len(parameters)))
+    if (
+        len(group) != 1
+        or group[0]["params"] != expected_ids
+        or group[0]["lr"] != 0.001
+        or tuple(group[0]["betas"]) != (0.9, 0.999)
+        or group[0]["eps"] != 1e-8
+        or group[0].get("weight_decay", 0) != 0
+        or group[0].get("amsgrad", False)
+        or group[0].get("maximize", False)
+        or group[0].get("decoupled_weight_decay", False)
+        or group[0].get("capturable", False)
+        or group[0].get("differentiable", False)
+        or group[0].get("foreach") is not None
+        or group[0].get("fused") is not None
+        or set(state["state"]) != set(expected_ids)
+    ):
+        raise ValueError("Teacher predictor Adam semantics or parameter order changed")
+    for index, (name, parameter) in enumerate(parameters):
+        moments = state["state"][index]
+        if float(moments["step"]) != step:
+            raise ValueError(f"Teacher predictor Adam step differs: {name}")
+        for key in ("exp_avg", "exp_avg_sq"):
+            value = moments[key]
+            if value.shape != parameter.shape or not bool(torch.isfinite(value).all()):
+                raise ValueError(f"Teacher predictor Adam moments differ: {name}")
+            if key == "exp_avg_sq" and bool((value < 0).any()):
+                raise ValueError("Teacher predictor Adam second moment is negative")
+    return copy.deepcopy(state)
 
 
 def load_inputs(
@@ -161,6 +212,9 @@ def load_inputs(
     ):
         raise ValueError("Teacher checkpoint identity or counters differ")
     model.load_state_dict(checkpoint["model"], strict=True)
+    predictor_optimizer = validated_predictor_optimizer(
+        model, checkpoint["optimizer"], expected_budgets[0]
+    )
     if frozen_hashes(model) != states or model.get_extra_state() != flags:
         raise ValueError("Teacher changed the frozen state maps or rollout")
     expected_encoder = curriculum["initial_encoder_hash"]
@@ -207,6 +261,7 @@ def load_inputs(
         model.eval().requires_grad_(False),
         table,
         latent_optimizer,
+        predictor_optimizer,
         group_indices,
         theta,
         curriculum,

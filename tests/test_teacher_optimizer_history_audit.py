@@ -246,6 +246,17 @@ def test_completed_fresh_omission_integration_and_tamper_guard(
     assert result["history"]["updates_per_row"] == 1
     assert (tmp_path / "history/completed.json").exists()
     assert all(sha(Path(name)) == expected for name, expected in hashes.items())
+    # A completed joint endpoint cannot be audited using the original frozen source P.
+    original_protocol = (endpoint / "protocol.json").read_bytes()
+    original_completion = (endpoint / "completed.json").read_bytes()
+    protocol = cast(dict[str, Any], read_json(endpoint / "protocol.json"))
+    protocol["config"]["train_predictor"] = True
+    write_json(endpoint / "protocol.json", protocol)
+    refresh_completion(endpoint)
+    with pytest.raises(ValueError, match="requires a fixed predictor"):
+        audit.run(endpoint, tmp_path / "joint-rejected", verification=True)
+    (endpoint / "protocol.json").write_bytes(original_protocol)
+    (endpoint / "completed.json").write_bytes(original_completion)
     payload = cast(
         dict[str, Any], torch.load(endpoint / "last.pt", map_location="cpu", weights_only=False)
     )
