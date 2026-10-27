@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from diagnostics.encoder_gradient_control.source import build_source_model
+from diagnostics.encoder_gradient_control.source import SourceBundle, build_source_model
 from diagnostics.group_latent_control.forward import clip_teacher_gradients, group_teacher_forward
 from diagnostics.joint_acquisition.baseline import (
     DiagnosticSelection,
@@ -37,6 +37,7 @@ from scjepa.training.loop import ObjectiveConfig
 from scjepa.training.rng import preserve_rng
 
 Phase = Literal["teacher", "amortization", "washout"]
+Initialization = Literal["warm", "fresh_zero"]
 PHASES: tuple[Phase, ...] = ("teacher", "amortization", "washout")
 
 
@@ -47,6 +48,7 @@ class Config:
     source_dir: str
     output_dir: str
     training_source_root: str | None = None
+    initialization: Initialization = "warm"
     seed: int = 202610261301
     device: str = "cpu"
     teacher_steps: int = 30000
@@ -63,6 +65,8 @@ class Config:
     def __post_init__(self) -> None:
         """Protect source artifacts and reject ambiguous scientific budgets."""
         budgets = (self.teacher_steps, self.amortization_steps, self.washout_steps)
+        if self.initialization not in ("warm", "fresh_zero"):
+            raise ValueError("Unknown curriculum initialization")
         if self.verification:
             if not all(1 <= value <= 3 for value in budgets) or not 2 <= self.groups <= 4:
                 raise ValueError(
@@ -103,6 +107,63 @@ def initialize_table(model: SCJEPA, train: TensorSplit, batch_size: int) -> nn.E
             "Teacher initialization must be one finite six-dimensional code per train group"
         )
     return nn.Embedding.from_pretrained(values.clone(), freeze=False, sparse=True)  # pyright: ignore[reportUnknownMemberType]
+
+
+def initialize_control(
+    model: SCJEPA, bundle: SourceBundle, initialization: Initialization
+) -> tuple[nn.Embedding, dict[str, Any], dict[str, str]]:
+    """Authenticate fresh learned modules while retaining the informative frozen states."""
+    source_hashes = dict(bundle.hashes)
+    initial_file: dict[str, str] | None = None
+    if initialization == "fresh_zero":
+        record = bundle.protocol["initializations"][str(bundle.seed)]
+        name = record["path"]
+        path = bundle.source_dir / name
+        if (
+            not isinstance(name, str)
+            or Path(name).is_absolute()
+            or (bundle.source_dir.resolve() not in path.resolve().parents)
+        ):
+            raise ValueError("Initialization must be inside the immutable source directory")
+        actual = sha(path)
+        if actual != record["sha256"] or actual != bundle.protocol["artifacts"].get(name):
+            raise ValueError("Initialization artifact hash differs from source protocol")
+        payload = cast(dict[str, Any], torch.load(path, map_location="cpu", weights_only=False))
+        if (
+            set(payload) != {"model", "seed", "source_sha256"}
+            or payload["seed"] != bundle.seed
+            or payload["source_sha256"] != bundle.protocol["source"]["sha256"]
+        ):
+            raise ValueError("Initialization provenance differs from source protocol")
+        candidate = copy.deepcopy(model)
+        candidate.load_state_dict(payload["model"], strict=True)
+        if (
+            frozen_hashes(candidate) != frozen_hashes(model)
+            or candidate.get_extra_state() != model.get_extra_state()
+        ):
+            raise ValueError("Initialization changes frozen states or rollout settings")
+        model.parameter_encoder.load_state_dict(
+            candidate.parameter_encoder.state_dict(), strict=True
+        )
+        model.predictor.load_state_dict(candidate.predictor.state_dict(), strict=True)
+        values = next(model.parameters()).new_zeros((bundle.train_groups, 6))
+        table = nn.Embedding.from_pretrained(values, freeze=False, sparse=True)  # pyright: ignore[reportUnknownMemberType]
+        source_hashes[name] = actual
+        initial_file = {"path": name, "sha256": actual}
+    elif initialization == "warm":
+        table = initialize_table(model, bundle.train, bundle.batch_size)
+    else:
+        raise ValueError("Unknown curriculum initialization")
+    return (
+        table,
+        {
+            "mode": initialization,
+            "source_initialization": initial_file,
+            "parameter_encoder_hash": module_fingerprint(model.parameter_encoder),
+            "predictor_hash": module_fingerprint(model.predictor),
+        },
+        source_hashes,
+    )
 
 
 def phase_optimizers(
@@ -222,7 +283,10 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
             del discarded_optimizer
             frozen = frozen_hashes(model)
             extra_state = model.get_extra_state()
-            table: nn.Embedding | None = initialize_table(model, bundle.train, bundle.batch_size)
+            table: nn.Embedding | None
+            table, initialization, source_hashes = initialize_control(
+                model, bundle, config.initialization
+            )
             initial_table_hash = module_fingerprint(table)
             initial_encoder_hash = module_fingerprint(model.parameter_encoder)
             settings = asdict(config)
@@ -244,7 +308,8 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                     digest.update(path.read_bytes())
             evidence = {
                 "settings": settings,
-                "source_hashes": bundle.hashes,
+                "source_hashes": source_hashes,
+                "initialization": initialization,
                 "source_step": source_step,
                 "initial_table_hash": initial_table_hash,
                 "initial_encoder_hash": initial_encoder_hash,
@@ -258,8 +323,9 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                 **evidence,
                 "config": asdict(config),
                 "hypothesis": (
-                    "Train-only latent optimization can bypass the collapsed encoder's "
-                    "learning path; one-context amortization can transfer the result."
+                    "Train-only latent optimization can bypass the encoder learning path; "
+                    "one-context amortization can transfer the result. Fresh-zero mode "
+                    "removes the trained encoder/predictor basin and random table nuisance."
                 ),
                 "controlled_change": (
                     "Teacher group-code fitting, then label-free auxiliary code "
@@ -275,8 +341,13 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                 "source_optimizer_retained": False,
                 "algorithm": {
                     "teacher": (
-                        "One 6D sparse embedding per train group, source donor0 initialization; "
-                        "fresh predictor Adam .001 and SparseAdam .01, combined gradient clip1; "
+                        "One 6D sparse embedding per train group; "
+                        + (
+                            "verified fresh encoder/predictor and zero codes; "
+                            if config.initialization == "fresh_zero"
+                            else "source encoder/predictor and donor0 code initialization; "
+                        )
+                        + "fresh predictor Adam .001 and SparseAdam .01, combined gradient clip1; "
                         "original forecast+logit+SIGReg, consistency identicallyzero."
                     ),
                     "amortization": (
@@ -602,7 +673,7 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                         out / filename, name=f"group-latent-{identity[:12]}-{Path(filename).stem}"
                     )
                 check_states()
-                for name, expected in bundle.hashes.items():
+                for name, expected in source_hashes.items():
                     if sha(source / name) != expected:
                         raise RuntimeError(f"Source artifact changed: {name}")
                 logger.finish()
@@ -642,6 +713,7 @@ def main() -> None:
     for name in ("source-dir", "output-dir"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--training-source-root")
+    parser.add_argument("--initialization", choices=("warm", "fresh_zero"), default="warm")
     for name, default in (
         ("seed", 202610261301),
         ("teacher-steps", 30000),

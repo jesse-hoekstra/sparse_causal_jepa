@@ -5,15 +5,57 @@ from typing import Any, cast
 
 import pytest
 import torch
-from test_encoder_gradient_source import write_source_fixture
+from omegaconf import DictConfig, OmegaConf
+from test_encoder_gradient_source import refresh_hashes, write_source_fixture
 from torch import Tensor, nn
 
+from diagnostics.encoder_gradient_control.source import build_source_model
 from diagnostics.group_latent_control import run as runner
-from diagnostics.group_latent_control.run import Config, Phase, run
-from diagnostics.multiquery_control.data import TensorSplit
-from diagnostics.multiquery_control.run import sha
+from diagnostics.group_latent_control.run import (
+    Config,
+    Initialization,
+    Phase,
+    initialize_control,
+    run,
+)
+from diagnostics.joint_acquisition.source import load_primary_source
+from diagnostics.multiquery_control.data import TensorSplit, module_fingerprint
+from diagnostics.multiquery_control.run import frozen_hashes, sha
 from diagnostics.predictive_supervision_control.objective import PredictiveSupervisionObjective
+from scjepa.experiments.storage import write_json
 from scjepa.models.model import SCJEPA
+from scjepa.training.factory import build_model
+from scjepa.training.rng import preserve_rng
+
+
+def source_with_initialization(root: Path) -> Path:
+    """Add an authenticated genuinely fresh E/P initialization to the tiny trained source."""
+    source = write_source_fixture(root)
+    bundle = load_primary_source(source, 7, expected_step=2, expected_checkpoint_sha256=None)
+    trained, _ = build_source_model(bundle, torch.device("cpu"))
+    with preserve_rng(torch.device("cpu")):
+        torch.default_generator.manual_seed(7)
+        fresh = build_model(cast(DictConfig, OmegaConf.create(bundle.protocol["model_config"])))
+    fresh.online_encoder.load_state_dict(trained.online_encoder.state_dict())
+    fresh.target_encoder.load_state_dict(trained.target_encoder.state_dict())
+    name = "initial_seed_7.pt"
+    torch.save(
+        {
+            "model": fresh.state_dict(),
+            "seed": 7,
+            "source_sha256": bundle.protocol["source"]["sha256"],
+        },
+        source / name,
+    )
+    protocol = bundle.protocol
+    protocol["initializations"]["7"] = {"path": name, "sha256": sha(source / name)}
+    protocol["artifacts"][name] = sha(source / name)
+    write_json(source / "protocol.json", protocol)
+    checkpoint = bundle.checkpoint
+    checkpoint["initial_sha256"] = sha(source / name)
+    torch.save(checkpoint, source / "seed-7/prediction_1/last.pt")
+    refresh_hashes(source)
+    return source
 
 
 @pytest.fixture(autouse=True)
@@ -30,10 +72,15 @@ def one_thread() -> Generator[None, None, None]:
     ("interrupted_phase", "interrupt_at"),
     [("teacher", 2), ("amortization", 1), ("amortization", 2)],
 )
+@pytest.mark.parametrize("initialization", ["warm", "fresh_zero"])
 def test_staged_resume_matches_uninterrupted_and_preserves_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupted_phase: Phase, interrupt_at: int
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupted_phase: Phase,
+    interrupt_at: int,
+    initialization: Initialization,
 ) -> None:
-    source = write_source_fixture(tmp_path / "source")
+    source = source_with_initialization(tmp_path / "source")
     hashes = {str(path): sha(path) for path in source.rglob("*") if path.is_file()}
     config = Config(
         source_dir=str(source),
@@ -45,6 +92,7 @@ def test_staged_resume_matches_uninterrupted_and_preserves_source(
         groups=2,
         bootstrap_samples=16,
         verification=True,
+        initialization=initialization,
     )
     complete = run(config)
     resumed_config = replace(config, output_dir=str(tmp_path / "resumed"))
@@ -87,6 +135,59 @@ def test_staged_resume_matches_uninterrupted_and_preserves_source(
     assert complete["final_test"] == resumed["final_test"]
     assert {str(path): sha(path) for path in source.rglob("*") if path.is_file()} == hashes
     assert run(resumed_config, resume=True) == resumed
+    other: Initialization = "fresh_zero" if initialization == "warm" else "warm"
+    with pytest.raises(ValueError, match="Resume source, settings or code changed"):
+        run(replace(resumed_config, initialization=other), resume=True)
+
+
+def test_fresh_initialization_copies_only_verified_learned_modules(tmp_path: Path) -> None:
+    source = source_with_initialization(tmp_path / "source")
+    before = {str(path): sha(path) for path in source.rglob("*") if path.is_file()}
+    bundle = load_primary_source(source, 7, expected_step=2, expected_checkpoint_sha256=None)
+    model, _ = build_source_model(bundle, torch.device("cpu"))
+    states = frozen_hashes(model)
+    old_encoder, old_predictor = (
+        module_fingerprint(model.parameter_encoder),
+        module_fingerprint(model.predictor),
+    )
+    table, evidence, hashes = initialize_control(model, bundle, "fresh_zero")
+    payload = cast(dict[str, Any], torch.load(source / "initial_seed_7.pt", weights_only=False))
+    expected, _ = build_source_model(bundle, torch.device("cpu"))
+    expected.load_state_dict(payload["model"])
+    assert frozen_hashes(model) == states
+    assert model.get_extra_state() == expected.get_extra_state()
+    for name, old in (("parameter_encoder", old_encoder), ("predictor", old_predictor)):
+        actual = module_fingerprint(getattr(model, name))
+        assert actual == module_fingerprint(getattr(expected, name))
+        assert actual != old
+        assert evidence[name + "_hash"] == actual
+    assert table.weight.shape == (4, 6)
+    assert table.sparse
+    assert torch.count_nonzero(table.weight) == 0
+    assert hashes["initial_seed_7.pt"] == sha(source / "initial_seed_7.pt")
+    assert {str(path): sha(path) for path in source.rglob("*") if path.is_file()} == before
+
+
+@pytest.mark.parametrize("change", ["bytes", "seed", "state", "flags"])
+def test_fresh_initialization_rejects_mismatch(tmp_path: Path, change: str) -> None:
+    source = source_with_initialization(tmp_path / "source")
+    bundle = load_primary_source(source, 7, expected_step=2, expected_checkpoint_sha256=None)
+    model, _ = build_source_model(bundle, torch.device("cpu"))
+    path = source / "initial_seed_7.pt"
+    payload = cast(dict[str, Any], torch.load(path, weights_only=False))
+    if change in ("bytes", "seed"):
+        payload["seed"] = 8
+    elif change == "state":
+        key = next(key for key in payload["model"] if key.startswith("online_encoder."))
+        payload["model"][key] += 1
+    else:
+        payload["model"]["_extra_state"]["autoregressive"] = False
+    torch.save(payload, path)
+    if change != "bytes":
+        bundle.protocol["initializations"]["7"]["sha256"] = sha(path)
+        bundle.protocol["artifacts"][path.name] = sha(path)
+    with pytest.raises(ValueError, match="Initialization"):
+        initialize_control(model, bundle, "fresh_zero")
 
 
 def test_scientific_budget_cannot_be_silently_changed(tmp_path: Path) -> None:

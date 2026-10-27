@@ -1,5 +1,6 @@
 import math
 from collections.abc import Generator
+from typing import cast
 
 import pytest
 import torch
@@ -104,3 +105,38 @@ def test_global_sparse_clip_and_unvisited_adam_rows_remain_unchanged() -> None:
             optimizer.state[table.weight][key][unvisited], before[unvisited], rtol=0, atol=0
         )
     assert not torch.equal(table.weight[[0, 2]], before_weight[[0, 2]])
+
+
+def test_fresh_predictor_at_zero_group_codes_has_forecast_learning_signal() -> None:
+    model = make_model()
+    _, batch = make_batch(model)
+    model.parameter_encoder.requires_grad_(False)
+    table = nn.Embedding(4, 6, sparse=True, dtype=torch.float64)
+    with torch.no_grad():
+        table.weight.zero_()
+    codes = table(torch.tensor([0, 2]))
+    output = group_teacher_forward(model, batch, codes)
+    total, terms = FrozenStateFastObjective(objective_config()).forward(output)
+    regularizer_gradient = cast(
+        Tensor, torch.autograd.grad(terms["parameter_regularizer"], codes, retain_graph=True)[0]
+    )
+    torch.testing.assert_close(regularizer_gradient, torch.zeros_like(codes), rtol=0, atol=0)
+    forecast_gradients = torch.autograd.grad(
+        terms["prediction"],
+        (codes, next(model.predictor.parameters())),
+        retain_graph=True,
+    )
+    assert all(
+        bool(torch.isfinite(g).all()) and bool(g.square().sum() > 0) for g in forecast_gradients
+    )
+    assert not torch.equal(forecast_gradients[0][0], forecast_gradients[0][1])
+    total.backward()  # pyright: ignore[reportUnknownMemberType]
+    assert table.weight.grad is not None
+    assert table.weight.grad.is_sparse
+    assert bool(table.weight.grad.coalesce().values().square().sum() > 0)
+    before = table.weight.detach().clone()
+    optimizer = torch.optim.SparseAdam(table.parameters(), lr=0.01)
+    clip_teacher_gradients(model.predictor.parameters(), table)
+    optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+    assert not torch.equal(table.weight[[0, 2]], before[[0, 2]])
+    torch.testing.assert_close(table.weight[[1, 3]], before[[1, 3]], rtol=0, atol=0)
