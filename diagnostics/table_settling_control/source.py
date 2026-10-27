@@ -134,7 +134,10 @@ def load_inputs(
         or any(value > STATE_TOLERANCE for value in receipt["state_max_absolute_error"].values())
     ):
         raise ValueError("Code audit did not fully verify parameter/cache binding")
-    labels = cast(dict[str, Any], torch.load(audit_root / "audit_inputs.pt", weights_only=False))
+    labels = cast(
+        dict[str, Any],
+        torch.load(audit_root / "audit_inputs.pt", map_location="cpu", weights_only=False),
+    )
     theta = cast(Tensor, labels["theta_evaluation_only"])
     if (
         labels["identity"] != audited["identity"]
@@ -147,7 +150,8 @@ def load_inputs(
     del discarded
     states, flags = frozen_hashes(model), model.get_extra_state()
     checkpoint = cast(
-        dict[str, Any], torch.load(curriculum_root / "teacher_final.pt", weights_only=False)
+        dict[str, Any],
+        torch.load(curriculum_root / "teacher_final.pt", map_location="cpu", weights_only=False),
     )
     if (
         checkpoint["identity"] != completed["identity"]
