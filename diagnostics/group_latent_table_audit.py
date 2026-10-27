@@ -14,9 +14,10 @@ from typing import Any, cast
 
 import torch
 from omegaconf import DictConfig, OmegaConf
-from torch import Tensor
+from torch import Tensor, nn
 
-from diagnostics.encoder_gradient_control.source import build_source_model
+from diagnostics.encoder_gradient_control.source import SourceBundle, build_source_model
+from diagnostics.group_latent_control.run import initialize_control
 from diagnostics.joint_acquisition.source import load_primary_source
 from diagnostics.multiquery_control.data import TensorSplit, encode_states, module_fingerprint
 from diagnostics.multiquery_control.evaluation import parameter_readouts
@@ -57,8 +58,8 @@ def verified_curriculum(output: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     if protocol["identity"] != completed["identity"] or result["identity"] != completed["identity"]:
         raise ValueError("Curriculum identity mismatch")
     config = protocol["config"]
-    if config.get("initialization", "warm") != "warm" or config["verification"]:
-        raise ValueError("This retrospective audit requires the completed warm scientific control")
+    if config.get("initialization", "warm") not in ("warm", "fresh_zero") or config["verification"]:
+        raise ValueError("This audit requires a completed warm or fresh_zero scientific control")
     if (
         tuple(config[name + "_steps"] for name in ("teacher", "amortization", "washout"))
         != (30000, 10000, 10000)
@@ -66,6 +67,54 @@ def verified_curriculum(output: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     ):
         raise ValueError("Curriculum did not finish its original fixed budget")
     return protocol, completed
+
+
+def prepare_audit_initialization(
+    model: SCJEPA, bundle: SourceBundle, curriculum: dict[str, Any]
+) -> tuple[Tensor | None, dict[str, str]]:
+    """Restore the authenticated initial learned modules on a disposable audit model.
+
+    Warm controls retain the original source model and reconstruct donor-zero
+    codes later. Fresh controls reuse source validation and copy only verified
+    initial E/P weights; no optimizer or source artifact is changed.
+    """
+    mode = curriculum["config"].get("initialization", "warm")
+    expected_codes: Tensor | None = None
+    source_hashes = dict(bundle.hashes)
+    if mode == "fresh_zero":
+        table, initialization, source_hashes = initialize_control(model, bundle, "fresh_zero")
+        if curriculum.get("initialization") != initialization:
+            raise ValueError("Fresh curriculum initialization evidence differs from source")
+        expected_codes = table.weight.detach().cpu().clone()
+        if bool(torch.count_nonzero(expected_codes)):
+            raise ValueError("Fresh curriculum must initialize its train table at zero")
+    elif mode != "warm":
+        raise ValueError("Unsupported curriculum initialization")
+    if source_hashes != curriculum["source_hashes"]:
+        raise ValueError("Curriculum source/initialization hashes differ from verified source")
+    if module_fingerprint(model.parameter_encoder) != curriculum["initial_encoder_hash"]:
+        raise ValueError("Curriculum initial encoder differs from authenticated initialization")
+    return expected_codes, source_hashes
+
+
+def verify_initial_table(
+    initial: dict[str, Any], curriculum: dict[str, Any], expected_codes: Tensor
+) -> Tensor:
+    """Authenticate the saved train table and its warm-context or exact-zero origin."""
+    if initial["identity"] != curriculum["identity"]:
+        raise ValueError("Initial group-code identity differs from curriculum")
+    values = cast(Tensor, initial["weight"])
+    if values.shape != expected_codes.shape or not bool(torch.isfinite(values).all()):
+        raise ValueError("Initial group codes have invalid shape or values")
+    table = nn.Embedding.from_pretrained(values, freeze=True, sparse=True)  # pyright: ignore[reportUnknownMemberType]
+    if module_fingerprint(table) != curriculum["initial_table_hash"]:
+        raise ValueError("Initial group-code table hash differs from curriculum")
+    if curriculum["config"].get("initialization", "warm") == "fresh_zero":
+        if not torch.equal(values, expected_codes) or bool(torch.count_nonzero(values)):
+            raise ValueError("Fresh initial group codes must be exactly zero")
+    elif float((values - expected_codes).abs().max()) > STATE_TOLERANCE:
+        raise ValueError("Initial group codes do not match original donor-zero group ordering")
+    return values
 
 
 @torch.no_grad()
@@ -203,14 +252,15 @@ def audit(
                 if config["training_source_root"]
                 else None,
             )
-            if bundle.hashes != curriculum["source_hashes"]:
-                raise ValueError("Curriculum original source hashes differ from verified source")
             if bundle.train_groups != sum(READOUT_COUNTS):
                 raise ValueError(
                     "Audit readout partition requires all 8192 original training groups"
                 )
             primary, _ = build_source_model(bundle, target_device)
             primary.eval().requires_grad_(False)
+            expected_initial, source_hashes = prepare_audit_initialization(
+                primary, bundle, curriculum
+            )
             provenance = bundle.protocol["source"]
             record_path = (
                 source_run_config or Path(provenance["checkpoint"]).parent / "run_config.json"
@@ -232,7 +282,11 @@ def audit(
             evidence: dict[str, Any] = {
                 "curriculum_identity": curriculum["identity"],
                 "curriculum_artifact_hashes": completion["hashes"],
-                "source_hashes": bundle.hashes,
+                "source_hashes": source_hashes,
+                "initialization": config.get("initialization", "warm"),
+                "initialization_code_sha256": sha(
+                    Path(__file__).parent / "group_latent_control/run.py"
+                ),
                 "source_run_config_sha256": sha(record_path),
                 "training_dataset_fingerprint": metadata["training_dataset_fingerprint"],
                 "training_source_root": config["training_source_root"],
@@ -295,17 +349,10 @@ def audit(
                         weights_only=False,
                     ),
                 )
-                if initial["identity"] != curriculum["identity"]:
-                    raise ValueError("Initial group-code identity differs from curriculum")
-                original_codes = donor_zero_codes(primary, bundle.train, bundle.batch_size)
-                if (
-                    initial["weight"].shape != original_codes.shape
-                    or float((initial["weight"] - original_codes).abs().max()) > STATE_TOLERANCE
-                ):
-                    raise ValueError(
-                        "Initial group codes do not match original donor-zero group ordering"
-                    )
-                variants: dict[str, Tensor] = {"initial_group_table": initial["weight"]}
+                if expected_initial is None:
+                    expected_initial = donor_zero_codes(primary, bundle.train, bundle.batch_size)
+                initial_values = verify_initial_table(initial, curriculum, expected_initial)
+                variants: dict[str, Tensor] = {"initial_group_table": initial_values}
                 expected_global = {"teacher": 30000, "amortization": 40000, "washout": 50000}
                 frozen = {
                     name: module_fingerprint(module)
@@ -407,7 +454,7 @@ def audit(
                     output / "results.json", name=f"group-table-audit-{identity[:12]}-results"
                 )
                 verified_curriculum(curriculum_output)
-                for name, expected in bundle.hashes.items():
+                for name, expected in source_hashes.items():
                     if sha(source / name) != expected:
                         raise RuntimeError("Source changed during retrospective audit")
                 logger.finish()
@@ -431,7 +478,7 @@ def audit(
 
 
 def main() -> None:
-    """Audit a completed warm curriculum on a fresh output path."""
+    """Audit a completed warm or fresh-zero curriculum on a fresh output path."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--curriculum-output", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
