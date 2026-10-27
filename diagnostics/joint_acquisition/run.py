@@ -40,6 +40,7 @@ from diagnostics.joint_acquisition.source import (
     load_comparison_sources,
     load_primary_source,
 )
+from diagnostics.joint_acquisition.tracking import publish_results
 from diagnostics.joint_acquisition.trajectories import TrajectorySettings, run_trajectory
 from diagnostics.multiquery_control.run import atomic_save, sha
 from scjepa.data.datasets import canonical_fingerprint
@@ -454,8 +455,9 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                     relative = f"{case}/last.pt"
                     if (out / relative).exists():
                         outputs[relative] = sha(out / relative)
-                write_json(out / "completed.json", {"identity": identity, "outputs": outputs})
+                publish_results(logger, result, out)
                 logger.finish()
+                write_json(out / "completed.json", {"identity": identity, "outputs": outputs})
                 return cast(dict[str, Any], read_json(out / "results.json"))
             except BaseException:
                 logger.finish(exit_code=1)
