@@ -36,6 +36,81 @@ READOUT_COUNTS = (4096, 2048, 2048)
 STATE_TOLERANCE = 2e-5
 
 
+def verified_teacher_snapshot(output: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Capture immutable teacher-phase inputs without claiming parent-run completion.
+
+    No parent completion manifest is read or synthesized. The receipt records
+    byte hashes observed now, bound to the protocol and fixed teacher counters.
+    These same hashes must still match after the read-only audit finishes.
+    """
+    names = ("protocol.json", "initial_group_codes.pt", "teacher_final.pt")
+    hashes = {name: sha(output / name) for name in names}
+    protocol = cast(dict[str, Any], read_json(output / "protocol.json"))
+    config = protocol["config"]
+    if (
+        config.get("initialization", "warm") not in ("warm", "fresh_zero")
+        or config["verification"]
+        or tuple(config[name + "_steps"] for name in ("teacher", "amortization", "washout"))
+        != (30000, 10000, 10000)
+    ):
+        raise ValueError("Teacher snapshot requires the scientific 30000/10000/10000 protocol")
+    settings = dict(config)
+    for key in ("source_dir", "output_dir", "training_source_root", "wandb_mode", "wandb_entity"):
+        settings.pop(key)
+    evidence = {
+        key: protocol[key]
+        for key in (
+            "settings",
+            "source_hashes",
+            "initialization",
+            "source_step",
+            "initial_table_hash",
+            "initial_encoder_hash",
+            "frozen_hashes",
+            "code_identity",
+            "torch",
+        )
+    }
+    if settings != protocol["settings"] or canonical_fingerprint(evidence) != protocol["identity"]:
+        raise ValueError("Teacher snapshot protocol identity or settings differ")
+    initial = cast(
+        dict[str, Any],
+        torch.load(output / "initial_group_codes.pt", map_location="cpu", weights_only=False),
+    )
+    teacher = cast(
+        dict[str, Any],
+        torch.load(output / "teacher_final.pt", map_location="cpu", weights_only=False),
+    )
+    if (
+        initial["identity"] != protocol["identity"]
+        or teacher["identity"] != protocol["identity"]
+        or teacher["phase"] != "teacher"
+        or teacher["phase_step"] != 30000
+        or teacher["global_step"] != 30000
+    ):
+        raise ValueError("Teacher snapshot identity or fixed phase counters differ")
+    table = nn.Embedding.from_pretrained(  # pyright: ignore[reportUnknownMemberType]
+        initial["weight"], freeze=True, sparse=True
+    )
+    if module_fingerprint(table) != protocol["initial_table_hash"]:
+        raise ValueError("Teacher snapshot initial table hash differs")
+    verify_snapshot_hashes(output, hashes)
+    return protocol, {
+        "kind": "read_only_teacher_phase_snapshot",
+        "parent_completion_required": False,
+        "parent_completion_status": "not_asserted",
+        "teacher_global_step": 30000,
+        "hashes": hashes,
+    }
+
+
+def verify_snapshot_hashes(output: Path, hashes: dict[str, str]) -> None:
+    """Reject mutation of any captured phase input, even if its internal IDs still match."""
+    for name, expected in hashes.items():
+        if sha(output / name) != expected:
+            raise ValueError(f"Teacher snapshot input changed during audit: {name}")
+
+
 def verified_curriculum(output: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """Require a completed immutable curriculum before retrospective label access."""
     completed = cast(dict[str, Any], read_json(output / "completed.json"))
@@ -230,10 +305,15 @@ def audit(
     *,
     device: str = "cpu",
     wandb_mode: str = "disabled",
+    teacher_snapshot: bool = False,
 ) -> dict[str, Any]:
     """Read immutable artifacts and evaluate code contents using group-disjoint probes."""
     curriculum_output, output = curriculum_output.resolve(), output.resolve()
-    curriculum, completion = verified_curriculum(curriculum_output)
+    curriculum, completion = (
+        verified_teacher_snapshot(curriculum_output)
+        if teacher_snapshot
+        else verified_curriculum(curriculum_output)
+    )
     config = curriculum["config"]
     source = Path(config["source_dir"]).resolve()
     if any(output == path or output.is_relative_to(path) for path in (source, curriculum_output)):
@@ -309,6 +389,12 @@ def audit(
                     Path(__file__).parent / "multiquery_control/data.py"
                 ),
             }
+            if teacher_snapshot:
+                evidence["phase_snapshot"] = completion
+                evidence["completion_scope"] = (
+                    "Completion means this read-only teacher-phase audit finished; "
+                    "the parent curriculum need not have completed its later phases."
+                )
             identity = canonical_fingerprint(evidence)
             output.mkdir(parents=True)
             write_json(output / "protocol.json", {"identity": identity, **evidence})
@@ -353,7 +439,11 @@ def audit(
                     expected_initial = donor_zero_codes(primary, bundle.train, bundle.batch_size)
                 initial_values = verify_initial_table(initial, curriculum, expected_initial)
                 variants: dict[str, Tensor] = {"initial_group_table": initial_values}
-                expected_global = {"teacher": 30000, "amortization": 40000, "washout": 50000}
+                expected_global = (
+                    {"teacher": 30000}
+                    if teacher_snapshot
+                    else {"teacher": 30000, "amortization": 40000, "washout": 50000}
+                )
                 frozen = {
                     name: module_fingerprint(module)
                     for name, module in (
@@ -440,6 +530,9 @@ def audit(
                     "scope": evidence["scope"],
                     "tracking": logger.metadata,
                 }
+                if teacher_snapshot:
+                    result["phase_snapshot"] = completion
+                    result["completion_scope"] = evidence["completion_scope"]
                 write_json(output / "results.json", result)
                 atomic_save(
                     output / "audit_inputs.pt",
@@ -453,7 +546,12 @@ def audit(
                 logger.log_artifact(
                     output / "results.json", name=f"group-table-audit-{identity[:12]}-results"
                 )
-                verified_curriculum(curriculum_output)
+                if teacher_snapshot:
+                    verify_snapshot_hashes(curriculum_output, completion["hashes"])
+                    if sha(record_path) != evidence["source_run_config_sha256"]:
+                        raise RuntimeError("Source run configuration changed during snapshot audit")
+                else:
+                    verified_curriculum(curriculum_output)
                 for name, expected in source_hashes.items():
                     if sha(source / name) != expected:
                         raise RuntimeError("Source changed during retrospective audit")
@@ -462,6 +560,14 @@ def audit(
                     output / "completed.json",
                     {
                         "identity": identity,
+                        **(
+                            {
+                                "completion_scope": "teacher_phase_audit_only",
+                                "parent_complete": None,
+                            }
+                            if teacher_snapshot
+                            else {}
+                        ),
                         "hashes": {
                             name: sha(output / name)
                             for name in ("results.json", "audit_inputs.pt", "protocol.json")
@@ -484,6 +590,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--source-run-config", type=Path)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--teacher-snapshot", action="store_true")
     parser.add_argument(
         "--wandb-mode", choices=("online", "offline", "disabled"), default="disabled"
     )
@@ -494,6 +601,7 @@ def main() -> None:
         args.source_run_config,
         device=args.device,
         wandb_mode=args.wandb_mode,
+        teacher_snapshot=args.teacher_snapshot,
     )
     print(result["identity"])
 
