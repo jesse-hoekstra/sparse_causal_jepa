@@ -392,6 +392,9 @@ def audit(curriculum_output: Path, output: Path, *, wandb_mode: str = "disabled"
                     )
                 },
                 "seed": AUDIT_SEED,
+                "device": "cpu",
+                "dtype": str(next(primary.parameters()).dtype),
+                "torch_version": torch.__version__,
                 "group_indices": selected.tolist(),  # pyright: ignore[reportUnknownMemberType]
                 "projection_seeds": seeds,
                 "objective": bundle.protocol["objective_config"],
@@ -423,7 +426,10 @@ def audit(curriculum_output: Path, output: Path, *, wandb_mode: str = "disabled"
                     "A favorable omission result establishes local forecast interference, "
                     "not acquisition of the four missing physical factors. "
                     "Finite changes include second-order effects; use the reported slope "
-                    "and linearization checks when interpreting directionality."
+                    "and linearization checks when interpreting directionality. "
+                    "CPU projection draws are matched between audit variants; they do not "
+                    "replay the original CUDA training draws. Bootstrap intervals condition "
+                    "on these three fixed projection draws."
                 ),
             }
             identity = canonical_fingerprint(evidence)
