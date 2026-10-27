@@ -103,7 +103,14 @@ def test_head_initialization_preserves_cpu_cuda_rng_and_existing_modules() -> No
         model = make_model()
         initialize_mlp(model, 7)
         model.to(device)
-        before = module_fingerprint(model)
+        modules = (
+            model.online_encoder,
+            model.target_encoder,
+            model.parameter_encoder,
+            model.predictor,
+        )
+        before = tuple(module_fingerprint(module) for module in modules)
+        flags = copy.deepcopy(model.get_extra_state())
         torch.default_generator.manual_seed(123)
         torch.cuda.manual_seed(456)
         cpu_rng, cuda_rng = torch.get_rng_state(), torch.cuda.get_rng_state(device)
@@ -111,7 +118,8 @@ def test_head_initialization_preserves_cpu_cuda_rng_and_existing_modules() -> No
         assert next(heads.parameters()).device == next(model.parameters()).device
         assert torch.equal(torch.get_rng_state(), cpu_rng)
         assert torch.equal(torch.cuda.get_rng_state(device), cuda_rng)
-        assert module_fingerprint(model) == before
+        assert tuple(module_fingerprint(module) for module in modules) == before
+        assert model.get_extra_state() == flags
 
 
 def test_leave_one_out_targets_ignore_own_context_with_fixed_train_normalizers() -> None:
