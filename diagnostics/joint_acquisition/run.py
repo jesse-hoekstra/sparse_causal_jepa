@@ -184,7 +184,7 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                         "chain_rule_relative_error": 1e-6,
                         "finite_relative_error": 1e-3,
                         "reconstruction_rms": 2e-5,
-                        "scope": "first selected validation group, donor 0",
+                        "scope": "first selected calibration group, donor 0",
                     },
                     "bootstrap": {
                         "unit": "parameter group",

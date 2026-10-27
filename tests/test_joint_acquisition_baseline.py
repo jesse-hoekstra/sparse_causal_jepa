@@ -137,14 +137,19 @@ def test_compatible_identical_codes_give_zero_paired_difference() -> None:
         compare_compatible_codes(model, degraded, data, selection, bootstrap_samples=16)
 
 
-def test_explicit_validation_geometry_checks_analytic_and_finite_responses() -> None:
+def test_numerical_geometry_checks_calibration_derivatives_without_fitting_corrections() -> None:
     from diagnostics.joint_acquisition.baseline import numerical_checks
 
     model = tiny_model()
     data, _ = tiny_data(model)
-    data["validation"] = data.pop("test")
+    data.pop("test")
+    before, rng = copy.deepcopy(model.state_dict()), torch.get_rng_state().clone()
     selection = DiagnosticSelection((0, 1), (0, 1), (0,), 4, 5)
     report, raw = numerical_checks(model, data, selection)
     assert report["passed"]
-    assert report["geometry"]["split"] == "validation"
+    assert report["geometry"]["split"] == "calibration"
     assert raw["encoder_jacobian"].shape == (1, 1, 6, 6)
+    assert not any("fitted" in name for name in raw)
+    assert bool((raw["finite_steps"] <= 1e-4).all())
+    torch.testing.assert_close(before, model.state_dict(), rtol=0, atol=0)
+    assert torch.equal(rng, torch.get_rng_state())

@@ -74,8 +74,10 @@ archive path and source availability have not been verified by this handoff.
 
 Every script invocation—including preflight, status and reattachment—runs local
 `git push` before SSH, then remote `git pull --ff-only` before remote work. It
-checks the same branch and exact commit and refuses tracked uncommitted changes.
-It never resets or overwrites either checkout.
+checks the same branch and exact commit. Local edits to the diagnostic workflow
+must be committed; unrelated local edits are preserved and are not deployed.
+The remote checkout must have no tracked uncommitted changes. The script never
+resets or overwrites either checkout.
 
 ## Commands and artifacts
 

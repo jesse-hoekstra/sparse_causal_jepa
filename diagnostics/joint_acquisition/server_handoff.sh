@@ -67,8 +67,10 @@ if [[ -n "$all_six_checkpoint" && "$all_six_checkpoint" != /* ]]; then
 fi
 local_repo=$(git rev-parse --show-toplevel)
 cd "$local_repo"
-git diff --quiet && git diff --cached --quiet || {
-    echo 'Commit local tracked changes before synchronizing the diagnostic.' >&2
+# Deploy the reviewed commit, preserving unrelated local work. Refuse uncommitted
+# changes to this workflow itself so the launch script cannot diverge from HEAD.
+git diff --quiet HEAD -- diagnostics/joint_acquisition || {
+    echo 'Commit changes to the diagnostic workflow before using this handoff.' >&2
     exit 1
 }
 branch=$(git symbolic-ref --quiet --short HEAD)
@@ -188,6 +190,7 @@ print("The runner additionally verifies full cache, optimizer and compatible-mod
 PY
 printf 'Resolved all-six checkpoint: %s\nHistorical source tree: %s\n' "$all_six_checkpoint" "$training_source_root"
 if [[ "$mode" == preflight ]]; then exit 0; fi
+mkdir -p "$repo/outputs/diagnostics"
 mkdir "$run_dir"  # Atomic refusal to overwrite any previous handoff/results.
 command=(.venv/bin/python -u -m diagnostics.joint_acquisition.run
     --source-dir "$source_dir" --output-dir "$output_dir"

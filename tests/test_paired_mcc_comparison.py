@@ -45,6 +45,7 @@ def _conditions(tmp_path: Path, features: tuple[Tensor, Tensor, Tensor]) -> dict
             directory / "run_config.json",
             {
                 "run_identity": name,
+                "condition": name,
                 "dataset_identity": "dataset",
                 "experiment_identity": "experiment",
                 "seed": 4,
@@ -98,6 +99,28 @@ def test_identical_conditions_have_exact_zero_paired_contrasts(tmp_path: Path) -
     baseline = _mapping(conditions["baseline"])
     assert baseline["parameter_routing_shd_descriptive"] == 24.0
     assert baseline["geco_feasible"] is True
+
+
+def test_comparison_rejects_swapped_condition_roles(tmp_path: Path) -> None:
+    truth = _truth()
+    directories = _conditions(tmp_path, (truth, truth, truth))
+    directories["dense"], directories["full"] = directories["full"], directories["dense"]
+    with pytest.raises(ValueError, match="condition"):
+        paired_mcc_comparison(directories, fixed_budget=100, resamples=16)
+
+
+def test_comparison_rejects_reused_run_identity(tmp_path: Path) -> None:
+    from scjepa.experiments.storage import read_json
+
+    truth = _truth()
+    directories = _conditions(tmp_path, (truth, truth, truth))
+    for relative in ("run_config.json", "evaluation/evaluated_checkpoint.json"):
+        path = directories["full"] / relative
+        record = read_json(path)
+        record["run_identity"] = "dense"
+        write_json(path, record)
+    with pytest.raises(ValueError, match="distinct run identity"):
+        paired_mcc_comparison(directories, fixed_budget=100, resamples=16)
 
 
 def test_positive_contrast_preserves_frozen_match_and_group_draws(tmp_path: Path) -> None:

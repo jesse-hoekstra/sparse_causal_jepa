@@ -13,6 +13,65 @@ def _use_parameters(assessment: dict[str, Any]) -> set[int]:
     return passing
 
 
+def _comparison_observations(comparison: dict[str, Any]) -> list[str]:
+    if comparison["status"] != "measured":
+        return [
+            "The compatible source-code comparison is unavailable; predictor adequacy "
+            "remains unresolved."
+        ]
+    differences = comparison["paired_source_minus_current_ordinary_mse_by_horizon"]
+    lines = [
+        f"Compatible source-minus-current ordinary MSE by horizon: {differences}. "
+        "Negative favors the source; these point differences alone have no reported "
+        "confidence interval.",
+        "",
+        "| Parameter | Source-current response error | Source-current predictive benefit |",
+        "| --- | --- | --- |",
+    ]
+    source_advantage: list[int] = []
+    for row in comparison["paired_per_parameter"]:
+        error = row["source_minus_current_normalized_response_error"]
+        benefit = row["source_minus_current_predictive_benefit"]
+        lines.append(
+            f"| theta_{row['parameter']} | {error['estimate']}; "
+            f"95% CI {error['interval_95']} | {benefit['estimate']}; "
+            f"95% CI {benefit['interval_95']} |"
+        )
+        if (
+            error["interval_95"] is not None
+            and benefit["interval_95"] is not None
+            and error["interval_95"][1] < 0
+            and benefit["interval_95"][0] > 0
+        ):
+            source_advantage.append(int(row["parameter"]))
+    lines.append("")
+    if source_advantage:
+        lines.append(
+            f"Paired source-code advantage for parameters {source_advantage}: both "
+            "response-error reduction and predictive-benefit gain exclude zero. This "
+            "supports a code-dependent limitation; investigate code content and the "
+            "predictor around current codes without attributing the gap uniquely to the encoder."
+        )
+    else:
+        lines.append(
+            "No parameter has paired intervals establishing both source-code improvements. "
+            "The compatible comparison is inconclusive for that joint criterion; ordinary "
+            "forecast point differences alone do not resolve it."
+        )
+    both_unestablished = sorted(
+        set(range(1, 7))
+        - (_use_parameters(comparison["source"]) | _use_parameters(comparison["current"]))
+    )
+    if both_unestablished:
+        lines.append(
+            "Neither code meets both predictive-use bounds, so predictor adequacy remains "
+            f"open for parameters {both_unestablished}. Failing these bounds is not proof "
+            "of predictor incapacity, and no universal forecast-error cutoff is assumed."
+        )
+    lines.append("The source encoder remains an imperfect comparator, not an exact oracle.")
+    return lines
+
+
 def _case_observations(result: dict[str, Any]) -> list[str]:
     baseline_pass = _use_parameters(result["baseline"])
     lines: list[str] = []
@@ -134,28 +193,10 @@ def decision_report(result: dict[str, Any]) -> str:
             "",
         ]
     )
-    compatibility = result["compatible_control"]
-    if compatibility["status"] != "measured":
-        lines.append(
-            "The compatible source-code comparison is unavailable; predictor adequacy "
-            "remains unresolved."
-        )
-    else:
-        lines.append(
-            "Inspect paired source/current errors and responses: a source advantage "
-            "supports a code-dependent limitation; poor performance in both keeps "
-            "predictor adequacy open. The source encoder is an imperfect comparator."
-        )
+    lines.extend(_comparison_observations(result["compatible_control"]))
     code = result["code_repair"]
     if code["status"] == "measured":
-        improved = [
-            str(row["parameter"])
-            for row in code["after"]["per_parameter"]
-            if row["normalized_response_error"]["interval_95"] is not None
-            and row["normalized_response_error"]["interval_95"][1] < 1
-            and row["predictive_benefit"]["interval_95"] is not None
-            and row["predictive_benefit"]["interval_95"][0] > 0
-        ]
+        improved = [str(parameter) for parameter in sorted(_use_parameters(code["after"]))]
         lines.append(
             "Bounded per-donor repair meets both use bounds for parameters: "
             f"{', '.join(improved) or 'none'}. Transfer across query episodes supports "

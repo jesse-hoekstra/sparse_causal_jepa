@@ -531,23 +531,114 @@ def compare_compatible_codes(
 def numerical_checks(
     model: SCJEPA, data: EvaluationData, selection: DiagnosticSelection
 ) -> tuple[dict[str, Any], dict[str, Tensor]]:
-    """Validate chain-rule and finite-response calculations on one disposable copy."""
+    """Validate calibration derivatives without fitting or applying code corrections."""
     import copy
     import math
 
-    from diagnostics.signal_path.geometry import geometry_diagnostic
-
-    summary, raw = geometry_diagnostic(
-        copy.deepcopy(model).double().eval().requires_grad_(False),
-        data,
-        groups=1,
-        donor_contexts=1,
-        fit_queries=selection.fit_queries,
-        test_queries=selection.heldout_queries,
-        split_name="validation",
-        group_indices=selection.validation_indices[:1],
-        calibration_indices=selection.calibration_indices,
+    from diagnostics.signal_path.geometry import (
+        donor_code,
+        exact_rollout,
+        jacobian_columns,
+        predict_rollout,
     )
+    from scjepa.data import simplified_gaussian as dgp
+    from scjepa.data.controlled_vector import VectorObservationMap
+
+    candidate = copy.deepcopy(model).double().eval().requires_grad_(False)
+    reference = next(candidate.parameters())
+    split = selected_split(data, selection, "calibration")
+    theta = split["theta"][0].to(reference)
+    states, actions = (split[key][0].to(reference) for key in ("true_states", "true_actions"))
+    if (
+        not selection.donors
+        or not 0 <= selection.donors[0] < 10
+        or min(selection.fit_queries, selection.heldout_queries) < 1
+        or selection.fit_queries + selection.heldout_queries > 9
+        or states.shape[0] != 10
+        or candidate.context_len != 10
+        or candidate.predictor.history_len != 1
+        or not candidate.autoregressive
+    ):
+        raise ValueError("Numerical checks require R10/K10/L1 and non-self query episodes")
+    donor = selection.donors[0]
+    query_indices = [
+        (donor + offset) % 10
+        for offset in range(1, selection.fit_queries + selection.heldout_queries + 1)
+    ]
+    donor_actions = actions[donor, :9]
+    query_states, query_actions = states[query_indices, 9], actions[query_indices, 9:11]
+    observation = VectorObservationMap(matrix=data["metadata"]["observation_matrix"], dimension=6)
+    with torch.no_grad():
+        history = candidate.online_encoder.encode_sequence(
+            observation.forward(query_states[:, None])
+        )
+
+    def infer(value: Tensor) -> Tensor:
+        return donor_code(candidate, observation, states[donor, 0], value, donor_actions)
+
+    def predict(value: Tensor) -> Tensor:
+        return predict_rollout(
+            candidate, history, value.expand(len(query_indices), -1), query_actions
+        )
+
+    def exact(value: Tensor) -> Tensor:
+        return exact_rollout(candidate, observation, query_states, value, query_actions)
+
+    def composed(value: Tensor) -> Tensor:
+        return predict(infer(value))
+
+    with torch.no_grad():
+        code = infer(theta)
+        cached_code = cast(
+            Tensor,
+            candidate.parameter_encoder(
+                split["states_online"][0, donor, :10].to(reference)[None],
+                split["actions"][0, donor, :9].to(reference)[None],
+            ),
+        )[0]
+    encoder = jacobian_columns(infer, theta)
+    predictor = jacobian_columns(predict, code)
+    target = jacobian_columns(exact, theta)
+    composed_jacobian = jacobian_columns(composed, theta)
+    remaining = dgp.PARAMETER_BOUND - theta.abs()
+    if not bool((remaining > 0).all()):
+        raise ValueError("Numerical derivative parameters must be inside their support")
+    steps = remaining.mul(0.5).clamp(max=1e-4)
+
+    def relative_error(actual: Tensor, expected: Tensor) -> float:
+        difference = float((actual - expected).square().sum())
+        energy = float(expected.square().sum())
+        return math.sqrt(difference / energy) if energy > 0 else math.sqrt(difference)
+
+    checks = {
+        "chain_rule_relative_error": relative_error(predictor @ encoder, composed_jacobian),
+        "reconstructed_vs_cached_code_rms": float((code - cached_code).square().mean().sqrt()),
+    }
+    raw = {
+        "encoder_jacobian": encoder[None, None].cpu(),
+        "predictor_jacobian": predictor[None, None].cpu(),
+        "target_jacobian": target[None, None].cpu(),
+        "composed_jacobian": composed_jacobian[None, None].cpu(),
+        "finite_steps": steps[None, None].cpu(),
+        "codes": code[None, None].cpu(),
+        "query_indices": torch.tensor(query_indices)[None, None],
+        "group_indices": torch.tensor(selection.calibration_indices[:1]),
+        "donor_indices": torch.tensor([donor]),
+    }
+    with torch.no_grad():
+        for name, function, derivative in (
+            ("encoder", infer, encoder),
+            ("composed", composed, composed_jacobian),
+            ("target", exact, target),
+        ):
+            columns: list[Tensor] = []
+            for factor, step in enumerate(steps):
+                shift = torch.zeros_like(theta)
+                shift[factor] = step
+                columns.append((function(theta + shift) - function(theta - shift)) / (2 * step))
+            finite = torch.stack(columns, -1)
+            checks[f"{name}_finite_difference_relative_error"] = relative_error(finite, derivative)
+            raw[f"{name}_finite_jacobian"] = finite[None, None].cpu()
     tolerances = {
         "chain_rule_relative_error": 1e-6,
         "encoder_finite_difference_relative_error": 1e-3,
@@ -556,15 +647,15 @@ def numerical_checks(
         "reconstructed_vs_cached_code_rms": 2e-5,
     }
     passed = all(
-        math.isfinite(summary["checks"][name]) and summary["checks"][name] <= tolerance
+        math.isfinite(checks[name]) and checks[name] <= tolerance
         for name, tolerance in tolerances.items()
     )
     return {
         "passed": passed,
         "tolerances": tolerances,
-        "geometry": summary,
+        "geometry": {"split": "calibration", "checks": checks},
         "scope": (
-            "First selected validation group, donor episode 0; numerical validation only. "
-            "Thresholds fixed before inspecting scientific validation outcomes."
+            "First selected calibration group and donor; derivative checks only, no correction "
+            "fitting or fitted-code displacement. Thresholds are fixed before validation outcomes."
         ),
     }, raw

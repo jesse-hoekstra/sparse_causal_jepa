@@ -89,6 +89,55 @@ def _classification(cosine: float | None, *, descent: bool) -> str:
     return "supportive" if favorable else "opposing"
 
 
+def _direction_components(
+    candidate: SCJEPA,
+    components: ComponentFunction,
+    direction: Mapping[str, Tensor],
+    initial_values: Mapping[str, float],
+    gradients: Mapping[str, Mapping[str, Tensor]],
+    settings: CorrectionSettings,
+) -> dict[str, dict[str, Any]]:
+    movement = vector_norm(direction)
+    actual_values: list[tuple[float, dict[str, float]]] = []
+    for fraction in settings.fractions:
+        finite = copy.deepcopy(candidate)
+        apply_direction(finite, direction, fraction)
+        measured = components(finite)
+        actual_values.append(
+            (fraction, {name: float(measured[name].detach()) for name in initial_values})
+        )
+    rows: dict[str, dict[str, Any]] = {}
+    for name, gradient in gradients.items():
+        norm = vector_norm({key: gradient[key] for key in direction})
+        slope = sum(
+            float((gradient[key] * delta.to(gradient[key])).sum())
+            for key, delta in direction.items()
+        )
+        cosine = slope / (norm * movement) if norm > 0 and movement > 0 else None
+        finite_rows: list[dict[str, Any]] = []
+        for fraction, measured in actual_values:
+            predicted = fraction * slope
+            actual = measured[name] - initial_values[name]
+            finite_rows.append(
+                {
+                    "fraction": fraction,
+                    "predicted_change": predicted,
+                    "actual_change": actual,
+                    "linearization_valid": abs(actual - predicted)
+                    <= settings.finite_atol + settings.finite_rtol * abs(predicted),
+                }
+            )
+        rows[name] = {
+            "initial_value": initial_values[name],
+            "gradient_norm": norm,
+            "directional_derivative": slope,
+            "gradient_direction_cosine": cosine,
+            "classification": _classification(cosine, descent=True),
+            "finite_steps": finite_rows,
+        }
+    return rows
+
+
 def analyze_incentives(
     model: SCJEPA,
     components: ComponentFunction,
@@ -120,48 +169,9 @@ def analyze_incentives(
             if not math.isfinite(movement) or movement <= 0:
                 rows[case] = {"defined": False}
                 continue
-            actual_values: list[dict[str, Any]] = []
-            for fraction in settings.fractions:
-                finite = copy.deepcopy(candidate)
-                apply_direction(finite, direction, fraction)
-                measured = components(finite)
-                actual_values.append(
-                    {
-                        "fraction": fraction,
-                        "values": {name: float(measured[name].detach()) for name in scalars},
-                    }
-                )
-            component_rows: dict[str, Any] = {}
-            for name, gradient in gradients.items():
-                selected = {key: gradient[key] for key in direction}
-                norm = vector_norm(selected)
-                slope = sum(
-                    float((gradient[key] * delta.to(gradient[key])).sum())
-                    for key, delta in direction.items()
-                )
-                cosine = slope / (norm * movement) if norm > 0 else None
-                finite_rows: list[dict[str, Any]] = []
-                for measured in actual_values:
-                    fraction = float(measured["fraction"])
-                    predicted = fraction * slope
-                    actual = measured["values"][name] - initial_values[name]
-                    finite_rows.append(
-                        {
-                            "fraction": fraction,
-                            "predicted_change": predicted,
-                            "actual_change": actual,
-                            "linearization_valid": abs(actual - predicted)
-                            <= settings.finite_atol + settings.finite_rtol * abs(predicted),
-                        }
-                    )
-                component_rows[name] = {
-                    "initial_value": initial_values[name],
-                    "gradient_norm": norm,
-                    "directional_derivative": slope,
-                    "gradient_direction_cosine": cosine,
-                    "classification": _classification(cosine, descent=True),
-                    "finite_steps": finite_rows,
-                }
+            component_rows = _direction_components(
+                candidate, components, direction, initial_values, gradients, settings
+            )
             saved = {key: corrections.saved_update[key] for key in direction}
             saved_norm = vector_norm(saved)
             dot = sum(
@@ -178,45 +188,16 @@ def analyze_incentives(
                     "classification": _classification(cosine, descent=False),
                 },
             }
-        saved_values: list[dict[str, Any]] = []
-        for fraction in settings.fractions:
-            finite = copy.deepcopy(candidate)
-            apply_direction(finite, corrections.saved_update, fraction)
-            measured = components(finite)
-            saved_values.append(
-                {
-                    "fraction": fraction,
-                    "values": {name: float(measured[name].detach()) for name in scalars},
-                }
-            )
-        saved_components: dict[str, Any] = {}
-        for name, gradient in gradients.items():
-            slope = sum(
-                float((gradient[key] * delta.to(gradient[key])).sum())
-                for key, delta in corrections.saved_update.items()
-            )
-            norm = vector_norm(gradient)
-            movement = vector_norm(corrections.saved_update)
-            cosine = slope / (norm * movement) if norm > 0 and movement > 0 else None
-            finite_rows = []
-            for measured in saved_values:
-                predicted = measured["fraction"] * slope
-                actual = measured["values"][name] - initial_values[name]
-                finite_rows.append(
-                    {
-                        "fraction": measured["fraction"],
-                        "predicted_change": predicted,
-                        "actual_change": actual,
-                        "linearization_valid": abs(actual - predicted)
-                        <= settings.finite_atol + settings.finite_rtol * abs(predicted),
-                    }
-                )
-            saved_components[name] = {
-                "directional_derivative": slope,
-                "gradient_direction_cosine": cosine,
-                "classification": _classification(cosine, descent=True),
-                "finite_steps": finite_rows,
+        saved_components = {
+            name: {
+                key: value
+                for key, value in row.items()
+                if key not in {"initial_value", "gradient_norm"}
             }
+            for name, row in _direction_components(
+                candidate, components, corrections.saved_update, initial_values, gradients, settings
+            ).items()
+        }
         saved_response: dict[str, Any] | None = None
         if fit_loss is not None:
             loss = fit_loss(candidate)

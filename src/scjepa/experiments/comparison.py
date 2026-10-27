@@ -181,6 +181,10 @@ def paired_mcc_comparison(
     conditions = {
         name: _load(directories[name], fixed_budget) for name in ("dense", "baseline", "full")
     }
+    if any(condition.record.get("condition") != name for name, condition in conditions.items()):
+        raise ValueError("Recorded condition roles do not match dense/baseline/full inputs")
+    if len({condition.record["run_identity"] for condition in conditions.values()}) != 3:
+        raise ValueError("Each condition must have a distinct run identity")
     reference = conditions["dense"]
     for condition in conditions.values():
         for key in ("dataset_identity", "experiment_identity", "seed"):
