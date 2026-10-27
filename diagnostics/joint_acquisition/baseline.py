@@ -118,6 +118,7 @@ def build_matched_batch(
     split: Literal["calibration", "validation"],
     *,
     displacement: float = 0.01,
+    perturbation_sign: Literal[-1, 1] = 1,
 ) -> MatchedBatch:
     """Regenerate donor contexts and exact futures with fixed recipient inputs."""
     import math
@@ -129,6 +130,8 @@ def build_matched_batch(
         raise ValueError("Use an eval-mode K10 autoregressive model")
     if model.predictor.history_len != 1 or not math.isfinite(displacement) or displacement <= 0:
         raise ValueError("Require L1 and a positive finite physical perturbation")
+    if type(perturbation_sign) is not int or perturbation_sign not in (-1, 1):
+        raise ValueError("Physical perturbation sign must be exactly -1 or 1")
     calibration = selected_split(data, selection, "calibration")
     validation = selected_split(data, selection, "validation")
     if bool((calibration["theta"][:, None] == validation["theta"][None]).all(-1).any()):
@@ -164,7 +167,7 @@ def build_matched_batch(
     remaining = dgp.PARAMETER_BOUND - theta.abs()
     if not bool((remaining > 0).all()):
         raise ValueError("Parameters must be strictly inside their support")
-    steps = remaining.mul(0.5).clamp(max=displacement)
+    steps = remaining.mul(0.5).clamp(max=displacement) * perturbation_sign
     changed_theta = theta[:, None, :] + torch.diag_embed(steps)
     observation = VectorObservationMap(matrix=data["metadata"]["observation_matrix"], dimension=6)
     donor_actions = actions[:, donors, :9]
