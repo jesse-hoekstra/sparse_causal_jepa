@@ -160,7 +160,6 @@ def build_matched_batch(
             ]
             for donor in donors
         ],
-        device=reference.device,
     )
     remaining = dgp.PARAMETER_BOUND - theta.abs()
     if not bool((remaining > 0).all()):
