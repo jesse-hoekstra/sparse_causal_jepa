@@ -500,6 +500,7 @@ def test_final_evaluation_has_only_core_metrics_and_frozen_separate_calibration_
     assert cast(Tensor, refs["target_match"]).shape == (10,)
     assert sorted(item.name for item in tmp_path.iterdir()) == [
         "evaluation_references.pt",
+        "mcc_samples.pt",
         "metrics.json",
         "protocol.json",
     ]

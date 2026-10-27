@@ -7,6 +7,7 @@ import statistics
 from pathlib import Path
 from typing import cast
 
+from scjepa.experiments.comparison import paired_mcc_comparison
 from scjepa.experiments.config import ExperimentConfig
 from scjepa.experiments.storage import file_lock, read_json, write_json
 
@@ -69,6 +70,8 @@ def aggregate_results(config: ExperimentConfig) -> dict[str, object]:
                     rows.append({"graph": graph, "seed": seed, "condition": condition, **metrics})
         summaries: dict[str, object] = {}
         differences: dict[str, object] = {}
+        group_mcc: dict[str, object] = {}
+        missing_group_mcc: list[str] = []
         for graph in config.graphs:
             for condition in config.conditions:
                 group = [
@@ -118,6 +121,19 @@ def aggregate_results(config: ExperimentConfig) -> dict[str, object]:
                 ):
                     raise ValueError(f"unmatched tau_calibration for {graph}, seed {seed}")
                 pairs.append((baseline[1], full[1]))
+                slug = f"{graph}/seed-{seed}"
+                directories = {name: root / slug / name for name in ("dense", "baseline", "full")}
+                if dense is None or any(
+                    not (path / "evaluation" / "mcc_samples.pt").exists()
+                    for path in directories.values()
+                ):
+                    # Legacy evaluations have no grouped samples. Scalar MCC
+                    # cannot supply a valid independent-group uncertainty estimate.
+                    missing_group_mcc.append(slug)
+                else:
+                    comparison = paired_mcc_comparison(directories, fixed_budget=config.train.steps)
+                    group_mcc[slug] = comparison
+                    write_json(root / "paired_mcc" / f"{slug}.json", comparison)
             if pairs:
                 keys = set[str].intersection(*(set(a) & set(b) for a, b in pairs))
                 differences[graph] = {
@@ -133,6 +149,8 @@ def aggregate_results(config: ExperimentConfig) -> dict[str, object]:
             "expected_runs": len(config.conditions) * len(config.graphs) * len(config.seeds),
             "per_condition": summaries,
             "paired_full_minus_baseline": differences,
+            "paired_group_mcc": group_mcc,
+            "missing_group_mcc": missing_group_mcc,
         }
         write_json(root / "summary.json", result)
         if rows:

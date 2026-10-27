@@ -6,7 +6,7 @@ used only to generate diagnostic derivatives, never as learned-code coordinates.
 
 import math
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 from torch import Tensor
@@ -165,6 +165,9 @@ def geometry_diagnostic(
     test_queries: int,
     rcond: float = 1e-6,
     displacement: float = 0.01,
+    split_name: Literal["calibration", "validation", "test"] = "test",
+    group_indices: tuple[int, ...] | None = None,
+    calibration_indices: tuple[int, ...] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Tensor]]:
     """Measure donor sensitivity, predictor transmission and held-out local access.
 
@@ -182,8 +185,25 @@ def geometry_diagnostic(
         raise ValueError("Group, donor and query counts must be positive")
     if not 0 < rcond < 1 or not math.isfinite(displacement) or displacement <= 0:
         raise ValueError("Require 0<rcond<1 and finite positive displacement")
-    split = cast(TensorSplit, data["test"])
+    if split_name not in {"calibration", "validation", "test"}:
+        raise ValueError("Unknown geometry split")
+    split = cast(TensorSplit, data[split_name])
     calibration = cast(TensorSplit, data["calibration"])
+    for name, indices, source in (
+        ("selected", group_indices, split),
+        ("calibration", calibration_indices, calibration),
+    ):
+        if indices is not None and (
+            not indices
+            or len(set(indices)) != len(indices)
+            or min(indices) < 0
+            or max(indices) >= len(source["theta"])
+        ):
+            raise ValueError(f"Invalid {name} geometry group selection")
+    if group_indices is not None:
+        split = {key: value[list(group_indices)] for key, value in split.items()}
+    if calibration_indices is not None:
+        calibration = {key: value[list(calibration_indices)] for key, value in calibration.items()}
     metadata = cast(dict[str, Any], data["metadata"])
     views = split["true_states"].shape[1]
     if views != 10 or donor_contexts > views or fit_queries + test_queries > views - 1:
@@ -351,6 +371,10 @@ def geometry_diagnostic(
         raw["required_code_shift_in_calibration_std"] = required_shift
     summary: dict[str, Any] = {
         "groups": groups,
+        "split": split_name,
+        "group_indices": list(group_indices[:groups])
+        if group_indices is not None
+        else list(range(groups)),
         "donor_contexts_per_group": donor_contexts,
         "fit_queries": fit_queries,
         "test_queries": test_queries,

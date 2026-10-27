@@ -617,6 +617,9 @@ def _run_one(
                         "run_identity": identity,
                         "checkpoint_path": final_path.name,
                         "checkpoint_sha256": checkpoint_fingerprint,
+                        "mcc_samples_sha256": _checkpoint_hash(
+                            directory / "evaluation" / "mcc_samples.pt"
+                        ),
                         "evaluated_step": payload["step"],
                         "selected_step": trainer.validation_state["best_step"],
                         "selection_metric": trainer.validation_state["selection_metric"],

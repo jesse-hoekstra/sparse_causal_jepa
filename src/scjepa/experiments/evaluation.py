@@ -570,6 +570,18 @@ def evaluate_model(
                 test.shuffled_prediction_mse - test.prediction_mse
             )
         truth = test.reference_graphs
+        views = base_data.episodes_per_parameter
+        torch.save(
+            {
+                "format_version": 1,
+                "group_ids": test.ids.reshape(-1, views)[:, 0],
+                "calibration_group_ids": calibration.ids.reshape(-1, views)[:, 0],
+                "states": test.states.reshape(-1, views, *test.states.shape[1:]),
+                "online": test.online.reshape(-1, views, *test.online.shape[1:]),
+                "state_match": torch.tensor(matches["state"].columns),
+            },
+            artifact_dir / "mcc_samples.pt",
+        )
         torch.save(
             {
                 "matrix": observation_matrix.detach().cpu(),

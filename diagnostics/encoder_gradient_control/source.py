@@ -182,12 +182,24 @@ def _validate_caches(bundle: SourceBundle) -> None:
                 raise ValueError(f"Invalid evaluation tensor: {split_name}/{key}")
 
 
-def load_source(source_dir: Path, seed: int) -> SourceBundle:
+def load_source(
+    source_dir: Path, seed: int, *, training_source_root: Path | None = None
+) -> SourceBundle:
     """Load only validated final weight-one artifacts; never write to the source directory."""
     root = source_dir.resolve()
     protocol_path = root / "protocol.json"
     protocol = cast(dict[str, Any], read_json(protocol_path))
-    if protocol["code_identity"] != training_code_identity():
+    if training_source_root is None:
+        source_code_identity = training_code_identity()
+    else:
+        from diagnostics.joint_acquisition.provenance import (
+            historical_training_identity,
+            validate_training_semantics,
+        )
+
+        source_code_identity = historical_training_identity(training_source_root)
+        validate_training_semantics(training_source_root, Path(__file__).resolve().parents[2])
+    if protocol["code_identity"] != source_code_identity:
         raise ValueError(
             "Source training code changed; restore its original helper/source versions"
         )
