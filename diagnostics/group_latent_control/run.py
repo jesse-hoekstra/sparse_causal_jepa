@@ -38,6 +38,7 @@ from scjepa.training.rng import preserve_rng
 
 Phase = Literal["teacher", "amortization", "washout"]
 Initialization = Literal["warm", "fresh_zero"]
+TeacherObjectiveArm = Literal["original", "without_parameter_sigreg"]
 PHASES: tuple[Phase, ...] = ("teacher", "amortization", "washout")
 
 
@@ -49,6 +50,7 @@ class Config:
     output_dir: str
     training_source_root: str | None = None
     initialization: Initialization = "warm"
+    teacher_objective_arm: TeacherObjectiveArm = "original"
     seed: int = 202610261301
     device: str = "cpu"
     teacher_steps: int = 30000
@@ -67,6 +69,8 @@ class Config:
         budgets = (self.teacher_steps, self.amortization_steps, self.washout_steps)
         if self.initialization not in ("warm", "fresh_zero"):
             raise ValueError("Unknown curriculum initialization")
+        if self.teacher_objective_arm not in ("original", "without_parameter_sigreg"):
+            raise ValueError("Unknown teacher objective arm")
         if self.verification:
             if not all(1 <= value <= 3 for value in budgets) or not 2 <= self.groups <= 4:
                 raise ValueError(
@@ -197,10 +201,14 @@ def training_loss(
     phase: Phase,
     table: nn.Embedding | None,
     objective: PredictiveSupervisionObjective,
+    *,
+    teacher_objective_arm: TeacherObjectiveArm = "original",
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Use group IDs only for train codes; washout has no auxiliary target or table."""
     if set(batch) != {"online", "target", "actions"}:
         raise ValueError("Training receives no physical parameters or reference maps")
+    if teacher_objective_arm not in ("original", "without_parameter_sigreg"):
+        raise ValueError("Unknown teacher objective arm")
     if phase == "teacher":
         if table is None:
             raise ValueError("Teacher phase needs train-group codes")
@@ -208,16 +216,50 @@ def training_loss(
     else:
         output = cached_multiquery_forward(model, batch, queries=1)
     loss, terms = objective(output)
+    original = loss
+    effective_weight = objective.config.parameter_regularizer_weight
+    if phase == "teacher" and teacher_objective_arm == "without_parameter_sigreg":
+        # Evaluate the original objective for matched RNG and reporting, but do not
+        # subtract its potentially dominant SIGReg gradient from a float32 sum.
+        loss = (
+            terms["weighted_prediction"]
+            + objective.config.logit_weight * terms["logit"]
+            + objective.config.parameter_consistency_weight * terms["parameter_consistency"]
+        )
+        effective_weight = 0.0
     if phase == "amortization":
         if table is None:
             raise ValueError("Amortization needs detached train-only targets")
         targets = table(indices).detach()[:, None]
         terms["code_amortization"] = (output.parameters - targets).square().mean()
         loss = loss + terms["code_amortization"]
+        original = original + terms["code_amortization"]
     elif phase == "washout" and table is not None:
         raise ValueError("Washout must discard the teacher table")
     terms["optimized_total"] = loss
+    terms["original_total"] = original
+    terms["effective_parameter_regularizer_weight"] = loss.new_tensor(effective_weight)
     return loss, terms
+
+
+@torch.no_grad()
+def scale_metrics(model: SCJEPA, table: nn.Embedding | None) -> dict[str, float]:
+    """Read full TRAIN-table scale and predictor input scale without RNG or state mutation."""
+    metrics = {
+        "scale/predictor_param_project_weight_norm": float(
+            model.predictor.param_project.weight.detach().double().square().sum().sqrt()
+        ),
+        "scale/teacher_table_available": float(table is not None),
+    }
+    if table is not None:
+        values = table.weight.detach().double().cpu()
+        centered = values - values.mean(0)
+        covariance = centered.T @ centered / (len(values) - 1)
+        metrics["scale/teacher_table_rms"] = float(values.square().mean().sqrt())
+        eigenvalues = cast(Tensor, torch.linalg.eigvalsh(covariance))  # pyright: ignore[reportUnknownMemberType]
+        for index, value in enumerate(eigenvalues):
+            metrics[f"scale/teacher_table_covariance_eigenvalue_{index + 1}"] = float(value)
+    return metrics
 
 
 def assess_model(
@@ -323,7 +365,10 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                 **evidence,
                 "config": asdict(config),
                 "hypothesis": (
-                    "Train-only latent optimization can bypass the encoder learning path; "
+                    "Removing teacher parameter SIGReg from update1 may permit transferable "
+                    "system-code learning instead of early nuisance-code variation."
+                    if config.teacher_objective_arm == "without_parameter_sigreg"
+                    else "Train-only latent optimization can bypass the encoder learning path; "
                     "one-context amortization can transfer the result. Fresh-zero mode "
                     "removes the trained encoder/predictor basin and random table nuisance."
                 ),
@@ -331,6 +376,19 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                     "Teacher group-code fitting, then label-free auxiliary code "
                     "amortization, then original joint objective; architecture/DGP/state "
                     "maps unchanged."
+                ),
+                "teacher_objective_arm": config.teacher_objective_arm,
+                "teacher_effective_parameter_regularizer_weight": (
+                    0.0
+                    if config.teacher_objective_arm == "without_parameter_sigreg"
+                    else bundle.protocol["objective_config"]["parameter_regularizer_weight"]
+                ),
+                "teacher_objective_change": (
+                    "Teacher only: omit parameter SIGReg from optimized loss from update1; "
+                    "compute original forward/projection RNG, optimize forecast+logit+consistency "
+                    "directly. Restore original .4 parameter SIGReg in amortization/washout."
+                    if config.teacher_objective_arm == "without_parameter_sigreg"
+                    else "Original objective in all phases."
                 ),
                 "decision": (
                     "Held-out single-context all-six retention/use supports transfer; low "
@@ -348,7 +406,8 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                             else "source encoder/predictor and donor0 code initialization; "
                         )
                         + "fresh predictor Adam .001 and SparseAdam .01, combined gradient clip1; "
-                        "original forecast+logit+SIGReg, consistency identicallyzero."
+                        "forecast+logit+selected teacher SIGReg; consistency zero by construction "
+                        "up to floating-point roundoff."
                     ),
                     "amortization": (
                         "Original encoder only, fresh Adam .001 clip1; mean square to detached "
@@ -454,11 +513,12 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                     bootstrap_samples=config.bootstrap_samples,
                     seed=config.seed,
                 )
-                row = {
+                row: dict[str, Any] = {
                     "global_step": global_step,
                     "phase": phase,
                     "phase_step": phase_step,
                     **measured,
+                    "scale": scale_metrics(model, table),
                 }
                 records.append(row)
                 raw_records[global_step] = raw
@@ -466,6 +526,7 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                     global_step,
                     {
                         **assessment_metrics(row),
+                        **row["scale"],
                         "phase/index": float(PHASES.index(phase)),
                         "phase/update": float(phase_step),
                     },
@@ -582,7 +643,20 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                         optimizer.zero_grad(set_to_none=True)
                         if latent_optimizer:
                             latent_optimizer.zero_grad(set_to_none=True)
-                        loss, terms = training_loss(model, batch, indices, phase, table, objective)
+                        objective_options: dict[str, TeacherObjectiveArm] = (
+                            {"teacher_objective_arm": config.teacher_objective_arm}
+                            if config.teacher_objective_arm != "original"
+                            else {}
+                        )
+                        loss, terms = training_loss(
+                            model,
+                            batch,
+                            indices,
+                            phase,
+                            table,
+                            objective,
+                            **objective_options,
+                        )
                         if not bool(torch.isfinite(loss)):
                             raise FloatingPointError(
                                 f"Nonfinite {phase} loss at update {phase_step}"
@@ -714,6 +788,11 @@ def main() -> None:
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--training-source-root")
     parser.add_argument("--initialization", choices=("warm", "fresh_zero"), default="warm")
+    parser.add_argument(
+        "--teacher-objective-arm",
+        choices=("original", "without_parameter_sigreg"),
+        default="original",
+    )
     for name, default in (
         ("seed", 202610261301),
         ("teacher-steps", 30000),

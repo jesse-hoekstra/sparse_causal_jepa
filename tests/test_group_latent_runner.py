@@ -15,6 +15,7 @@ from diagnostics.group_latent_control.run import (
     Config,
     Initialization,
     Phase,
+    TeacherObjectiveArm,
     initialize_control,
     run,
 )
@@ -73,12 +74,14 @@ def one_thread() -> Generator[None, None, None]:
     [("teacher", 2), ("amortization", 1), ("amortization", 2)],
 )
 @pytest.mark.parametrize("initialization", ["warm", "fresh_zero"])
+@pytest.mark.parametrize("teacher_arm", ["original", "without_parameter_sigreg"])
 def test_staged_resume_matches_uninterrupted_and_preserves_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     interrupted_phase: Phase,
     interrupt_at: int,
     initialization: Initialization,
+    teacher_arm: TeacherObjectiveArm,
 ) -> None:
     source = source_with_initialization(tmp_path / "source")
     hashes = {str(path): sha(path) for path in source.rglob("*") if path.is_file()}
@@ -93,6 +96,7 @@ def test_staged_resume_matches_uninterrupted_and_preserves_source(
         bootstrap_samples=16,
         verification=True,
         initialization=initialization,
+        teacher_objective_arm=teacher_arm,
     )
     complete = run(config)
     resumed_config = replace(config, output_dir=str(tmp_path / "resumed"))
@@ -106,13 +110,23 @@ def test_staged_resume_matches_uninterrupted_and_preserves_source(
         phase: Phase,
         table: nn.Embedding | None,
         objective: PredictiveSupervisionObjective,
+        *,
+        teacher_objective_arm: TeacherObjectiveArm = "original",
     ) -> tuple[Tensor, dict[str, Tensor]]:
         nonlocal calls
         if phase == interrupted_phase:
             calls += 1
             if calls == interrupt_at:
                 raise RuntimeError("Operational interruption")
-        return original(model, batch, indices, phase, table, objective)
+        return original(
+            model,
+            batch,
+            indices,
+            phase,
+            table,
+            objective,
+            teacher_objective_arm=teacher_objective_arm,
+        )
 
     monkeypatch.setattr(runner, "training_loss", interrupt)
     with pytest.raises(RuntimeError, match="Operational interruption"):
@@ -138,6 +152,11 @@ def test_staged_resume_matches_uninterrupted_and_preserves_source(
     other: Initialization = "fresh_zero" if initialization == "warm" else "warm"
     with pytest.raises(ValueError, match="Resume source, settings or code changed"):
         run(replace(resumed_config, initialization=other), resume=True)
+    other_arm: TeacherObjectiveArm = (
+        "original" if teacher_arm == "without_parameter_sigreg" else "without_parameter_sigreg"
+    )
+    with pytest.raises(ValueError, match="Resume source, settings or code changed"):
+        run(replace(resumed_config, teacher_objective_arm=other_arm), resume=True)
 
 
 def test_fresh_initialization_copies_only_verified_learned_modules(tmp_path: Path) -> None:
