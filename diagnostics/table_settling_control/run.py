@@ -4,7 +4,7 @@ import argparse
 import hashlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 from torch import Tensor, nn
@@ -27,16 +27,48 @@ from diagnostics.table_settling_control.evaluation import (
 from diagnostics.table_settling_control.source import load_inputs, model_fingerprint
 from scjepa.data.datasets import canonical_fingerprint, tensor_fingerprint
 from scjepa.experiments.storage import file_lock, read_json, write_json
-from scjepa.models.model import SCJEPA
+from scjepa.models.model import SCJEPA, ModelOutput
 from scjepa.training.distributed import GlobalBatchSampler
 from scjepa.training.logging import WandbConfig, WandbLogger
 from scjepa.training.loop import ObjectiveConfig
 from scjepa.training.rng import preserve_rng
 
+ObjectiveArm = Literal["original", "without_parameter_sigreg"]
+
+
+class TableSettlingObjective(PredictiveSupervisionObjective):
+    """Omit only parameter SIGReg when selected, preserving its original RNG draw."""
+
+    def __init__(self, config: ObjectiveConfig, arm: ObjectiveArm = "original") -> None:
+        """Retain the fixed original configuration and validate the isolated loss arm."""
+        if arm not in ("original", "without_parameter_sigreg"):
+            raise ValueError("Unknown table-settling objective arm")
+        super().__init__(config, 1.0)
+        self.arm = arm
+
+    def forward(self, output: ModelOutput) -> tuple[Tensor, dict[str, Tensor]]:
+        """Compute matched components and explicitly distinguish optimized from original loss."""
+        original, terms = super().forward(output)
+        optimized = original
+        effective_weight = self.config.parameter_regularizer_weight
+        if self.arm == "without_parameter_sigreg":
+            # Do not subtract a possibly dominant SIGReg gradient from a summed
+            # float32 gradient. This graph contains only the retained components.
+            optimized = (
+                terms["weighted_prediction"]
+                + self.config.logit_weight * terms["logit"]
+                + self.config.parameter_consistency_weight * terms["parameter_consistency"]
+            )
+            effective_weight = 0.0
+        terms["original_objective"] = original
+        terms["optimized_objective"] = optimized
+        terms["effective_parameter_regularizer_weight"] = original.new_tensor(effective_weight)
+        return optimized, terms
+
 
 @dataclass(frozen=True)
 class Config:
-    """One bounded teacher-settling diagnostic; no model or forecast-only arm."""
+    """One bounded teacher-settling arm; no model updates or label-supervised loss."""
 
     curriculum_dir: str
     audit_dir: str
@@ -47,6 +79,7 @@ class Config:
     groups: int = 256
     bootstrap_samples: int = 1000
     threads: int = 1
+    objective_arm: ObjectiveArm = "original"
     verification: bool = False
     wandb_mode: str = "disabled"
     wandb_project: str = "sparse_causal_jepa"
@@ -54,6 +87,8 @@ class Config:
 
     def __post_init__(self) -> None:
         """Fix scientific budget and require isolated outputs."""
+        if self.objective_arm not in ("original", "without_parameter_sigreg"):
+            raise ValueError("Unknown table-settling objective arm")
         if self.verification:
             if not 1 <= self.steps <= 3 or self.groups != 4:
                 raise ValueError("Verification requires four groups and at most three steps")
@@ -165,16 +200,27 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                 "config": asdict(config),
                 "hypothesis": (
                     "Free train-group codes are under-settled relative to the fixed predictor."
+                    if config.objective_arm == "original"
+                    else "Parameter SIGReg impedes transferable settling under the fixed predictor."
                 ),
                 "controlled_change": (
-                    "Only selected train-code rows receive additional full-objective "
+                    "Only selected train-code rows receive additional "
                     "SparseAdam .01 updates with source moment rows and global step retained; "
-                    "global clip1; all model weights fixed."
+                    "global clip1; all model weights fixed. "
+                    + (
+                        "Optimize the original objective unchanged."
+                        if config.objective_arm == "original"
+                        else "Omit only parameter SIGReg from the optimized loss; compute the "
+                        "same original forward and preserve its projection RNG consumption."
+                    )
                 ),
                 "decision": (
                     "Improvement on cached and new episodes supports transferable settling; "
                     "cached-only improvement suggests nuisance fitting; neither does not "
-                    "exclude joint underoptimization."
+                    "exclude joint underoptimization. For the omission arm, compare paired "
+                    "system forecasts and missing-factor readouts against the original arm "
+                    "started from the same teacher checkpoint, moments and seeds. Forecast "
+                    "improvement without retention does not establish acquisition."
                 ),
                 "scope": (
                     "Already-trained systems only. 128/64/64 readout is low-power diagnostic "
@@ -188,6 +234,11 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                     "optimization; no model/encoder training or early selection."
                 ),
                 "objective": inputs.bundle.protocol["objective_config"],
+                "effective_parameter_regularizer_weight": (
+                    inputs.bundle.protocol["objective_config"]["parameter_regularizer_weight"]
+                    if config.objective_arm == "original"
+                    else 0.0
+                ),
             }
             if resume:
                 if read_json(out / "protocol.json")["identity"] != identity:
@@ -275,8 +326,8 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                 resume_state=tracking,
             )
             write_json(out / "tracking.json", logger.metadata)
-            objective = PredictiveSupervisionObjective(
-                ObjectiveConfig(**inputs.bundle.protocol["objective_config"]), 1.0
+            objective = TableSettlingObjective(
+                ObjectiveConfig(**inputs.bundle.protocol["objective_config"]), config.objective_arm
             ).to(device)
             batch_size = inputs.bundle.batch_size
             if not config.verification and batch_size != 16:
@@ -371,6 +422,7 @@ def run(config: Config, *, resume: bool = False) -> dict[str, Any]:
                     raise RuntimeError("Evaluation-only episodes changed during optimization")
                 result = {
                     "identity": identity,
+                    "objective_arm": config.objective_arm,
                     "step": step,
                     "scope": protocol["scope"],
                     "records": records,
@@ -420,6 +472,11 @@ def main() -> None:
     for name in ("curriculum-dir", "audit-dir", "output-dir"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--objective-arm",
+        choices=("original", "without_parameter_sigreg"),
+        default="original",
+    )
     for name, default in (
         ("seed", 2026102703),
         ("steps", 4000),

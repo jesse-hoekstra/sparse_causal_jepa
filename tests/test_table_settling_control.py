@@ -1,3 +1,4 @@
+import copy
 from collections.abc import Generator
 from dataclasses import replace
 from pathlib import Path
@@ -10,6 +11,7 @@ from test_group_latent_runner import source_with_initialization
 from test_multiquery_control import make_batch, make_model, objective_config
 from torch import Tensor, nn
 
+from diagnostics.group_latent_control.forward import clip_teacher_gradients, group_teacher_forward
 from diagnostics.group_latent_control.run import Config as CurriculumConfig
 from diagnostics.group_latent_control.run import run as curriculum_run
 from diagnostics.multiquery_control.data import TensorSplit
@@ -17,7 +19,13 @@ from diagnostics.multiquery_control.run import sha
 from diagnostics.predictive_supervision_control.objective import PredictiveSupervisionObjective
 from diagnostics.table_settling_control import run as runner
 from diagnostics.table_settling_control.evaluation import new_episodes, paired_change
-from diagnostics.table_settling_control.run import Config, run, train_update
+from diagnostics.table_settling_control.run import (
+    Config,
+    ObjectiveArm,
+    TableSettlingObjective,
+    run,
+    train_update,
+)
 from diagnostics.table_settling_control.source import load_inputs, model_fingerprint
 from scjepa.data.datasets import canonical_fingerprint, tensor_fingerprint
 from scjepa.experiments.storage import read_json, write_json
@@ -121,6 +129,65 @@ def test_only_sampled_table_rows_change_and_labels_cannot_enter_training() -> No
         )
 
 
+@pytest.mark.parametrize("arm", ["original", "without_parameter_sigreg"])
+def test_matched_arm_preserves_rng_and_sparse_moments_update(arm: ObjectiveArm) -> None:
+    model = make_model().requires_grad_(False)
+    _, batch = make_batch(model)
+    table = nn.Embedding.from_pretrained(  # pyright: ignore[reportUnknownMemberType]
+        torch.randn(4, 6, dtype=torch.float64), freeze=False, sparse=True
+    )
+    indices = torch.tensor([0, 2])
+    optimizer = torch.optim.SparseAdam(table.parameters(), lr=0.01)
+    ordinary = PredictiveSupervisionObjective(objective_config(), 1.0)
+    train_update(model, table, optimizer, batch, indices, ordinary)
+    before = table.weight.detach().clone()
+    model_before = model_fingerprint(model)
+    expected_table = copy.deepcopy(table)
+    expected_optimizer = torch.optim.SparseAdam(expected_table.parameters(), lr=0.01)
+    expected_optimizer.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+    expected_optimizer.zero_grad(set_to_none=True)
+    torch.manual_seed(837)  # pyright: ignore[reportUnknownMemberType]
+    original, components = ordinary(group_teacher_forward(model, batch, expected_table(indices)))
+    expected = original
+    if arm == "without_parameter_sigreg":
+        expected = (
+            components["prediction"]
+            + objective_config().logit_weight * components["logit"]
+            + objective_config().parameter_consistency_weight * components["parameter_consistency"]
+        )
+    expected.backward()  # pyright: ignore[reportUnknownMemberType]
+    clip_teacher_gradients((), expected_table, 1.0)
+    expected_optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+    expected_rng = torch.get_rng_state().clone()
+    torch.manual_seed(837)  # pyright: ignore[reportUnknownMemberType]
+    objective = (
+        TableSettlingObjective(objective_config())
+        if arm == "original"
+        else TableSettlingObjective(objective_config(), arm)
+    )
+    actual = train_update(model, table, optimizer, batch, indices, objective)
+    assert actual["original_objective"] == float(original.detach())
+    assert actual["optimized_objective"] == float(expected.detach())
+    assert actual["effective_parameter_regularizer_weight"] == (0.4 if arm == "original" else 0.0)
+    assert torch.equal(torch.get_rng_state(), expected_rng)
+    torch.testing.assert_close(table.weight, expected_table.weight, rtol=0, atol=0)
+    torch.testing.assert_close(table.weight.grad, expected_table.weight.grad, rtol=0, atol=0)
+    torch.testing.assert_close(
+        optimizer.state_dict(), expected_optimizer.state_dict(), rtol=0, atol=0
+    )
+    assert optimizer.state_dict()["state"][0]["step"] == 2
+    assert torch.equal(table.weight[[1, 3]], before[[1, 3]])
+    assert model_fingerprint(model) == model_before
+    assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_objective_arm_is_validated() -> None:
+    with pytest.raises(ValueError, match="objective arm"):
+        Config("/curriculum", "/audit", "/output", objective_arm=cast(ObjectiveArm, "other"))
+    with pytest.raises(ValueError, match="objective arm"):
+        TableSettlingObjective(objective_config(), cast(ObjectiveArm, "other"))
+
+
 def test_new_episodes_are_reproducible_evaluation_only_and_independent() -> None:
     model = make_model().float().eval().requires_grad_(False)
     theta = torch.zeros(4, 6, dtype=torch.float64, requires_grad=True)
@@ -214,6 +281,25 @@ def test_resume_freeze_source_integrity_and_evaluation_separation(
     assert last["optimizer"]["state"][0]["step"] == 5
     assert all(sha(Path(name)) == expected for name, expected in source_hashes.items())
     assert run(resumed_config, resume=True) == resumed
+    omission_config = replace(
+        config,
+        output_dir=str(tmp_path / "omission"),
+        objective_arm="without_parameter_sigreg",
+    )
+    omission = run(omission_config)
+    assert omission["identity"] != full["identity"]
+    assert omission["objective_arm"] == "without_parameter_sigreg"
+    assert omission["records"][0] == full["records"][0]
+    first_evaluation = torch.load(tmp_path / "full/evaluation_only.pt", weights_only=False)
+    omission_evaluation = torch.load(tmp_path / "omission/evaluation_only.pt", weights_only=False)
+    for key in ("group_indices", "new_episodes", "theta_evaluation_only"):
+        torch.testing.assert_close(first_evaluation[key], omission_evaluation[key], rtol=0, atol=0)
+    assert (
+        read_json(tmp_path / "omission/protocol.json")["effective_parameter_regularizer_weight"]
+        == 0
+    )
+    with pytest.raises(ValueError, match="Resume settings"):
+        run(replace(resumed_config, objective_arm="without_parameter_sigreg"), resume=True)
     with pytest.raises(ValueError, match="Resume settings"):
         run(replace(resumed_config, seed=14), resume=True)
     eval_path = tmp_path / "resumed/evaluation_only.pt"
