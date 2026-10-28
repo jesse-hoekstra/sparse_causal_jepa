@@ -1,6 +1,11 @@
+import json
+import math
+from pathlib import Path
+
 import torch
 
 from diagnostics.oracle_state_learning.analysis import (
+    controller_history,
     grouped_moments,
     moment_mcc,
     paired_mcc_interval,
@@ -55,3 +60,18 @@ def test_routing_uses_distinct_online_and_target_calibration_permutations() -> N
     for name, edges in (("state", 18), ("action", 96), ("parameter", 12)):
         assert result[f"routing/{name}_observed_union_edges"] == edges
         assert result[f"routing/{name}_aligned_union_shd"] == 0
+
+
+def test_controller_history_deduplicates_resumed_steps_and_labels_sampling(tmp_path: Path) -> None:
+    path = tmp_path / "history.jsonl"
+    rows = [
+        {"step": 100, "geco/penalty_weight": math.exp(-12)},
+        {"step": 200, "geco/penalty_weight": math.exp(-12)},
+        {"step": 200, "geco/penalty_weight": 0.1},
+        {"step": 200, "validation/state_mcc": 0.99},
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    result = controller_history(path)
+    assert result["logged_updates"] == 2
+    assert result["fraction_logged_at_penalty_floor"] == 0.5
+    assert result["maximum_penalty_weight"] == result["final_penalty_weight"] == 0.1

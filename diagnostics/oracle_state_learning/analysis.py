@@ -153,6 +153,27 @@ def routing_metrics(samples: dict[str, Tensor], matching: dict[str, Any]) -> dic
     return result
 
 
+def controller_history(path: Path) -> dict[str, float]:
+    """Summarize logged accepted updates without treating samples as every update."""
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    logged = {int(row["step"]): row for row in rows if "geco/penalty_weight" in row}
+    if not logged:
+        return {}
+    weights = [float(logged[step]["geco/penalty_weight"]) for step in sorted(logged)]
+    if any(not math.isfinite(value) or value <= 0 for value in weights):
+        raise ValueError("Nonfinite or nonpositive logged GECO penalty weight")
+    return {
+        "logged_updates": float(len(weights)),
+        "minimum_penalty_weight": min(weights),
+        "maximum_penalty_weight": max(weights),
+        "final_penalty_weight": weights[-1],
+        "fraction_logged_at_penalty_floor": sum(
+            value <= math.exp(-12) * (1 + 1e-5) for value in weights
+        )
+        / len(weights),
+    }
+
+
 def _load(directory: Path) -> dict[str, Any]:
     from diagnostics.oracle_state_learning.run import verify_completion
 
@@ -241,6 +262,7 @@ def analyze(directories: Sequence[Path], output: Path) -> dict[str, Any]:
                 "directory": arm["directory"],
                 "metrics": {split: payload["metrics"] for split, payload in arm["splits"].items()},
                 "verified_artifact_count": len(arm["completion"]["hashes"]),
+                "controller_history": controller_history(Path(arm["directory"]) / "history.jsonl"),
             }
         )
     for seed in (0, 1):
