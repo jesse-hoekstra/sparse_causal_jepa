@@ -149,9 +149,15 @@ def audit(config: AuditConfig) -> dict[str, Any]:
         raise ValueError("Completed checkpoint, data or fixed update budget differs")
     saved = cast(dict[str, Any], torch.load(source / "validation.pt", weights_only=True))
     previous_threads = torch.get_num_threads()
+    previous_precision = torch.get_float32_matmul_precision()
+    previous_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    previous_cudnn_tf32 = torch.backends.cudnn.allow_tf32
     logger: WandbLogger | None = None
     try:
         torch.set_num_threads(config.threads)
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
         with (
             file_lock(output.parent / f".{output.name}.lock"),
             preserve_rng(torch.device(config.device)),
@@ -218,6 +224,9 @@ def audit(config: AuditConfig) -> dict[str, Any]:
         raise
     finally:
         torch.set_num_threads(previous_threads)
+        torch.set_float32_matmul_precision(previous_precision)
+        torch.backends.cuda.matmul.allow_tf32 = previous_matmul_tf32
+        torch.backends.cudnn.allow_tf32 = previous_cudnn_tf32
 
 
 def main() -> None:

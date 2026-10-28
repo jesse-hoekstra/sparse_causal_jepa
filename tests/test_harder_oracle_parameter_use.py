@@ -8,23 +8,32 @@ from typing import Any, cast
 
 import pytest
 import torch
+from torch import Tensor
 
-from diagnostics.harder_oracle.data import PrepareConfig, build_data, prepare
+from diagnostics.harder_oracle import parameter_use
+from diagnostics.harder_oracle.data import PrepareConfig, StateData, build_data, prepare
 from diagnostics.harder_oracle.model import build_control
 from diagnostics.harder_oracle.parameter_use import AuditConfig, audit, cyclic_donors, measure
 from diagnostics.harder_oracle.run import TrainConfig, train, verify_completion
 from diagnostics.oracle_state_learning.data import read_json, sha
 from scjepa.data.controlled_vector import VectorObservationMap
+from scjepa.models.model import SCJEPA
 
 
 @pytest.fixture(autouse=True)
 def one_thread() -> Iterator[None]:
     previous = torch.get_num_threads()
+    precision = torch.get_float32_matmul_precision()
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
     torch.set_num_threads(1)
     try:
         yield
     finally:
         torch.set_num_threads(previous)
+        torch.set_float32_matmul_precision(precision)
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
 
 
 def _config(path: Path) -> PrepareConfig:
@@ -79,7 +88,7 @@ def test_measure_replaces_only_theta_and_preserves_all_model_tensors(tmp_path: P
 
 
 def test_completed_audit_reproduces_factual_predictions_without_touching_source(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cache, source, destination = (tmp_path / name for name in ("data", "trained", "audit"))
     prepare(_config(cache))
@@ -98,7 +107,29 @@ def test_completed_audit_reproduces_factual_predictions_without_touching_source(
     )
     before = {path.name: sha(path) for path in source.iterdir() if path.is_file()}
     matched = read_json(source / "matching.json")
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    observed: list[tuple[str, bool, bool]] = []
+
+    def inspect_precision(
+        model: SCJEPA, data: StateData, *, batch_size: int = 16, device: str = "cpu"
+    ) -> tuple[dict[str, float], dict[str, Tensor]]:
+        observed.append(
+            (
+                torch.get_float32_matmul_precision(),
+                bool(torch.backends.cuda.matmul.allow_tf32),
+                torch.backends.cudnn.allow_tf32,
+            )
+        )
+        return measure(model, data, batch_size=batch_size, device=device)
+
+    monkeypatch.setattr(parameter_use, "measure", inspect_precision)
     result = audit(AuditConfig(str(source), str(cache), str(destination)))
+    assert observed == [("highest", False, False)]
+    assert torch.get_float32_matmul_precision() == "high"
+    assert torch.backends.cuda.matmul.allow_tf32
+    assert torch.backends.cudnn.allow_tf32
     assert result["parent_identity"] == trained["identity"]
     assert result["split"] == "validation"
     assert result["steps"] == 2
@@ -115,6 +146,9 @@ def test_completed_audit_reproduces_factual_predictions_without_touching_source(
         assert sha(destination / name) == digest
     with pytest.raises(FileExistsError, match="fresh"):
         audit(AuditConfig(str(source), str(cache), str(destination)))
+    assert torch.get_float32_matmul_precision() == "high"
+    assert torch.backends.cuda.matmul.allow_tf32
+    assert torch.backends.cudnn.allow_tf32
 
 
 def test_invalid_donor_population_and_nonvalidation_split_are_rejected(tmp_path: Path) -> None:

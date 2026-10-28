@@ -2,6 +2,7 @@
 
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Literal
 
 import pytest
 import torch
@@ -74,14 +75,17 @@ def test_true22action_support_is_aligned_with_separate_encoder_assignments() -> 
         assert result[f"routing/{name}_aligned_union_shd"] == 0
 
 
+@pytest.mark.parametrize("transport_chart", ["mixed", "physical"])
 def test_analysis_audits_real_tiny_endpoints_but_cannot_call_them_scientific(
     tmp_path: Path,
+    transport_chart: Literal["mixed", "physical"],
 ) -> None:
     before = code_identity()
     prepare(
         PrepareConfig(
             str(tmp_path / "data"),
             profile="smoke",
+            transport_chart=transport_chart,
             train_groups=4,
             calibration_groups=2,
             validation_groups=2,
@@ -114,10 +118,27 @@ def test_analysis_audits_real_tiny_endpoints_but_cannot_call_them_scientific(
     directories = [tmp_path / name for name in ("dense", "mlp", "baseline", "full")]
     with pytest.raises(ValueError, match="Scientific analysis"):
         analyze(directories, tmp_path / "forbidden")
-    result = analyze(directories, tmp_path / "analysis", draws=10, allow_smoke=True)
+    result = analyze(
+        directories,
+        tmp_path / "analysis",
+        primary_chart=transport_chart,
+        draws=10,
+        allow_smoke=True,
+    )
     assert result["profile"] == "smoke"
+    assert result["primary_chart"] == transport_chart
     assert len(result["arms"]) == 4
     assert len(result["comparisons"]) == 4
     assert all(row["split"] == "validation" for row in result["comparisons"])
     assert before == code_identity()
     assert not any((directory / "test.pt").exists() for directory in directories)
+    wrong_chart = "mixed" if transport_chart == "physical" else "physical"
+    with pytest.raises(ValueError, match="must use only the declared"):
+        analyze(directories, tmp_path / "wrong-chart", primary_chart=wrong_chart, allow_smoke=True)
+
+
+def test_physical_primary_rejects_original_companion_before_reading_artifacts(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="only to the mixed primary"):
+        analyze([], tmp_path / "analysis", primary_chart="physical", companion=tmp_path / "unused")

@@ -224,14 +224,23 @@ def analyze(
     output: Path,
     *,
     companion: Path | None = None,
+    primary_chart: str = "mixed",
     draws: int = 1000,
     allow_smoke: bool = False,
 ) -> dict[str, Any]:
-    """Audit four primary fits and separately describe the physical-transport companion."""
+    """Audit one chart; mixed primary may add a physical-transport dense companion."""
+    if primary_chart not in {"mixed", "physical"}:
+        raise ValueError("Primary chart must be mixed or physical")
+    if companion is not None and primary_chart != "mixed":
+        raise ValueError("The physical companion applies only to the mixed primary comparison")
     arms = [_load(directory, allow_smoke=allow_smoke) for directory in directories]
     indexed = {arm["condition"]: arm for arm in arms}
     if len(arms) != 4 or set(indexed) != {"dense", "mlp", "baseline", "full"}:
         raise ValueError("Require exactly four unique primary-condition endpoints")
+    if any(arm["config"]["candidate_settings"]["transport_chart"] != primary_chart for arm in arms):
+        raise ValueError(
+            f"Primary comparison must use only the declared {primary_chart} state transport"
+        )
     for key in ("data_identity", "code_identity", "initial_encoder_identity"):
         if len({arm["completion"][key] for arm in arms}) != 1:
             raise ValueError(f"Primary arms differ in {key}")
@@ -245,8 +254,6 @@ def analyze(
         != 1
     ):
         raise ValueError("Primary SPARTAN predictor initialization differs")
-    if any(arm["config"]["candidate_settings"]["transport_chart"] != "mixed" for arm in arms):
-        raise ValueError("Primary comparison must use the declared mixed state transport")
     if len({arm["completion"]["steps"] for arm in arms}) != 1:
         raise ValueError("Primary fixed budgets differ")
     sparse = [indexed[name] for name in ("baseline", "full")]
@@ -286,6 +293,7 @@ def analyze(
     result: dict[str, Any] = {
         "schema": "harder-oracle-validation-analysis-v1",
         "profile": "smoke" if allow_smoke else "exploratory",
+        "primary_chart": primary_chart,
         "geco_tau": tau,
         **screen_decision(
             {name: arm["splits"]["validation"]["metrics"] for name, arm in indexed.items()}
@@ -351,10 +359,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs", nargs=4, type=Path, required=True)
     parser.add_argument("--companion", type=Path)
+    parser.add_argument("--primary-chart", choices=("mixed", "physical"), default="mixed")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     torch.set_num_threads(1)
-    result = analyze(args.runs, args.output_dir, companion=args.companion)
+    result = analyze(
+        args.runs, args.output_dir, companion=args.companion, primary_chart=args.primary_chart
+    )
     print(
         json.dumps({"decision": result["decision"], "comparisons": result["comparisons"]}, indent=2)
     )
