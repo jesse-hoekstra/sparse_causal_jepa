@@ -41,6 +41,45 @@ def _source(root: Path) -> Path:
     return source
 
 
+def test_persisted_observation_matrix_survives_platform_qr_rounding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    original_map = data.VectorObservationMap
+    persisted = cast(
+        dict[str, Tensor], torch.load(source / "observation_map.pt", weights_only=True)
+    )["matrix"]
+    alternate = persisted.clone()
+    alternate[0, 0] = torch.nextafter(alternate[0, 0], torch.tensor(float("inf")))
+    assert not torch.equal(alternate, persisted)
+    # Both matrices satisfy the real map's orthogonality validation; only their
+    # final floating-point rounding differs, as with platform-dependent QR.
+    original_map(matrix=alternate, dimension=6)
+    supplied_matrices: list[Tensor | None] = []
+
+    class PlatformMap(original_map):
+        def __init__(
+            self, seed: int = 1729, matrix: Tensor | None = None, *, dimension: int = 6
+        ) -> None:
+            supplied_matrices.append(matrix)
+            super().__init__(
+                seed=seed, matrix=alternate if matrix is None else matrix, dimension=dimension
+            )
+
+    monkeypatch.setattr(data, "VectorObservationMap", PlatformMap)
+    output = tmp_path / "paired"
+    data.prepare(data.PrepareConfig(str(output), str(source), profile="smoke"))
+    assert len(supplied_matrices) == 1
+    assert supplied_matrices[0] is not None
+    assert torch.equal(supplied_matrices[0], persisted)
+    assert sha(output / "observation_map.pt") == sha(source / "observation_map.pt")
+    old = cast(dict[str, Any], torch.load(source / "train.pt", weights_only=True))
+    new = cast(dict[str, Any], torch.load(output / "train.pt", weights_only=True))
+    assert torch.equal(
+        old["tensors"]["observations"][:, :, 0], new["tensors"]["observations"][:, :, 0]
+    )
+
+
 def test_regenerated_phase_preserves_inputs_and_initial_states_without_loading_test_labels(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -216,14 +216,12 @@ def prepare(config: PrepareConfig, *, resume: bool = False) -> dict[str, Any]:
                 ("completion.json", "source_completion.json"),
             ):
                 shutil.copyfile(source / original, output / copied)
-            observation = VectorObservationMap(seed=1729, dimension=6)
             source_map = cast(
                 dict[str, Tensor], torch.load(output / "observation_map.pt", weights_only=True)
             )
-            if set(source_map) != {"matrix"} or not torch.equal(
-                source_map["matrix"], observation.matrix
-            ):
-                raise ValueError("Paired observation map differs from the fixed renderer")
+            if set(source_map) != {"matrix"}:
+                raise ValueError("Paired observation map must contain only its persisted matrix")
+            observation = VectorObservationMap(seed=1729, matrix=source_map["matrix"], dimension=6)
             names = [
                 "protocol.json",
                 "wandb.json",
