@@ -9,7 +9,12 @@ from typing import Any, cast
 
 import torch
 
-from diagnostics.harder_oracle.analysis import analyze, routing_metrics, screen_decision
+from diagnostics.harder_oracle.analysis import (
+    analyze,
+    ordering_evidence,
+    routing_metrics,
+    screen_decision,
+)
 from diagnostics.harder_oracle.run import verify_completion
 from diagnostics.oracle_state_learning.analysis import audit_samples, paired_mcc_interval, read_json
 from diagnostics.oracle_state_learning.data import sha
@@ -176,7 +181,9 @@ def confirm(
                 ),
             }
         )
-    decision = screen_decision({name: item["metrics"] for name, item in indexed.items()})
+    endpoint_metrics = {name: item["metrics"] for name, item in indexed.items()}
+    decision = screen_decision(endpoint_metrics)
+    ordering = ordering_evidence(endpoint_metrics, comparisons, split="test")
     passed = decision.pop("screen_passed")
     decision["confirmation_passed"] = passed
     decision["decision"] = (
@@ -190,6 +197,14 @@ def confirm(
         **decision,
         "source_identity": source,
         "validation_screen_passed": validation["screen_passed"],
+        "validation_ordering_supported": validation["ordering_supported"],
+        "validation_confirmation_eligible": validation["confirmation_eligible"],
+        "confirmed_requested_ordering": ordering["confirmation_eligible"],
+        "test_ordering_supported": ordering["ordering_supported"],
+        "ordering_interval_lower_bounds_positive": ordering[
+            "ordering_interval_lower_bounds_positive"
+        ],
+        "adaptive_ordering_rule": ordering["adaptive_ordering_rule"],
         "geco_tau": validation["geco_tau"],
         "all_sparse_test_constraints_feasible": all(
             indexed[name]["metrics"]["base"] <= validation["geco_tau"]
@@ -224,6 +239,9 @@ def confirm(
             "test uses its frozen final checkpoints.",
             "One training seed is exploratory. Paired group intervals condition on trained "
             "models and do not estimate training-seed variability.",
+            "confirmed_requested_ordering uses the adaptive rule declared during validation "
+            "development before test. It does not replace the original .05/.03 targets, "
+            "confirmation_passed or their original decision.",
             "No model training, inference, test-fitted assignment or test-fitted probe "
             "occurs in this audit.",
             "Oracle parameters are supplied; success does not establish learned-parameter "
@@ -259,7 +277,15 @@ def main() -> None:
     torch.set_num_threads(1)
     result = confirm(args.runs, args.parents, args.output_dir, primary_chart=args.primary_chart)
     print(
-        json.dumps({"decision": result["decision"], "comparisons": result["comparisons"]}, indent=2)
+        json.dumps(
+            {
+                "decision": result["decision"],
+                "confirmation_passed": result["confirmation_passed"],
+                "confirmed_requested_ordering": result["confirmed_requested_ordering"],
+                "comparisons": result["comparisons"],
+            },
+            indent=2,
+        )
     )
 
 

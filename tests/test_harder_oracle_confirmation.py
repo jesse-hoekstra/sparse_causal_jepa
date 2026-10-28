@@ -93,6 +93,9 @@ def test_confirm_reads_saved_samples_and_never_calls_training_or_inference(
     assert result["profile"] == "smoke"
     assert result["primary_chart"] == "mixed"
     assert not result["confirmation_passed"]
+    assert not result["confirmed_requested_ordering"]
+    assert "validation_confirmation_eligible" in result
+    assert result["criteria"]["full_baseline_gap_minimum"] == 0.05
     assert len(result["comparisons"]) == 4
     assert all(pair["split"] == "test" for pair in result["comparisons"])
     assert "source_identity" in result

@@ -98,6 +98,75 @@ def screen_decision(metrics: dict[str, dict[str, float]]) -> dict[str, Any]:
     }
 
 
+def ordering_evidence(
+    metrics: dict[str, dict[str, float]],
+    comparisons: Sequence[dict[str, Any]],
+    *,
+    split: str,
+) -> dict[str, Any]:
+    """Apply the adaptive ordering rule separately from the original effect targets."""
+    if split not in {"validation", "test"}:
+        raise ValueError("Ordering evidence requires validation or test comparisons")
+    strict = screen_decision(metrics)
+    positive: dict[str, bool] = {}
+    for left, right in (("full", "baseline"), ("baseline", "dense")):
+        matching = [
+            item
+            for item in comparisons
+            if (item.get("left"), item.get("right"), item.get("split")) == (left, right, split)
+        ]
+        if len(matching) != 1:
+            raise ValueError("Ordering evidence requires exactly one interval for each comparison")
+        interval = matching[0]
+        lower, upper, difference = (
+            float(interval[name]) for name in ("lower_95", "upper_95", "difference")
+        )
+        if not all(math.isfinite(value) for value in (lower, upper, difference)) or lower > upper:
+            raise ValueError("Ordering intervals must be finite and correctly ordered")
+        expected = metrics[left]["state_mcc"] - metrics[right]["state_mcc"]
+        if not math.isclose(difference, expected, abs_tol=1e-9, rel_tol=1e-8):
+            raise ValueError("Ordering interval difference disagrees with endpoint MCC")
+        positive[f"{left}_minus_{right}"] = lower > 0
+    supported = all(positive.values())
+    full_recovered = metrics["full"]["state_mcc"] >= FULL_MCC_MINIMUM
+    quality = all(
+        strict[key]
+        for key in (
+            "code_health_all_conditions",
+            "state_linear_r2_all_conditions",
+            "reasonably_low_forecast_error_all_conditions",
+        )
+    )
+    return {
+        "ordering_supported": supported,
+        "confirmation_eligible": supported and full_recovered and quality,
+        "ordering_interval_lower_bounds_positive": positive,
+        "adaptive_ordering_rule": {
+            "status": "adaptively declared after validation monitoring, before scientific test",
+            "full_mcc_minimum": FULL_MCC_MINIMUM,
+            "all_four_conditions_require": {
+                "online_and_target_variance_min_exclusive": 1e-12,
+                "whole_code_state_linear_r2_minimum": STATE_R2_MINIMUM,
+                "normalized_forecast_mse_maximum": QUALITY_CAP,
+                "finite_reported_metrics": True,
+            },
+            "required_intervals": (
+                "full-minus-baseline and baseline-minus-dense each have paired "
+                "group-bootstrap 95% lower bound > 0"
+            ),
+            "ordering_supported_definition": "both required interval lower bounds are positive",
+            "confirmation_eligible_definition": (
+                "ordering_supported plus full MCC and all-four-arm quality requirements"
+            ),
+            "original_strict_effect_targets_unchanged": True,
+            "scope": (
+                "separate group-conditional intervals for one trained seed; "
+                "no training-seed robustness guarantee"
+            ),
+        },
+    }
+
+
 def _load(directory: Path, *, allow_smoke: bool) -> dict[str, Any]:
     completion = verify_completion(directory, kind="train", require_current_source=False)
     config = read_json(directory / "config.json")
@@ -290,14 +359,16 @@ def analyze(
                 ),
             }
         )
+    endpoint_metrics = {
+        name: arm["splits"]["validation"]["metrics"] for name, arm in indexed.items()
+    }
     result: dict[str, Any] = {
         "schema": "harder-oracle-validation-analysis-v1",
         "profile": "smoke" if allow_smoke else "exploratory",
         "primary_chart": primary_chart,
         "geco_tau": tau,
-        **screen_decision(
-            {name: arm["splits"]["validation"]["metrics"] for name, arm in indexed.items()}
-        ),
+        **screen_decision(endpoint_metrics),
+        **ordering_evidence(endpoint_metrics, comparisons, split="validation"),
         "arms": [_summary(arm) for arm in arms],
         "comparisons": comparisons,
         "all_sparse_validation_constraints_feasible": all(
@@ -308,6 +379,8 @@ def analyze(
             "test confirmation.",
             "One seed is exploratory. Group intervals condition on trained models and "
             "do not estimate training-seed variability.",
+            "The adaptive ordering rule does not replace the original .05/.03 effect "
+            "targets or imply that screen_passed is true.",
             "Different transport DGPs have different physical trajectories. Companion "
             "differences are descriptive, not paired identical-state effects.",
             "Finite routing unions do not certify population functional causal supports "
@@ -367,7 +440,16 @@ def main() -> None:
         args.runs, args.output_dir, companion=args.companion, primary_chart=args.primary_chart
     )
     print(
-        json.dumps({"decision": result["decision"], "comparisons": result["comparisons"]}, indent=2)
+        json.dumps(
+            {
+                "decision": result["decision"],
+                "screen_passed": result["screen_passed"],
+                "ordering_supported": result["ordering_supported"],
+                "confirmation_eligible": result["confirmation_eligible"],
+                "comparisons": result["comparisons"],
+            },
+            indent=2,
+        )
     )
 
 
