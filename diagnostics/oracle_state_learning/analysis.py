@@ -120,6 +120,39 @@ def audit_samples(payload: dict[str, Any], groups: int) -> dict[str, Tensor]:
     return samples
 
 
+def routing_metrics(samples: dict[str, Tensor], matching: dict[str, Any]) -> dict[str, float]:
+    """Describe observed path unions; finite local routes do not certify causal support."""
+    result: dict[str, float] = {}
+    rows = list(matching["target_columns"])
+    columns = list(matching["online_columns"])
+    state_truth = torch.zeros(6, 6, dtype=torch.bool)
+    state_truth[:3, :3] = True
+    state_truth[3:, 3:] = True
+    parameter_truth = torch.eye(6, dtype=torch.bool)
+    parameter_truth[torch.arange(6), [3, 4, 5, 0, 1, 2]] = True
+    truths = {
+        "state": state_truth,
+        "action": torch.ones(6, 16, dtype=torch.bool),
+        "parameter": parameter_truth,
+    }
+    for name, truth in truths.items():
+        if f"graph_{name}" not in samples:
+            continue
+        frequencies = samples[f"graph_{name}"].double().mean(0)
+        if frequencies.shape != truth.shape or not bool(
+            ((frequencies >= 0) & (frequencies <= 1)).all()
+        ):
+            raise ValueError("Malformed local routing frequencies")
+        aligned = frequencies[rows]
+        if name == "state":
+            aligned = aligned[:, columns]
+        support = aligned > 0
+        result[f"routing/{name}_observed_union_edges"] = float(support.sum())
+        result[f"routing/{name}_mean_local_edges"] = float(frequencies.sum())
+        result[f"routing/{name}_aligned_union_shd"] = float((support ^ truth).sum())
+    return result
+
+
 def _load(directory: Path) -> dict[str, Any]:
     from diagnostics.oracle_state_learning.run import verify_completion
 
@@ -163,6 +196,7 @@ def _load(directory: Path) -> dict[str, Any]:
             value = mean_correlation_coefficient(CoordinateMatch(columns), features, truth)
             if not math.isclose(value, payload["metrics"][key], rel_tol=1e-9, abs_tol=1e-10):
                 raise ValueError("Reported state MCC disagrees with frozen calibration assignment")
+        payload["metrics"].update(routing_metrics(samples, matching))
         splits[split] = payload
     return {
         "directory": str(directory),
@@ -215,9 +249,13 @@ def analyze(directories: Sequence[Path], output: Path) -> dict[str, Any]:
             raise ValueError("Within-seed initial state encoders differ")
         if len({arm["startup"]["predictor_identity"] for arm in paired[:3]}) != 1:
             raise ValueError("Within-seed initial SPARTAN predictors differ")
-        for left, right in (("full", "baseline"), ("baseline", "mlp")):
+        for left, right, split in (
+            ("full", "baseline", "test"),
+            ("baseline", "mlp", "test"),
+            ("baseline", "dense", "validation"),
+        ):
             a, b = indexed[(left, seed)], indexed[(right, seed)]
-            av, bv = a["splits"]["test"]["samples"], b["splits"]["test"]["samples"]
+            av, bv = a["splits"][split]["samples"], b["splits"][split]["samples"]
             if not torch.equal(av["group_ids"], bv["group_ids"]) or not torch.equal(
                 av["states"], bv["states"]
             ):
@@ -225,6 +263,7 @@ def analyze(directories: Sequence[Path], output: Path) -> dict[str, Any]:
             comparisons.append(
                 {
                     "seed": seed,
+                    "split": split,
                     "left": left,
                     "right": right,
                     **paired_mcc_interval(
@@ -274,6 +313,8 @@ def analyze(directories: Sequence[Path], output: Path) -> dict[str, Any]:
             "training-seed robustness.",
             "Oracle parameters remove acquisition; results do not establish ordinary "
             "label-free parameter recovery.",
+            "Observed routing unions use calibration coordinate assignments; they are "
+            "finite path diagnostics, not certified functional causal graphs.",
             "Finite training does not certify global functional graph minima or falsify "
             "the identifiability theorem.",
         ],
