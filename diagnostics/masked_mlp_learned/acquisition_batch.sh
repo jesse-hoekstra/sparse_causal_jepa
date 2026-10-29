@@ -27,7 +27,15 @@ printf '%s\n' "code=$CODE_DIR" "state_batch=$STATE_BATCH" "hosts=${HOSTS[*]}" \
 git -C "$CODE_DIR" rev-parse HEAD >> "$BATCH/protocol.txt"
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$BATCH/coordinator.log"; }
-on_host() { local host=$1; shift; ssh -n -o BatchMode=yes -o ConnectTimeout=10 "omi-rapid-$host" "$@"; }
+on_host() {
+  local host=$1
+  shift
+  if [ "$(hostname -s)" = "omi-rapid-$host" ]; then
+    bash -c "$*"
+  else
+    ssh -n -o BatchMode=yes -o ConnectTimeout=10 "omi-rapid-$host" "$@"
+  fi
+}
 idle() {
   local memory utilization
   read -r memory utilization < <(on_host "$1" \
