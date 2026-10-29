@@ -62,6 +62,7 @@ for attempt in {0..7}; do
     {
       printf '#!/usr/bin/env bash\nset -uo pipefail\ncd %q\n' "$CODE_DIR"
       printf 'export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1\n'
+      printf 'export PYTHONPATH=%q\n' "$CODE_DIR/src:$CODE_DIR"
       printf '%q ' "$PYTHON" -u -m diagnostics.masked_mlp_learned.run train \
         --condition dense --seed "$seed" --acquisition-seed "$((1000 + 100 * attempt + seed))" \
         --steps 100000 --states-from "$STATE_BATCH/states-s$seed/results" \
@@ -95,6 +96,7 @@ for attempt in {0..7}; do
 done
 
 cd "$CODE_DIR"
+export PYTHONPATH="$CODE_DIR/src:$CODE_DIR"
 admitted=1
 for seed in {0..4}; do
   candidates=()
