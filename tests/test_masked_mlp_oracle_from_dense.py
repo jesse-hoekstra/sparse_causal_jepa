@@ -1,5 +1,7 @@
 """Dense-endpoint initialization, endpoint authentication and exact resume of sparse arms."""
 
+import json
+import math
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -117,6 +119,8 @@ def test_endpoint_seed_condition_and_arm_are_checked(tmp_path: Path) -> None:
         from_dense.FromDenseConfig(_train_config(tmp_path, "dense"), "unused")
     with pytest.raises(ValueError, match="geco_step_size"):
         from_dense.FromDenseConfig(_train_config(tmp_path, "full"), "unused", geco_step_size=0)
+    with pytest.raises(ValueError, match="lambda_init"):
+        from_dense.FromDenseConfig(_train_config(tmp_path, "full"), "unused", geco_lambda_init=0)
     _prepare(tmp_path, dense_seeds=(0, 1))
     with pytest.raises(ValueError, match="seed differs"):
         from_dense.train(_config(tmp_path, "full", seed=0, init_seed=1))
@@ -172,10 +176,19 @@ def test_geco_step_size_is_recorded_and_changes_the_run_identity(tmp_path: Path)
         replace(config.train, output_dir=str(tmp_path / "slow-geco")),
         config.init_dir,
         geco_step_size=0.001,
+        geco_lambda_init=50.0,
     )
     completion = from_dense.train(slow)
     record = read_json(tmp_path / "slow-geco/config.json")
     assert record["geco"]["step_size"] == 0.001
+    assert record["geco"]["lambda_init"] == 50.0
+    first = next(
+        json.loads(line)
+        for line in (tmp_path / "slow-geco/history.jsonl").read_text().splitlines()
+        if "geco/log10_penalty_weight" in line
+    )
+    # One update from log(50); the multiplier moves by at most step * |violation|.
+    assert abs(first["geco/log10_penalty_weight"] + math.log10(50.0)) < 0.05
     assert completion["identity"] != default["identity"]
     history = (tmp_path / "slow-geco/history.jsonl").read_text().splitlines()
     assert any("geco/log10_penalty_weight" in line for line in history)

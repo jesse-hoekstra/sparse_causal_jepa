@@ -54,6 +54,7 @@ class FromDenseConfig:
     train: run.TrainConfig
     init_dir: str
     geco_step_size: float = 0.1
+    geco_lambda_init: float = 1000.0
 
     def __post_init__(self) -> None:
         """Only the sparse arms start from a dense endpoint."""
@@ -61,6 +62,13 @@ class FromDenseConfig:
             raise ValueError("a dense endpoint initializes only baseline or full arms")
         if not math.isfinite(self.geco_step_size) or self.geco_step_size <= 0:
             raise ValueError("geco_step_size must be finite and positive")
+        # GECOConfig validates the initial multiplier against its log bounds.
+        GECOConfig(
+            enabled=True,
+            tau=1.0,
+            step_size=self.geco_step_size,
+            lambda_init=self.geco_lambda_init,
+        )
 
 
 def verify_completion(
@@ -165,7 +173,12 @@ def _train(config: FromDenseConfig, output: Path, *, resume: bool) -> dict[str, 
     _load_dense(model, endpoint["state"])
     model = model.to(device)
     initials = run._initial_identities(model)  # pyright: ignore[reportPrivateUsage]
-    controller = GECOConfig(enabled=True, tau=1.0, step_size=config.geco_step_size)
+    controller = GECOConfig(
+        enabled=True,
+        tau=1.0,
+        step_size=config.geco_step_size,
+        lambda_init=config.geco_lambda_init,
+    )
     objective = TrainingObjective(objective_config(settings.condition, 0.0), controller).to(device)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if any(parameter.requires_grad for parameter in model.target_encoder.parameters()):
@@ -460,6 +473,7 @@ def main() -> None:
     train_parser.add_argument("--wandb-entity")
     train_parser.add_argument("--wandb-group", default="masked-mlp-oracle-from-dense")
     train_parser.add_argument("--geco-step-size", type=float, default=0.1)
+    train_parser.add_argument("--geco-lambda-init", type=float, default=1000.0)
     summary_parser = commands.add_parser("summarize")
     summary_parser.add_argument("--runs", nargs="+", required=True)
     arguments = parser.parse_args()
@@ -483,6 +497,7 @@ def main() -> None:
                 ),
                 arguments.init_dir,
                 geco_step_size=arguments.geco_step_size,
+                geco_lambda_init=arguments.geco_lambda_init,
             ),
             resume=arguments.resume,
         )
