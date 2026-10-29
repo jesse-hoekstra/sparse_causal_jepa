@@ -13,6 +13,7 @@ from diagnostics.balanced_action_oracle.data import PrepareConfig, prepare
 from diagnostics.isotropic_oracle.data import PrepareConfig as SourcePrepareConfig
 from diagnostics.isotropic_oracle.data import prepare as prepare_source
 from diagnostics.masked_mlp_oracle import run as runner
+from diagnostics.masked_mlp_oracle.model import build_predictor
 from diagnostics.oracle_state_learning.data import read_json
 from scjepa.models.model import SCJEPA, ModelOutput
 from scjepa.training.loop import TrainingObjective
@@ -144,6 +145,16 @@ def test_exact_interruption_resume(
     )
     for key in ("model", "optimizer", "objective", "sampler", "torch_rng", "cuda_rng"):
         torch.testing.assert_close(left[key], right[key], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs a non-CPU device")
+def test_graph_metrics_accept_predictors_on_an_accelerator() -> None:
+    predictor = build_predictor("full").to("mps")
+    graphs = predictor.thresholded_graphs()
+    assert all(value.device.type == "cpu" for value in graphs.values())
+    metrics = runner.graph_metrics(predictor, list(range(6)))
+    assert metrics["masks/parameter_edges"] == 36.0
+    assert metrics["masks/parameter_aligned_shd"] == 24.0
 
 
 def test_protocol_drift_and_source_changes_are_rejected(

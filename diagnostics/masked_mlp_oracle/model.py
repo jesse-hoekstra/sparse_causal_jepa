@@ -131,7 +131,7 @@ class MaskedTrunkPredictor(nn.Module):
         return {name: value for name, value in blocks.items() if value is not None}
 
     def thresholded_graphs(self) -> dict[str, Tensor]:
-        """Return evaluation-time global graphs; fixed-open blocks are all ones."""
+        """Return evaluation-time global graphs on CPU; fixed-open blocks are all ones."""
         shapes = {
             "state": self.state_dim,
             "action": self.action_dim,
@@ -139,7 +139,7 @@ class MaskedTrunkPredictor(nn.Module):
         }
         logits = self.learned_logits()
         return {
-            name: (logits[name] > 0)
+            name: (logits[name].detach() > 0).cpu()
             if name in logits
             else torch.ones(self.state_dim, inputs, dtype=torch.bool)
             for name, inputs in shapes.items()
