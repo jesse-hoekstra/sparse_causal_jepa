@@ -2,18 +2,21 @@
 
 Adapted from the masked-MLP oracle runners (``diagnostics/masked_mlp_oracle``). The
 only scientific change is the parameter source: a transition-set parameter encoder
-infers a six-dimensional code from each episode's first ten online state encodings
-and nine actions, and that attached code predicts another episode of the same
-parameter group (cyclic donor/recipient routing). True theta never enters training;
-it is used only to evaluate the code. There is no parameter regularizer and no
+infers a code from each episode's first ten online state encodings and nine
+actions, and that attached code predicts another episode of the same parameter
+group (cyclic donor/recipient routing). True theta never enters training; it is
+used only to evaluate the code. There is no parameter regularizer and no
 consistency term. Everything else is unchanged: the authenticated Paley24 cache,
 the chart-equivariant masked MLP, the 6-64-64-6 state encoder with Gaussian head,
 EMA .996, state SIGReg .4, AdamW .001, clip 1, B16/R10/K10/T12/L1 and the attached
 two-step forecast from online state 9.
 
-Protocol: fresh dense arms (all masks open) for 100k updates; ``calibrate`` fixes
-``tau`` as 1.1 times the seed-zero dense calibration prediction MSE; baseline and
-full arms start from their seed's dense endpoint (encoders, parameter encoder,
+Protocol: fresh dense arms (all masks open) for 100k updates, by default with the
+audited acquisition recipe (twelve-dimensional code, encoder gains, shared-feature
+output rows; see ``acquisition``); ``project`` maps each twelve-code dense endpoint
+to a six-code model through TRAIN shared modes; ``calibrate`` fixes ``tau`` as 1.1
+times the seed-zero six-code dense calibration prediction MSE; baseline and full
+arms start from their seed's six-code dense endpoint (encoders, parameter encoder,
 trunk, readouts; fresh mask logits, AdamW, GECO, sampler) and run 100k or 200k
 sparse updates with GECO on the normalized prediction loss.
 """
@@ -35,11 +38,16 @@ from scipy.optimize import linear_sum_assignment  # pyright: ignore[reportUnknow
 from torch import Tensor, nn
 
 from diagnostics.balanced_action_oracle.data import StateData, load_data
+from diagnostics.isotropic_oracle.dgp import graphs as true_graphs
+from diagnostics.masked_mlp_learned.acquisition import (
+    apply_encoder_gains,
+    initialize_shared_output,
+    project_code,
+)
 from diagnostics.masked_mlp_oracle import run as oracle
 from diagnostics.masked_mlp_oracle.model import (
     MaskedTrunkPredictor,
     _gaussian_,  # pyright: ignore[reportPrivateUsage]
-    build_predictor,
     trunk_width,
 )
 from diagnostics.oracle_state_learning.core import EvaluationResult, objective_config
@@ -57,28 +65,46 @@ from scjepa.training.logging import WandbConfig, WandbLogger
 from scjepa.training.loop import TrainingObjective, seed_everything
 from scjepa.training.rng import preserve_rng
 
-SCHEMA = "masked-mlp-learned-state-learning-v1"
+SCHEMA = "masked-mlp-learned-state-learning-v2"
 NORMALIZED_MSE_CAP = 0.15
 SEEDS = (0, 1, 2, 3, 4)
+SPARSE_CODE_DIM = 6
+CODE_DIMS = (6, 12)
 PAIRS = ((0, 3), (1, 4), (2, 5))
 INPUT_KEYS = frozenset({"observations", "actions"})
 MASK_LOGITS = frozenset(f"predictor.{name}_logits" for name in ("state", "action", "parameter"))
 type Condition = Literal["dense", "baseline", "full"]
 type Profile = Literal["exploratory", "smoke"]
+type Initializer = Literal["native", "gain", "shared_feature"]
+INITIALIZERS: tuple[Initializer, ...] = ("native", "gain", "shared_feature")
 
 
 def code_identity() -> str:
     """Bind the masked-MLP oracle identity (cache, model, helpers) plus this runner."""
-    files = {name: sha(Path(__file__).with_name(name)) for name in ("__init__.py", "run.py")}
+    files = {
+        name: sha(Path(__file__).with_name(name))
+        for name in ("__init__.py", "acquisition.py", "run.py")
+    }
     return canonical_fingerprint({"oracle_code_identity": oracle.code_identity(), "files": files})
 
 
-def build_control(condition: Condition, seed: int) -> SCJEPA:
-    """Pair encoder, parameter encoder, trunk and readouts across conditions for one seed."""
+def build_control(
+    condition: Condition,
+    seed: int,
+    code_dim: int = SPARSE_CODE_DIM,
+    initializer: Initializer = "native",
+) -> SCJEPA:
+    """Pair encoder, parameter encoder, trunk and readouts across conditions for one seed.
+
+    ``gain`` and ``shared_feature`` scale the parameter encoder; the data-dependent
+    shared-feature output rows are fitted afterwards by ``initialize_shared_output``.
+    """
+    if code_dim not in CODE_DIMS or initializer not in INITIALIZERS:
+        raise ValueError("unknown code dimension or initializer")
     config = ModelConfig(
         observation_dim=6,
         state_dim=6,
-        param_dim=6,
+        param_dim=code_dim,
         action_dim=24,
         context_len=10,
         history_len=1,
@@ -109,7 +135,17 @@ def build_control(condition: Condition, seed: int) -> SCJEPA:
             _gaussian_(layer.weight, layer.in_features)
             _gaussian_(layer.bias, layer.in_features)
         model.target_encoder.load_state_dict(model.online_encoder.state_dict())
-        predictor = build_predictor(condition)
+        if initializer != "native":
+            apply_encoder_gains(model)
+        if condition not in {"dense", "baseline", "full"}:
+            raise ValueError("Unknown masked MLP condition")
+        sparse = condition != "dense"
+        predictor = MaskedTrunkPredictor(
+            param_dim=code_dim,
+            learn_state=sparse,
+            learn_action=sparse,
+            learn_parameter=condition == "full",
+        )
     model.predictor = cast(Spartan, predictor)
     return model
 
@@ -325,7 +361,7 @@ def code_metrics(calibration: EvaluationResult, result: EvaluationResult) -> dic
     rows_, cols = cast(tuple[Any, Any], linear_sum_assignment(-correlation.numpy()))
     metrics["code_mcc"] = float(correlation[rows_, cols].mean())
     purities: list[float] = []
-    for j in range(6):
+    for j in range(codes.shape[1]):
         scores: list[float] = []
         for pair in PAIRS:
             weights = _ridge(_design(theta[:, list(pair)], "linear"), codes[:, j : j + 1])
@@ -360,6 +396,8 @@ class TrainConfig:
     calibration_dir: str | None = None
     init_dir: str | None = None
     geco_step_size: float = 0.1
+    code_dim: int | None = None
+    initializer: Initializer | None = None
     device: str = "cpu"
     threads: int = 1
     log_every: int = 100
@@ -381,6 +419,12 @@ class TrainConfig:
         sparse = self.condition != "dense"
         if sparse != (self.calibration_dir is not None) or sparse != (self.init_dir is not None):
             raise ValueError("exactly the sparse arms need a calibration and a dense endpoint")
+        if sparse and (self.code_dim is not None or self.initializer is not None):
+            raise ValueError("sparse arms inherit a six-code model from their dense endpoint")
+        if self.code_dim is not None and self.code_dim not in CODE_DIMS:
+            raise ValueError(f"code dimension must be one of {CODE_DIMS}")
+        if self.initializer is not None and self.initializer not in INITIALIZERS:
+            raise ValueError(f"initializer must be one of {INITIALIZERS}")
         if self.profile == "exploratory":
             if (self.batch_size, self.lr, self.grad_clip) != (16, 0.001, 1.0):
                 raise ValueError("exploratory optimizer settings are fixed")
@@ -403,6 +447,20 @@ class TrainConfig:
         if any(not math.isfinite(value) or value <= 0 for value in values):
             raise ValueError("learning rate, clipping and GECO step must be finite and positive")
         WandbConfig(mode=self.wandb_mode, project=self.wandb_project, entity=self.wandb_entity)
+
+    @property
+    def model_code_dim(self) -> int:
+        """Dense arms default to the audited twelve-code interface; sparse arms use six."""
+        if self.condition != "dense":
+            return SPARSE_CODE_DIM
+        return 12 if self.code_dim is None else self.code_dim
+
+    @property
+    def model_initializer(self) -> Initializer:
+        """Dense arms default to the audited recipe; sparse arms load every weight."""
+        if self.condition != "dense":
+            return "native"
+        return "shared_feature" if self.initializer is None else self.initializer
 
 
 def verify_completion(
@@ -451,6 +509,18 @@ def _initial_identities(model: SCJEPA) -> dict[str, str]:
     }
 
 
+def _six_code_dense(directory: Path, profile: str) -> dict[str, Any]:
+    """Authenticate a six-code dense endpoint: a six-code fit or a projected twelve-code fit."""
+    completion = verify_completion(directory, require_current_source=True)
+    if completion["kind"] not in {"train", "projection"}:
+        raise ValueError("dense endpoint must be a training or projection completion")
+    if completion["condition"] != "dense" or completion["profile"] != profile:
+        raise ValueError("reference must be a matching-profile dense endpoint")
+    if completion["code_dim"] != SPARSE_CODE_DIM:
+        raise ValueError("project the twelve-code dense endpoint to six codes first")
+    return completion
+
+
 @dataclass(frozen=True)
 class CalibrateConfig:
     """Fix the prediction bound from the one seed-zero dense endpoint."""
@@ -476,9 +546,7 @@ def calibrate(config: CalibrateConfig) -> dict[str, Any]:
     with file_lock(output.parent / f".{output.name}.lock"):
         _fresh_output(output)
         directory = Path(config.dense_dir).resolve()
-        completion = verify_completion(directory, kind="train", require_current_source=True)
-        if completion["condition"] != "dense" or completion["profile"] != config.profile:
-            raise ValueError("calibration reference must be a matching-profile dense fit")
+        completion = _six_code_dense(directory, config.profile)
         if completion["seed"] != 0:
             raise ValueError("calibration requires the seed-zero dense reference")
         metrics = read_json(directory / "calibration.json")["metrics"]
@@ -495,12 +563,15 @@ def calibrate(config: CalibrateConfig) -> dict[str, Any]:
             "tau_factor": config.tau_factor,
             "reference": {
                 "directory": str(directory),
+                "kind": completion["kind"],
                 "identity": completion["identity"],
                 "completion_sha256": sha(directory / "completion.json"),
                 "prediction_loss": prediction,
                 "steps": completion["steps"],
             },
-            "policy": "tau_factor times dense calibration prediction MSE; no weights transferred",
+            "policy": (
+                "tau_factor times six-code dense calibration prediction MSE; no weights transferred"
+            ),
         }
         record["identity"] = canonical_fingerprint(record)
         write_json(output / "calibration.json", record)
@@ -529,11 +600,11 @@ def _dense_endpoint(config: TrainConfig, data_identity: str) -> dict[str, Any] |
     if config.init_dir is None:
         return None
     directory = Path(config.init_dir).resolve()
-    completion = verify_completion(directory, kind="train", require_current_source=True)
-    if completion["condition"] != "dense" or completion["seed"] != config.seed:
+    completion = _six_code_dense(directory, config.profile)
+    if completion["seed"] != config.seed:
         raise ValueError("initialization must be the seed-matched dense endpoint")
-    if completion["profile"] != config.profile or completion["data_identity"] != data_identity:
-        raise ValueError("dense endpoint profile or data identity differs")
+    if completion["data_identity"] != data_identity:
+        raise ValueError("dense endpoint data identity differs")
     checkpoint = cast(
         dict[str, Any], torch.load(directory / "last.pt", map_location="cpu", weights_only=False)
     )
@@ -544,6 +615,7 @@ def _dense_endpoint(config: TrainConfig, data_identity: str) -> dict[str, Any] |
     return {
         "record": {
             "directory": str(directory),
+            "kind": completion["kind"],
             "identity": completion["identity"],
             "completion_sha256": sha(directory / "completion.json"),
             "checkpoint_sha256": sha(directory / "last.pt"),
@@ -562,29 +634,54 @@ def _load_dense(model: SCJEPA, state: dict[str, Tensor]) -> None:
         raise ValueError("dense endpoint and sparse model differ beyond mask logits")
 
 
+def _graph_metrics(predictor: MaskedTrunkPredictor, columns: list[int]) -> dict[str, float]:
+    """Aligned graphs; an open twelve-code predictor uses a padded true parameter graph.
+
+    The six extra code columns of the padded graph have no true edges.
+    """
+    if predictor.param_dim == SPARSE_CODE_DIM:
+        return oracle.graph_metrics(predictor, columns)
+    if predictor.learned_logits():
+        raise ValueError("only open dense predictors use a twelve-dimensional code")
+    truth = true_graphs()
+    metrics: dict[str, float] = {}
+    for name, expected in (("state", truth.state[:, 0]), ("action", truth.action[:, 0])):
+        metrics[f"masks/{name}_edges"] = float(expected.numel())
+        metrics[f"masks/{name}_true_edges"] = float(expected.sum())
+        metrics[f"masks/{name}_aligned_shd"] = float((~expected).sum())
+        metrics[f"masks/{name}_missing_true_edges"] = 0.0
+    edges = predictor.state_dim * predictor.param_dim
+    true_edges = float(truth.parameter.sum())
+    metrics["masks/parameter_edges"] = float(edges)
+    metrics["masks/parameter_true_edges"] = true_edges
+    metrics["masks/parameter_aligned_shd"] = edges - true_edges
+    metrics["masks/parameter_missing_true_edges"] = 0.0
+    return metrics
+
+
 def _collect(
     model: SCJEPA,
     data: dict[str, StateData],
-    config: TrainConfig,
+    batch_size: int,
     device: torch.device,
     objective: TrainingObjective,
     tau_prediction: float | None,
 ) -> tuple[dict[str, EvaluationResult], dict[str, list[int]]]:
-    calibration = evaluate(model, data["calibration"], config.batch_size, device, objective)
+    calibration = evaluate(model, data["calibration"], batch_size, device, objective)
     results = {"calibration": calibration}
     matching: dict[str, list[int]] = {}
     for split in ("calibration", "validation"):
         result = (
             calibration
             if split == "calibration"
-            else evaluate(model, data[split], config.batch_size, device, objective)
+            else evaluate(model, data[split], batch_size, device, objective)
         )
         metrics, matching = recovery_metrics(calibration, result)
         metrics["forecast_quality_pass"] = float(
             metrics["normalized_prediction_mse"] <= NORMALIZED_MSE_CAP
         )
         metrics |= oracle.block_purity(calibration, result)
-        metrics |= oracle.graph_metrics(_predictor(model), matching["online_columns"])
+        metrics |= _graph_metrics(_predictor(model), matching["online_columns"])
         metrics |= code_metrics(calibration, result)
         if objective.geco is not None and tau_prediction is not None:
             relative = result.metrics["prediction"] / tau_prediction
@@ -621,19 +718,26 @@ def _scientific_config(config: TrainConfig) -> dict[str, Any]:
             "wandb_group",
         }
     }
+    code_dim = config.model_code_dim
     return values | {
+        "code_dim": code_dim,
+        "initializer": config.model_initializer,
         "parameter_source": "learned transition-set encoder, cross-episode donor codes",
         "parameter_training": "forecast only; no parameter regularizer or consistency term",
         "objective": asdict(objective_config(config.condition, 0.0)),
         "constraint": "sparse arms: GECO on prediction MSE / tau_prediction <= 1",
         "initialization": (
-            "fresh paired Gaussian encoder head, parameter-encoder input layer, trunk, readouts"
+            "fresh paired Gaussian encoder head, parameter-encoder input layer, trunk, "
+            f"readouts; parameter-encoder policy {config.model_initializer}"
             if config.condition == "dense"
-            else "seed-matched final dense endpoint; fresh mask logits, AdamW, GECO, sampler"
+            else "seed-matched six-code dense endpoint; fresh mask logits, AdamW, GECO, sampler"
         ),
         "ema_decay": 0.996,
         "weight_decay": 0.0,
-        "predictor": f"shared 36-{trunk_width()}-{trunk_width()} ReLU trunk, per-output readouts",
+        "predictor": (
+            f"shared {30 + code_dim}-{trunk_width()}-{trunk_width()} ReLU trunk, "
+            "per-output readouts"
+        ),
         "forecast": "attached two-step prediction from online state 9; EMA targets 10/11",
         "test_policy": "validation-only screen; no test command",
     }
@@ -674,10 +778,22 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
     endpoint = _dense_endpoint(config, data_identity)
     tau_prediction = float(calibration["tau_prediction"]) if calibration else None
     seed_everything(config.seed)
-    model = build_control(config.condition, config.seed)
-    if endpoint is not None:
+    model = build_control(
+        config.condition, config.seed, config.model_code_dim, config.model_initializer
+    ).to(device)
+    initialization: dict[str, Any] | None = None
+    if resume:
+        # The data-dependent initializer is restored, never refitted, on resume.
+        saved = cast(
+            dict[str, Any],
+            torch.load(output / "initial.pt", map_location="cpu", weights_only=False),
+        )
+        model.load_state_dict(saved["model"], strict=True)
+        initialization = saved.get("initialization")
+    elif endpoint is not None:
         _load_dense(model, endpoint["state"])
-    model = model.to(device)
+    elif config.model_initializer == "shared_feature":
+        initialization = initialize_shared_output(model, data["train"], device)
     initials = _initial_identities(model)
     controller = (
         GECOConfig(enabled=True, tau=1.0, step_size=config.geco_step_size)
@@ -703,6 +819,7 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
         "tau_prediction": tau_prediction,
         "geco": asdict(controller),
         "dense_endpoint": endpoint["record"] if endpoint else None,
+        "initialization": initialization,
         **initials,
     }
     identity = canonical_fingerprint(specification)
@@ -756,7 +873,10 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
                 raise ValueError("completed run differs from requested continuation")
             return completed
     else:
-        save_torch(output / "initial.pt", {"model": model.state_dict(), **initials})
+        save_torch(
+            output / "initial.pt",
+            {"model": model.state_dict(), "initialization": initialization, **initials},
+        )
     initial_checkpoint_sha256 = sha(output / "initial.pt")
     record["initial_checkpoint_sha256"] = initial_checkpoint_sha256
     write_json(output / "config.json", record)
@@ -798,7 +918,7 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
         )
 
     def collect() -> tuple[dict[str, EvaluationResult], dict[str, list[int]]]:
-        return _collect(model, data, config, device, objective, tau_prediction)
+        return _collect(model, data, config.batch_size, device, objective, tau_prediction)
 
     def flat(results: dict[str, EvaluationResult]) -> dict[str, float]:
         return {
@@ -895,6 +1015,7 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
             "profile": config.profile,
             "condition": config.condition,
             "seed": config.seed,
+            "code_dim": config.model_code_dim,
             "steps": config.steps,
             "successful_updates": config.steps,
             "skipped_updates": 0,
@@ -911,6 +1032,127 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
     except BaseException:
         logger.finish(exit_code=1)
         raise
+
+
+@dataclass(frozen=True)
+class ProjectConfig:
+    """Map one twelve-code dense endpoint to six codes through TRAIN shared modes."""
+
+    output_dir: str
+    dense_dir: str
+    data_dir: str
+    profile: Profile = "exploratory"
+    batch_size: int = 16
+    device: str = "cpu"
+    threads: int = 1
+
+    def __post_init__(self) -> None:
+        """Keep the evaluation batch of the training runs."""
+        if self.profile not in {"exploratory", "smoke"}:
+            raise ValueError("profile must be exploratory or smoke")
+        if self.profile == "exploratory" and self.batch_size != 16:
+            raise ValueError("exploratory evaluation batch is fixed")
+        if type(self.batch_size) is not int or self.batch_size < 2:
+            raise ValueError("batch_size must be an integer of at least two")
+
+
+def project(config: ProjectConfig) -> dict[str, Any]:
+    """Write a six-code dense endpoint; only TRAIN observations, actions and groups enter."""
+    output = Path(config.output_dir).resolve()
+    with file_lock(output.parent / f".{output.name}.lock"):
+        _fresh_output(output)
+        torch.set_num_threads(config.threads)
+        device = resolve_device(config.device)
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        directory = Path(config.dense_dir).resolve()
+        completion = verify_completion(directory, kind="train", require_current_source=True)
+        if completion["condition"] != "dense" or completion["profile"] != config.profile:
+            raise ValueError("projection source must be a matching-profile dense fit")
+        if completion["code_dim"] <= SPARSE_CODE_DIM:
+            raise ValueError("projection source must have more than six code coordinates")
+        data, cache = load_data(Path(config.data_dir))
+        if str(cache["identity"]) != completion["data_identity"]:
+            raise ValueError("projection data differs from the dense fit")
+        checkpoint = cast(
+            dict[str, Any],
+            torch.load(directory / "last.pt", map_location="cpu", weights_only=False),
+        )
+        if checkpoint.get("identity") != completion["identity"]:
+            raise ValueError("dense checkpoint does not belong to its completion record")
+        if int(checkpoint["step"]) != int(completion["steps"]):
+            raise ValueError("dense checkpoint is not the final endpoint")
+        seed = int(completion["seed"])
+        source = build_control("dense", seed, int(completion["code_dim"])).to(device)
+        source.load_state_dict(checkpoint["model"], strict=True)
+        model = build_control("dense", seed, SPARSE_CODE_DIM).to(device)
+        receipt = project_code(source, model, data["train"], device)
+        objective = TrainingObjective(objective_config("dense", 0.0), GECOConfig()).to(device)
+        results, matching = _collect(model, data, config.batch_size, device, objective, None)
+        source_metrics = read_json(directory / "validation.json")["metrics"]
+        specification: dict[str, Any] = {
+            "code_identity": code_identity(),
+            "data_identity": completion["data_identity"],
+            "source": {
+                "directory": str(directory),
+                "identity": completion["identity"],
+                "completion_sha256": sha(directory / "completion.json"),
+                "checkpoint_sha256": sha(directory / "last.pt"),
+                "code_dim": completion["code_dim"],
+            },
+            "projection": receipt,
+            "policy": (
+                "top six TRAIN shared modes of the twelve-dimensional code; encoder output "
+                "rows composed with the projection, predictor code columns with its "
+                "least-squares reconstruction; no theta, held-out data or optimization"
+            ),
+        }
+        identity = canonical_fingerprint(specification)
+        save_torch(
+            output / "last.pt",
+            {
+                "schema": SCHEMA,
+                "identity": identity,
+                "step": completion["steps"],
+                "model": model.state_dict(),
+            },
+        )
+        write_json(
+            output / "projection.json",
+            {
+                **specification,
+                "identity": identity,
+                "source_validation": {
+                    key: source_metrics.get(key)
+                    for key in ("normalized_prediction_mse", "code_r2_min", "code_r2_mean")
+                },
+            },
+        )
+        write_json(output / "matching.json", matching)
+        names = ["last.pt", "projection.json", "matching.json"]
+        for split, result in results.items():
+            write_json(output / f"{split}.json", {"metrics": result.metrics})
+            save_torch(
+                output / f"{split}.pt", {"metrics": result.metrics, "samples": result.samples}
+            )
+            names += [f"{split}.json", f"{split}.pt"]
+        record: dict[str, Any] = {
+            "schema": SCHEMA,
+            "kind": "projection",
+            "identity": identity,
+            "code_identity": specification["code_identity"],
+            "profile": config.profile,
+            "condition": "dense",
+            "seed": seed,
+            "code_dim": SPARSE_CODE_DIM,
+            "steps": completion["steps"],
+            "data_identity": completion["data_identity"],
+            "source": specification["source"],
+            "hashes": {name: sha(output / name) for name in names},
+        }
+        write_json(output / "completion.json", record)
+        return record
 
 
 SUMMARY_KEYS = (
@@ -935,23 +1177,31 @@ def summarize(directories: list[str]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for value in directories:
         directory = Path(value).resolve()
-        completion = verify_completion(directory, kind="train")
+        completion = verify_completion(directory)
+        if completion["kind"] not in {"train", "projection"}:
+            raise ValueError(f"{directory} is not a training or projection endpoint")
         final = read_json(directory / "validation.json")["metrics"]
-        start = read_json(directory / "startup.json")["metrics"]["validation"]
+        start: dict[str, Any] = (
+            read_json(directory / "startup.json")["metrics"]["validation"]
+            if completion["kind"] == "train"
+            else {}
+        )
         rows.append(
             {
                 "condition": completion["condition"],
+                "kind": completion["kind"],
                 "seed": completion["seed"],
+                "code_dim": completion["code_dim"],
                 "steps": completion["steps"],
                 "initial_state_mcc": start.get("state_mcc"),
                 **{key: final.get(key) for key in SUMMARY_KEYS},
             }
         )
-    return sorted(rows, key=lambda row: (row["condition"], row["seed"]))
+    return sorted(rows, key=lambda row: (row["condition"], row["kind"], row["seed"]))
 
 
 def main() -> None:
-    """Train one arm, fix the dense bound, or summarize completed endpoints."""
+    """Train one arm, project a dense code, fix the dense bound, or summarize endpoints."""
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     train_parser = commands.add_parser("train")
@@ -964,6 +1214,8 @@ def main() -> None:
     train_parser.add_argument("--calibration-dir")
     train_parser.add_argument("--init-dir")
     train_parser.add_argument("--geco-step-size", type=float, default=0.1)
+    train_parser.add_argument("--code-dim", type=int, choices=CODE_DIMS)
+    train_parser.add_argument("--initializer", choices=INITIALIZERS)
     train_parser.add_argument("--device", default="cpu")
     train_parser.add_argument("--threads", type=int, default=1)
     train_parser.add_argument("--resume", action="store_true")
@@ -971,6 +1223,15 @@ def main() -> None:
     train_parser.add_argument("--wandb-project", default="sparse_causal_jepa")
     train_parser.add_argument("--wandb-entity")
     train_parser.add_argument("--wandb-group", default="masked-mlp-learned")
+    project_parser = commands.add_parser("project")
+    project_parser.add_argument("--output-dir", required=True)
+    project_parser.add_argument("--dense-dir", required=True)
+    project_parser.add_argument("--data-dir", required=True)
+    project_parser.add_argument(
+        "--profile", choices=("exploratory", "smoke"), default="exploratory"
+    )
+    project_parser.add_argument("--device", default="cpu")
+    project_parser.add_argument("--threads", type=int, default=1)
     calibrate_parser = commands.add_parser("calibrate")
     calibrate_parser.add_argument("--output-dir", required=True)
     calibrate_parser.add_argument("--dense-dir", required=True)
@@ -992,6 +1253,8 @@ def main() -> None:
                 calibration_dir=arguments.calibration_dir,
                 init_dir=arguments.init_dir,
                 geco_step_size=arguments.geco_step_size,
+                code_dim=arguments.code_dim,
+                initializer=arguments.initializer,
                 device=arguments.device,
                 threads=arguments.threads,
                 wandb_mode=arguments.wandb_mode,
@@ -1000,6 +1263,17 @@ def main() -> None:
                 wandb_group=arguments.wandb_group,
             ),
             resume=arguments.resume,
+        )
+    elif arguments.command == "project":
+        result = project(
+            ProjectConfig(
+                arguments.output_dir,
+                arguments.dense_dir,
+                arguments.data_dir,
+                profile=arguments.profile,
+                device=arguments.device,
+                threads=arguments.threads,
+            )
         )
     elif arguments.command == "calibrate":
         result = calibrate(

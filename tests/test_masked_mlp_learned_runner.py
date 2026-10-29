@@ -1,4 +1,4 @@
-"""Learned parameter codes: label-free training, dense initialization, code probes, resume."""
+"""Learned parameter codes: label-free training, projection, dense initialization, resume."""
 
 from collections.abc import Iterator
 from dataclasses import replace
@@ -11,7 +11,9 @@ from torch import Tensor
 
 from diagnostics.balanced_action_oracle.data import PrepareConfig, prepare
 from diagnostics.isotropic_oracle.data import PrepareConfig as SourcePrepareConfig
+from diagnostics.isotropic_oracle.data import StateData
 from diagnostics.isotropic_oracle.data import prepare as prepare_source
+from diagnostics.masked_mlp_learned import acquisition
 from diagnostics.masked_mlp_learned import run as runner
 from diagnostics.masked_mlp_oracle.model import INITIAL_LOGIT
 from diagnostics.oracle_state_learning.core import EvaluationResult
@@ -58,7 +60,7 @@ def _config(root: Path, condition: runner.Condition, seed: int = 0) -> runner.Tr
         checkpoint_every=1,
         evaluate_every=3,
         calibration_dir=str(root / "bound") if sparse else None,
-        init_dir=str(root / f"dense-s{seed}") if sparse else None,
+        init_dir=str(root / f"projected-s{seed}") if sparse else None,
     )
 
 
@@ -68,9 +70,29 @@ def _checkpoint(path: Path) -> dict[str, Any]:
 
 def _dense_and_bound(root: Path) -> None:
     runner.train(_config(root, "dense"))
-    runner.calibrate(
-        runner.CalibrateConfig(str(root / "bound"), str(root / "dense-s0"), profile="smoke")
+    runner.project(
+        runner.ProjectConfig(
+            str(root / "projected-s0"), str(root / "dense-s0"), str(root / "data"), profile="smoke"
+        )
     )
+    runner.calibrate(
+        runner.CalibrateConfig(str(root / "bound"), str(root / "projected-s0"), profile="smoke")
+    )
+
+
+def _train_split(groups: int = 32) -> StateData:
+    """Synthetic TRAIN contexts whose group offsets dominate the within-group noise."""
+    generator = torch.Generator().manual_seed(1)
+    offsets = 2 * torch.randn(groups, 1, 1, 6, generator=generator)
+    observations = offsets + 0.1 * torch.randn(groups, 10, 12, 6, generator=generator)
+    tensors = {
+        "observations": observations,
+        "actions": torch.randn(groups, 1, 11, 24, generator=generator)
+        + 0.1 * torch.randn(groups, 10, 11, 24, generator=generator),
+        "oracle_parameters": torch.zeros(groups, 6),
+        "episode_ids": torch.arange(groups),
+    }
+    return StateData("train", tensors, None, {})
 
 
 def test_training_never_feeds_true_theta_to_the_model(
@@ -108,14 +130,20 @@ def test_training_never_feeds_true_theta_to_the_model(
 def test_sparse_arms_start_from_the_dense_endpoint_and_report_codes(tmp_path: Path) -> None:
     _prepare(tmp_path)
     _dense_and_bound(tmp_path)
-    dense = _checkpoint(tmp_path / "dense-s0/last.pt")["model"]
-    dense_initial = _checkpoint(tmp_path / "dense-s0/initial.pt")["model"]
+    trained = _checkpoint(tmp_path / "dense-s0/last.pt")["model"]
+    dense_initial = _checkpoint(tmp_path / "dense-s0/initial.pt")
+    assert dense_initial["initialization"]["code_dimension"] == 12
     changed = [
         key
-        for key in dense
-        if key.startswith("parameter_encoder.") and not torch.equal(dense[key], dense_initial[key])
+        for key in trained
+        if key.startswith("parameter_encoder.")
+        and not torch.equal(trained[key], dense_initial["model"][key])
     ]
     assert changed, "the parameter encoder must learn during dense training"
+    assert trained["parameter_encoder.head.4.weight"].shape == (12, 128)
+    dense = _checkpoint(tmp_path / "projected-s0/last.pt")["model"]
+    assert dense["parameter_encoder.head.4.weight"].shape == (6, 128)
+    assert dense["predictor.first.weight"].shape[1] == 36
     for condition in ("baseline", "full"):
         completion = runner.train(_config(tmp_path, condition))
         initial = _checkpoint(tmp_path / f"{condition}-s0/initial.pt")["model"]
@@ -138,9 +166,82 @@ def test_sparse_arms_start_from_the_dense_endpoint_and_report_codes(tmp_path: Pa
         ):
             assert key in metrics
         assert completion["dense_endpoint"]["seed"] == 0
+        assert completion["dense_endpoint"]["kind"] == "projection"
         assert runner.verify_completion(tmp_path / f"{condition}-s0") == completion
-    rows = runner.summarize([str(tmp_path / f"{c}-s0") for c in ("dense", "baseline", "full")])
-    assert [row["condition"] for row in rows] == ["baseline", "dense", "full"]
+    names = ("dense", "projected", "baseline", "full")
+    rows = runner.summarize([str(tmp_path / f"{name}-s0") for name in names])
+    assert [(row["condition"], row["code_dim"]) for row in rows] == [
+        ("baseline", 6),
+        ("dense", 6),
+        ("dense", 12),
+        ("full", 6),
+    ]
+    with pytest.raises(ValueError, match="project"):
+        runner.calibrate(
+            runner.CalibrateConfig(
+                str(tmp_path / "unprojected"), str(tmp_path / "dense-s0"), profile="smoke"
+            )
+        )
+
+
+def test_projection_is_exact_for_a_six_dimensional_code() -> None:
+    source = runner.build_control("dense", 0, 12, "gain")
+    output = cast(torch.nn.Sequential, source.parameter_encoder.head)[4]
+    assert isinstance(output, torch.nn.Linear)
+    mixing = torch.randn(6, 6, generator=torch.Generator().manual_seed(2))
+    with torch.no_grad():
+        output.weight[6:] = mixing @ output.weight[:6]
+        output.bias[6:] = mixing @ output.bias[:6] + 0.3
+    target = runner.build_control("dense", 0, 6)
+    train = _train_split()
+    receipt = acquisition.project_code(source, target, train, torch.device("cpu"))
+    assert receipt["reconstructed_variance_fraction"] > 1 - 1e-6
+    batch = train.batch(torch.arange(8), "cpu")
+    source.eval()
+    target.eval()
+    with torch.no_grad():
+        expected = source(batch["observations"], batch["actions"]).predictions
+        actual = target(batch["observations"], batch["actions"]).predictions
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+    full = runner.build_control("full", 0, 6)
+    with pytest.raises(ValueError, match="dense endpoint"):
+        acquisition.project_code(
+            runner.build_control("full", 0, 12), full, train, torch.device("cpu")
+        )
+
+
+def test_acquisition_initializers_keep_everything_else() -> None:
+    native = runner.build_control("dense", 0, 12)
+    gained = runner.build_control("dense", 0, 12, "shared_feature")
+    for key, value in native.state_dict().items():
+        other = gained.state_dict()[key]
+        if key.startswith("parameter_encoder.") and key.endswith("weight"):
+            gain = 3 if key == "parameter_encoder.head.4.weight" else 6
+            torch.testing.assert_close(other, value * gain**0.5)
+        else:
+            torch.testing.assert_close(other, value, rtol=0, atol=0)
+    train = _train_split()
+    before = {
+        key: value.clone()
+        for key, value in gained.state_dict().items()
+        if isinstance(value, Tensor)
+    }
+    old = acquisition.train_contexts(gained, train, torch.device("cpu"), codes=True)
+    receipt = acquisition.initialize_shared_output(gained, train, torch.device("cpu"))
+    new = acquisition.train_contexts(gained, train, torch.device("cpu"), codes=True)
+    after = gained.state_dict()
+    changed = {key for key, value in before.items() if not torch.equal(after[key], value)}
+    assert changed == {"parameter_encoder.head.4.weight", "parameter_encoder.head.4.bias"}
+    old_rows, new_rows = old.flatten(0, 1), new.flatten(0, 1)
+    torch.testing.assert_close(new_rows.mean(0), old_rows.mean(0), rtol=0, atol=1e-5)
+    torch.testing.assert_close(
+        new_rows.var(0, correction=0).mean(),
+        old_rows.var(0, correction=0).mean(),
+        rtol=1e-4,
+        atol=0,
+    )
+    assert receipt["code_dimension"] == 12
+    assert receipt["training_parameter_labels_absent"]
 
 
 def test_code_metrics_recover_an_informative_code() -> None:
@@ -182,11 +283,21 @@ def test_protocol_is_checked_and_resume_is_exact(
         runner.TrainConfig("u", "u", "dense", steps=200_000)
     with pytest.raises(ValueError, match="seed"):
         runner.TrainConfig("u", "u", "dense", seed=5)
+    with pytest.raises(ValueError, match="inherit"):
+        runner.TrainConfig("u", "u", "full", calibration_dir="u", init_dir="u", code_dim=12)
     _prepare(tmp_path)
     _dense_and_bound(tmp_path)
-    config = _config(tmp_path, "full")
-    complete = runner.train(config)
-    interrupted = replace(config, output_dir=str(tmp_path / "interrupted"))
+    for config in (_config(tmp_path, "dense"), _config(tmp_path, "full")):
+        _check_resume(tmp_path, config, monkeypatch)
+
+
+def _check_resume(root: Path, config: runner.TrainConfig, monkeypatch: pytest.MonkeyPatch) -> None:
+    complete = (
+        runner.verify_completion(Path(config.output_dir))
+        if config.condition == "dense"
+        else runner.train(config)
+    )
+    interrupted = replace(config, output_dir=str(root / f"interrupted-{config.condition}"))
     actual = runner.forward_loss
     updates = 0
 
@@ -208,10 +319,10 @@ def test_protocol_is_checked_and_resume_is_exact(
         patch.setattr(runner, "forward_loss", interrupt)
         with pytest.raises(RuntimeError, match="deliberate"):
             runner.train(interrupted)
-    assert _checkpoint(tmp_path / "interrupted/last.pt")["step"] == 2
+    assert _checkpoint(Path(interrupted.output_dir) / "last.pt")["step"] == 2
     resumed = runner.train(interrupted, resume=True)
     assert complete["identity"] == resumed["identity"]
     left = _checkpoint(Path(config.output_dir) / "last.pt")
-    right = _checkpoint(tmp_path / "interrupted/last.pt")
+    right = _checkpoint(Path(interrupted.output_dir) / "last.pt")
     for key in ("model", "optimizer", "objective", "sampler", "torch_rng"):
         torch.testing.assert_close(left[key], right[key], rtol=0, atol=0)

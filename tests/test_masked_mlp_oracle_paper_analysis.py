@@ -157,14 +157,24 @@ def test_learned_code_batches_add_code_figures_and_table(tmp_path: Path) -> None
             checkpoint_every=1,
             evaluate_every=2,
             calibration_dir=str(batch / "calibration/results") if sparse else None,
-            init_dir=str(batch / f"dense-s{seed}/results") if sparse else None,
+            init_dir=str(batch / f"projected-s{seed}/results") if sparse else None,
         )
 
     for seed in (0, 1):
         learned.train(config("dense", seed))
+        learned.project(
+            learned.ProjectConfig(
+                str(batch / f"projected-s{seed}/results"),
+                str(batch / f"dense-s{seed}/results"),
+                str(tmp_path / "data"),
+                profile="smoke",
+            )
+        )
     learned.calibrate(
         learned.CalibrateConfig(
-            str(batch / "calibration/results"), str(batch / "dense-s0/results"), profile="smoke"
+            str(batch / "calibration/results"),
+            str(batch / "projected-s0/results"),
+            profile="smoke",
         )
     )
     for condition in ("baseline", "full"):
