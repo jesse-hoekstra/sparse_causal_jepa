@@ -161,7 +161,7 @@ def test_protocol_drift_and_source_changes_are_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     with pytest.raises(ValueError, match="seed"):
-        runner.TrainConfig("unused", "unused", "dense", seed=3)
+        runner.TrainConfig("unused", "unused", "dense", seed=5)
     with pytest.raises(ValueError, match="100000"):
         runner.TrainConfig("unused", "unused", "dense", steps=10)
     with pytest.raises(ValueError, match="calibration directory"):

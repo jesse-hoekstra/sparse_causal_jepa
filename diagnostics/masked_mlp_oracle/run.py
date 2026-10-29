@@ -50,7 +50,7 @@ from scjepa.training.loop import TrainingObjective, seed_everything
 
 SCHEMA = "masked-mlp-oracle-state-learning-v1"
 NORMALIZED_MSE_CAP = 0.15
-SEEDS = (0, 1, 2)
+SEEDS = (0, 1, 2, 3, 4)
 BLOCKS = ((0, 1, 2), (3, 4, 5))
 type Profile = Literal["exploratory", "smoke"]
 
