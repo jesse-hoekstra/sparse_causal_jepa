@@ -520,7 +520,10 @@ def figure_penalty(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
 
 
 def _fmt(stats: dict[str, float], digits: int = 3) -> str:
-    return f"{stats['mean']:.{digits}f} $\\pm$ {stats['sd']:.{digits}f}"
+    # A spread that rounds to zero is printed as a bound, not as "0.000".
+    floor = 0.5 * 10**-digits
+    spread = f"$<${2 * floor:.{digits}f}" if stats["sd"] < floor else f"{stats['sd']:.{digits}f}"
+    return f"{stats['mean']:.{digits}f} $\\pm$ {spread}"
 
 
 def write_tables(

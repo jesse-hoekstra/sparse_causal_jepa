@@ -118,3 +118,10 @@ def test_end_to_end_outputs_on_a_smoke_batch(tmp_path: Path) -> None:
     assert result["paired"]["full - baseline"]["n"] == 2
     rows = (tmp_path / "paper/per_run.csv").read_text().splitlines()
     assert len(rows) == 1 + 3 * 2
+
+
+def test_spreads_that_round_to_zero_are_printed_as_bounds() -> None:
+    fmt = paper_analysis._fmt  # pyright: ignore[reportPrivateUsage]
+    assert fmt({"mean": 0.99498, "sd": 0.00004}) == r"0.995 $\pm$ $<$0.001"
+    assert fmt({"mean": 0.792, "sd": 0.019}) == r"0.792 $\pm$ 0.019"
+    assert fmt({"mean": 0.0089, "sd": 0.00004}, 4) == r"0.0089 $\pm$ $<$0.0001"
