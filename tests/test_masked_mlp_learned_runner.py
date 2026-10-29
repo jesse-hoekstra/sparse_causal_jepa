@@ -253,6 +253,43 @@ def test_projection_is_exact_for_a_six_dimensional_code() -> None:
         )
 
 
+def test_acquisition_restart_changes_initialization_not_states_or_sampling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare(tmp_path)
+    runner.train(_config(tmp_path, "dense"))
+    config = replace(
+        _config(tmp_path, "dense"),
+        output_dir=str(tmp_path / "restart-s0"),
+        states_from=str(tmp_path / "dense-s0"),
+        acquisition_seed=1000,
+    )
+    completion = runner.train(config)
+    source = _checkpoint(tmp_path / "dense-s0/last.pt")
+    initial = _checkpoint(tmp_path / "restart-s0/initial.pt")["model"]
+    final = _checkpoint(tmp_path / "restart-s0/last.pt")
+    fresh = runner.build_control("dense", 1000, 12, "shared_feature").state_dict()
+    previous = runner.build_control("dense", 0, 12, "shared_feature").state_dict()
+    for key, value in initial.items():
+        if key.startswith(runner.STATE_ENCODERS):
+            torch.testing.assert_close(value, source["model"][key], rtol=0, atol=0)
+            torch.testing.assert_close(final["model"][key], value, rtol=0, atol=0)
+        elif key.startswith("predictor."):
+            torch.testing.assert_close(value, fresh[key], rtol=0, atol=0)
+    assert not torch.equal(initial["predictor.first.weight"], previous["predictor.first.weight"])
+    torch.testing.assert_close(final["sampler"], source["sampler"], rtol=0, atol=0)
+    assert completion["seed"] == completion["state_source"]["seed"] == 0
+    assert (
+        read_json(tmp_path / "restart-s0/config.json")["scientific_config"]["acquisition_seed"]
+        == 1000
+    )
+    _check_resume(tmp_path, config, monkeypatch)
+    with pytest.raises(ValueError, match="frozen states"):
+        replace(config, states_from=None)
+    with pytest.raises(ValueError, match="integer"):
+        replace(config, acquisition_seed=-1)
+
+
 def test_acquisition_initializers_keep_everything_else() -> None:
     native = runner.build_control("dense", 0, 12)
     gained = runner.build_control("dense", 0, 12, "shared_feature")

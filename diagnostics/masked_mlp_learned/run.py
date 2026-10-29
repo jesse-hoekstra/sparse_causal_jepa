@@ -400,6 +400,7 @@ class TrainConfig:
     calibration_dir: str | None = None
     init_dir: str | None = None
     states_from: str | None = None
+    acquisition_seed: int | None = None
     geco_step_size: float = 0.1
     code_dim: int | None = None
     initializer: Initializer | None = None
@@ -426,6 +427,11 @@ class TrainConfig:
             raise ValueError("exactly the sparse arms need a calibration and a dense endpoint")
         if sparse and self.states_from is not None:
             raise ValueError("only dense arms acquire codes on frozen states")
+        if self.acquisition_seed is not None:
+            if self.states_from is None:
+                raise ValueError("acquisition_seed requires frozen states")
+            if type(self.acquisition_seed) is not int or not 0 <= self.acquisition_seed < 2**32:
+                raise ValueError("acquisition_seed must be an integer in [0, 2**32)")
         if sparse and (self.code_dim is not None or self.initializer is not None):
             raise ValueError("sparse arms inherit a six-code model from their dense endpoint")
         if self.code_dim is not None and self.code_dim not in CODE_DIMS:
@@ -461,6 +467,11 @@ class TrainConfig:
         if self.condition != "dense":
             return SPARSE_CODE_DIM
         return 12 if self.code_dim is None else self.code_dim
+
+    @property
+    def initialization_seed(self) -> int:
+        """Allow fresh acquisition initializations while retaining the state/donor seed."""
+        return self.seed if self.acquisition_seed is None else self.acquisition_seed
 
     @property
     def model_initializer(self) -> Initializer:
@@ -846,7 +857,10 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
     tau_prediction = float(calibration["tau_prediction"]) if calibration else None
     seed_everything(config.seed)
     model = build_control(
-        config.condition, config.seed, config.model_code_dim, config.model_initializer
+        config.condition,
+        config.initialization_seed,
+        config.model_code_dim,
+        config.model_initializer,
     ).to(device)
     initialization: dict[str, Any] | None = None
     if resume:
@@ -1289,6 +1303,7 @@ def main() -> None:
     train_parser.add_argument("--calibration-dir")
     train_parser.add_argument("--init-dir")
     train_parser.add_argument("--states-from")
+    train_parser.add_argument("--acquisition-seed", type=int)
     train_parser.add_argument("--geco-step-size", type=float, default=0.1)
     train_parser.add_argument("--code-dim", type=int, choices=CODE_DIMS)
     train_parser.add_argument("--initializer", choices=INITIALIZERS)
@@ -1329,6 +1344,7 @@ def main() -> None:
                 calibration_dir=arguments.calibration_dir,
                 init_dir=arguments.init_dir,
                 states_from=arguments.states_from,
+                acquisition_seed=arguments.acquisition_seed,
                 geco_step_size=arguments.geco_step_size,
                 code_dim=arguments.code_dim,
                 initializer=arguments.initializer,
