@@ -125,3 +125,57 @@ def test_spreads_that_round_to_zero_are_printed_as_bounds() -> None:
     assert fmt({"mean": 0.99498, "sd": 0.00004}) == r"0.995 $\pm$ $<$0.001"
     assert fmt({"mean": 0.792, "sd": 0.019}) == r"0.792 $\pm$ 0.019"
     assert fmt({"mean": 0.0089, "sd": 0.00004}, 4) == r"0.0089 $\pm$ $<$0.0001"
+
+
+def test_learned_code_batches_add_code_figures_and_table(tmp_path: Path) -> None:
+    from diagnostics.masked_mlp_learned import run as learned
+
+    prepare_source(
+        SourcePrepareConfig(
+            str(tmp_path / "source"),
+            train_groups=4,
+            calibration_groups=4,
+            validation_groups=2,
+            test_groups=2,
+            profile="smoke",
+        )
+    )
+    prepare(PrepareConfig(str(tmp_path / "data"), str(tmp_path / "source"), profile="smoke"))
+    batch = tmp_path / "batch"
+
+    def config(condition: learned.Condition, seed: int) -> learned.TrainConfig:
+        sparse = condition != "dense"
+        return learned.TrainConfig(
+            str(batch / f"{condition}-s{seed}/results"),
+            str(tmp_path / "data"),
+            condition,
+            profile="smoke",
+            seed=seed,
+            steps=3,
+            batch_size=2,
+            log_every=1,
+            checkpoint_every=1,
+            evaluate_every=2,
+            calibration_dir=str(batch / "calibration/results") if sparse else None,
+            init_dir=str(batch / f"dense-s{seed}/results") if sparse else None,
+        )
+
+    for seed in (0, 1):
+        learned.train(config("dense", seed))
+    learned.calibrate(
+        learned.CalibrateConfig(
+            str(batch / "calibration/results"), str(batch / "dense-s0/results"), profile="smoke"
+        )
+    )
+    for condition in ("baseline", "full"):
+        for seed in (0, 1):
+            learned.train(config(condition, seed))
+    result = paper_analysis.analyse(batch, tmp_path / "paper")
+    assert result["learned_codes"]
+    for name in (
+        "fig_code_retention_box.pdf",
+        "fig_code_correlations_median_seed.png",
+        "table_codes.tex",
+    ):
+        assert (tmp_path / "paper" / name).is_file()
+    assert "learned parameter codes" in (tmp_path / "paper/README.md").read_text()

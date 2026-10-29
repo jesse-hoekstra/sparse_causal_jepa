@@ -26,6 +26,7 @@ from numpy.typing import NDArray
 from scipy.optimize import linear_sum_assignment  # pyright: ignore[reportUnknownVariableType]
 
 from diagnostics.isotropic_oracle.dgp import graphs as true_graphs
+from diagnostics.masked_mlp_learned import run as learned
 from diagnostics.masked_mlp_oracle import from_dense, run
 from diagnostics.oracle_state_learning.data import read_json
 from scjepa.eval.recovery import pearson_matrix
@@ -37,6 +38,13 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
 ARMS = ("dense", "baseline", "full")
+CODE_KEYS = (
+    "code_r2_min",
+    "code_r2_mean",
+    "code_pair_purity",
+    "code_mcc",
+    "forecast/code_use_ratio",
+)
 LABELS = {
     "dense": "Dense",
     "baseline": "State/action\nsparsity",
@@ -83,6 +91,7 @@ class Run:
     columns: list[int]
     correlation: Array
     graphs: dict[str, NDArray[np.bool_]]
+    code_correlation: Array | None = None
 
 
 def _aligned_graphs(state: dict[str, Any], columns: list[int]) -> dict[str, NDArray[np.bool_]]:
@@ -104,8 +113,15 @@ def _aligned_graphs(state: dict[str, Any], columns: list[int]) -> dict[str, NDAr
 
 def load_run(directory: Path, arm: str, seed: int) -> Run:
     """Authenticate one run directory and extract its endpoint and curves."""
-    verify = run.verify_completion if arm == "dense" else from_dense.verify_completion
-    completion = verify(directory, kind="train")
+    verifiers = {
+        run.SCHEMA: run.verify_completion,
+        from_dense.SCHEMA: from_dense.verify_completion,
+        learned.SCHEMA: learned.verify_completion,
+    }
+    schema = read_json(directory / "completion.json").get("schema")
+    if schema not in verifiers:
+        raise ValueError(f"{directory} has an unknown completion schema {schema}")
+    completion = verifiers[schema](directory, kind="train")
     if completion["condition"] != arm or completion["seed"] != seed:
         raise ValueError(f"{directory} does not hold {arm} seed {seed}")
     metrics = cast(dict[str, float], read_json(directory / "validation.json")["metrics"])
@@ -126,10 +142,17 @@ def load_run(directory: Path, arm: str, seed: int) -> Run:
         dict[str, Any],
         torch.load(directory / "validation.pt", map_location="cpu", weights_only=False),
     )["samples"]
-    learned = cast(torch.Tensor, samples["online_states"]).reshape(-1, 6).double()
+    learned_states = cast(torch.Tensor, samples["online_states"]).reshape(-1, 6).double()
     truth = cast(torch.Tensor, samples["states"]).reshape(-1, 6).double()
     # pearson_matrix has true rows and learned columns; order columns by the matching.
-    correlation = pearson_matrix(learned, truth)[:, columns].numpy()
+    correlation = pearson_matrix(learned_states, truth)[:, columns].numpy()
+    code_correlation = None
+    if "codes" in samples:
+        codes = cast(torch.Tensor, samples["codes"]).double()
+        theta = (
+            cast(torch.Tensor, samples["theta"]).double()[:, None].expand(-1, codes.shape[1], -1)
+        )
+        code_correlation = _matched_code_correlation(codes.flatten(0, 1), theta.flatten(0, 1))
     state = cast(
         dict[str, Any],
         torch.load(directory / "last.pt", map_location="cpu", weights_only=False),
@@ -145,7 +168,20 @@ def load_run(directory: Path, arm: str, seed: int) -> Run:
         columns=columns,
         correlation=correlation,
         graphs=_aligned_graphs(state, columns),
+        code_correlation=code_correlation,
     )
+
+
+# Parameter pairs (1,4), (2,5), (3,6) placed next to each other for display.
+PAIR_ORDER = (0, 3, 1, 4, 2, 5)
+
+
+def _matched_code_correlation(codes: torch.Tensor, theta: torch.Tensor) -> Array:
+    """|corr(theta_k, code_j)| with theta in pair order and codes matched to it."""
+    correlation = pearson_matrix(codes, theta).numpy()[list(PAIR_ORDER)]
+    rows, cols = cast(tuple[Array, Array], linear_sum_assignment(-np.abs(correlation)))
+    order = cols.astype(int)[np.argsort(rows.astype(int))]
+    return np.abs(correlation[:, order])
 
 
 def load_batch(batch: Path) -> dict[str, dict[int, Run]]:
@@ -519,6 +555,125 @@ def figure_penalty(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
     return figure
 
 
+def figure_code_retention(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
+    """Whole-code retention R² per parameter, one box per model."""
+    figure, axis = cast(tuple[Any, Any], plt.subplots(figsize=(6.4, 2.8)))
+    width = 0.24
+    for offset, arm in zip((-width, 0.0, width), ARMS, strict=True):
+        values = [
+            [_metric(runs[arm][s], f"code_r2/theta_{k + 1}") for s in seeds] for k in range(6)
+        ]
+        positions = np.arange(6) + offset
+        box = axis.boxplot(
+            values,
+            positions=positions,
+            widths=width * 0.85,
+            showfliers=False,
+            patch_artist=True,
+            medianprops={"color": INK, "lw": 1.0},
+            whiskerprops={"color": INK2, "lw": 0.7},
+            capprops={"color": INK2, "lw": 0.7},
+            boxprops={"lw": 0.7, "edgecolor": INK2},
+        )
+        for patch in box["boxes"]:
+            patch.set_facecolor(COLORS[arm])
+            patch.set_alpha(0.45)
+        axis.plot([], [], color=COLORS[arm], lw=6, alpha=0.6, label=SHORT[arm])
+    axis.set_xticks(range(6), [f"θ{k + 1}" for k in range(6)])
+    axis.set_ylabel("Whole-code retention R² (validation)")
+    axis.axhline(0.8, color=INK2, lw=0.7, ls=(0, (3, 2)))
+    axis.text(5.55, 0.8, "  0.8", color=INK2, fontsize=6.8, va="center")
+    axis.grid(axis="y", color=GRID, lw=0.6)
+    axis.set_axisbelow(True)
+    axis.legend(loc="lower left", frameon=False, ncol=3)
+    axis.set_title(
+        "Physical parameters recoverable from the learned code (probe per parameter)",
+        loc="left",
+        color=INK,
+    )
+    return figure
+
+
+def figure_code_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figure:
+    """Matched |corr(theta, code)| for one seed; theta rows grouped by parameter pair."""
+    figure, axes = cast(
+        tuple[Any, Any], plt.subplots(1, 3, figsize=(6.4, 2.4), constrained_layout=True)
+    )
+    labels = [f"θ{k + 1}" for k in PAIR_ORDER]
+    image = None
+    for axis, arm in zip(axes, ARMS, strict=True):
+        matrix = runs[arm][seed].code_correlation
+        if matrix is None:
+            raise ValueError("code correlations require a learned-code batch")
+        image = axis.imshow(matrix, vmin=0, vmax=1, cmap="Blues")
+        for boundary in (1.5, 3.5):
+            axis.axhline(boundary, color=INK2, lw=0.6)
+            axis.axvline(boundary, color=INK2, lw=0.6)
+        axis.set_xticks(range(6), [f"q{j + 1}" for j in range(6)], fontsize=6.5)
+        axis.set_yticks(range(6), labels, fontsize=6.5)
+        axis.tick_params(length=0)
+        for spine in axis.spines.values():
+            spine.set_visible(False)
+        axis.set_title(
+            f"{SHORT[arm]}  (code MCC {runs[arm][seed].metrics['code_mcc']:.3f})",
+            loc="left",
+            color=INK,
+        )
+    if image is not None:
+        figure.colorbar(image, ax=axes, shrink=0.8, label="|Pearson correlation|")
+    figure.suptitle(
+        f"Learned code vs true parameters, seed {seed} (rows grouped by parameter pair)",
+        x=0.02,
+        ha="left",
+        color=INK,
+        fontsize=8.5,
+    )
+    return figure
+
+
+def write_code_table(runs: dict[str, dict[int, Run]], seeds: list[int], output: Path) -> None:
+    """LaTeX table of code retention, alignment and predictive use per model."""
+    keys = {
+        "code_r2_min": "Min.\\ retention $R^2$",
+        "code_r2_mean": "Mean retention $R^2$",
+        "code_pair_purity": "Pair purity",
+        "code_mcc": "Code MCC",
+        "forecast/code_use_ratio": "Shuffled/factual NMSE",
+    }
+    rows: list[str] = []
+    for arm in ARMS:
+        cells = [SHORT[arm]] + [
+            _fmt(describe([_metric(runs[arm][s], key) for s in seeds]), 2 if "ratio" in key else 3)
+            for key in keys
+        ]
+        rows.append(" & ".join(cells) + r" \\")
+    table = "\n".join(
+        [
+            r"\begin{table}[t]",
+            r"\centering",
+            r"\small",
+            r"\begin{tabular}{l" + "c" * len(keys) + "}",
+            r"\toprule",
+            "Model & " + " & ".join(keys.values()) + r" \\",
+            r"\midrule",
+            *rows,
+            r"\bottomrule",
+            r"\end{tabular}",
+            r"\caption{Learned parameter codes, mean $\pm$ s.d.\ over "
+            + str(len(seeds))
+            + r" seeds (validation). Retention: linear or cubic probe of each true parameter "
+            r"from the whole code, fitted and selected on calibration halves. Pair purity: "
+            r"best single-pair linear $R^2$ of each code coordinate (pairs (1,4), (2,5), (3,6)). "
+            r"Shuffled/factual: forecast error with codes from another parameter group, "
+            r"relative to the factual error.}",
+            r"\label{tab:masked-mlp-learned-codes}",
+            r"\end{table}",
+            "",
+        ]
+    )
+    (output / "table_codes.tex").write_text(table)
+
+
 def _fmt(stats: dict[str, float], digits: int = 3) -> str:
     # A spread that rounds to zero is printed as a bound, not as "0.000".
     floor = 0.5 * 10**-digits
@@ -641,6 +796,7 @@ def write_csv(runs: dict[str, dict[int, Run]], seeds: list[int], output: Path) -
         "masks/parameter_edges",
         "masks/parameter_aligned_shd",
         "geco/relative_prediction",
+        *CODE_KEYS,
     ]
     with (output / "per_run.csv").open("w", newline="") as stream:
         writer = csv.writer(stream)
@@ -679,6 +835,13 @@ def analyse(batch: Path, output: Path) -> dict[str, Any]:
         "fig_forecast_quality": figure_quality(runs, seeds),
         "fig_geco_multiplier": figure_penalty(runs, seeds),
     }
+    learned_codes = all(runs[arm][s].code_correlation is not None for arm in ARMS for s in seeds)
+    if learned_codes:
+        figures["fig_code_retention_box"] = figure_code_retention(runs, seeds)
+        figures["fig_code_correlations_median_seed"] = figure_code_correlations(
+            runs, representative
+        )
+        write_code_table(runs, seeds, output)
     files = {name: _save(figure, output, name) for name, figure in figures.items()}
     tables = write_tables(runs, seeds, output, chance)
     write_csv(runs, seeds, output)
@@ -686,6 +849,7 @@ def analyse(batch: Path, output: Path) -> dict[str, Any]:
         "batch": str(batch),
         "seeds": seeds,
         "representative_seed": representative,
+        "learned_codes": learned_codes,
         "chance": chance,
         **tables,
         "figures": files,
@@ -695,6 +859,11 @@ def analyse(batch: Path, output: Path) -> dict[str, Any]:
                     "state_mcc": _metric(runs[arm][s], "state_mcc"),
                     "block_purity": _metric(runs[arm][s], "block_purity"),
                     "start_state_mcc": _start_mcc(runs[arm][s]),
+                    **{
+                        key: _metric(runs[arm][s], key)
+                        for key in CODE_KEYS
+                        if key in runs[arm][s].metrics
+                    },
                 }
                 for s in seeds
             }
@@ -713,8 +882,17 @@ def write_readme(result: dict[str, Any], output: Path) -> None:
     mcc = {arm: summary[arm]["state_mcc"] for arm in ARMS}
     purity = {arm: summary[arm]["block_purity"] for arm in ARMS}
     fb = tests["full - baseline"]
+    summary_codes = {
+        arm: {
+            key: float(np.mean([row[key] for row in result["per_run"][arm].values()]))
+            for key in CODE_KEYS
+            if all(key in row for row in result["per_run"][arm].values())
+        }
+        for arm in ARMS
+    }
+    source = "learned parameter codes" if result["learned_codes"] else "oracle theta"
     text = (
-        f"""# Masked-MLP oracle batch: paper figures and tables
+        f"""# Masked-MLP batch ({source}): paper figures and tables
 
 Source batch: `{result["batch"]}` ({n} training seeds per model, validation endpoints).
 
@@ -755,6 +933,26 @@ Full - baseline MCC: {fb["mean"]:+.3f} (s.d. {fb["sd"]:.3f}), positive in
 - `table_main.tex`, `table_paired.tex` — LaTeX (booktabs) tables; `per_run.csv`,
   `summary.json` — every number above.
 """
+        + (
+            """- `fig_code_retention_box` — Whole-code retention R² of each true parameter, per
+  model; the dashed line marks the repo's 0.8 retention criterion.
+- `fig_code_correlations_median_seed` — |Pearson| between true parameters (grouped by
+  pair) and matched code coordinates; complementary parameter graphs identify codes
+  only up to mixing within each pair.
+- `table_codes.tex` — Code retention, pair purity, code MCC and predictive use.
+
+Code summary (mean over seeds): """
+            + "; ".join(
+                f"{SHORT[arm]} min retention "
+                f"{summary_codes[arm]['code_r2_min']:.3f}, pair purity "
+                f"{summary_codes[arm]['code_pair_purity']:.3f}, shuffled/factual NMSE "
+                f"{summary_codes[arm]['forecast/code_use_ratio']:.2f}"
+                for arm in ARMS
+            )
+            + ".\n"
+            if result["learned_codes"]
+            else ""
+        )
     )
     (output / "README.md").write_text(text)
 
