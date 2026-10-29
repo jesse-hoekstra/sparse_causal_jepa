@@ -186,6 +186,9 @@ def test_learned_code_batches_add_code_figures_and_table(tmp_path: Path) -> None
         "fig_code_retention_box.pdf",
         "fig_code_correlations_median_seed.png",
         "table_codes.tex",
+        "table_projection.tex",
     ):
         assert (tmp_path / "paper" / name).is_file()
+    assert sorted(result["projections"]) == ["0", "1"]
+    assert result["projections"]["0"]["source_code_dim"] == 12
     assert "learned parameter codes" in (tmp_path / "paper/README.md").read_text()

@@ -3,7 +3,9 @@
 Read-only: it authenticates completed run directories and reads their saved
 validation endpoints, learning curves, matchings and final mask logits. It loads
 no model for inference and never touches test data. Excluded from numerical
-identity. Layout expected under ``--batch-dir``: ``{dense,baseline,full}-s{seed}/results``.
+identity. Layout expected under ``--batch-dir``: ``{dense,baseline,full}-s{seed}/results``,
+plus ``projected-s{seed}/results`` when a learned twelve-code dense arm was projected to the
+six-code starting point of the sparse arms.
 
 Outputs: box plots of MCC and block purity per arm with chance references, MCC
 learning curves, edge-recovery frequencies of the learned graphs, matched
@@ -92,6 +94,7 @@ class Run:
     correlation: Array
     graphs: dict[str, NDArray[np.bool_]]
     code_correlation: Array | None = None
+    code_columns: list[int] | None = None
 
 
 def _aligned_graphs(state: dict[str, Any], columns: list[int]) -> dict[str, NDArray[np.bool_]]:
@@ -146,13 +149,15 @@ def load_run(directory: Path, arm: str, seed: int) -> Run:
     truth = cast(torch.Tensor, samples["states"]).reshape(-1, 6).double()
     # pearson_matrix has true rows and learned columns; order columns by the matching.
     correlation = pearson_matrix(learned_states, truth)[:, columns].numpy()
-    code_correlation = None
+    code_correlation = code_columns = None
     if "codes" in samples:
         codes = cast(torch.Tensor, samples["codes"]).double()
         theta = (
             cast(torch.Tensor, samples["theta"]).double()[:, None].expand(-1, codes.shape[1], -1)
         )
-        code_correlation = _matched_code_correlation(codes.flatten(0, 1), theta.flatten(0, 1))
+        code_correlation, code_columns = _matched_code_correlation(
+            codes.flatten(0, 1), theta.flatten(0, 1)
+        )
     state = cast(
         dict[str, Any],
         torch.load(directory / "last.pt", map_location="cpu", weights_only=False),
@@ -169,6 +174,7 @@ def load_run(directory: Path, arm: str, seed: int) -> Run:
         correlation=correlation,
         graphs=_aligned_graphs(state, columns),
         code_correlation=code_correlation,
+        code_columns=code_columns,
     )
 
 
@@ -176,12 +182,15 @@ def load_run(directory: Path, arm: str, seed: int) -> Run:
 PAIR_ORDER = (0, 3, 1, 4, 2, 5)
 
 
-def _matched_code_correlation(codes: torch.Tensor, theta: torch.Tensor) -> Array:
-    """|corr(theta_k, code_j)| with theta in pair order and codes matched to it."""
+def _matched_code_correlation(codes: torch.Tensor, theta: torch.Tensor) -> tuple[Array, list[int]]:
+    """|corr(theta_k, code_j)| with theta in pair order and six codes matched to it.
+
+    A longer code contributes its six best-matched coordinates; their indices return too.
+    """
     correlation = pearson_matrix(codes, theta).numpy()[list(PAIR_ORDER)]
     rows, cols = cast(tuple[Array, Array], linear_sum_assignment(-np.abs(correlation)))
     order = cols.astype(int)[np.argsort(rows.astype(int))]
-    return np.abs(correlation[:, order])
+    return np.abs(correlation[:, order]), [int(c) for c in order]
 
 
 def load_batch(batch: Path) -> dict[str, dict[int, Run]]:
@@ -609,7 +618,8 @@ def figure_code_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figu
         for boundary in (1.5, 3.5):
             axis.axhline(boundary, color=INK2, lw=0.6)
             axis.axvline(boundary, color=INK2, lw=0.6)
-        axis.set_xticks(range(6), [f"q{j + 1}" for j in range(6)], fontsize=6.5)
+        columns = runs[arm][seed].code_columns or list(range(6))
+        axis.set_xticks(range(6), [f"q{j + 1}" for j in columns], fontsize=6.5)
         axis.set_yticks(range(6), labels, fontsize=6.5)
         axis.tick_params(length=0)
         for spine in axis.spines.values():
@@ -629,6 +639,75 @@ def figure_code_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figu
         fontsize=8.5,
     )
     return figure
+
+
+def load_projections(batch: Path, seeds: list[int]) -> dict[int, dict[str, float]] | None:
+    """Authenticated twelve-to-six code projections, one per seed, or None if absent."""
+    found = sorted(batch.glob("projected-s*/results"))
+    if not found:
+        return None
+    result: dict[int, dict[str, float]] = {}
+    for path in found:
+        completion = learned.verify_completion(path, kind="projection")
+        seed = int(completion["seed"])
+        record = read_json(path / "projection.json")
+        metrics = read_json(path / "validation.json")["metrics"]
+        source = record["source_validation"]
+        result[seed] = {
+            "source_code_dim": float(record["source"]["code_dim"]),
+            "source_r2_min": float(source["code_r2_min"]),
+            "source_r2_mean": float(source["code_r2_mean"]),
+            "source_nmse": float(source["normalized_prediction_mse"]),
+            "projected_r2_min": float(metrics["code_r2_min"]),
+            "projected_r2_mean": float(metrics["code_r2_mean"]),
+            "projected_nmse": float(metrics["normalized_prediction_mse"]),
+            "projected_pair_purity": float(metrics["code_pair_purity"]),
+            "reconstructed_variance": float(
+                record["projection"]["reconstructed_variance_fraction"]
+            ),
+        }
+    if sorted(result) != seeds:
+        raise ValueError(f"projections cover seeds {sorted(result)}, runs cover {seeds}")
+    return result
+
+
+def write_projection_table(projections: dict[int, dict[str, float]], output: Path) -> None:
+    """LaTeX table of retention and forecast error before and after the projection."""
+    rows = [
+        f"{seed} & {v['source_r2_min']:.3f} & {v['projected_r2_min']:.3f} & "
+        f"{v['source_r2_mean']:.3f} & {v['projected_r2_mean']:.3f} & "
+        f"{v['source_nmse']:.4f} & {v['projected_nmse']:.4f} & "
+        f"{v['reconstructed_variance']:.3f} \\\\"
+        for seed, v in sorted(projections.items())
+    ]
+    dimension = int(next(iter(projections.values()))["source_code_dim"])
+    table = "\n".join(
+        [
+            r"\begin{table}[t]",
+            r"\centering",
+            r"\small",
+            r"\begin{tabular}{lccccccc}",
+            r"\toprule",
+            r" & \multicolumn{2}{c}{Min.\ retention $R^2$} & "
+            r"\multicolumn{2}{c}{Mean retention $R^2$} & \multicolumn{2}{c}{NMSE} & \\",
+            f"Seed & {dimension}-code & 6-code & {dimension}-code & 6-code & "
+            f"{dimension}-code & 6-code & Code variance kept \\\\",
+            r"\midrule",
+            *rows,
+            r"\bottomrule",
+            r"\end{tabular}",
+            r"\caption{Projection of each dense endpoint's "
+            + str(dimension)
+            + r"-dimensional code onto the six leading eigenvectors of its TRAIN group-shared "
+            r"code covariance, the starting point of both sparse arms (validation). The "
+            r"projection uses no parameter labels; code variance kept is the TRAIN fraction "
+            r"of centered code variance its least-squares reconstruction explains.}",
+            r"\label{tab:masked-mlp-learned-projection}",
+            r"\end{table}",
+            "",
+        ]
+    )
+    (output / "table_projection.tex").write_text(table)
 
 
 def write_code_table(runs: dict[str, dict[int, Run]], seeds: list[int], output: Path) -> None:
@@ -842,6 +921,9 @@ def analyse(batch: Path, output: Path) -> dict[str, Any]:
             runs, representative
         )
         write_code_table(runs, seeds, output)
+    projections = load_projections(batch, seeds)
+    if projections is not None:
+        write_projection_table(projections, output)
     files = {name: _save(figure, output, name) for name, figure in figures.items()}
     tables = write_tables(runs, seeds, output, chance)
     write_csv(runs, seeds, output)
@@ -850,6 +932,9 @@ def analyse(batch: Path, output: Path) -> dict[str, Any]:
         "seeds": seeds,
         "representative_seed": representative,
         "learned_codes": learned_codes,
+        "projections": None
+        if projections is None
+        else {str(seed): values for seed, values in projections.items()},
         "chance": chance,
         **tables,
         "figures": files,
@@ -954,6 +1039,12 @@ Code summary (mean over seeds): """
             else ""
         )
     )
+    if result["projections"]:
+        text += (
+            "- `table_projection.tex` — Retention and forecast error of each dense endpoint's "
+            "code before and after the label-free projection to the six-code starting point "
+            "of both sparse arms.\n"
+        )
     (output / "README.md").write_text(text)
 
 
