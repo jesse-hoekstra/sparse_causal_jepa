@@ -184,6 +184,49 @@ def test_sparse_arms_start_from_the_dense_endpoint_and_report_codes(tmp_path: Pa
         )
 
 
+def test_codes_can_be_reacquired_on_frozen_trained_states(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare(tmp_path)
+    runner.train(_config(tmp_path, "dense"))
+    config = replace(
+        _config(tmp_path, "dense"),
+        output_dir=str(tmp_path / "acquired-s0"),
+        states_from=str(tmp_path / "dense-s0"),
+    )
+    completion = runner.train(config)
+    assert completion["state_source"]["seed"] == 0
+    source = _checkpoint(tmp_path / "dense-s0/last.pt")["model"]
+    fresh = runner.build_control("dense", 0, 12, "shared_feature").state_dict()
+    initial = _checkpoint(tmp_path / "acquired-s0/initial.pt")
+    final = _checkpoint(tmp_path / "acquired-s0/last.pt")["model"]
+    for key, value in final.items():
+        if key.startswith(("online_encoder.", "target_encoder.")):
+            torch.testing.assert_close(value, source[key], rtol=0, atol=0)
+            torch.testing.assert_close(initial["model"][key], source[key], rtol=0, atol=0)
+        elif key.startswith("predictor."):
+            torch.testing.assert_close(initial["model"][key], fresh[key], rtol=0, atol=0)
+    assert not torch.equal(
+        initial["model"]["parameter_encoder.head.4.weight"],
+        fresh["parameter_encoder.head.4.weight"],
+    ), "shared-feature rows are fitted on the reused states"
+    assert not torch.equal(
+        final["parameter_encoder.head.4.weight"],
+        initial["model"]["parameter_encoder.head.4.weight"],
+    )
+    _check_resume(tmp_path, config, monkeypatch)
+    with pytest.raises(ValueError, match="jointly trained"):
+        runner.train(
+            replace(
+                config,
+                output_dir=str(tmp_path / "twice"),
+                states_from=str(tmp_path / "acquired-s0"),
+            )
+        )
+    with pytest.raises(ValueError, match="frozen states"):
+        replace(_config(tmp_path, "full"), states_from="u")
+
+
 def test_projection_is_exact_for_a_six_dimensional_code() -> None:
     source = runner.build_control("dense", 0, 12, "gain")
     output = cast(torch.nn.Sequential, source.parameter_encoder.head)[4]
