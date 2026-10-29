@@ -1,10 +1,13 @@
 import json
 import math
 from pathlib import Path
+from typing import Any
 
+import pytest
 import torch
 
 from diagnostics.oracle_state_learning.analysis import (
+    audit_samples,
     controller_history,
     grouped_moments,
     moment_mcc,
@@ -12,6 +15,48 @@ from diagnostics.oracle_state_learning.analysis import (
     routing_metrics,
 )
 from scjepa.eval.recovery import CoordinateMatch, mean_correlation_coefficient
+
+
+def _rounding_payload() -> dict[str, Any]:
+    states = torch.linspace(-2, 2, 2 * 10 * 12 * 6).reshape(2, 10, 12, 6)
+    targets = states[:, :, 10:12].clone()
+    # Captured CUDA float32 encodings of one identical observation, using
+    # 320-frame versus 1920-frame GEMMs. Float64 replay agrees exactly.
+    states[0, 0, 11, 0] = 0.1287655234336853
+    targets[0, 0, 1, 0] = 0.1287667453289032
+    predictions = targets + 0.1
+    return {
+        "samples": {
+            "online_states": states.clone(),
+            "target_states": states,
+            "states": states.clone(),
+            "targets": targets,
+            "predictions": predictions,
+            "group_ids": torch.arange(2),
+        },
+        "metrics": {"prediction": float((predictions.double() - targets.double()).square().mean())},
+    }
+
+
+def test_sample_audit_accepts_captured_batch_shape_rounding_without_changing_targets() -> None:
+    payload = _rounding_payload()
+    original = payload["samples"]["targets"].clone()
+    audited = audit_samples(payload, 2)
+    assert torch.equal(audited["targets"], original)
+
+
+@pytest.mark.parametrize("corruption", ["wrong_frame", "changed_encoder", "wrong_metric"])
+def test_sample_audit_still_rejects_semantic_or_metric_mismatch(corruption: str) -> None:
+    payload = _rounding_payload()
+    if corruption == "wrong_frame":
+        payload["samples"]["target_states"] = payload["samples"]["target_states"].roll(1, 2)
+    elif corruption == "changed_encoder":
+        payload["samples"]["target_states"] += 1e-4
+    else:
+        payload["metrics"]["prediction"] += 0.01
+    message = "Reported forecast MSE" if corruption == "wrong_metric" else "Forecast targets differ"
+    with pytest.raises(ValueError, match=message):
+        audit_samples(payload, 2)
 
 
 def test_group_moments_match_pearson_and_keep_calibration_assignment() -> None:

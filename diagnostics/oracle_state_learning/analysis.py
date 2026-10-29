@@ -108,9 +108,11 @@ def audit_samples(payload: dict[str, Any], groups: int) -> dict[str, Tensor]:
             raise ValueError(f"Endpoint samples must be finite and on CPU: {name}")
     if len({int(value) for value in samples["group_ids"]}) != groups:
         raise ValueError("Repeated independent parameter-group ID")
-    # Different GEMM batch shapes can produce rounding-level differences.
+    # The same frozen encoder uses 320-frame versus 1920-frame GEMMs here.
+    # CUDA float32 replay reproduces ~1.2e-6 differences near zero, while
+    # float64 agrees exactly. Allow this rounding without changing either tensor.
     if not torch.allclose(
-        samples["targets"], samples["target_states"][:, :, 10:12], atol=1e-6, rtol=1e-6
+        samples["targets"], samples["target_states"][:, :, 10:12], atol=2e-6, rtol=1e-6
     ):
         raise ValueError("Forecast targets differ from final EMA state coordinates")
     error = float((samples["predictions"].double() - samples["targets"].double()).square().mean())
