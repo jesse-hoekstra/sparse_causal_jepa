@@ -149,6 +149,11 @@ def load_run(directory: Path, arm: str, seed: int) -> Run:
     truth = cast(torch.Tensor, samples["states"]).reshape(-1, 6).double()
     # pearson_matrix has true rows and learned columns; order columns by the matching.
     correlation = pearson_matrix(learned_states, truth)[:, columns].numpy()
+    state = cast(
+        dict[str, Any],
+        torch.load(directory / "last.pt", map_location="cpu", weights_only=False),
+    )["model"]
+    graphs = _aligned_graphs(state, columns)
     code_correlation = code_columns = None
     if "codes" in samples:
         codes = cast(torch.Tensor, samples["codes"]).double()
@@ -158,10 +163,11 @@ def load_run(directory: Path, arm: str, seed: int) -> Run:
         code_correlation, code_columns = _matched_code_correlation(
             codes.flatten(0, 1), theta.flatten(0, 1)
         )
-    state = cast(
-        dict[str, Any],
-        torch.load(directory / "last.pt", map_location="cpu", weights_only=False),
-    )["model"]
+        if "predictor.parameter_logits" in state:
+            # The runner aligns only the state rows; a learned code's columns are unordered.
+            order = _code_order(codes.flatten(0, 1), theta.flatten(0, 1))
+            graphs["parameter"] = graphs["parameter"][:, order]
+            metrics = metrics | _code_aligned_metrics(graphs["parameter"])
     return Run(
         arm=arm,
         seed=seed,
@@ -172,7 +178,7 @@ def load_run(directory: Path, arm: str, seed: int) -> Run:
         penalty=penalty,
         columns=columns,
         correlation=correlation,
-        graphs=_aligned_graphs(state, columns),
+        graphs=graphs,
         code_correlation=code_correlation,
         code_columns=code_columns,
     )
@@ -191,6 +197,46 @@ def _matched_code_correlation(codes: torch.Tensor, theta: torch.Tensor) -> tuple
     rows, cols = cast(tuple[Array, Array], linear_sum_assignment(-np.abs(correlation)))
     order = cols.astype(int)[np.argsort(rows.astype(int))]
     return np.abs(correlation[:, order]), [int(c) for c in order]
+
+
+def _code_order(codes: torch.Tensor, theta: torch.Tensor) -> list[int]:
+    """The code coordinate matched to each theta_k, by parameter pair first.
+
+    Complementary parameter graphs identify a code only up to mixing within the pairs
+    (1,4), (2,5), (3,6), and swapping the two coordinates of a pair leaves the true graph
+    unchanged. Each pair therefore takes the two coordinates its linear fit explains
+    best; |correlation| only orders them within the pair.
+    """
+    if codes.shape[1] != 6:
+        raise ValueError("code alignment needs a six-dimensional code")
+    codes = (codes - codes.mean(0)) / codes.std(0).clamp_min(1e-10)
+    theta = (theta - theta.mean(0)) / theta.std(0).clamp_min(1e-10)
+    pair_r2 = np.zeros((6, len(learned.PAIRS)))
+    for p, pair in enumerate(learned.PAIRS):
+        design = torch.cat([theta[:, list(pair)], torch.ones(len(theta), 1).double()], 1)
+        weights = cast(
+            torch.Tensor,
+            torch.linalg.solve(design.T @ design, design.T @ codes),  # pyright: ignore[reportUnknownMemberType]
+        )
+        fit = design @ weights
+        pair_r2[:, p] = (1 - ((fit - codes) ** 2).mean(0)).numpy()
+    pair_of = [next(p for p, pair in enumerate(learned.PAIRS) if k in pair) for k in range(6)]
+    correlation = np.abs(pearson_matrix(codes, theta).numpy()).T  # rows: codes
+    score = pair_r2[:, pair_of] + 1e-3 * correlation
+    rows, cols = cast(tuple[Array, Array], linear_sum_assignment(-score))
+    return [int(c) for c in rows.astype(int)[np.argsort(cols.astype(int))]]
+
+
+CODE_ALIGNED_SHD = "masks/parameter_code_aligned_shd"
+
+
+def _code_aligned_metrics(graph: NDArray[np.bool_]) -> dict[str, float]:
+    expected = true_graphs().parameter.numpy()
+    return {
+        CODE_ALIGNED_SHD: float((graph != expected).sum()),
+        "masks/parameter_code_aligned_missing_true_edges": float((~graph & expected).sum()),
+        "masks/parameter_code_aligned_false_edges": float((graph & ~expected).sum()),
+    }
 
 
 def load_batch(batch: Path) -> dict[str, dict[int, Run]]:
@@ -772,8 +818,16 @@ def write_tables(
         "masks/state_aligned_shd": "SHD$_z$",
         "masks/parameter_aligned_shd": "SHD$_\\theta$",
     }
+
+    def value(run_: Run, key: str) -> float:
+        # A learned code's parameter SHD needs its code columns matched to theta first.
+        if key == "masks/parameter_aligned_shd" and CODE_ALIGNED_SHD in run_.metrics:
+            key = CODE_ALIGNED_SHD
+        return _metric(run_, key)
+
+    code_aligned = all(CODE_ALIGNED_SHD in runs["full"][s].metrics for s in seeds)
     summary: dict[str, dict[str, dict[str, float]]] = {
-        arm: {key: describe([_metric(runs[arm][s], key) for s in seeds]) for key in keys}
+        arm: {key: describe([value(runs[arm][s], key) for s in seeds]) for key in keys}
         for arm in ARMS
     }
     rows: list[str] = []
@@ -814,8 +868,15 @@ def write_tables(
             + str(len(seeds))
             + r" training seeds. SHD: structural Hamming distance of the thresholded learned "
             r"graph to the true graph after the MCC matching; ``open'': the block is not "
-            r"learned (all edges present). Chance rows: random orthogonal re-charting of the "
-            r"true states.}",
+            r"learned (all edges present). "
+            + (
+                r"The learned code's coordinates are first matched to the true parameter "
+                r"pairs by linear pair $R^2$ (complementary graphs identify codes only up to "
+                r"mixing within a pair, which leaves the parameter graph unchanged). "
+                if code_aligned
+                else ""
+            )
+            + r"Chance rows: random orthogonal re-charting of the true states.}",
             r"\label{tab:masked-mlp-oracle}",
             r"\end{table}",
             "",
@@ -874,6 +935,9 @@ def write_csv(runs: dict[str, dict[int, Run]], seeds: list[int], output: Path) -
         "masks/state_aligned_shd",
         "masks/parameter_edges",
         "masks/parameter_aligned_shd",
+        CODE_ALIGNED_SHD,
+        "masks/parameter_code_aligned_missing_true_edges",
+        "masks/parameter_code_aligned_false_edges",
         "geco/relative_prediction",
         *CODE_KEYS,
     ]
@@ -1024,6 +1088,10 @@ Full - baseline MCC: {fb["mean"]:+.3f} (s.d. {fb["sd"]:.3f}), positive in
 - `fig_code_correlations_median_seed` — |Pearson| between true parameters (grouped by
   pair) and matched code coordinates; complementary parameter graphs identify codes
   only up to mixing within each pair.
+- In `fig_graph_recovery`, `table_main.tex` and `per_run.csv`
+  (`masks/parameter_code_aligned_*`), the full model's parameter-graph columns are code
+  coordinates matched to the true parameter pairs by linear pair R²; the runner's own
+  `masks/parameter_aligned_shd` aligns only the state rows.
 - `table_codes.tex` — Code retention, pair purity, code MCC and predictive use.
 
 Code summary (mean over seeds): """

@@ -1,5 +1,6 @@
 """Statistics, chance references, graph alignment and end-to-end paper outputs."""
 
+import csv
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import torch
 from diagnostics.balanced_action_oracle.data import PrepareConfig, prepare
 from diagnostics.isotropic_oracle.data import PrepareConfig as SourcePrepareConfig
 from diagnostics.isotropic_oracle.data import prepare as prepare_source
+from diagnostics.isotropic_oracle.dgp import graphs as true_graphs
 from diagnostics.masked_mlp_oracle import from_dense, paper_analysis
 from diagnostics.masked_mlp_oracle import run as runner
 
@@ -57,6 +59,36 @@ def test_graphs_are_aligned_by_the_matching() -> None:
     assert graphs["state"][0, 1]
     assert int(graphs["state"].sum()) == 1
     assert bool(graphs["parameter"].all())
+
+
+def test_learned_code_columns_are_matched_to_parameter_pairs() -> None:
+    generator = torch.Generator().manual_seed(0)
+    theta = torch.randn(4000, 6, generator=generator, dtype=torch.float64)
+    # Codes in a scrambled order, each mixing the two parameters of one pair.
+    codes = torch.stack(
+        [
+            theta[:, 1],
+            theta[:, 3] + 0.5 * theta[:, 0],
+            theta[:, 2] - 0.3 * theta[:, 5],
+            theta[:, 4] + 0.8 * theta[:, 1],
+            theta[:, 0] - theta[:, 3],
+            theta[:, 5],
+        ],
+        1,
+    )
+    order = paper_analysis._code_order(codes, theta)  # pyright: ignore[reportPrivateUsage]
+    assert {order[0], order[3]} == {1, 4}
+    assert {order[1], order[4]} == {0, 3}
+    assert {order[2], order[5]} == {2, 5}
+    # Within a pair |correlation| decides: code 4 tracks theta_1, code 1 tracks theta_4.
+    assert (order[0], order[3]) == (4, 1)
+    truth = true_graphs().parameter.numpy()
+    scrambled = np.zeros_like(truth)
+    scrambled[:, order] = truth
+    aligned = paper_analysis._code_aligned_metrics(  # pyright: ignore[reportPrivateUsage]
+        scrambled[:, order]
+    )
+    assert aligned["masks/parameter_code_aligned_shd"] == 0.0
 
 
 def test_end_to_end_outputs_on_a_smoke_batch(tmp_path: Path) -> None:
@@ -192,3 +224,9 @@ def test_learned_code_batches_add_code_figures_and_table(tmp_path: Path) -> None
     assert sorted(result["projections"]) == ["0", "1"]
     assert result["projections"]["0"]["source_code_dim"] == 12
     assert "learned parameter codes" in (tmp_path / "paper/README.md").read_text()
+    with (tmp_path / "paper/per_run.csv").open() as stream:
+        rows = list(csv.DictReader(stream))
+    for row in rows:
+        aligned = row["masks/parameter_code_aligned_shd"]
+        assert (aligned != "") == (row["arm"] == "full")
+    assert "pair $R^2$" in (tmp_path / "paper/table_main.tex").read_text()
