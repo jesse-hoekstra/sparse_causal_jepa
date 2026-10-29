@@ -55,11 +55,21 @@ class FromDenseConfig:
     init_dir: str
     geco_step_size: float = 0.1
     geco_lambda_init: float = 1000.0
+    sparse_steps: int | None = None
+
+    @property
+    def budget(self) -> int:
+        """Sparse updates; ``train.steps`` stays the dense reference budget."""
+        return self.train.steps if self.sparse_steps is None else self.sparse_steps
 
     def __post_init__(self) -> None:
         """Only the sparse arms start from a dense endpoint."""
         if self.train.condition == "dense":
             raise ValueError("a dense endpoint initializes only baseline or full arms")
+        if type(self.budget) is not int or self.budget < 1:
+            raise ValueError("sparse_steps must be a positive integer")
+        if self.train.profile == "exploratory" and self.budget not in (100_000, 200_000):
+            raise ValueError("exploratory sparse budget is 100000 or 200000 updates")
         if not math.isfinite(self.geco_step_size) or self.geco_step_size <= 0:
             raise ValueError("geco_step_size must be finite and positive")
         # GECOConfig validates the initial multiplier against its log bounds.
@@ -149,6 +159,7 @@ def train(config: FromDenseConfig, *, resume: bool = False) -> dict[str, Any]:
 
 def _train(config: FromDenseConfig, output: Path, *, resume: bool) -> dict[str, Any]:
     settings = config.train
+    budget = config.budget
     torch.set_num_threads(settings.threads)
     device = resolve_device(settings.device)
     torch.set_float32_matmul_precision("highest")
@@ -191,6 +202,7 @@ def _train(config: FromDenseConfig, output: Path, *, resume: bool) -> dict[str, 
             "seed-matched final dense endpoint (online/EMA encoder, trunk, readouts); "
             "fresh mask logits, AdamW, GECO and sampler"
         ),
+        "sparse_steps": budget,
     }
     specification: dict[str, Any] = {
         "scientific_config": scientific,
@@ -239,7 +251,7 @@ def _train(config: FromDenseConfig, output: Path, *, resume: bool) -> dict[str, 
         optimizer.load_state_dict(restored["optimizer"])
         sampler.load_state_dict(restored["sampler"])
         start = int(restored["step"])
-        if not 0 <= start <= settings.steps:
+        if not 0 <= start <= budget:
             raise ValueError("checkpoint step exceeds its fixed budget")
         for state in optimizer.state.values():
             if int(cast(Tensor, state["step"])) != start:
@@ -255,7 +267,7 @@ def _train(config: FromDenseConfig, output: Path, *, resume: bool) -> dict[str, 
             torch.cuda.set_rng_state(restored["cuda_rng"], device)
         if (output / "completion.json").exists():
             completed = verify_completion(output, kind="train", require_current_source=True)
-            if completed["identity"] != identity or completed["steps"] != settings.steps:
+            if completed["identity"] != identity or completed["steps"] != budget:
                 raise ValueError("completed run differs from requested continuation")
             return completed
     else:
@@ -327,7 +339,7 @@ def _train(config: FromDenseConfig, output: Path, *, resume: bool) -> dict[str, 
             save(0)
         model.train()
         objective.train()
-        for step in range(start + 1, settings.steps + 1):
+        for step in range(start + 1, budget + 1):
             batch = data["train"].batch(sampler.next(), device)
             optimizer.zero_grad(set_to_none=True)
             torch.manual_seed((1 << 40) + settings.seed + step)  # pyright: ignore[reportUnknownMemberType]
@@ -344,7 +356,7 @@ def _train(config: FromDenseConfig, output: Path, *, resume: bool) -> dict[str, 
             model.update_target()
             assert objective.geco is not None
             objective.geco.update(terms["prediction"].detach() / tau_prediction)
-            if step % settings.log_every == 0 or step == settings.steps:
+            if step % settings.log_every == 0 or step == budget:
                 metrics = {f"loss/{key}": float(value.detach()) for key, value in terms.items()}
                 metrics.update(
                     {
@@ -364,7 +376,7 @@ def _train(config: FromDenseConfig, output: Path, *, resume: bool) -> dict[str, 
                     )
                     metrics[f"masks/{name}_edges"] = float((logits.detach() > 0).sum())
                 _log(logger, output, step, metrics)
-            if step % settings.evaluate_every == 0 and step != settings.steps:
+            if step % settings.evaluate_every == 0 and step != budget:
                 interim, _ = collect()
                 _log(
                     logger,
@@ -376,7 +388,7 @@ def _train(config: FromDenseConfig, output: Path, *, resume: bool) -> dict[str, 
                         for key, value in result.metrics.items()
                     },
                 )
-            if step % settings.checkpoint_every == 0 or step == settings.steps:
+            if step % settings.checkpoint_every == 0 or step == budget:
                 save(step)
         names = [
             "initial.pt",
@@ -398,10 +410,10 @@ def _train(config: FromDenseConfig, output: Path, *, resume: bool) -> dict[str, 
             _log(
                 logger,
                 output,
-                settings.steps,
+                budget,
                 {f"{split}/{key}": value for key, value in result.metrics.items()},
             )
-        _log(logger, output, settings.steps, {"diagnostic/complete": 1.0})
+        _log(logger, output, budget, {"diagnostic/complete": 1.0})
         logger.finish()
         if code_identity() != source_identity:
             raise RuntimeError("numerical source changed during training; completion refused")
@@ -413,8 +425,8 @@ def _train(config: FromDenseConfig, output: Path, *, resume: bool) -> dict[str, 
             "profile": settings.profile,
             "condition": settings.condition,
             "seed": settings.seed,
-            "steps": settings.steps,
-            "successful_updates": settings.steps,
+            "steps": budget,
+            "successful_updates": budget,
             "skipped_updates": 0,
             "data_identity": cache["identity"],
             "calibration_identity": calibration["identity"],
@@ -464,7 +476,8 @@ def main() -> None:
     train_parser.add_argument("--condition", choices=("baseline", "full"), required=True)
     train_parser.add_argument("--profile", choices=("exploratory", "smoke"), default="exploratory")
     train_parser.add_argument("--seed", type=int, default=0)
-    train_parser.add_argument("--steps", type=int, default=100_000)
+    train_parser.add_argument("--steps", type=int, default=100_000, help="dense reference budget")
+    train_parser.add_argument("--sparse-steps", type=int, help="sparse budget (default: --steps)")
     train_parser.add_argument("--device", default="cpu")
     train_parser.add_argument("--threads", type=int, default=1)
     train_parser.add_argument("--resume", action="store_true")
@@ -498,6 +511,7 @@ def main() -> None:
                 arguments.init_dir,
                 geco_step_size=arguments.geco_step_size,
                 geco_lambda_init=arguments.geco_lambda_init,
+                sparse_steps=arguments.sparse_steps,
             ),
             resume=arguments.resume,
         )

@@ -192,3 +192,21 @@ def test_geco_step_size_is_recorded_and_changes_the_run_identity(tmp_path: Path)
     assert completion["identity"] != default["identity"]
     history = (tmp_path / "slow-geco/history.jsonl").read_text().splitlines()
     assert any("geco/log10_penalty_weight" in line for line in history)
+
+
+def test_sparse_budget_is_independent_of_the_dense_reference_budget(tmp_path: Path) -> None:
+    exploratory = runner.TrainConfig("unused", "unused", "full", calibration_dir="unused")
+    assert from_dense.FromDenseConfig(exploratory, "unused", sparse_steps=200_000).budget == 200_000
+    with pytest.raises(ValueError, match="100000 or 200000"):
+        from_dense.FromDenseConfig(exploratory, "unused", sparse_steps=150_000)
+    _prepare(tmp_path)
+    config = _config(tmp_path, "full")
+    longer = from_dense.FromDenseConfig(
+        replace(config.train, output_dir=str(tmp_path / "longer")), config.init_dir, sparse_steps=6
+    )
+    completion = from_dense.train(longer)
+    assert completion["steps"] == 6
+    assert _checkpoint(tmp_path / "longer/last.pt")["step"] == 6
+    record = read_json(tmp_path / "longer/config.json")
+    assert record["scientific_config"]["sparse_steps"] == 6
+    assert record["scientific_config"]["steps"] == 4
