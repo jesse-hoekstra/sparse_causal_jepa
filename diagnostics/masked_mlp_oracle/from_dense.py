@@ -53,11 +53,14 @@ class FromDenseConfig:
 
     train: run.TrainConfig
     init_dir: str
+    geco_step_size: float = 0.1
 
     def __post_init__(self) -> None:
         """Only the sparse arms start from a dense endpoint."""
         if self.train.condition == "dense":
             raise ValueError("a dense endpoint initializes only baseline or full arms")
+        if not math.isfinite(self.geco_step_size) or self.geco_step_size <= 0:
+            raise ValueError("geco_step_size must be finite and positive")
 
 
 def verify_completion(
@@ -162,7 +165,7 @@ def _train(config: FromDenseConfig, output: Path, *, resume: bool) -> dict[str, 
     _load_dense(model, endpoint["state"])
     model = model.to(device)
     initials = run._initial_identities(model)  # pyright: ignore[reportPrivateUsage]
-    controller = GECOConfig(enabled=True, tau=1.0)
+    controller = GECOConfig(enabled=True, tau=1.0, step_size=config.geco_step_size)
     objective = TrainingObjective(objective_config(settings.condition, 0.0), controller).to(device)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if any(parameter.requires_grad for parameter in model.target_encoder.parameters()):
@@ -337,6 +340,8 @@ def _train(config: FromDenseConfig, output: Path, *, resume: bool) -> dict[str, 
                         "train/successful_updates": float(step),
                         "train/elapsed_seconds": time.monotonic() - started,
                         "geco/penalty_weight": float(objective.geco.penalty_weight),
+                        "geco/log10_penalty_weight": -float(objective.geco.log_lambda)
+                        / math.log(10),
                         "geco/moving_violation": float(objective.geco.ma_error),
                     }
                 )
@@ -454,6 +459,7 @@ def main() -> None:
     train_parser.add_argument("--wandb-project", default="sparse_causal_jepa")
     train_parser.add_argument("--wandb-entity")
     train_parser.add_argument("--wandb-group", default="masked-mlp-oracle-from-dense")
+    train_parser.add_argument("--geco-step-size", type=float, default=0.1)
     summary_parser = commands.add_parser("summarize")
     summary_parser.add_argument("--runs", nargs="+", required=True)
     arguments = parser.parse_args()
@@ -476,6 +482,7 @@ def main() -> None:
                     wandb_group=arguments.wandb_group,
                 ),
                 arguments.init_dir,
+                geco_step_size=arguments.geco_step_size,
             ),
             resume=arguments.resume,
         )

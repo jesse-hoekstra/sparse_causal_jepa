@@ -105,6 +105,7 @@ def test_sparse_arms_start_exactly_from_the_seed_matched_dense_endpoint(tmp_path
         assert from_dense.verify_completion(directory, require_current_source=True) == completion
         record = read_json(directory / "config.json")
         assert record["geco"]["tau"] == 1.0
+        assert record["geco"]["step_size"] == 0.1
         assert "dense endpoint" in record["scientific_config"]["initialization"]
     rows = from_dense.summarize(runs)
     assert [row["condition"] for row in rows] == ["baseline", "full"]
@@ -114,6 +115,8 @@ def test_sparse_arms_start_exactly_from_the_seed_matched_dense_endpoint(tmp_path
 def test_endpoint_seed_condition_and_arm_are_checked(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="only baseline or full"):
         from_dense.FromDenseConfig(_train_config(tmp_path, "dense"), "unused")
+    with pytest.raises(ValueError, match="geco_step_size"):
+        from_dense.FromDenseConfig(_train_config(tmp_path, "full"), "unused", geco_step_size=0)
     _prepare(tmp_path, dense_seeds=(0, 1))
     with pytest.raises(ValueError, match="seed differs"):
         from_dense.train(_config(tmp_path, "full", seed=0, init_seed=1))
@@ -159,3 +162,20 @@ def test_exact_interruption_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     right = _checkpoint(tmp_path / "interrupted/last.pt")
     for key in ("model", "optimizer", "objective", "sampler", "torch_rng", "cuda_rng"):
         torch.testing.assert_close(left[key], right[key], rtol=0, atol=0)
+
+
+def test_geco_step_size_is_recorded_and_changes_the_run_identity(tmp_path: Path) -> None:
+    _prepare(tmp_path)
+    default = from_dense.train(_config(tmp_path, "full"))
+    config = _config(tmp_path, "full")
+    slow = from_dense.FromDenseConfig(
+        replace(config.train, output_dir=str(tmp_path / "slow-geco")),
+        config.init_dir,
+        geco_step_size=0.001,
+    )
+    completion = from_dense.train(slow)
+    record = read_json(tmp_path / "slow-geco/config.json")
+    assert record["geco"]["step_size"] == 0.001
+    assert completion["identity"] != default["identity"]
+    history = (tmp_path / "slow-geco/history.jsonl").read_text().splitlines()
+    assert any("geco/log10_penalty_weight" in line for line in history)
