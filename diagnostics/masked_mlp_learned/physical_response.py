@@ -1,15 +1,17 @@
-"""Validation-only physical-response assay for the learned-code Paley24 experiment.
+"""Validation-only physical-response assay for the Paley24 experiment.
 
 True parameters and physical states enter only this frozen-model evaluation.
 The donor context is regenerated after changing one physical parameter; its
 entire inferred code predicts the unchanged recipient history and actions.
 No code coordinate is assumed to correspond to a physical parameter.
+The explicit oracle-control mode supplies true parameters and bypasses the
+unused parameter encoder; it does not fit or modify any model.
 """
 
 import argparse
 import math
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 from torch import Tensor
@@ -18,7 +20,9 @@ from diagnostics.balanced_action_oracle import dgp
 from diagnostics.balanced_action_oracle.data import StateData, load_data
 from diagnostics.joint_acquisition.baseline import MatchedBatch, MatchedPredictions, response_report
 from diagnostics.masked_mlp_learned import run
-from diagnostics.oracle_state_learning.data import save_torch, sha
+from diagnostics.masked_mlp_oracle import from_dense
+from diagnostics.masked_mlp_oracle import run as oracle_run
+from diagnostics.oracle_state_learning.data import read_json, save_torch, sha
 from diagnostics.overcomplete_use_precision.evaluation import direct_decomposition, join_batches
 from diagnostics.signal_path.geometry import predict_rollout
 from scjepa.data.controlled_vector import VectorObservationMap
@@ -143,26 +147,34 @@ def matched_batch(
     )
 
 
-def predict_matched(model: SCJEPA, batch: MatchedBatch) -> MatchedPredictions:
-    """Use each donor's complete six- or twelve-dimensional code at both forecast steps."""
+def predict_matched(
+    model: SCJEPA, batch: MatchedBatch, *, oracle_parameters: Tensor | None = None
+) -> MatchedPredictions:
+    """Use complete donor codes, or explicit oracle-control inputs, at both forecast steps."""
     width = model.predictor.param_dim
     if width not in (6, 12) or model.parameter_encoder.param_dim != width:
-        raise ValueError("Require matching six- or twelve-dimensional learned codes")
+        raise ValueError("Require matching six- or twelve-dimensional code interfaces")
     batch = batch.to(next(model.parameters()))
     groups, donors, queries = batch.history.shape[:3]
-    codes = cast(
-        Tensor,
-        model.parameter_encoder(
-            batch.donor_states.flatten(0, 1), batch.donor_actions.flatten(0, 1)
-        ),
-    ).reshape(groups, donors, width)
-    changed_codes = cast(
-        Tensor,
-        model.parameter_encoder(
-            batch.changed_donor_states.flatten(0, 2),
-            batch.donor_actions[:, :, None].expand(-1, -1, 6, -1, -1).flatten(0, 2),
-        ),
-    ).reshape(groups, donors, 6, width)
+    if oracle_parameters is None:
+        codes = cast(
+            Tensor,
+            model.parameter_encoder(
+                batch.donor_states.flatten(0, 1), batch.donor_actions.flatten(0, 1)
+            ),
+        ).reshape(groups, donors, width)
+        changed_codes = cast(
+            Tensor,
+            model.parameter_encoder(
+                batch.changed_donor_states.flatten(0, 2),
+                batch.donor_actions[:, :, None].expand(-1, -1, 6, -1, -1).flatten(0, 2),
+            ),
+        ).reshape(groups, donors, 6, width)
+    else:
+        if width != 6 or oracle_parameters.shape != (groups, 6) or batch.split != "validation":
+            raise ValueError("Oracle response requires six parameters per validation group")
+        codes = oracle_parameters.to(batch.history)[:, None].expand(-1, donors, -1)
+        changed_codes = codes[:, :, None] + torch.diag_embed(batch.finite_steps)[:, None]
     base = predict_rollout(
         model,
         batch.history.flatten(0, 2),
@@ -180,11 +192,18 @@ def predict_matched(model: SCJEPA, batch: MatchedBatch) -> MatchedPredictions:
 
 @torch.no_grad()
 def assess(
-    model: SCJEPA, data: StateData, observation: VectorObservationMap, *, chunk_size: int = 16
+    model: SCJEPA,
+    data: StateData,
+    observation: VectorObservationMap,
+    *,
+    chunk_size: int = 16,
+    parameter_source: Literal["learned", "oracle"] = "learned",
 ) -> tuple[dict[str, Any], dict[str, Tensor]]:
     """Assess all existing validation groups with one fixed independent-group bootstrap."""
     if chunk_size < 1:
         raise ValueError("Chunk size must be positive")
+    if parameter_source not in {"learned", "oracle"}:
+        raise ValueError("Unknown parameter source")
     batches: list[MatchedBatch] = []
     predictions: list[Tensor] = []
     changes: list[Tensor] = []
@@ -192,7 +211,12 @@ def assess(
         batch = matched_batch(
             model, data, observation, tuple(range(start, min(start + chunk_size, len(data))))
         )
-        result = predict_matched(model, batch)
+        parameters = (
+            data.tensors["oracle_parameters"][list(batch.group_indices)]
+            if parameter_source == "oracle"
+            else None
+        )
+        result = predict_matched(model, batch, oracle_parameters=parameters)
         batches.append(batch.to(torch.zeros((), dtype=torch.float64)))
         predictions.append(result.predictions.cpu())
         changes.append(result.changed_predictions.cpu())
@@ -221,6 +245,7 @@ def assess(
         row["response_fidelity_pass"] = bool(nre["defined"] and nre["interval_95"][1] < 1)
         row["positive_benefit_pass"] = bool(benefit["defined"] and benefit["interval_95"][0] > 0)
     report.update(
+        parameter_source=parameter_source,
         all_six_response_fidelity_pass=all(
             row["response_fidelity_pass"] for row in report["per_parameter"]
         ),
@@ -233,8 +258,13 @@ def assess(
             key: [float(value) for value in tensor.mean(0)] for key, tensor in decomposition.items()
         },
         interpretation=(
-            "Frozen final-budget checkpoint; complete single-context codes; validation only. "
-            "NRE and signed benefit remain separate. Factorwise intervals are not simultaneous. "
+            "Frozen final-budget checkpoint; validation only. "
+            + (
+                "Complete single-context learned codes. "
+                if parameter_source == "learned"
+                else "Explicit oracle-control parameter inputs; context encoder bypassed. "
+            )
+            + "NRE and signed benefit remain separate. Factorwise intervals are not simultaneous. "
             "No probe, code-coordinate alignment, fitting, or checkpoint selection enters."
         ),
     )
@@ -254,6 +284,7 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--parameter-source", choices=("learned", "oracle"), default="learned")
     parser.add_argument(
         "--wandb-mode", choices=("disabled", "offline", "online"), default="disabled"
     )
@@ -265,7 +296,17 @@ def main() -> None:
     if output.exists():
         raise FileExistsError(output)
     source = cast(Path, args.run_dir).resolve()
-    completion = run.verify_completion(source)
+    if args.parameter_source == "oracle":
+        verifiers = {
+            oracle_run.SCHEMA: oracle_run.verify_completion,
+            from_dense.SCHEMA: from_dense.verify_completion,
+        }
+        schema = read_json(source / "completion.json").get("schema")
+        if schema not in verifiers:
+            raise ValueError("Oracle response requires an authenticated oracle checkpoint")
+        completion = verifiers[schema](source, kind="train")
+    else:
+        completion = run.verify_completion(source)
     if completion["kind"] not in {"train", "projection"}:
         raise ValueError("Require a completed final-budget model")
     data, cache = load_data(args.data_dir)
@@ -279,14 +320,21 @@ def main() -> None:
         or checkpoint["identity"] != completion["identity"]
     ):
         raise ValueError("Require the authenticated fixed-budget checkpoint")
-    model = run.build_control(completion["condition"], completion["seed"], completion["code_dim"])
+    model = (
+        oracle_run.build_control(completion["condition"], completion["seed"])
+        if args.parameter_source == "oracle"
+        else run.build_control(completion["condition"], completion["seed"], completion["code_dim"])
+    )
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device=args.device, dtype=torch.float64).requires_grad_(False).eval()
     matrix = cast(
         dict[str, Tensor], torch.load(args.data_dir / "observation_map.pt", weights_only=True)
     )["matrix"]
     report, raw = assess(
-        model, data["validation"], VectorObservationMap(matrix=matrix, dimension=6)
+        model,
+        data["validation"],
+        VectorObservationMap(matrix=matrix, dimension=6),
+        parameter_source=args.parameter_source,
     )
     output.mkdir(parents=True)
     save_torch(output / "responses.pt", raw)
@@ -310,7 +358,8 @@ def main() -> None:
                 )
             },
             "responses_sha256": sha(output / "responses.pt"),
-            "code_dimension": completion["code_dim"],
+            "code_dimension": model.predictor.param_dim,
+            "parameter_source": args.parameter_source,
             "split": "validation",
             "response": report,
         },
@@ -324,7 +373,11 @@ def main() -> None:
             name=output.name,
             job_type="validation-physical-response",
         ),
-        resolved_config={"source_identity": completion["identity"], "split": "validation"},
+        resolved_config={
+            "source_identity": completion["identity"],
+            "split": "validation",
+            "parameter_source": args.parameter_source,
+        },
         dataset_identity=cache["identity"],
         out_dir=output,
     )

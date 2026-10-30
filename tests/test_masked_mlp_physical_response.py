@@ -14,6 +14,7 @@ from diagnostics.balanced_action_oracle.data import StateData
 from diagnostics.masked_mlp_learned import physical_response as assay
 from diagnostics.masked_mlp_learned.run import build_control
 from diagnostics.masked_mlp_oracle.model import MaskedTrunkPredictor
+from diagnostics.masked_mlp_oracle.model import build_control as build_oracle
 from scjepa.data.controlled_vector import VectorObservationMap
 
 
@@ -113,3 +114,56 @@ def test_frozen_predictor_transmits_the_second_forecast_gradient_to_codes() -> N
     assert raw["factual_predictions"].shape == (2, 1, 5, 2, 6)
     assert raw["finite_steps"].shape == (2, 6)
     torch.testing.assert_close(raw["predictive_benefit"], raw["benefit_from_direct_vectors"])
+
+
+@pytest.mark.parametrize("condition", ["dense", "full"])
+def test_oracle_reference_bypasses_context_encoder_and_perturbs_physical_inputs(
+    condition: assay.oracle_run.Condition, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data, observation = _data()
+    model = build_oracle(condition, 0).double().eval()
+
+    def forbidden(*_args: Tensor) -> Tensor:
+        raise AssertionError("Oracle reference must bypass the unused parameter encoder")
+
+    monkeypatch.setattr(model.parameter_encoder, "forward", forbidden)
+    batch = assay.matched_batch(model, data, observation, (0, 1))
+    theta = data.tensors["oracle_parameters"].double()
+    output = assay.predict_matched(model, batch, oracle_parameters=theta)
+    torch.testing.assert_close(output.codes[:, 0], theta)
+    torch.testing.assert_close(
+        output.changed_codes[:, 0] - theta[:, None], torch.diag_embed(batch.finite_steps)
+    )
+
+    # Independently forecast a changed recipient through both steps. Its second
+    # input must be the first forecast and the same changed physical parameter.
+    group, factor, recipient = 1, 4, 3
+    parameters = theta[group : group + 1].clone()
+    parameters[:, factor] += batch.finite_steps[group, factor]
+    history = batch.history[group : group + 1, 0, recipient]
+    actions = batch.query_actions[group : group + 1, 0, recipient]
+    first = model.predictor(history, parameters, actions[:, :1]).prediction
+    second = model.predictor(first[:, None], parameters, actions[:, 1:2]).prediction
+    torch.testing.assert_close(
+        output.changed_predictions[group, 0, factor, recipient],
+        torch.stack((first[0], second[0])),
+    )
+    report, raw = assay.assess(model, data, observation, chunk_size=1, parameter_source="oracle")
+    assert report["parameter_source"] == "oracle"
+    assert len(report["per_parameter"]) == 6
+    torch.testing.assert_close(raw["factual_predictions"], output.predictions)
+    torch.testing.assert_close(raw["counterfactual_predictions"], output.changed_predictions)
+
+
+def test_oracle_reference_rejects_wrong_dimensions_or_split() -> None:
+    data, observation = _data()
+    model = build_oracle("dense", 0).double().eval()
+    batch = assay.matched_batch(model, data, observation, (0, 1))
+    theta = data.tensors["oracle_parameters"]
+    with pytest.raises(ValueError, match="six parameters per validation group"):
+        assay.predict_matched(model, batch, oracle_parameters=theta[:1])
+    with pytest.raises(ValueError, match="six parameters per validation group"):
+        assay.predict_matched(model, replace(batch, split="train"), oracle_parameters=theta)
+    overcomplete = build_control("dense", 0, 12).double().eval()
+    with pytest.raises(ValueError, match="six parameters per validation group"):
+        assay.predict_matched(overcomplete, batch, oracle_parameters=theta)
