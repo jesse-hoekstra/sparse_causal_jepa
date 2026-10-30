@@ -400,6 +400,7 @@ class TrainConfig:
     calibration_dir: str | None = None
     init_dir: str | None = None
     states_from: str | None = None
+    adapt_from: str | None = None
     acquisition_seed: int | None = None
     geco_step_size: float = 0.1
     code_dim: int | None = None
@@ -427,6 +428,14 @@ class TrainConfig:
             raise ValueError("exactly the sparse arms need a calibration and a dense endpoint")
         if sparse and self.states_from is not None:
             raise ValueError("only dense arms acquire codes on frozen states")
+        if self.adapt_from is not None and (
+            sparse
+            or self.states_from is not None
+            or self.acquisition_seed is not None
+            or self.code_dim is not None
+            or self.initializer is not None
+        ):
+            raise ValueError("adaptation inherits one projected six-code dense model")
         if self.acquisition_seed is not None:
             if self.states_from is None:
                 raise ValueError("acquisition_seed requires frozen states")
@@ -441,7 +450,10 @@ class TrainConfig:
         if self.profile == "exploratory":
             if (self.batch_size, self.lr, self.grad_clip) != (16, 0.001, 1.0):
                 raise ValueError("exploratory optimizer settings are fixed")
-            allowed = (100_000, 200_000) if sparse else (100_000,)
+            if self.adapt_from is not None:
+                allowed = (50_000,)
+            else:
+                allowed = (100_000, 200_000) if sparse else (100_000,)
             if self.steps not in allowed:
                 raise ValueError(f"exploratory budget must be one of {allowed}")
         for name in (
@@ -463,8 +475,8 @@ class TrainConfig:
 
     @property
     def model_code_dim(self) -> int:
-        """Dense arms default to the audited twelve-code interface; sparse arms use six."""
-        if self.condition != "dense":
+        """Fresh dense arms default to twelve codes; projected transfers use six."""
+        if self.condition != "dense" or self.adapt_from is not None:
             return SPARSE_CODE_DIM
         return 12 if self.code_dim is None else self.code_dim
 
@@ -475,8 +487,8 @@ class TrainConfig:
 
     @property
     def model_initializer(self) -> Initializer:
-        """Dense arms default to the audited recipe; sparse arms load every weight."""
-        if self.condition != "dense":
+        """Fresh dense arms use the audited recipe; projected transfers load every weight."""
+        if self.condition != "dense" or self.adapt_from is not None:
             return "native"
         return "shared_feature" if self.initializer is None else self.initializer
 
@@ -647,6 +659,46 @@ def _dense_endpoint(config: TrainConfig, data_identity: str) -> dict[str, Any] |
 STATE_ENCODERS = ("online_encoder.", "target_encoder.")
 
 
+def _adaptation_source(config: TrainConfig, data_identity: str) -> dict[str, Any] | None:
+    """Authenticate a projected warm start, retaining its possibly older source identity.
+
+    This is an explicit model transfer. Calibration/sparse initialization and
+    resume retain their existing strict current-source checks.
+    """
+    if config.adapt_from is None:
+        return None
+    directory = Path(config.adapt_from).resolve()
+    completion = verify_completion(directory, kind="projection")
+    if (
+        completion["condition"] != "dense"
+        or completion["code_dim"] != SPARSE_CODE_DIM
+        or completion["seed"] != config.seed
+    ):
+        raise ValueError("adaptation requires the seed-matched projected six-code dense endpoint")
+    if completion["profile"] != config.profile or completion["data_identity"] != data_identity:
+        raise ValueError("adaptation endpoint profile or data identity differs")
+    checkpoint = cast(
+        dict[str, Any], torch.load(directory / "last.pt", map_location="cpu", weights_only=False)
+    )
+    if checkpoint.get("identity") != completion["identity"]:
+        raise ValueError("adaptation checkpoint does not belong to its completion record")
+    if int(checkpoint["step"]) != int(completion["steps"]):
+        raise ValueError("adaptation checkpoint is not the final endpoint")
+    return {
+        "record": {
+            "directory": str(directory),
+            "kind": completion["kind"],
+            "identity": completion["identity"],
+            "code_identity": completion["code_identity"],
+            "completion_sha256": sha(directory / "completion.json"),
+            "checkpoint_sha256": sha(directory / "last.pt"),
+            "seed": completion["seed"],
+            "steps": completion["steps"],
+        },
+        "state": checkpoint["model"],
+    }
+
+
 def _state_source(config: TrainConfig, data_identity: str) -> dict[str, Any] | None:
     """Authenticate the dense endpoint whose trained state encoders are reused and frozen."""
     if config.states_from is None:
@@ -657,7 +709,10 @@ def _state_source(config: TrainConfig, data_identity: str) -> dict[str, Any] | N
         raise ValueError("state encoders must come from the seed-matched dense endpoint")
     if completion["profile"] != config.profile or completion["data_identity"] != data_identity:
         raise ValueError("state endpoint profile or data identity differs")
-    if completion.get("state_source") is not None:
+    if (
+        completion.get("state_source") is not None
+        or completion.get("adaptation_source") is not None
+    ):
         raise ValueError("state encoders must come from a jointly trained dense endpoint")
     checkpoint = cast(
         dict[str, Any], torch.load(directory / "last.pt", map_location="cpu", weights_only=False)
@@ -779,6 +834,7 @@ def _scientific_config(config: TrainConfig) -> dict[str, Any]:
             "calibration_dir",
             "init_dir",
             "states_from",
+            "adapt_from",
             "device",
             "threads",
             "log_every",
@@ -791,6 +847,19 @@ def _scientific_config(config: TrainConfig) -> dict[str, Any]:
         }
     }
     code_dim = config.model_code_dim
+    if config.adapt_from is not None:
+        initialization = (
+            "every projected six-code tensor copied; fresh AdamW and sampler; frozen states"
+        )
+    elif config.condition == "dense":
+        initialization = (
+            "fresh paired Gaussian encoder head, parameter-encoder input layer, trunk, "
+            f"readouts; parameter-encoder policy {config.model_initializer}"
+        )
+    else:
+        initialization = (
+            "seed-matched six-code dense endpoint; fresh mask logits, AdamW, GECO, sampler"
+        )
     return values | {
         "code_dim": code_dim,
         "initializer": config.model_initializer,
@@ -798,17 +867,12 @@ def _scientific_config(config: TrainConfig) -> dict[str, Any]:
         "parameter_training": "forecast only; no parameter regularizer or consistency term",
         "state_training": (
             "frozen online and target encoders of a dense endpoint; no EMA update"
-            if config.states_from is not None
+            if config.states_from is not None or config.adapt_from is not None
             else "joint, EMA target"
         ),
         "objective": asdict(objective_config(config.condition, 0.0)),
         "constraint": "sparse arms: GECO on prediction MSE / tau_prediction <= 1",
-        "initialization": (
-            "fresh paired Gaussian encoder head, parameter-encoder input layer, trunk, "
-            f"readouts; parameter-encoder policy {config.model_initializer}"
-            if config.condition == "dense"
-            else "seed-matched six-code dense endpoint; fresh mask logits, AdamW, GECO, sampler"
-        ),
+        "initialization": initialization,
         "ema_decay": 0.996,
         "weight_decay": 0.0,
         "predictor": (
@@ -854,6 +918,8 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
     calibration = _calibration(config, data_identity)
     endpoint = _dense_endpoint(config, data_identity)
     states = _state_source(config, data_identity)
+    adaptation = _adaptation_source(config, data_identity)
+    frozen_states = states is not None or adaptation is not None
     tau_prediction = float(calibration["tau_prediction"]) if calibration else None
     seed_everything(config.seed)
     model = build_control(
@@ -873,12 +939,14 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
         initialization = saved.get("initialization")
     elif endpoint is not None:
         _load_dense(model, endpoint["state"])
+    elif adaptation is not None:
+        model.load_state_dict(adaptation["state"], strict=True)
     else:
         if states is not None:
             _load_states(model, states["state"])
         if config.model_initializer == "shared_feature":
             initialization = initialize_shared_output(model, data["train"], device)
-    if states is not None:
+    if frozen_states:
         model.online_encoder.requires_grad_(False)
     initials = _initial_identities(model)
     controller = (
@@ -906,6 +974,7 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
         "geco": asdict(controller),
         "dense_endpoint": endpoint["record"] if endpoint else None,
         "state_source": states["record"] if states else None,
+        "adaptation_source": adaptation["record"] if adaptation else None,
         "initialization": initialization,
         **initials,
     }
@@ -917,7 +986,11 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
         "config": asdict(config),
         "physical_state_training": False,
         "true_parameter_training": False,
-        "target_policy": "EMA .996, no optimizer gradients",
+        "target_policy": (
+            "frozen inherited target; no optimizer gradients or EMA updates"
+            if frozen_states
+            else "EMA .996, no optimizer gradients"
+        ),
         "runtime": {
             "torch_version": str(torch.__version__),
             "cuda_version": torch.version.cuda,
@@ -1039,7 +1112,7 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
                 parameters, config.grad_clip, error_if_nonfinite=True
             )
             optimizer.step()  # pyright: ignore[reportUnknownMemberType]
-            if states is None:
+            if not frozen_states:
                 model.update_target()
             if objective.geco is not None and tau_prediction is not None:
                 objective.geco.update(terms["prediction"].detach() / tau_prediction)
@@ -1112,6 +1185,7 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
             "tau_prediction": tau_prediction,
             "dense_endpoint": endpoint["record"] if endpoint else None,
             "state_source": states["record"] if states else None,
+            "adaptation_source": adaptation["record"] if adaptation else None,
             **initials,
             "wandb": logger.metadata,
             "hashes": {name: sha(output / name) for name in names},
@@ -1303,6 +1377,7 @@ def main() -> None:
     train_parser.add_argument("--calibration-dir")
     train_parser.add_argument("--init-dir")
     train_parser.add_argument("--states-from")
+    train_parser.add_argument("--adapt-from")
     train_parser.add_argument("--acquisition-seed", type=int)
     train_parser.add_argument("--geco-step-size", type=float, default=0.1)
     train_parser.add_argument("--code-dim", type=int, choices=CODE_DIMS)
@@ -1344,6 +1419,7 @@ def main() -> None:
                 calibration_dir=arguments.calibration_dir,
                 init_dir=arguments.init_dir,
                 states_from=arguments.states_from,
+                adapt_from=arguments.adapt_from,
                 acquisition_seed=arguments.acquisition_seed,
                 geco_step_size=arguments.geco_step_size,
                 code_dim=arguments.code_dim,

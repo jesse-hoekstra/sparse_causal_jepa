@@ -253,6 +253,117 @@ def test_projection_is_exact_for_a_six_dimensional_code() -> None:
         )
 
 
+def test_projected_adaptation_preserves_states_and_supports_exact_resume_and_sparse_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare(tmp_path)
+    _dense_and_bound(tmp_path)
+    projected = tmp_path / "projected-s0"
+    source = _checkpoint(projected / "last.pt")["model"]
+    original_identity = runner.verify_completion(projected)["code_identity"]
+    config = replace(
+        _config(tmp_path, "dense"),
+        output_dir=str(tmp_path / "adapted-s0"),
+        adapt_from=str(projected),
+    )
+    seen: list[set[str]] = []
+    actual = runner.forward_loss
+
+    def observe(
+        model: SCJEPA,
+        batch: dict[str, Tensor],
+        objective: TrainingObjective,
+        *,
+        forward_seed: int | None = None,
+    ) -> tuple[Tensor, dict[str, Tensor], ModelOutput]:
+        if model.training:
+            seen.append(set(batch))
+            assert not any(p.requires_grad for p in model.online_encoder.parameters())
+            assert not any(p.requires_grad for p in model.target_encoder.parameters())
+            assert all(p.requires_grad for p in model.parameter_encoder.parameters())
+            assert objective.geco is None
+        return actual(model, batch, objective, forward_seed=forward_seed)
+
+    # Model transfer records the old source identity. Ordinary calibration still
+    # rejects the old runtime; adaptation's own resume uses the new identity.
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, "code_identity", lambda: "f" * 64)
+        patch.setattr(runner, "forward_loss", observe)
+        with pytest.raises(ValueError, match="numerical source"):
+            runner.calibrate(
+                runner.CalibrateConfig(str(tmp_path / "old-bound"), str(projected), profile="smoke")
+            )
+        completion = runner.train(config)
+        assert completion["adaptation_source"]["code_identity"] == original_identity
+        assert completion["code_identity"] == "f" * 64
+        assert completion["code_dim"] == 6
+        initial = _checkpoint(tmp_path / "adapted-s0/initial.pt")["model"]
+        final = _checkpoint(tmp_path / "adapted-s0/last.pt")["model"]
+        torch.testing.assert_close(initial, source, rtol=0, atol=0)
+        for key, value in final.items():
+            if key.startswith(runner.STATE_ENCODERS):
+                torch.testing.assert_close(value, source[key], rtol=0, atol=0)
+        for prefix in ("parameter_encoder.", "predictor."):
+            assert any(
+                key.startswith(prefix)
+                and isinstance(value, Tensor)
+                and not torch.equal(value, initial[key])
+                for key, value in final.items()
+            )
+        _check_resume(tmp_path, config, monkeypatch)
+        assert seen
+        assert all(keys == {"observations", "actions"} for keys in seen)
+
+        # The fixed adapted endpoint is a normal six-code dense parent for both
+        # sparse arms, where the online states become trainable again.
+        patch.setattr(runner, "forward_loss", actual)
+        bound = tmp_path / "adapted-bound"
+        runner.calibrate(runner.CalibrateConfig(str(bound), config.output_dir, profile="smoke"))
+        full = replace(
+            _config(tmp_path, "full"), init_dir=config.output_dir, calibration_dir=str(bound)
+        )
+        runner.train(full)
+        sparse_initial = _checkpoint(tmp_path / "full-s0/initial.pt")["model"]
+        sparse_final = _checkpoint(tmp_path / "full-s0/last.pt")["model"]
+        for key, value in final.items():
+            torch.testing.assert_close(sparse_initial[key], value, rtol=0, atol=0)
+        assert not torch.equal(
+            sparse_final["online_encoder.head.weight"], sparse_initial["online_encoder.head.weight"]
+        )
+
+
+def test_adaptation_requires_an_authenticated_matching_projection(tmp_path: Path) -> None:
+    _prepare(tmp_path)
+    _dense_and_bound(tmp_path)
+    config = replace(
+        _config(tmp_path, "dense"),
+        output_dir=str(tmp_path / "adapted-s0"),
+        adapt_from=str(tmp_path / "projected-s0"),
+    )
+    with pytest.raises(ValueError, match="seed-matched"):
+        runner.train(replace(config, seed=1, output_dir=str(tmp_path / "wrong-seed")))
+    with pytest.raises(ValueError, match="stage differs"):
+        runner.train(
+            replace(
+                config,
+                adapt_from=str(tmp_path / "dense-s0"),
+                output_dir=str(tmp_path / "wrong-kind"),
+            )
+        )
+    for override in ({"states_from": "u"}, {"code_dim": 12}, {"acquisition_seed": 10}):
+        with pytest.raises(ValueError, match="adaptation inherits"):
+            replace(config, **override)
+    with pytest.raises(ValueError, match="one of"):
+        runner.TrainConfig("u", "u", "dense", adapt_from="u", steps=100_000)
+    declared = runner.TrainConfig("u", "u", "dense", adapt_from="u", steps=50_000)
+    assert declared.model_code_dim == 6
+    assert declared.model_initializer == "native"
+    with (tmp_path / "projected-s0/projection.json").open("a") as stream:
+        stream.write("\n")
+    with pytest.raises(ValueError, match="artifact hash"):
+        runner.train(config)
+
+
 def test_acquisition_restart_changes_initialization_not_states_or_sampling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
