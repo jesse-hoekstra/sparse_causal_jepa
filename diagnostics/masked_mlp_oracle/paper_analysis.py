@@ -698,12 +698,12 @@ def figure_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figure:
 
 
 def figure_quality(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
-    """Forecast error and whole-code state information per arm."""
+    """Forecast error and whole-state information per arm."""
     figure, axes = cast(tuple[Any, Any], plt.subplots(1, 2, figsize=(6.4, 2.7)))
     _box_panel(axes[0], runs, "normalized_prediction_mse", seeds, "Normalized forecast MSE")
-    _box_panel(axes[1], runs, "online_state_probe/r2", seeds, "Whole-code linear state R²")
+    _box_panel(axes[1], runs, "online_state_probe/r2", seeds, "Whole-state linear R²")
     axes[0].set_title("Forecast error (two-step)", loc="left", color=INK)
-    axes[1].set_title("State information in the code", loc="left", color=INK)
+    axes[1].set_title("Retained state information", loc="left", color=INK)
     figure.tight_layout()
     return figure
 
@@ -1295,7 +1295,7 @@ Full - baseline MCC: {fb["mean"]:+.3f} (s.d. {fb["sd"]:.3f}), positive in
   by the calibration MCC matching; numbers count seeds with each edge.
 - `fig_correlations_median_seed` — |Pearson| between true and matched learned
   coordinates for the seed with the median full-model MCC (seed {result["representative_seed"]}).
-- `fig_forecast_quality` — Forecast error and whole-code state information per model,
+- `fig_forecast_quality` — Forecast error and whole-state information per model,
   checking prediction accuracy and retained state information.
 - `fig_geco_multiplier` — Supplementary: GECO penalty weight over sparse training.
 - `table_main.tex`, `table_paired.tex` — LaTeX (booktabs) tables; `per_run.csv`,
