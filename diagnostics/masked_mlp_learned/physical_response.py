@@ -24,6 +24,7 @@ from diagnostics.signal_path.geometry import predict_rollout
 from scjepa.data.controlled_vector import VectorObservationMap
 from scjepa.experiments.storage import write_json
 from scjepa.models.model import SCJEPA
+from scjepa.training.logging import WandbConfig, WandbLogger
 
 BOOTSTRAP_SEED = 202610261301
 
@@ -253,6 +254,11 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument(
+        "--wandb-mode", choices=("disabled", "offline", "online"), default="disabled"
+    )
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-group", default="masked-mlp-physical-response")
     args = parser.parse_args()
     torch.set_num_threads(1)
     output = cast(Path, args.output_dir).resolve()
@@ -309,6 +315,35 @@ def main() -> None:
             "response": report,
         },
     )
+    logger = WandbLogger(
+        WandbConfig(
+            mode=args.wandb_mode,
+            project="sparse_causal_jepa",
+            entity=args.wandb_entity,
+            group=args.wandb_group,
+            name=output.name,
+            job_type="validation-physical-response",
+        ),
+        resolved_config={"source_identity": completion["identity"], "split": "validation"},
+        dataset_identity=cache["identity"],
+        out_dir=output,
+    )
+    try:
+        write_json(output / "wandb.json", logger.metadata)
+        logger.log(
+            completion["steps"],
+            {
+                f"theta_{row['parameter']}/{metric}": float(row[metric]["estimate"])
+                for row in report["per_parameter"]
+                for metric in ("normalized_response_error", "predictive_benefit")
+                if row[metric]["defined"]
+            },
+        )
+        logger.log_artifact(output / "report.json", name=output.name)
+        logger.finish()
+    except BaseException:
+        logger.finish(exit_code=1)
+        raise
     print(output / "report.json", flush=True)
 
 
