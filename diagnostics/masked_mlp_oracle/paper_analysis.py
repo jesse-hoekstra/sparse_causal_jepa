@@ -137,6 +137,28 @@ def _aligned_graphs(state: dict[str, Any], columns: list[int]) -> dict[str, NDAr
     return result
 
 
+def history_series(
+    rows: list[dict[str, Any]],
+) -> tuple[list[tuple[int, float, float]], list[tuple[int, float]]]:
+    """Keep the latest replay of each logged step, separately for validation and training.
+
+    A resumed run can append repeated steps after restoring its last checkpoint.
+    Raw logs remain intact; figures follow the retained optimization trajectory.
+    """
+    curves: dict[int, tuple[float, float]] = {}
+    penalties: dict[int, float] = {}
+    for row in rows:
+        step = int(row["step"])
+        if "validation/state_mcc" in row:
+            curves[step] = (
+                float(row["validation/state_mcc"]),
+                float(row["validation/block_purity"]),
+            )
+        if "geco/penalty_weight" in row and "loss/prediction" in row:
+            penalties[step] = math.log10(float(row["geco/penalty_weight"]))
+    return [(step, *values) for step, values in sorted(curves.items())], sorted(penalties.items())
+
+
 def load_run(directory: Path, arm: str, seed: int) -> Run:
     """Authenticate one run directory and extract its endpoint and curves."""
     verifiers = {
@@ -153,16 +175,7 @@ def load_run(directory: Path, arm: str, seed: int) -> Run:
     metrics = cast(dict[str, float], read_json(directory / "validation.json")["metrics"])
     startup = read_json(directory / "startup.json")["metrics"]
     rows = [json.loads(line) for line in (directory / "history.jsonl").read_text().splitlines()]
-    curve = [
-        (int(r["step"]), float(r["validation/state_mcc"]), float(r["validation/block_purity"]))
-        for r in rows
-        if "validation/state_mcc" in r
-    ]
-    penalty = [
-        (int(r["step"]), math.log10(float(r["geco/penalty_weight"])))
-        for r in rows
-        if "geco/penalty_weight" in r and "loss/prediction" in r
-    ]
+    curve, penalty = history_series(rows)
     columns = [int(c) for c in read_json(directory / "matching.json")["online_columns"]]
     samples = cast(
         dict[str, Any],

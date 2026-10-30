@@ -40,6 +40,24 @@ def test_sign_flip_test_is_exact() -> None:
     assert tied["p_one_sided"] == 1.0
 
 
+def test_resumed_histories_keep_latest_replay_without_mixing_metric_streams() -> None:
+    rows = [
+        {"step": 10, "validation/state_mcc": 0.8, "validation/block_purity": 0.9},
+        {"step": 10, "loss/prediction": 0.01, "geco/penalty_weight": 0.01},
+        {"step": 20, "loss/prediction": 0.02, "geco/penalty_weight": 0.001},
+        {"step": 20, "validation/state_mcc": 0.85, "validation/block_purity": 0.95},
+        # A checkpoint rollback replays both logged steps with different values.
+        {"step": 10, "loss/prediction": 0.03, "geco/penalty_weight": 0.1},
+        {"step": 10, "validation/state_mcc": 0.82, "validation/block_purity": 0.92},
+        {"step": 20, "validation/state_mcc": 0.88, "validation/block_purity": 0.98},
+        {"step": 20, "loss/prediction": 0.04, "geco/penalty_weight": 1.0},
+    ]
+    curve, penalty = paper_analysis.history_series(rows)
+    assert curve == [(10, 0.82, 0.92), (20, 0.88, 0.98)]
+    assert penalty == [(10, -1.0), (20, 0.0)]
+    assert len(rows) == 8  # Original evidence is not modified.
+
+
 def test_retention_figure_displays_every_seed_including_failed_outliers() -> None:
     seeds = list(range(5))
     runs: dict[str, dict[int, paper_analysis.Run]] = {}
