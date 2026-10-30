@@ -608,7 +608,10 @@ def figure_graphs(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
     truth = true_graphs()
     expected = {"state": truth.state[:, 0].numpy(), "parameter": truth.parameter.numpy()}
     figure, axes = cast(
-        tuple[Any, Any], plt.subplots(2, 3, figsize=(7.2, 4.8), constrained_layout=True)
+        tuple[Any, Any],
+        plt.subplots(
+            2, 3, figsize=(7.2, 4.8), gridspec_kw={"hspace": 0.2}, constrained_layout=True
+        ),
     )
     columns = (("truth", "true"), ("baseline", "baseline"), ("full", "full"))
     names = (("state", "State graph"), ("parameter", "Parameter graph"))
