@@ -9,12 +9,12 @@ import pytest
 import torch
 from torch import Tensor
 
-from diagnostics.balanced_action_oracle.data import PrepareConfig, prepare
-from diagnostics.isotropic_oracle.data import PrepareConfig as SourcePrepareConfig
-from diagnostics.isotropic_oracle.data import prepare as prepare_source
 from diagnostics.masked_mlp_oracle import run as runner
 from diagnostics.masked_mlp_oracle.model import build_predictor
-from diagnostics.oracle_state_learning.data import read_json
+from diagnostics.shared.data import PrepareConfig, prepare
+from diagnostics.shared.io import read_json
+from diagnostics.shared.source_data import PrepareConfig as SourcePrepareConfig
+from diagnostics.shared.source_data import prepare as prepare_source
 from scjepa.models.model import SCJEPA, ModelOutput
 from scjepa.training.loop import TrainingObjective
 

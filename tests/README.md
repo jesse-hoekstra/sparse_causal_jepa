@@ -1,23 +1,12 @@
-# Contract tests
+# Verification contracts
 
-Run `OMP_NUM_THREADS=1 pytest` from the repository root. Tests use synthetic CPU
-tensors, including two-process Gloo checks; no dataset download or GPU is required.
-They cover independent frames, permitted context, arbitrary dimensions, history
-and action indexing, attached parameter reuse, online-only gradients, EMA timing
-and checkpoints, sparse path blocks, independent penalties, numerical guards,
-configuration, and generic data/evaluation helpers.
+Run `.venv/bin/python -m pytest`. The masked-MLP tests cover paired
+initialization, deterministic chart equivariance, label exclusion, attached
+two-step gradients, fixed-budget guards, exact resume, source authentication,
+TRAIN-only selection, code projection and paper metrics. DGP tests verify the
+Paley orientation, smooth rotations, analytic Jacobians and separate cache
+labels. Core tests cover the reusable model, loss and training components.
 
-`python scripts/smoke.py` additionally checks image/vector forward/backward with
-representation regularizers and gradient accumulation. These checks establish
-software contracts, not scientific recovery or identifiability.
-
-Scientific data tests compare both equations to independent float64 references,
-check Jacobians/supports, recovery and sufficient-influence constructions, native
-frame rendering, paired draws, split/worker determinism, dataset bundles, and
-dataset-aware resume. Their CPU integrations use only tiny generated episodes.
-
-Experiment tests cover paired initialization/data, SIGReg-only objectives,
-dense tau calibration, calibration-only Pearson MCC matching and routing SHD,
-GECO accumulation/skip/distributed timing and checkpoint restoration, best
-checkpoint provenance, interrupted resume, aggregation, and CLI preflight.
-All use tiny synthetic CPU episodes; W&B unit tests use isolated mocks.
+`python scripts/smoke.py` provides a short CPU check of both published model
+paths. Passing software checks is distinct from scientific recovery evidence,
+which is recorded in `results/`.

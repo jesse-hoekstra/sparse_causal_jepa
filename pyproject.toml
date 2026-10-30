@@ -28,9 +28,11 @@ dev = [
     "pre-commit>=4.0,<5",
 ]
 logging = ["wandb>=0.19"]
+analysis = ["scipy>=1.14,<2", "matplotlib>=3.9,<4"]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["scjepa*", "diagnostics*"]
 
 [tool.setuptools.package-data]
 "scjepa.third_party" = ["**/*.md", "**/LICENSE*"]
@@ -84,7 +86,7 @@ pythonVersion = "3.12"
 # without this, pyright falls back to the ambient interpreter, which lacks torch.
 venvPath = "."
 venv = ".venv"
-include = ["src", "tests", "scripts"]
+include = ["src", "tests", "scripts", "diagnostics"]
 # Vendored code is exempt from type gates; wrappers in src/ are fully typed.
 exclude = ["**/third_party", "**/.venv", "**/__pycache__"]
 

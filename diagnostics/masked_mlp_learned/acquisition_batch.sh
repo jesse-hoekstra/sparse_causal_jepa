@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fixed acquisition pool for each of five frozen-state seeds; defaults to eight.
+# Fixed acquisition pool for each of five frozen-state seeds; defaults to sixteen.
 # Run in detached tmux on the server. No sparse phase or test evaluation is launched.
 set -euo pipefail
 if [ "$#" -ne 7 ]; then
@@ -12,7 +12,7 @@ shift 2
 HOSTS=("$@")
 FIRST_ATTEMPT=${FIRST_ATTEMPT:-0}
 PREVIOUS_BATCH=${PREVIOUS_BATCH:-}
-POOL_ATTEMPTS=${POOL_ATTEMPTS:-8}
+POOL_ATTEMPTS=${POOL_ATTEMPTS:-16}
 CONCURRENT_WAVES=${CONCURRENT_WAVES:-1}
 if [[ ! "$POOL_ATTEMPTS" =~ ^(8|16)$ ]] || \
    [[ ! "$FIRST_ATTEMPT" =~ ^([0-9]|1[0-5])$ ]] || \
@@ -28,13 +28,13 @@ REPO_ROOT=${REPO_ROOT:-/nfs/home/jesseh/sparse_causal_jepa}
 CODE_DIR=${CODE_DIR:-$REPO_ROOT}
 PYTHON=$REPO_ROOT/.venv/bin/python
 BATCH=$REPO_ROOT/outputs/diagnostics/masked-mlp-restarts-$TAG
-DATA=$REPO_ROOT/outputs/diagnostics/balanced-action-prepare-balanced-20261028T202921Z-b577779/results
+DATA=${DATA_DIR:-$REPO_ROOT/outputs/data/experiment1}
 mkdir -p "$BATCH"
 if [ -e "$BATCH/protocol.txt" ]; then
   echo "refusing to overwrite an existing batch: $BATCH" >&2
   exit 2
 fi
-printf '%s\n' "code=$CODE_DIR" "state_batch=$STATE_BATCH" "hosts=${HOSTS[*]}" \
+printf '%s\n' "code=$CODE_DIR" "data=$DATA" "state_batch=$STATE_BATCH" "hosts=${HOSTS[*]}" \
   "first_attempt=$FIRST_ATTEMPT; previous_batch=$PREVIOUS_BATCH" \
   "attempts=$POOL_ATTEMPTS; concurrent_waves=$CONCURRENT_WAVES" \
   "updates=100000; initialization_seed=1000+100*attempt+state_seed" \

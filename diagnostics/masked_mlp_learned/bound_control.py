@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from diagnostics.masked_mlp_learned.run import verify_completion
-from diagnostics.oracle_state_learning.data import read_json, sha
+from diagnostics.shared.io import read_json, sha
 from scjepa.data.datasets import canonical_fingerprint
 from scjepa.experiments.storage import file_lock, write_json
 

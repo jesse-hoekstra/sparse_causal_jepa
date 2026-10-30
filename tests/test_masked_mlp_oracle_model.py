@@ -6,7 +6,6 @@ import pytest
 import torch
 from torch import Tensor, nn
 
-from diagnostics.isotropic_oracle.model import build_control as build_native
 from diagnostics.masked_mlp_oracle.model import (
     MaskedTrunkPredictor,
     build_control,
@@ -58,7 +57,9 @@ def _inputs(batch: int = 64) -> tuple[Tensor, Tensor, Tensor]:
 
 
 def test_dense_is_the_parameter_matched_global_mlp_and_arms_are_paired() -> None:
-    native = build_native("mlp", 0).predictor
+    native = nn.Sequential(
+        nn.Linear(36, 209), nn.ReLU(), nn.Linear(209, 209), nn.ReLU(), nn.Linear(209, 6)
+    )
     dense = build_predictor("dense")
     assert trunk_width() == 209
     assert [tuple(p.shape) for p in native.parameters()] == [

@@ -16,16 +16,21 @@ from typing import Any, Literal, cast
 import torch
 from torch import Tensor
 
-from diagnostics.balanced_action_oracle import dgp
-from diagnostics.balanced_action_oracle.data import StateData, load_data
-from diagnostics.joint_acquisition.baseline import MatchedBatch, MatchedPredictions, response_report
 from diagnostics.masked_mlp_learned import run
 from diagnostics.masked_mlp_oracle import from_dense
 from diagnostics.masked_mlp_oracle import run as oracle_run
-from diagnostics.oracle_state_learning.data import read_json, save_torch, sha
-from diagnostics.overcomplete_use_precision.evaluation import direct_decomposition, join_batches
-from diagnostics.signal_path.geometry import predict_rollout
-from scjepa.data.controlled_vector import VectorObservationMap
+from diagnostics.shared import geometry as dgp
+from diagnostics.shared.data import StateData, load_data
+from diagnostics.shared.io import read_json, save_torch, sha
+from diagnostics.shared.responses import (
+    MatchedBatch,
+    MatchedPredictions,
+    direct_decomposition,
+    join_batches,
+    predict_rollout,
+    response_report,
+)
+from scjepa.data.observations import VectorObservationMap
 from scjepa.experiments.storage import write_json
 from scjepa.models.model import SCJEPA
 from scjepa.training.logging import WandbConfig, WandbLogger

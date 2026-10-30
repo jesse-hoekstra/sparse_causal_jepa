@@ -1,14 +1,8 @@
-"""Label-free code acquisition aids from the twelve-code audits, and the 12-to-6 projection.
-
-These follow the completed acquisition record (``docs/current_experiment.md``,
-"Fresh-code conditioning", "Selected mechanism controls" and the canonical
-shared-seed PCA audit), where a twelve-coordinate code with these two
-initializers retained all six parameters in both declared seeds:
+"""Label-free code initialization and the twelve-to-six shared-mode projection.
 
 - **Encoder gains.** The five hidden ``Linear`` weights of the transition parameter
   encoder are multiplied by sqrt(6) (variance 2/fan_in) and its output weights by
-  sqrt(3) (1/fan_in); biases are unchanged. A fresh code otherwise varies about a
-  thousand times less than the states and actions entering the predictor.
+  sqrt(3) (1/fan_in); biases are unchanged.
 - **Shared-feature output rows.** From the penultimate features h of every TRAIN
   context, W is the mean unbiased within-group covariance, S = Cov(group means) - W/R
   and T = Cov(all contexts). T is whitened with a relative eigenvalue floor of 1e-6
@@ -22,7 +16,7 @@ initializers retained all six parameters in both declared seeds:
   rows are composed with U^T and the predictor's code columns with the least-squares
   reconstruction ``q ~ mu + T U (U^T T U)^-1 c``, so the six-code model starts from
   the twelve-code one. The sparse arms then use a square code, as the
-  identifiability theorem assumes.
+  identifiability theorem assumes. Dimension alone does not establish invertibility.
 
 Only observations, actions and the known group membership of the TRAIN contexts
 enter; true parameters never do.
@@ -34,8 +28,8 @@ from typing import Any, cast
 import torch
 from torch import Tensor, nn
 
-from diagnostics.isotropic_oracle.data import StateData
 from diagnostics.masked_mlp_oracle.model import MaskedTrunkPredictor
+from diagnostics.shared.source_data import StateData
 from scjepa.data.datasets import tensor_fingerprint
 from scjepa.models.model import SCJEPA
 from scjepa.models.parameter_encoder import TransitionParameterEncoder

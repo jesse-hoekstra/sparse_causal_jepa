@@ -28,10 +28,10 @@ import torch
 from numpy.typing import NDArray
 from scipy.optimize import linear_sum_assignment  # pyright: ignore[reportUnknownVariableType]
 
-from diagnostics.isotropic_oracle.dgp import graphs as true_graphs
 from diagnostics.masked_mlp_learned import run as learned
 from diagnostics.masked_mlp_oracle import from_dense, run
-from diagnostics.oracle_state_learning.data import read_json, sha
+from diagnostics.shared.io import read_json, sha
+from diagnostics.shared.source_geometry import graphs as true_graphs
 from scjepa.data.datasets import tensor_fingerprint
 from scjepa.eval.recovery import pearson_matrix
 

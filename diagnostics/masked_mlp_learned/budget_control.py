@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from diagnostics.masked_mlp_learned.run import TrainConfig, train
-from diagnostics.oracle_state_learning.data import sha
+from diagnostics.shared.io import sha
 
 SCHEMA = "masked-mlp-sparse-budget-control-v1"
 STEPS = 300_000

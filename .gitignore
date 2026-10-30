@@ -1,20 +1,26 @@
-# Local data and run artifacts are never part of code cleanup.
-/data/ at any depth, so the whole data MODULE was never committed
-# (discovered 2026-07-19 when the Isambard clone came up without it).
+# Local scientific inputs, raw runs and private working records.
 /data/
-checkpoints/
+/outputs/
+/checkpoints/
+/logs/
+/sources/
+/docs/
+/raw/
+/.scratch/
+/.agents/
+/wiki/
+/AGENTS.md
+/GLOSSARY.md
+/skills-lock.json
+/schema.md
 wandb/
-# Hydra run dirs / sweep dirs (no inline comments — git treats them as pattern text)
-outputs/
-logs/
-sources/
 multirun/
 /slurm-*.out
 *.ckpt
 *.pt
 *.pth
 
-# --- Python ---
+# Python environments, packages and caches.
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -24,15 +30,21 @@ dist/
 .venv/
 venv/
 .python-version
-
-# --- Tooling caches ---
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .coverage
 htmlcov/
 
-# --- Editors / OS cruft ---
+# TeX intermediates; the manuscript PDF and figure PDFs are versioned.
+/publication/*.aux
+/publication/*.log
+/publication/*.out
+/publication/*.fls
+/publication/*.fdb_latexmk
+/publication/*.synctex.gz
+
+# Editors and operating system metadata.
 .DS_Store
 .idea/
 .vscode/

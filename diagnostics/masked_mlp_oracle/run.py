@@ -21,9 +21,6 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from diagnostics.balanced_action_oracle.data import StateData, load_data
-from diagnostics.balanced_action_oracle.data import code_identity as cache_code_identity
-from diagnostics.isotropic_oracle.dgp import graphs as true_graphs
 from diagnostics.masked_mlp_oracle.model import (
     INITIAL_LOGIT,
     Condition,
@@ -31,16 +28,19 @@ from diagnostics.masked_mlp_oracle.model import (
     build_control,
     trunk_width,
 )
-from diagnostics.oracle_state_learning.core import (
+from diagnostics.shared.data import StateData, load_data
+from diagnostics.shared.data import code_identity as cache_code_identity
+from diagnostics.shared.io import read_json, save_torch, sha
+from diagnostics.shared.oracle import (
     EvaluationResult,
     LiveStateData,
     evaluate,
     forward_loss,
     objective_config,
 )
-from diagnostics.oracle_state_learning.data import read_json, save_torch, sha
-from diagnostics.oracle_state_learning.run import recovery_metrics
-from diagnostics.oracle_state_predictor.run import GroupSampler, resolve_device
+from diagnostics.shared.recovery import recovery_metrics
+from diagnostics.shared.sampling import GroupSampler, resolve_device
+from diagnostics.shared.source_geometry import graphs as true_graphs
 from scjepa.data.datasets import canonical_fingerprint, tensor_fingerprint
 from scjepa.experiments.storage import file_lock, write_json
 from scjepa.models.model import SCJEPA

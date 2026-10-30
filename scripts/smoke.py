@@ -1,66 +1,48 @@
-"""Short CPU-only forward/backward validation using random tensors, never a dataset."""
+"""Short CPU forward/backward check of both published masked-MLP model paths."""
 
 import json
 
 import torch
+from torch import nn
 
-from scjepa.training import ObjectiveConfig, TrainConfig, Trainer, seed_everything
-from scjepa.training.factory import ModelConfig, build_model
+from diagnostics.masked_mlp_learned import run as learned
+from diagnostics.masked_mlp_oracle.model import build_control as build_oracle
+from diagnostics.shared.oracle import forward_loss as oracle_loss
+from diagnostics.shared.oracle import objective_config
+from scjepa.training.loop import TrainingObjective, seed_everything
 
 
 def main() -> None:
-    """Check image/vector gradients, finite updates, and EMA with small tensors."""
+    """Check attached gradients, finite updates and stopped EMA targets on random inputs."""
     torch.set_num_threads(1)
     seed_everything(7)
-    for kind in ("vector", "image"):
-        config = ModelConfig(
-            observation_kind=kind,
-            state_dim=5,
-            param_dim=3,
-            action_dim=2,
-            context_len=3,
-            history_len=2,
-            encoder_hidden_dims=(16,),
-            image_channels=(8, 16),
-            parameter_embed_dim=16,
-            spartan_embed_dim=16,
-            spartan_mlp_hidden=16,
-            spartan_dense=True,
+    batch = {
+        "observations": torch.randn(2, 10, 12, 6),
+        "actions": torch.randn(2, 10, 11, 24),
+        "oracle_parameters": torch.rand(2, 6) - 0.5,
+        "episode_ids": torch.arange(2),
+    }
+    for mode in ("oracle", "learned"):
+        model = build_oracle("full", 7) if mode == "oracle" else learned.build_control("full", 7)
+        objective = TrainingObjective(objective_config("full", logit_weight=0.0))
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0)
+        forward = oracle_loss if mode == "oracle" else learned.forward_loss
+        loss, _, output = forward(model, batch, objective)
+        loss.backward()  # pyright: ignore[reportUnknownMemberType]
+        modules: list[nn.Module] = [model.online_encoder, model.predictor]
+        if mode == "learned":
+            modules.append(model.parameter_encoder)
+        assert all(
+            any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
+            for module in modules
         )
-        trainer = Trainer(
-            build_model(config),
-            TrainConfig(
-                batch_size=3,
-                accumulation_steps=2,
-                objective=ObjectiveConfig(
-                    state_regularizer="sigreg",
-                    state_regularizer_weight=0.01,
-                    parameter_regularizer="sigreg",
-                    parameter_regularizer_weight=0.01,
-                    regularizer_num_projections=8,
-                ),
-            ),
-        )
-        shape = (3, 6, 8) if kind == "vector" else (3, 6, 3, 16, 16)
-        batch = {
-            "observations": torch.randn(shape),
-            "actions": torch.randn(3, 5, 2),
-            "episode_ids": torch.arange(3),
-        }
-        first = trainer.train_step(batch)
-        assert first["health/updated"] == 0
-        for module in (
-            trainer.model.online_encoder,
-            trainer.model.parameter_encoder,
-            trainer.model.predictor,
-        ):
-            assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
-        assert all(p.grad is None for p in trainer.model.target_encoder.parameters())
-        metrics = trainer.train_step(batch)
-        assert metrics["health/updated"] == 1
-        assert metrics["health/skipped"] == 0
-        assert torch.isfinite(torch.tensor(metrics["loss/total"]))
-        print(json.dumps({"encoder": kind, "prediction_shape": [3, 3, 5], **metrics}))
+        assert all(p.grad is None for p in model.target_encoder.parameters())
+        assert torch.isfinite(loss)
+        assert len(output.dynamics) == 2
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+        model.update_target()
+        print(json.dumps({"mode": mode, "loss": float(loss.detach()), "two_attached_steps": True}))
 
 
 if __name__ == "__main__":

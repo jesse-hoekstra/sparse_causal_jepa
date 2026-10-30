@@ -1,28 +1,18 @@
-"""Masked MLP state learning with a learned parameter encoder (full Experiment 1 setting).
+"""Masked-MLP Experiment 1 with learned states and single-context parameter codes.
 
-Adapted from the masked-MLP oracle runners (``diagnostics/masked_mlp_oracle``). The
-only scientific change is the parameter source: a transition-set parameter encoder
-infers a code from each episode's first ten online state encodings and nine
-actions, and that attached code predicts another episode of the same parameter
-group (cyclic donor/recipient routing). True theta never enters training; it is
-used only to evaluate the code. There is no parameter regularizer and no
-consistency term. Everything else is unchanged: the authenticated Paley24 cache,
-the chart-equivariant masked MLP, the 6-64-64-6 state encoder with Gaussian head,
-EMA .996, state SIGReg .4, AdamW .001, clip 1, B16/R10/K10/T12/L1 and the attached
-two-step forecast from online state 9.
+The transition parameter encoder reads ten online state encodings and nine
+observed actions. Its attached code predicts another episode sharing the same
+parameters, through two attached autoregressive steps. True parameters and
+physical states enter evaluation only. State SIGReg is weighted by .4; there is
+no parameter regularizer or consistency loss.
 
-Protocol: fresh dense arms (all masks open) for 100k updates, by default with the
-audited acquisition recipe (twelve-dimensional code, encoder gains, shared-feature
-output rows; see ``acquisition``). ``--states-from`` repeats the dense arm on the
-frozen state encoders of a completed dense endpoint with a fresh parameter encoder
-and predictor, as in the audits, where acquisition succeeded on fixed informative
-states and the shared-feature rows were fitted from them. ``project`` maps each
-twelve-code dense endpoint to a six-code model through TRAIN shared modes;
-``calibrate`` fixes ``tau`` as 1.1 times the seed-zero six-code dense calibration
-prediction MSE; baseline and full arms start from their seed's six-code dense
-endpoint (encoders, parameter encoder, trunk, readouts; fresh mask logits, AdamW,
-GECO, sampler) and run 100k or 200k sparse updates with GECO on the normalized
-prediction loss.
+The final protocol uses joint dense twelve-code training, sixteen frozen-state
+acquisition restarts selected by TRAIN loss, shared-covariance projection to six
+codes, and frozen-state forecast adaptation. Baseline and full share the adapted
+endpoint. The explicit ``bound_control`` and ``budget_control`` entry points fix
+the final .8 calibration factor and 300k sparse budget, preserving the original
+runner's configuration guards and authenticated ancestry. See README.md for the
+complete schedule and publication/REPRODUCING.md for commands.
 """
 
 import argparse
@@ -41,8 +31,6 @@ import torch
 from scipy.optimize import linear_sum_assignment  # pyright: ignore[reportUnknownVariableType]
 from torch import Tensor, nn
 
-from diagnostics.balanced_action_oracle.data import StateData, load_data
-from diagnostics.isotropic_oracle.dgp import graphs as true_graphs
 from diagnostics.masked_mlp_learned.acquisition import (
     apply_encoder_gains,
     initialize_shared_output,
@@ -54,10 +42,12 @@ from diagnostics.masked_mlp_oracle.model import (
     _gaussian_,  # pyright: ignore[reportPrivateUsage]
     trunk_width,
 )
-from diagnostics.oracle_state_learning.core import EvaluationResult, objective_config
-from diagnostics.oracle_state_learning.data import read_json, save_torch, sha
-from diagnostics.oracle_state_learning.run import recovery_metrics
-from diagnostics.oracle_state_predictor.run import GroupSampler, resolve_device
+from diagnostics.shared.data import StateData, load_data
+from diagnostics.shared.io import read_json, save_torch, sha
+from diagnostics.shared.oracle import EvaluationResult, objective_config
+from diagnostics.shared.recovery import recovery_metrics
+from diagnostics.shared.sampling import GroupSampler, resolve_device
+from diagnostics.shared.source_geometry import graphs as true_graphs
 from scjepa.data.datasets import canonical_fingerprint, tensor_fingerprint
 from scjepa.experiments.storage import file_lock, write_json
 from scjepa.models.model import SCJEPA, ModelOutput

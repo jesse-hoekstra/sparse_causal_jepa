@@ -11,12 +11,12 @@ import numpy as np
 import pytest
 import torch
 
-from diagnostics.balanced_action_oracle.data import PrepareConfig, prepare
-from diagnostics.isotropic_oracle.data import PrepareConfig as SourcePrepareConfig
-from diagnostics.isotropic_oracle.data import prepare as prepare_source
-from diagnostics.isotropic_oracle.dgp import graphs as true_graphs
 from diagnostics.masked_mlp_oracle import from_dense, paper_analysis
 from diagnostics.masked_mlp_oracle import run as runner
+from diagnostics.shared.data import PrepareConfig, prepare
+from diagnostics.shared.source_data import PrepareConfig as SourcePrepareConfig
+from diagnostics.shared.source_data import prepare as prepare_source
+from diagnostics.shared.source_geometry import graphs as true_graphs
 
 
 @pytest.fixture(autouse=True)

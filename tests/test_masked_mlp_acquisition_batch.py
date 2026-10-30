@@ -57,6 +57,7 @@ elif name == "python":
     if "train" in args:
         output = Path(args[args.index("--output-dir") + 1])
         output.mkdir(parents=True)
+        assert args[args.index("--data-dir") + 1] == str(root / "custom data")
         seed = int(args[args.index("--acquisition-seed") + 1])
         (root / "started" / str(seed)).write_text(json.dumps(args))
         deadline = time.monotonic() + 20
@@ -110,6 +111,7 @@ def test_parallel_extension_preserves_prior_attempts_and_stops_owned_jobs(
         "PATH": f"{tools}:{os.environ['PATH']}",
         "REPO_ROOT": str(repository),
         "CODE_DIR": str(ROOT),
+        "DATA_DIR": str(tmp_path / "custom data"),
         "FIRST_ATTEMPT": "8",
         "PREVIOUS_BATCH": str(previous),
         "POOL_ATTEMPTS": "16",

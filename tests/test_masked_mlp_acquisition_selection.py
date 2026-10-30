@@ -8,7 +8,7 @@ import pytest
 
 from diagnostics.masked_mlp_learned.run import SCHEMA
 from diagnostics.masked_mlp_learned.selection import select, training_score
-from diagnostics.oracle_state_learning.data import sha
+from diagnostics.shared.io import sha
 from scjepa.experiments.storage import write_json
 
 

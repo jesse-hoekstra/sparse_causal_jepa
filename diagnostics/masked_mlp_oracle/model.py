@@ -1,20 +1,18 @@
-"""A shared-trunk MLP with static per-edge input masks, built for chart equivariance.
+"""Shared-trunk MLP with static per-edge masks for the two published experiments.
 
-Every output coordinate ``i`` applies one shared trunk to its own masked input
-``[z * m_z[i], a * m_a[i], theta * m_theta[i]]`` and reads the result with its
-own linear readout. There is no output-index embedding. Mask logits are static
-parameters, one per (output, input) edge and independent of input values, so the
-thresholded masks are global functional graphs. Training samples hard logistic-
-noise gates with a straight-through derivative; evaluation thresholds at zero.
-Each block's sparsity term is the exact expected open-edge fraction,
-``sigmoid(logit)`` averaged over that block, with SPARTAN's block normalization.
+Each output applies the same trunk to its masked state, action and parameter-code
+inputs, then uses its own linear readout. There is no output-index embedding.
+A closed gate excludes an input globally; an open gate is only a potential
+functional dependency. Training samples hard logistic-noise gates with a
+straight-through derivative; evaluation thresholds at zero. The sparsity penalty
+is each graph block's mean open probability.
 
-With every mask open this is exactly the global ``36-H-H-6`` MLP. With
-block-equal state masks and fixed-open parameter masks (the baseline), any
-within-block orthogonal re-charting of the state is absorbed exactly by the
-trunk's state columns and the readouts. Gaussian initialization keeps that
-symmetry in distribution, so the baseline cannot prefer one within-block chart.
-Only learned parameter masks (full) can break it.
+With all gates open this is a global MLP. With block-equal state masks and equal
+action/parameter masks across mixed outputs, within-block orthogonal state changes
+can be absorbed by the trunk and readouts. Gaussian initialization respects that
+symmetry in distribution. Independent sampled gates and AdamW do not make finite
+training trajectories equivariant. Complementary parameter masks restrict the
+baseline's freedom to mix states within a block.
 """
 
 import math
@@ -24,8 +22,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from diagnostics.isotropic_oracle.model import ACTION_DIMENSION
-from diagnostics.isotropic_oracle.model import build_control as build_native
+from diagnostics.shared.initialization import ACTION_DIMENSION
+from diagnostics.shared.initialization import build_control as build_native
 from scjepa.models.model import SCJEPA
 from scjepa.models.spartan import GraphBlocks, GraphPenalties, Spartan, SpartanOutput
 from scjepa.training.rng import preserve_rng
@@ -60,7 +58,7 @@ def _hard_gates(logits: Tensor, batch: int, temperature: float, training: bool) 
 
 
 class MaskedTrunkPredictor(nn.Module):
-    """Predict ``z_{t+1}`` from one state lag, observed actions and supplied theta."""
+    """Predict ``z_{t+1}`` from one state lag, observed actions and a parameter code."""
 
     history_len = 1
 

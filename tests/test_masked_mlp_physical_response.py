@@ -9,13 +9,13 @@ import pytest
 import torch
 from torch import Tensor, nn
 
-from diagnostics.balanced_action_oracle import dgp
-from diagnostics.balanced_action_oracle.data import StateData
 from diagnostics.masked_mlp_learned import physical_response as assay
 from diagnostics.masked_mlp_learned.run import build_control
 from diagnostics.masked_mlp_oracle.model import MaskedTrunkPredictor
 from diagnostics.masked_mlp_oracle.model import build_control as build_oracle
-from scjepa.data.controlled_vector import VectorObservationMap
+from diagnostics.shared import geometry as dgp
+from diagnostics.shared.data import StateData
+from scjepa.data.observations import VectorObservationMap
 
 
 @pytest.fixture(autouse=True)
