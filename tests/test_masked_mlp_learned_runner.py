@@ -1,5 +1,6 @@
 """Learned parameter codes: label-free training, projection, dense initialization, resume."""
 
+import math
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -13,7 +14,7 @@ from diagnostics.balanced_action_oracle.data import PrepareConfig, prepare
 from diagnostics.isotropic_oracle.data import PrepareConfig as SourcePrepareConfig
 from diagnostics.isotropic_oracle.data import StateData
 from diagnostics.isotropic_oracle.data import prepare as prepare_source
-from diagnostics.masked_mlp_learned import acquisition
+from diagnostics.masked_mlp_learned import acquisition, bound_control
 from diagnostics.masked_mlp_learned import run as runner
 from diagnostics.masked_mlp_oracle.model import INITIAL_LOGIT
 from diagnostics.oracle_state_learning.core import EvaluationResult
@@ -182,6 +183,75 @@ def test_sparse_arms_start_from_the_dense_endpoint_and_report_codes(tmp_path: Pa
                 str(tmp_path / "unprojected"), str(tmp_path / "dense-s0"), profile="smoke"
             )
         )
+
+
+def test_tighter_bound_preserves_sources_and_initial_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare(tmp_path)
+    _dense_and_bound(tmp_path)
+    source = tmp_path / "bound"
+    before = {path: path.read_bytes() for path in source.iterdir() if path.is_file()}
+    original = runner.verify_completion(source, kind="calibration")
+    read = bound_control.read_json
+    read_names: list[str] = []
+
+    def calibration_only(path: Path) -> dict[str, Any]:
+        read_names.append(path.name)
+        assert path.name == "calibration.json"
+        return read(path)
+
+    monkeypatch.setattr(bound_control, "read_json", calibration_only)
+    output = tmp_path / "tighter"
+    control = bound_control.tighten_bound(
+        source, output, tau_factor=0.8, hypothesis="Preserve weak predictive dependencies"
+    )
+    assert read_names == ["calibration.json", "calibration.json"]
+    assert control["tau_prediction"] == 0.8 * original["reference"]["prediction_loss"]
+    assert control["identity"] != original["identity"]
+    assert control["code_identity"] == original["code_identity"] == runner.code_identity()
+    assert control["reference"] == original["reference"]
+    assert control["bound_control"]["original_identity"] == original["identity"]
+    assert control["bound_control"]["generator_sha256"] == runner.sha(Path(bound_control.__file__))
+    assert all(path.read_bytes() == value for path, value in before.items())
+    assert runner.verify_completion(output, kind="calibration") == control
+    with pytest.raises(FileExistsError, match="not empty"):
+        bound_control.tighten_bound(source, output, tau_factor=0.8, hypothesis="Same control")
+    with pytest.raises(ValueError, match="original 1.1"):
+        bound_control.tighten_bound(output, tmp_path / "chained", tau_factor=0.7, hypothesis="No")
+    with pytest.raises(ValueError, match="prespecified"):
+        runner.CalibrateConfig("unused", "unused", tau_factor=0.8)
+
+    completion = runner.train(replace(_config(tmp_path, "full"), calibration_dir=str(output)))
+    assert completion["calibration_identity"] == control["identity"]
+    initial = _checkpoint(tmp_path / "full-s0/initial.pt")["model"]
+    dense = _checkpoint(tmp_path / "projected-s0/last.pt")["model"]
+    for key, value in dense.items():
+        if isinstance(value, Tensor):
+            torch.testing.assert_close(initial[key], value, rtol=0, atol=0)
+    validation = read_json(tmp_path / "full-s0/validation.json")["metrics"]
+    assert math.isclose(
+        validation["geco/relative_prediction"],
+        validation["prediction"] / control["tau_prediction"],
+        rel_tol=1e-6,
+    )
+
+    with (source / "calibration.json").open("a") as stream:
+        stream.write("\n")
+    with pytest.raises(ValueError, match="artifact hash"):
+        bound_control.tighten_bound(
+            source, tmp_path / "tampered", tau_factor=0.8, hypothesis="Reject modified source"
+        )
+    assert not (tmp_path / "tampered").exists()
+
+
+@pytest.mark.parametrize("factor", [0.0, -1.0, 1.1, 2.0, float("nan"), float("inf")])
+def test_tighter_bound_rejects_invalid_or_wider_constraints(tmp_path: Path, factor: float) -> None:
+    with pytest.raises(ValueError, match="tighter control"):
+        bound_control.tighten_bound(
+            tmp_path / "unused", tmp_path / "output", tau_factor=factor, hypothesis="Declared"
+        )
+    assert not (tmp_path / "output").exists()
 
 
 def test_codes_can_be_reacquired_on_frozen_trained_states(
