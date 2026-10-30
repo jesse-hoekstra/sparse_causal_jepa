@@ -993,6 +993,7 @@ def write_tables(
         return _metric(run_, key)
 
     code_aligned = all(CODE_ALIGNED_SHD in runs["full"][s].metrics for s in seeds)
+    label_prefix = "masked-mlp-learned" if code_aligned else "masked-mlp-oracle"
     summary: dict[str, dict[str, dict[str, float]]] = {
         arm: {key: describe([value(runs[arm][s], key) for s in seeds]) for key in keys}
         for arm in ARMS
@@ -1040,11 +1041,12 @@ def write_tables(
                 r"The learned code's coordinates are first matched to the true parameter "
                 r"pairs by linear pair $R^2$ (complementary graphs identify codes only up to "
                 r"mixing within a pair, which leaves the parameter graph unchanged). "
+                r"This descriptive code matching uses validation samples. "
                 if code_aligned
                 else ""
             )
             + r"Chance rows: random orthogonal re-charting of the true states.}",
-            r"\label{tab:masked-mlp-oracle}",
+            r"\label{tab:" + label_prefix + "}",
             r"\end{table}",
             "",
         ]
@@ -1083,7 +1085,7 @@ def write_tables(
         r"\caption{Seed-paired MCC differences. $p$: exact sign-flip permutation test over "
         r"all $2^n$ sign assignments (smallest attainable value $2^{-n}$). CI: percentile "
         r"bootstrap over seeds, descriptive only for small $n$.}",
-        r"\label{tab:masked-mlp-oracle-paired}",
+        r"\label{tab:" + label_prefix + "-paired}",
         r"\end{table}",
         "",
     ]
@@ -1255,7 +1257,7 @@ Full - baseline MCC: {fb["mean"]:+.3f} (s.d. {fb["sd"]:.3f}), positive in
 - `fig_correlations_median_seed` — |Pearson| between true and matched learned
   coordinates for the seed with the median full-model MCC (seed {result["representative_seed"]}).
 - `fig_forecast_quality` — Forecast error and whole-code state information per model,
-  showing comparable prediction and retained information.
+  checking prediction accuracy and retained state information.
 - `fig_geco_multiplier` — Supplementary: GECO penalty weight over sparse training.
 - `table_main.tex`, `table_paired.tex` — LaTeX (booktabs) tables; `per_run.csv`,
   `summary.json` — every number above.
