@@ -31,6 +31,7 @@ from diagnostics.isotropic_oracle.dgp import graphs as true_graphs
 from diagnostics.masked_mlp_learned import run as learned
 from diagnostics.masked_mlp_oracle import from_dense, run
 from diagnostics.oracle_state_learning.data import read_json
+from scjepa.data.datasets import tensor_fingerprint
 from scjepa.eval.recovery import pearson_matrix
 
 matplotlib.use("Agg")
@@ -93,6 +94,9 @@ class Run:
     columns: list[int]
     correlation: Array
     graphs: dict[str, NDArray[np.bool_]]
+    group_moments: Array
+    physical_samples_sha256: str
+    data_identity: str
     code_correlation: Array | None = None
     code_columns: list[int] | None = None
 
@@ -179,6 +183,9 @@ def load_run(directory: Path, arm: str, seed: int) -> Run:
         columns=columns,
         correlation=correlation,
         graphs=graphs,
+        group_moments=matched_group_moments(samples["online_states"], samples["states"], columns),
+        physical_samples_sha256=tensor_fingerprint(samples["states"]),
+        data_identity=completion["data_identity"],
         code_correlation=code_correlation,
         code_columns=code_columns,
     )
@@ -340,6 +347,79 @@ def paired(left: list[float], right: list[float], *, seed: int = 0) -> dict[str,
         "ci_low": float(np.percentile(boot, 2.5)),
         "ci_high": float(np.percentile(boot, 97.5)),
     }
+
+
+def matched_group_moments(states: torch.Tensor, truth: torch.Tensor, columns: list[int]) -> Array:
+    """Sufficient moments for fixed-matching Pearson MCC, keeping independent groups intact."""
+    if states.shape != truth.shape or states.ndim < 3 or states.shape[-1] != 6:
+        raise ValueError(
+            "State tensors must share group/sample/coordinate axes with six coordinates"
+        )
+    if sorted(columns) != list(range(6)):
+        raise ValueError("Require a fixed calibration permutation of six coordinates")
+    x = states.detach().double().cpu().reshape(len(states), -1, 6).numpy()[:, :, columns]
+    y = truth.detach().double().cpu().reshape(len(truth), -1, 6).numpy()
+    if not np.isfinite(x).all() or not np.isfinite(y).all():
+        raise ValueError("Nonfinite state samples")
+    # A common translation leaves every resampled correlation unchanged and
+    # avoids cancellation for nearly constant coordinates with large means.
+    x = x - x.mean((0, 1))
+    y = y - y.mean((0, 1))
+    return np.stack(
+        [x.mean(1), y.mean(1), (x * x).mean(1), (y * y).mean(1), (x * y).mean(1)], axis=1
+    )
+
+
+def _moment_mcc(moments: Array) -> Array:
+    x, y, xx, yy, xy = (moments[..., index, :] for index in range(5))
+    denominator = np.sqrt(np.maximum(xx - x * x, 0) * np.maximum(yy - y * y, 0))
+    correlations = (xy - x * y) / np.maximum(denominator, 1e-30)
+    return np.minimum(np.abs(correlations), 1).mean(-1)
+
+
+def paired_group_mcc(
+    left: Array, right: Array, *, draws: int = 1000, seed: int = 2026103001
+) -> dict[str, float]:
+    """Paired group bootstrap conditional on one training seed and fixed calibration matches."""
+    if left.shape != right.shape or left.ndim != 3 or left.shape[1:] != (5, 6):
+        raise ValueError("Require matching group-level MCC moments")
+    groups = len(left)
+    if groups < 2 or draws < 2 or seed < 0:
+        raise ValueError("Require at least two groups/draws and a nonnegative seed")
+    rng = np.random.default_rng(seed)
+    indices = rng.integers(groups, size=(draws, groups))
+    boot = _moment_mcc(left[indices].mean(1)) - _moment_mcc(right[indices].mean(1))
+    return {
+        "groups": float(groups),
+        "bootstrap_draws": float(draws),
+        "bootstrap_seed": float(seed),
+        "estimate": float(_moment_mcc(left.mean(0)) - _moment_mcc(right.mean(0))),
+        "ci_low": float(np.percentile(boot, 2.5)),
+        "ci_high": float(np.percentile(boot, 97.5)),
+    }
+
+
+def group_mcc_contrasts(runs: dict[str, dict[int, Run]], seeds: list[int]) -> dict[str, Any]:
+    """Check group pairing and reproduce every endpoint MCC before reporting its differences."""
+    contrasts = {"full - baseline": ("full", "baseline"), "baseline - dense": ("baseline", "dense")}
+    result: dict[str, Any] = {}
+    for name, (left, right) in contrasts.items():
+        result[name] = {}
+        for seed in seeds:
+            a, b = runs[left][seed], runs[right][seed]
+            if (
+                a.data_identity != b.data_identity
+                or a.physical_samples_sha256 != b.physical_samples_sha256
+            ):
+                raise ValueError("Paired MCC contrasts require identical ordered physical groups")
+            for item in (a, b):
+                if (
+                    abs(float(_moment_mcc(item.group_moments.mean(0))) - item.metrics["state_mcc"])
+                    > 1e-6
+                ):
+                    raise ValueError("Group moments do not reproduce the recorded fixed-match MCC")
+            result[name][str(seed)] = paired_group_mcc(a.group_moments, b.group_moments)
+    return result
 
 
 def _metric(run_: Run, key: str) -> float:
@@ -990,6 +1070,10 @@ def analyse(batch: Path, output: Path) -> dict[str, Any]:
         write_projection_table(projections, output)
     files = {name: _save(figure, output, name) for name, figure in figures.items()}
     tables = write_tables(runs, seeds, output, chance)
+    group_contrasts = group_mcc_contrasts(runs, seeds)
+    (output / "group_mcc_contrasts.json").write_text(
+        json.dumps(group_contrasts, indent=2, sort_keys=True)
+    )
     write_csv(runs, seeds, output)
     result: dict[str, Any] = {
         "batch": str(batch),
@@ -1001,6 +1085,7 @@ def analyse(batch: Path, output: Path) -> dict[str, Any]:
         else {str(seed): values for seed, values in projections.items()},
         "chance": chance,
         **tables,
+        "paired_group_mcc": group_contrasts,
         "figures": files,
         "per_run": {
             arm: {
@@ -1081,6 +1166,10 @@ Full - baseline MCC: {fb["mean"]:+.3f} (s.d. {fb["sd"]:.3f}), positive in
 - `fig_geco_multiplier` — Supplementary: GECO penalty weight over sparse training.
 - `table_main.tex`, `table_paired.tex` — LaTeX (booktabs) tables; `per_run.csv`,
   `summary.json` — every number above.
+- `group_mcc_contrasts.json` — Paired 95% group-bootstrap intervals for full minus
+  baseline and baseline minus dense, separately for each training seed. Groups
+  remain intact and calibration matchings remain fixed. These intervals are
+  conditional on the trained models; the seed-level sign-flip tests are separate.
 """
         + (
             """- `fig_code_retention_box` — Whole-code retention R² of each true parameter, per

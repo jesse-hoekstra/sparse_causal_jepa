@@ -37,6 +37,36 @@ def test_sign_flip_test_is_exact() -> None:
     assert tied["p_one_sided"] == 1.0
 
 
+def test_group_bootstrap_matches_explicit_resampling_with_fixed_coordinate_matches() -> None:
+    generator = torch.Generator().manual_seed(73)
+    truth = torch.randn(7, 5, 6, generator=generator, dtype=torch.float64)
+    permutation = [3, 2, 0, 1, 5, 4]
+    columns = [2, 3, 1, 0, 5, 4]
+    left = truth[:, :, permutation] + 0.2 * torch.randn(
+        7, 5, 6, generator=generator, dtype=torch.float64
+    )
+    right = truth + 0.8 * torch.randn(7, 5, 6, generator=generator, dtype=torch.float64)
+    a = paper_analysis.matched_group_moments(left, truth, columns)
+    b = paper_analysis.matched_group_moments(right, truth, list(range(6)))
+    result = paper_analysis.paired_group_mcc(a, b, draws=32, seed=42)
+    indices = np.random.default_rng(42).integers(7, size=(32, 7))
+
+    def direct(sample: list[int]) -> float:
+        target = truth[sample].reshape(-1, 6)
+        values: list[float] = []
+        for states, order in ((left, columns), (right, list(range(6)))):
+            correlation = paper_analysis.pearson_matrix(states[sample].reshape(-1, 6), target)
+            values.append(float(correlation[torch.arange(6), order].abs().mean()))
+        return values[0] - values[1]
+
+    differences = [direct([int(i) for i in sample]) for sample in indices]
+    assert result["estimate"] == pytest.approx(direct(list(range(7))), abs=1e-12)  # pyright: ignore[reportUnknownMemberType]
+    assert result["ci_low"] == pytest.approx(float(np.percentile(differences, 2.5)), abs=1e-12)  # pyright: ignore[reportUnknownMemberType]
+    assert result["ci_high"] == pytest.approx(float(np.percentile(differences, 97.5)), abs=1e-12)  # pyright: ignore[reportUnknownMemberType]
+    identical = paper_analysis.paired_group_mcc(a, a)
+    assert identical["estimate"] == identical["ci_low"] == identical["ci_high"] == 0
+
+
 def test_chance_levels_match_their_limits() -> None:
     singletons = paper_analysis.chance_levels((1, 1, 1, 1, 1, 1), draws=50)
     assert singletons["mcc_mean"] == pytest.approx(1.0)  # pyright: ignore[reportUnknownMemberType]
@@ -144,10 +174,12 @@ def test_end_to_end_outputs_on_a_smoke_batch(tmp_path: Path) -> None:
         "table_paired.tex",
         "per_run.csv",
         "summary.json",
+        "group_mcc_contrasts.json",
         "README.md",
     ):
         assert (tmp_path / "paper" / name).is_file()
     assert result["paired"]["full - baseline"]["n"] == 2
+    assert result["paired_group_mcc"]["full - baseline"]["0"]["groups"] == 2
     rows = (tmp_path / "paper/per_run.csv").read_text().splitlines()
     assert len(rows) == 1 + 3 * 2
 
