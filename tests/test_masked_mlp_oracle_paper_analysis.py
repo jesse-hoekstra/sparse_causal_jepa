@@ -163,6 +163,53 @@ def test_learned_code_columns_are_matched_to_parameter_pairs() -> None:
     assert aligned["masks/parameter_code_aligned_shd"] == 0.0
 
 
+def test_graph_summaries_keep_row_only_and_code_aligned_scores_distinct(tmp_path: Path) -> None:
+    runs: dict[str, dict[int, paper_analysis.Run]] = {}
+    for arm in paper_analysis.ARMS:
+        metrics = {
+            "state_mcc": {"dense": 0.6, "baseline": 0.8, "full": 0.99}[arm],
+            "block_purity": 0.99,
+            "normalized_prediction_mse": 0.01,
+            "online_state_probe/r2": 0.99,
+            "masks/state_aligned_shd": 0.0,
+            "masks/parameter_aligned_shd": 20.0 if arm == "full" else 24.0,
+        }
+        if arm == "full":
+            metrics[paper_analysis.CODE_ALIGNED_SHD] = 1.0
+        runs[arm] = {
+            0: paper_analysis.Run(
+                arm=arm,
+                seed=0,
+                directory=Path("unused"),
+                metrics=metrics,
+                start=None,
+                curve=[],
+                penalty=[],
+                columns=list(range(6)),
+                correlation=np.eye(6),
+                graphs={},
+                group_moments=np.zeros((1, 31)),
+                physical_samples_sha256="unused",
+                data_identity="unused",
+            )
+        }
+    chance = {
+        "within_block": {"mcc_mean": 0.83, "purity_mean": 1.0},
+        "any_rotation": {"mcc_mean": 0.69, "purity_mean": 0.71},
+    }
+    result = paper_analysis.write_tables(runs, [0], tmp_path, chance)
+    full = result["summary"]["full"]
+    assert full["masks/parameter_aligned_shd"]["mean"] == 20.0
+    assert full[paper_analysis.CODE_ALIGNED_SHD]["mean"] == 1.0
+    assert result["parameter_graph_metric"] == paper_analysis.CODE_ALIGNED_SHD
+    row = next(
+        line
+        for line in (tmp_path / "table_main.tex").read_text().splitlines()
+        if line.startswith("Full &")
+    )
+    assert row.endswith(r"1.0 $\pm$ 0.0 \\")
+
+
 def test_end_to_end_outputs_on_a_smoke_batch(tmp_path: Path) -> None:
     prepare_source(
         SourcePrepareConfig(
@@ -313,6 +360,12 @@ def test_learned_code_batches_add_code_figures_and_table(tmp_path: Path, adapt: 
     for row in rows:
         aligned = row["masks/parameter_code_aligned_shd"]
         assert (aligned != "") == (row["arm"] == "full")
+        saved = result["per_run"][row["arm"]][row["seed"]]
+        assert saved["masks/parameter_aligned_shd"] == float(row["masks/parameter_aligned_shd"])
+        if row["arm"] == "full":
+            assert saved[paper_analysis.CODE_ALIGNED_SHD] == float(aligned)
+        assert "geco/relative_prediction" in saved or row["arm"] == "dense"
+    assert result["parameter_graph_metric"] == paper_analysis.CODE_ALIGNED_SHD
     assert "pair $R^2$" in (tmp_path / "paper/table_main.tex").read_text()
     if adapt:
         assert result["adaptations"]["0"]["updates"] == 3

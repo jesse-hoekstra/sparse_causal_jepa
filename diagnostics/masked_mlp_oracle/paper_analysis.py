@@ -49,6 +49,24 @@ CODE_KEYS = (
     "code_mcc",
     "forecast/code_use_ratio",
 )
+CODE_ALIGNED_SHD = "masks/parameter_code_aligned_shd"
+ENDPOINT_KEYS = (
+    "state_mcc",
+    "block_purity",
+    "normalized_prediction_mse",
+    "online_state_probe/r2",
+    "masks/state_edges",
+    "masks/state_aligned_shd",
+    "masks/action_edges",
+    "masks/action_aligned_shd",
+    "masks/parameter_edges",
+    "masks/parameter_aligned_shd",
+    CODE_ALIGNED_SHD,
+    "masks/parameter_code_aligned_missing_true_edges",
+    "masks/parameter_code_aligned_false_edges",
+    "geco/relative_prediction",
+    *CODE_KEYS,
+)
 LABELS = {
     "dense": "Dense",
     "baseline": "State/action\nsparsity",
@@ -233,9 +251,6 @@ def _code_order(codes: torch.Tensor, theta: torch.Tensor) -> list[int]:
     score = pair_r2[:, pair_of] + 1e-3 * correlation
     rows, cols = cast(tuple[Array, Array], linear_sum_assignment(-score))
     return [int(c) for c in rows.astype(int)[np.argsort(cols.astype(int))]]
-
-
-CODE_ALIGNED_SHD = "masks/parameter_code_aligned_shd"
 
 
 def _code_aligned_metrics(graph: NDArray[np.bool_]) -> dict[str, float]:
@@ -1003,23 +1018,27 @@ def write_tables(
         "masks/parameter_aligned_shd": "SHD$_\\theta$",
     }
 
-    def value(run_: Run, key: str) -> float:
-        # A learned code's parameter SHD needs its code columns matched to theta first.
-        if key == "masks/parameter_aligned_shd" and CODE_ALIGNED_SHD in run_.metrics:
-            key = CODE_ALIGNED_SHD
-        return _metric(run_, key)
-
     code_aligned = all(CODE_ALIGNED_SHD in runs["full"][s].metrics for s in seeds)
     label_prefix = "masked-mlp-learned" if code_aligned else "masked-mlp-oracle"
     summary: dict[str, dict[str, dict[str, float]]] = {
-        arm: {key: describe([value(runs[arm][s], key) for s in seeds]) for key in keys}
+        arm: {key: describe([_metric(runs[arm][s], key) for s in seeds]) for key in keys}
         for arm in ARMS
     }
+    if code_aligned:
+        # Keep the runner's state-row-only metric literal in machine-readable output.
+        summary["full"][CODE_ALIGNED_SHD] = describe(
+            [_metric(runs["full"][s], CODE_ALIGNED_SHD) for s in seeds]
+        )
     rows: list[str] = []
     for arm in ARMS:
         cells = [SHORT[arm]]
         for key in keys:
-            stats = summary[arm][key]
+            displayed_key = (
+                CODE_ALIGNED_SHD
+                if key == "masks/parameter_aligned_shd" and arm == "full" and code_aligned
+                else key
+            )
+            stats = summary[arm][displayed_key]
             if (key == "masks/parameter_aligned_shd" and arm != "full") or (
                 key.startswith("masks/") and arm == "dense"
             ):
@@ -1107,26 +1126,18 @@ def write_tables(
         "",
     ]
     (output / "table_paired.tex").write_text("\n".join(lines))
-    return {"summary": summary, "paired": tests}
+    return {
+        "summary": summary,
+        "paired": tests,
+        "parameter_graph_metric": CODE_ALIGNED_SHD
+        if code_aligned
+        else "masks/parameter_aligned_shd",
+    }
 
 
 def write_csv(runs: dict[str, dict[int, Run]], seeds: list[int], output: Path) -> None:
     """One row per run with its endpoint metrics and source directory."""
-    keys = [
-        "state_mcc",
-        "block_purity",
-        "normalized_prediction_mse",
-        "online_state_probe/r2",
-        "masks/state_edges",
-        "masks/state_aligned_shd",
-        "masks/parameter_edges",
-        "masks/parameter_aligned_shd",
-        CODE_ALIGNED_SHD,
-        "masks/parameter_code_aligned_missing_true_edges",
-        "masks/parameter_code_aligned_false_edges",
-        "geco/relative_prediction",
-        *CODE_KEYS,
-    ]
+    keys = ENDPOINT_KEYS
     with (output / "per_run.csv").open("w", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(["arm", "seed", "start_state_mcc", *keys, "directory"])
@@ -1202,12 +1213,10 @@ def analyse(batch: Path, output: Path) -> dict[str, Any]:
         "per_run": {
             arm: {
                 str(s): {
-                    "state_mcc": _metric(runs[arm][s], "state_mcc"),
-                    "block_purity": _metric(runs[arm][s], "block_purity"),
                     "start_state_mcc": _start_mcc(runs[arm][s]),
                     **{
                         key: _metric(runs[arm][s], key)
-                        for key in CODE_KEYS
+                        for key in ENDPOINT_KEYS
                         if key in runs[arm][s].metrics
                     },
                 }
