@@ -10,6 +10,14 @@ TAG=$1
 STATE_BATCH=$2
 shift 2
 HOSTS=("$@")
+FIRST_ATTEMPT=${FIRST_ATTEMPT:-0}
+PREVIOUS_BATCH=${PREVIOUS_BATCH:-}
+if [[ ! "$FIRST_ATTEMPT" =~ ^[0-7]$ ]] || \
+   { [ "$FIRST_ATTEMPT" -gt 0 ] && [[ "$PREVIOUS_BATCH" != /* ]]; } || \
+   { [ "$FIRST_ATTEMPT" -eq 0 ] && [ -n "$PREVIOUS_BATCH" ]; }; then
+  echo "FIRST_ATTEMPT must be 0..7; a continuation requires absolute PREVIOUS_BATCH" >&2
+  exit 2
+fi
 REPO_ROOT=/nfs/home/jesseh/sparse_causal_jepa
 CODE_DIR=${CODE_DIR:-$REPO_ROOT}
 PYTHON=$REPO_ROOT/.venv/bin/python
@@ -21,6 +29,7 @@ if [ -e "$BATCH/protocol.txt" ]; then
   exit 2
 fi
 printf '%s\n' "code=$CODE_DIR" "state_batch=$STATE_BATCH" "hosts=${HOSTS[*]}" \
+  "first_attempt=$FIRST_ATTEMPT; previous_batch=$PREVIOUS_BATCH" \
   "attempts=8; updates=100000; initialization_seed=1000+100*attempt+state_seed" \
   "selection=mean logged TRAIN prediction, steps 95100..100000; maximum=0.025" \
   "no sparse launch; no test evaluation" > "$BATCH/protocol.txt"
@@ -43,8 +52,27 @@ idle() {
   [ "${memory:-999999}" -lt 1000 ] && [ "${utilization:-100}" -lt 5 ]
 }
 
-log "waiting for all five GPUs to be idle before the first wave"
-for attempt in {0..7}; do
+if [ "$FIRST_ATTEMPT" -gt 0 ]; then
+  log "waiting for earlier attempts in $PREVIOUS_BATCH; their workers are not modified"
+  for ((attempt=0; attempt<FIRST_ATTEMPT; attempt++)); do
+    for seed in {0..4}; do
+      prior=$PREVIOUS_BATCH/attempt-$attempt-s$seed
+      if [ ! -d "$prior" ]; then
+        log "missing prior attempt $prior"
+        exit 2
+      fi
+      until [ -f "$prior/exit-code.txt" ]; do sleep 30; done
+      if [ "$(cat "$prior/exit-code.txt")" != 0 ] || [ ! -f "$prior/results/completion.json" ]; then
+        log "prior attempt failed or lacks its completion: $prior"
+        exit 2
+      fi
+      ln -s "$prior" "$BATCH/attempt-$attempt-s$seed"
+    done
+  done
+fi
+
+log "waiting for the assigned GPUs to be idle before the next wave"
+for ((attempt=FIRST_ATTEMPT; attempt<8; attempt++)); do
   while true; do
     ready=1
     for host in "${HOSTS[@]}"; do idle "$host" || ready=0; done
