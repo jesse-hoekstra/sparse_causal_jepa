@@ -11,6 +11,12 @@ def main() -> None:
     """Create physical data, then express the same controls in the Paley chart."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--rotation-scale",
+        type=float,
+        default=source_data.dgp.ROTATION_SCALE,
+        help="Positive Cayley rotation scale; the default reproduces the released data.",
+    )
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--wandb-mode", default="disabled")
     parser.add_argument("--wandb-project", default="sparse_causal_jepa")
@@ -23,6 +29,7 @@ def main() -> None:
     source_data.prepare(
         source_data.PrepareConfig(
             str(physical),
+            rotation_scale=args.rotation_scale,
             threads=args.threads,
             wandb_mode=args.wandb_mode,
             wandb_project=args.wandb_project,

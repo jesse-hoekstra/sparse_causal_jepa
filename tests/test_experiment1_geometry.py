@@ -2,6 +2,7 @@
 
 import math
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,6 +15,7 @@ from diagnostics.shared import source_data
 from diagnostics.shared import source_geometry as source_dgp
 from diagnostics.shared.data import PrepareConfig, load_data, prepare
 from diagnostics.shared.io import read_json, sha
+from scjepa.data.observations import VectorObservationMap
 
 
 @pytest.fixture(autouse=True)
@@ -181,3 +183,41 @@ def test_source_hash_tampering_is_rejected_before_copying(tmp_path: Path) -> Non
     with pytest.raises(ValueError, match="Completed artifact changed"):
         prepare(PrepareConfig(str(output), str(source), profile="smoke"))
     assert not output.exists()
+
+
+def test_rotation_scale_changes_only_transport_with_identical_random_draws(tmp_path: Path) -> None:
+    config = source_data.PrepareConfig(str(tmp_path), rotation_scale=0.2)
+    assert config.rotation_scale == 0.2
+    tiny = replace(
+        config,
+        profile="smoke",
+        train_groups=2,
+        calibration_groups=2,
+        validation_groups=2,
+        test_groups=2,
+    )
+    observation = VectorObservationMap(seed=1729, dimension=6)
+    rounded = source_data.build_data(tiny, "validation", observation)
+    original = source_data.build_data(
+        replace(tiny, rotation_scale=source_dgp.ROTATION_SCALE), "validation", observation
+    )
+    for name in ("actions", "oracle_parameters", "episode_ids"):
+        assert torch.equal(rounded.tensors[name], original.tensors[name])
+    assert rounded.states is not None
+    assert original.states is not None
+    assert torch.equal(rounded.states[:, :, 0], original.states[:, :, 0])
+    assert not torch.equal(rounded.states[:, :, 1:], original.states[:, :, 1:])
+    assert not torch.equal(rounded.tensors["observations"], original.tensors["observations"])
+    assert rounded.metadata["rotation_scale"] == 0.2
+    assert (
+        rounded.metadata["observation_matrix_sha256"]
+        == (original.metadata["observation_matrix_sha256"])
+    )
+    expected = source_dgp.simulate(
+        rounded.states[:, :, 0],
+        rounded.tensors["oracle_parameters"][:, None].double(),
+        rounded.tensors["actions"].double(),
+        rotation_scale=0.2,
+    )
+    # Stored inputs are float32; the original simulator draws were float64.
+    torch.testing.assert_close(rounded.states, expected, atol=2e-7, rtol=2e-7)

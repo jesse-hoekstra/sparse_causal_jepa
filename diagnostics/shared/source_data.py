@@ -55,11 +55,8 @@ class PrepareConfig:
             raise ValueError("Transport chart must be isotropic")
         if not math.isfinite(self.rotation_scale) or self.rotation_scale <= 0:
             raise ValueError("Rotation scale must be finite and positive")
-        if self.profile == "exploratory" and (self.rho, self.rotation_scale) != (
-            0.7,
-            dgp.ROTATION_SCALE,
-        ):
-            raise ValueError("Exploratory isotropic rho and trace-matched rotation scale are fixed")
+        if self.profile == "exploratory" and self.rho != 0.7:
+            raise ValueError("Exploratory isotropic rho is fixed at 0.7")
         if self.seed != 0 or self.threads < 1 or self.profile not in {"exploratory", "smoke"}:
             raise ValueError("Require data seed zero, positive threads and a declared profile")
         counts = tuple(getattr(self, f"{split}_groups") for split in SPLITS)

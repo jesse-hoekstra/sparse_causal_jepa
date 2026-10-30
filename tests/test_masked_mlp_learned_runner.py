@@ -189,8 +189,9 @@ def test_sparse_arms_start_from_the_dense_endpoint_and_report_codes(tmp_path: Pa
         )
 
 
+@pytest.mark.parametrize("factor", [0.8, 1.0])
 def test_tighter_bound_preserves_sources_and_initial_weights(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factor: float
 ) -> None:
     _prepare(tmp_path)
     _dense_and_bound(tmp_path)
@@ -208,10 +209,10 @@ def test_tighter_bound_preserves_sources_and_initial_weights(
     monkeypatch.setattr(bound_control, "read_json", calibration_only)
     output = tmp_path / "tighter"
     control = bound_control.tighten_bound(
-        source, output, tau_factor=0.8, hypothesis="Preserve weak predictive dependencies"
+        source, output, tau_factor=factor, hypothesis="Preserve weak predictive dependencies"
     )
     assert read_names == ["calibration.json", "calibration.json"]
-    assert control["tau_prediction"] == 0.8 * original["reference"]["prediction_loss"]
+    assert control["tau_prediction"] == factor * original["reference"]["prediction_loss"]
     assert control["identity"] != original["identity"]
     assert control["code_identity"] == original["code_identity"] == runner.code_identity()
     assert control["reference"] == original["reference"]
