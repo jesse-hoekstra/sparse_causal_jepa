@@ -4,8 +4,9 @@ Read-only: it authenticates completed run directories and reads their saved
 validation endpoints, learning curves, matchings and final mask logits. It loads
 no model for inference and never touches test data. Excluded from numerical
 identity. Layout expected under ``--batch-dir``: ``{dense,baseline,full}-s{seed}/results``,
-plus ``projected-s{seed}/results`` when a learned twelve-code dense arm was projected to the
-six-code starting point of the sparse arms.
+plus ``projected-s{seed}/results`` when initialization includes a learned-code projection.
+An adapted dense endpoint additionally reports its authenticated projection-to-adaptation
+comparison. When adaptation is present, that six-code endpoint initializes both sparse arms.
 
 Outputs: box plots of MCC and block purity per arm with chance references, MCC
 learning curves, edge-recovery frequencies of the learned graphs, matched
@@ -30,7 +31,7 @@ from scipy.optimize import linear_sum_assignment  # pyright: ignore[reportUnknow
 from diagnostics.isotropic_oracle.dgp import graphs as true_graphs
 from diagnostics.masked_mlp_learned import run as learned
 from diagnostics.masked_mlp_oracle import from_dense, run
-from diagnostics.oracle_state_learning.data import read_json
+from diagnostics.oracle_state_learning.data import read_json, sha
 from scjepa.data.datasets import tensor_fingerprint
 from scjepa.eval.recovery import pearson_matrix
 
@@ -822,10 +823,10 @@ def write_projection_table(projections: dict[int, dict[str, float]], output: Pat
             *rows,
             r"\bottomrule",
             r"\end{tabular}",
-            r"\caption{Projection of each dense endpoint's "
+            r"\caption{Projection of each acquired "
             + str(dimension)
             + r"-dimensional code onto the six leading eigenvectors of its TRAIN group-shared "
-            r"code covariance, the starting point of both sparse arms (validation). The "
+            r"code covariance in the initialization pipeline (validation). The "
             r"projection uses no parameter labels; code variance kept is the TRAIN fraction "
             r"of centered code variance its least-squares reconstruction explains.}",
             r"\label{tab:masked-mlp-learned-projection}",
@@ -834,6 +835,92 @@ def write_projection_table(projections: dict[int, dict[str, float]], output: Pat
         ]
     )
     (output / "table_projection.tex").write_text(table)
+
+
+def load_adaptations(batch: Path, seeds: list[int]) -> dict[int, dict[str, float]] | None:
+    """Authenticate a projected-to-adapted dense comparison without opening test data."""
+    records = {seed: read_json(batch / f"dense-s{seed}/results/completion.json") for seed in seeds}
+    if not any(record.get("adaptation_source") is not None for record in records.values()):
+        return None
+    result: dict[int, dict[str, float]] = {}
+    for seed, record in records.items():
+        source = record.get("adaptation_source")
+        if not isinstance(source, dict):
+            raise ValueError("all dense seeds must share the adaptation protocol")
+        source = cast(dict[str, Any], source)
+        directory = batch / f"dense-s{seed}/results"
+        completion = learned.verify_completion(directory, kind="train")
+        projection = batch / f"projected-s{seed}/results"
+        if not projection.exists():
+            projection = Path(source["directory"])
+        parent = learned.verify_completion(projection, kind="projection")
+        if (
+            completion["condition"] != "dense"
+            or completion["code_dim"] != 6
+            or completion["seed"] != seed
+            or parent["seed"] != seed
+            or parent["data_identity"] != completion["data_identity"]
+            or parent["identity"] != source["identity"]
+            or parent["code_identity"] != source["code_identity"]
+            or sha(projection / "completion.json") != source["completion_sha256"]
+            or sha(projection / "last.pt") != source["checkpoint_sha256"]
+        ):
+            raise ValueError("adaptation and its declared projection differ")
+        for arm in ("baseline", "full"):
+            sparse = read_json(batch / f"{arm}-s{seed}/results/completion.json")
+            sparse_parent = sparse.get("dense_endpoint")
+            if not isinstance(sparse_parent, dict):
+                raise ValueError("sparse arms must use the reported adapted dense endpoint")
+            sparse_parent = cast(dict[str, Any], sparse_parent)
+            if (
+                sparse_parent.get("identity") != completion["identity"]
+                or sparse_parent.get("completion_sha256") != sha(directory / "completion.json")
+                or sparse_parent.get("checkpoint_sha256") != sha(directory / "last.pt")
+            ):
+                raise ValueError("sparse arms must use the reported adapted dense endpoint")
+        row = {"updates": float(completion["steps"])}
+        for stage, path in (("projected", projection), ("adapted", directory)):
+            metrics = read_json(path / "validation.json")["metrics"]
+            row[f"{stage}_r2_min"] = float(metrics["code_r2_min"])
+            row[f"{stage}_nmse"] = float(metrics["normalized_prediction_mse"])
+            row[f"{stage}_calibration_prediction"] = float(
+                read_json(path / "calibration.json")["metrics"]["prediction"]
+            )
+        result[seed] = row
+    return result
+
+
+def write_adaptation_table(adaptations: dict[int, dict[str, float]], output: Path) -> None:
+    """Show the fixed six-code adaptation budget, retained information and forecast change."""
+    rows = [
+        f"{seed} & {int(row['updates'])} & {row['projected_r2_min']:.3f} & "
+        f"{row['adapted_r2_min']:.3f} & {row['projected_nmse']:.4f} & "
+        f"{row['adapted_nmse']:.4f}" + r" \\"
+        for seed, row in sorted(adaptations.items())
+    ]
+    table = "\n".join(
+        [
+            r"\begin{table}[t]",
+            r"\centering",
+            r"\small",
+            r"\begin{tabular}{lccccc}",
+            r"\toprule",
+            r"Seed & Updates & Min.\ $R^2$ before & after & NMSE before & after \\",
+            r"\midrule",
+            *rows,
+            r"\bottomrule",
+            r"\end{tabular}",
+            r"\caption{Six-code adaptation from the fixed projected endpoints (validation). "
+            r"Both learned state encoders remain frozen; only the parameter encoder and "
+            r"dense predictor learn from the ordinary label-free forecast objective. "
+            r"All values use the final fixed-budget endpoint; retention is measured from "
+            r"the complete code with the unchanged calibration-fitted probes.}",
+            r"\label{tab:masked-mlp-learned-adaptation}",
+            r"\end{table}",
+            "",
+        ]
+    )
+    (output / "table_adaptation.tex").write_text(table)
 
 
 def write_code_table(runs: dict[str, dict[int, Run]], seeds: list[int], output: Path) -> None:
@@ -1068,6 +1155,9 @@ def analyse(batch: Path, output: Path) -> dict[str, Any]:
     projections = load_projections(batch, seeds)
     if projections is not None:
         write_projection_table(projections, output)
+    adaptations = load_adaptations(batch, seeds)
+    if adaptations is not None:
+        write_adaptation_table(adaptations, output)
     files = {name: _save(figure, output, name) for name, figure in figures.items()}
     tables = write_tables(runs, seeds, output, chance)
     group_contrasts = group_mcc_contrasts(runs, seeds)
@@ -1083,6 +1173,9 @@ def analyse(batch: Path, output: Path) -> dict[str, Any]:
         "projections": None
         if projections is None
         else {str(seed): values for seed, values in projections.items()},
+        "adaptations": None
+        if adaptations is None
+        else {str(seed): values for seed, values in adaptations.items()},
         "chance": chance,
         **tables,
         "paired_group_mcc": group_contrasts,
@@ -1198,9 +1291,14 @@ Code summary (mean over seeds): """
     )
     if result["projections"]:
         text += (
-            "- `table_projection.tex` — Retention and forecast error of each dense endpoint's "
-            "code before and after the label-free projection to the six-code starting point "
-            "of both sparse arms.\n"
+            "- `table_projection.tex` — Retention and forecast error of each acquired code "
+            "before and after the label-free projection in the initialization pipeline.\n"
+        )
+    if result["adaptations"]:
+        text += (
+            "- `table_adaptation.tex` — The fixed six-code forecast-adaptation budget and "
+            "retention/forecast accuracy before and after adaptation on frozen learned states. "
+            "The adapted dense endpoints initialize the sparse comparison.\n"
         )
     (output / "README.md").write_text(text)
 

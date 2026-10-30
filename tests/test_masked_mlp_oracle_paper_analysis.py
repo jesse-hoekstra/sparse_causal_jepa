@@ -1,7 +1,9 @@
 """Statistics, chance references, graph alignment and end-to-end paper outputs."""
 
 import csv
+import json
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -191,7 +193,8 @@ def test_spreads_that_round_to_zero_are_printed_as_bounds() -> None:
     assert fmt({"mean": 0.0089, "sd": 0.00004}, 4) == r"0.0089 $\pm$ $<$0.0001"
 
 
-def test_learned_code_batches_add_code_figures_and_table(tmp_path: Path) -> None:
+@pytest.mark.parametrize("adapt", [False, True])
+def test_learned_code_batches_add_code_figures_and_table(tmp_path: Path, adapt: bool) -> None:
     from diagnostics.masked_mlp_learned import run as learned
 
     prepare_source(
@@ -221,23 +224,32 @@ def test_learned_code_batches_add_code_figures_and_table(tmp_path: Path) -> None
             checkpoint_every=1,
             evaluate_every=2,
             calibration_dir=str(batch / "calibration/results") if sparse else None,
-            init_dir=str(batch / f"projected-s{seed}/results") if sparse else None,
+            init_dir=str(batch / f"{'dense' if adapt else 'projected'}-s{seed}/results")
+            if sparse
+            else None,
         )
 
     for seed in (0, 1):
-        learned.train(config("dense", seed))
+        initial = config("dense", seed)
+        if adapt:
+            initial = replace(initial, output_dir=str(batch / f"acquired-s{seed}/results"))
+        learned.train(initial)
         learned.project(
             learned.ProjectConfig(
                 str(batch / f"projected-s{seed}/results"),
-                str(batch / f"dense-s{seed}/results"),
+                initial.output_dir,
                 str(tmp_path / "data"),
                 profile="smoke",
             )
         )
+        if adapt:
+            learned.train(
+                replace(config("dense", seed), adapt_from=str(batch / f"projected-s{seed}/results"))
+            )
     learned.calibrate(
         learned.CalibrateConfig(
             str(batch / "calibration/results"),
-            str(batch / "projected-s0/results"),
+            str(batch / f"{'dense' if adapt else 'projected'}-s0/results"),
             profile="smoke",
         )
     )
@@ -262,3 +274,23 @@ def test_learned_code_batches_add_code_figures_and_table(tmp_path: Path) -> None
         aligned = row["masks/parameter_code_aligned_shd"]
         assert (aligned != "") == (row["arm"] == "full")
     assert "pair $R^2$" in (tmp_path / "paper/table_main.tex").read_text()
+    if adapt:
+        assert result["adaptations"]["0"]["updates"] == 3
+        assert (tmp_path / "paper/table_adaptation.tex").is_file()
+        assert "frozen learned states" in (tmp_path / "paper/README.md").read_text()
+        completion_path = batch / "dense-s0/results/completion.json"
+        completion = json.loads(completion_path.read_text())
+        original = completion_path.read_text()
+        completion["adaptation_source"]["identity"] = "wrong parent"
+        completion_path.write_text(json.dumps(completion))
+        with pytest.raises(ValueError, match="declared projection"):
+            paper_analysis.load_adaptations(batch, [0, 1])
+        completion_path.write_text(original)
+        sparse_path = batch / "full-s0/results/completion.json"
+        sparse = json.loads(sparse_path.read_text())
+        sparse["dense_endpoint"]["identity"] = "different initializer"
+        sparse_path.write_text(json.dumps(sparse))
+        with pytest.raises(ValueError, match="reported adapted dense endpoint"):
+            paper_analysis.load_adaptations(batch, [0, 1])
+    else:
+        assert result["adaptations"] is None
