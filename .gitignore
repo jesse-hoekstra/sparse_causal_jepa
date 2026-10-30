@@ -1,6 +1,9 @@
 # Local scientific inputs, raw runs and private working records.
 /data/
 /outputs/
+/publication/
+/results/
+/tmp/
 /checkpoints/
 /logs/
 /sources/
@@ -20,6 +23,10 @@ multirun/
 *.pt
 *.pth
 
+# Manuscripts and scientific documents stay private, including outside those folders.
+*.pdf
+*.tex
+
 # Python environments, packages and caches.
 __pycache__/
 *.py[cod]
@@ -35,14 +42,6 @@ venv/
 .mypy_cache/
 .coverage
 htmlcov/
-
-# TeX intermediates; the manuscript PDF and figure PDFs are versioned.
-/publication/*.aux
-/publication/*.log
-/publication/*.out
-/publication/*.fls
-/publication/*.fdb_latexmk
-/publication/*.synctex.gz
 
 # Editors and operating system metadata.
 .DS_Store
