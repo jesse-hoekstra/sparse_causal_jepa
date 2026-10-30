@@ -19,6 +19,7 @@ from diagnostics.masked_mlp_learned import (
     bound_control,
     budget_control,
     cooldown_control,
+    cooldown_from_prefix,
 )
 from diagnostics.masked_mlp_learned import run as runner
 from diagnostics.masked_mlp_oracle.model import INITIAL_LOGIT
@@ -443,6 +444,89 @@ def test_cooldown_resume_crosses_the_schedule_boundary_exactly(
         changed = replace(config)
     with pytest.raises(ValueError, match="checkpoint configuration"):
         cooldown_control.train_cooldown(changed, resume=True)
+
+
+def test_reused_prefix_matches_full_schedule_and_resumes_exactly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare(tmp_path)
+    _dense_and_bound(tmp_path)
+    base = _config(tmp_path, "full")
+    prefix = tmp_path / "prefix"
+    prefix_config = budget_control.BudgetConfig(**asdict(replace(base, output_dir=str(prefix))))
+    runner.train(prefix_config)
+    source_hashes = {
+        name: runner.sha(prefix / name)
+        for name in ("completion.json", "last.pt", "initial.pt", "history.jsonl")
+    }
+    reference_config = cooldown_control.CooldownConfig(
+        **asdict(replace(base, output_dir=str(tmp_path / "reference"), steps=8)),
+        cooldown_start=4,
+    )
+    cooldown_control.train_cooldown(reference_config)
+    config = cooldown_from_prefix.make_config(
+        prefix, tmp_path / "child", wandb_group=base.wandb_group, cooldown_updates=4
+    )
+    completed = cooldown_from_prefix.train_from_prefix(config)
+    assert completed["steps"] == completed["successful_updates"] == 8
+    assert completed["hashes"]["prefix.pt"] == source_hashes["last.pt"]
+    assert runner.sha(tmp_path / "child/initial.pt") == source_hashes["initial.pt"]
+    reference = _checkpoint(tmp_path / "reference/last.pt")
+    child = _checkpoint(tmp_path / "child/last.pt")
+    for key in ("model", "optimizer", "objective", "sampler", "torch_rng", "python_rng"):
+        torch.testing.assert_close(reference[key], child[key], rtol=0, atol=0)
+    assert reference["numpy_rng"][0] == child["numpy_rng"][0]
+    assert (reference["numpy_rng"][1] == child["numpy_rng"][1]).all()
+    assert reference["numpy_rng"][2:] == child["numpy_rng"][2:]
+    assert all(runner.sha(prefix / name) == value for name, value in source_hashes.items())
+
+    interrupted = replace(config, output_dir=str(tmp_path / "interrupted-child"))
+    actual = runner.forward_loss
+    updates = 0
+
+    def interrupt(
+        model: SCJEPA,
+        batch: dict[str, Tensor],
+        objective: TrainingObjective,
+        *,
+        forward_seed: int | None = None,
+    ) -> tuple[Tensor, dict[str, Tensor], ModelOutput]:
+        nonlocal updates
+        if model.training:
+            updates += 1
+            if updates == 2:
+                raise RuntimeError("deliberate suffix interruption")
+        return actual(model, batch, objective, forward_seed=forward_seed)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, "forward_loss", interrupt)
+        with pytest.raises(RuntimeError, match="suffix interruption"):
+            cooldown_from_prefix.train_from_prefix(interrupted)
+    assert _checkpoint(Path(interrupted.output_dir) / "last.pt")["step"] == 5
+    resumed = cooldown_from_prefix.train_from_prefix(interrupted, resume=True)
+    assert resumed["identity"] == completed["identity"]
+    restored = _checkpoint(Path(interrupted.output_dir) / "last.pt")
+    for key in ("model", "optimizer", "objective", "sampler", "torch_rng", "python_rng"):
+        torch.testing.assert_close(child[key], restored[key], rtol=0, atol=0)
+    assert runner.verify_completion(Path(interrupted.output_dir)) == resumed
+    with pytest.raises(ValueError, match="every numerical prefix setting"):
+        cooldown_from_prefix.train_from_prefix(
+            replace(config, output_dir=str(tmp_path / "changed"), lr=0.002)
+        )
+    assert not (tmp_path / "changed").exists()
+    with pytest.raises(ValueError, match="fixed endpoint changed"):
+        cooldown_from_prefix.train_from_prefix(replace(config, cooldown_start=3), resume=True)
+
+    original_sha = cooldown_from_prefix.sha
+
+    def changed_adapter(path: Path) -> str:
+        return "f" * 64 if path == Path(cooldown_from_prefix.__file__) else original_sha(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cooldown_from_prefix, "sha", changed_adapter)
+        changed = replace(config)
+    with pytest.raises(ValueError, match="continuation configuration or source"):
+        cooldown_from_prefix.train_from_prefix(changed, resume=True)
 
 
 def test_projection_is_exact_for_a_six_dimensional_code() -> None:
