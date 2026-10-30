@@ -14,7 +14,12 @@ from diagnostics.balanced_action_oracle.data import PrepareConfig, prepare
 from diagnostics.isotropic_oracle.data import PrepareConfig as SourcePrepareConfig
 from diagnostics.isotropic_oracle.data import StateData
 from diagnostics.isotropic_oracle.data import prepare as prepare_source
-from diagnostics.masked_mlp_learned import acquisition, bound_control, budget_control
+from diagnostics.masked_mlp_learned import (
+    acquisition,
+    bound_control,
+    budget_control,
+    cooldown_control,
+)
 from diagnostics.masked_mlp_learned import run as runner
 from diagnostics.masked_mlp_oracle.model import INITIAL_LOGIT
 from diagnostics.oracle_state_learning.core import EvaluationResult
@@ -347,6 +352,97 @@ def test_budget_control_binds_source_and_preserves_exact_resume(
         changed = replace(config)
     with pytest.raises(ValueError, match="checkpoint configuration"):
         runner.train(changed, resume=True)
+
+
+def test_cooldown_preserves_protocol_guards() -> None:
+    config = cooldown_control.CooldownConfig(
+        "unused", "unused", "full", calibration_dir="unused", init_dir="unused"
+    )
+    assert config.steps == 350_000
+    assert config.cooldown_start == 300_000
+    with pytest.raises(ValueError, match="exactly 300k plus 50k"):
+        replace(config, cooldown_start=250_000)
+    with pytest.raises(ValueError, match="exactly 0.1"):
+        replace(config, cooldown_factor=0.2)
+    with pytest.raises(ValueError, match="optimizer settings"):
+        replace(config, lr=0.002)
+    with pytest.raises(ValueError, match="matched sparse"):
+        cooldown_control.CooldownConfig("unused", "unused", "dense")
+    with pytest.raises(ValueError, match="exploratory budget"):
+        runner.TrainConfig(
+            "unused", "unused", "full", steps=350_000, calibration_dir="u", init_dir="u"
+        )
+
+
+def test_cooldown_changes_only_the_declared_optimizer_tail_and_removes_its_hook() -> None:
+    config = cooldown_control.CooldownConfig(
+        "unused",
+        "unused",
+        "full",
+        profile="smoke",
+        steps=4,
+        cooldown_start=2,
+        calibration_dir="unused",
+        init_dir="unused",
+    )
+    reference = torch.nn.Parameter(torch.ones(2))
+    scheduled = torch.nn.Parameter(reference.detach().clone())
+    ordinary = torch.optim.AdamW([reference], lr=config.lr, weight_decay=0)
+    controlled = torch.optim.AdamW([scheduled], lr=config.lr, weight_decay=0)
+    for _ in range(2):
+        reference.grad = torch.ones_like(reference)
+        ordinary.step()  # pyright: ignore[reportUnknownMemberType]
+    with cooldown_control.cooldown_schedule(config):
+        for _ in range(2):
+            scheduled.grad = torch.ones_like(scheduled)
+            controlled.step()  # pyright: ignore[reportUnknownMemberType]
+        torch.testing.assert_close(reference, scheduled, rtol=0, atol=0)
+        torch.testing.assert_close(ordinary.state_dict(), controlled.state_dict(), rtol=0, atol=0)
+        for _ in range(2):
+            scheduled.grad = torch.ones_like(scheduled)
+            controlled.step()  # pyright: ignore[reportUnknownMemberType]
+    ordinary.param_groups[0]["lr"] = 0.0001
+    for _ in range(2):
+        reference.grad = torch.ones_like(reference)
+        ordinary.step()  # pyright: ignore[reportUnknownMemberType]
+    torch.testing.assert_close(reference, scheduled, rtol=0, atol=0)
+    torch.testing.assert_close(ordinary.state_dict(), controlled.state_dict(), rtol=0, atol=0)
+    with (
+        pytest.raises(RuntimeError, match="planned failure"),
+        cooldown_control.cooldown_schedule(config),
+    ):
+        raise RuntimeError("planned failure")
+    ordinary.param_groups[0]["lr"] = 0.003
+    ordinary.step()  # pyright: ignore[reportUnknownMemberType]
+    assert ordinary.param_groups[0]["lr"] == 0.003
+
+
+def test_cooldown_resume_crosses_the_schedule_boundary_exactly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare(tmp_path)
+    _dense_and_bound(tmp_path)
+    config = cooldown_control.CooldownConfig(**asdict(_config(tmp_path, "full")), cooldown_start=2)
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, "train", cooldown_control.train_cooldown)
+        _check_resume(tmp_path, config, patch)
+    checkpoint = _checkpoint(tmp_path / "full-s0/last.pt")
+    assert checkpoint["optimizer"]["param_groups"][0]["lr"] == 0.0001
+    record = read_json(tmp_path / "full-s0/config.json")
+    assert record["scientific_config"]["cooldown_control_sha256"] == runner.sha(
+        Path(cooldown_control.__file__)
+    )
+    with pytest.raises(ValueError, match="checkpoint configuration"):
+        runner.train(_config(tmp_path, "full"), resume=True)
+
+    def changed_source(_: Path) -> str:
+        return "changed cooldown source"
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cooldown_control, "sha", changed_source)
+        changed = replace(config)
+    with pytest.raises(ValueError, match="checkpoint configuration"):
+        cooldown_control.train_cooldown(changed, resume=True)
 
 
 def test_projection_is_exact_for_a_six_dimensional_code() -> None:
