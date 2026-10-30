@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fixed pool of eight acquisition initializations for each of five frozen-state seeds.
+# Fixed acquisition pool for each of five frozen-state seeds; defaults to eight.
 # Run in detached tmux on the server. No sparse phase or test evaluation is launched.
 set -euo pipefail
 if [ "$#" -ne 7 ]; then
@@ -12,13 +12,19 @@ shift 2
 HOSTS=("$@")
 FIRST_ATTEMPT=${FIRST_ATTEMPT:-0}
 PREVIOUS_BATCH=${PREVIOUS_BATCH:-}
-if [[ ! "$FIRST_ATTEMPT" =~ ^[0-7]$ ]] || \
+POOL_ATTEMPTS=${POOL_ATTEMPTS:-8}
+CONCURRENT_WAVES=${CONCURRENT_WAVES:-1}
+if [[ ! "$POOL_ATTEMPTS" =~ ^(8|16)$ ]] || \
+   [[ ! "$FIRST_ATTEMPT" =~ ^([0-9]|1[0-5])$ ]] || \
+   [[ ! "$CONCURRENT_WAVES" =~ ^[1-8]$ ]] || \
+   [ "$FIRST_ATTEMPT" -ge "$POOL_ATTEMPTS" ] || \
    { [ "$FIRST_ATTEMPT" -gt 0 ] && [[ "$PREVIOUS_BATCH" != /* ]]; } || \
    { [ "$FIRST_ATTEMPT" -eq 0 ] && [ -n "$PREVIOUS_BATCH" ]; }; then
-  echo "FIRST_ATTEMPT must be 0..7; a continuation requires absolute PREVIOUS_BATCH" >&2
+  echo "require POOL_ATTEMPTS=8|16, FIRST_ATTEMPT below it, CONCURRENT_WAVES=1..8" >&2
+  echo "a continuation requires absolute PREVIOUS_BATCH; a fresh pool must omit it" >&2
   exit 2
 fi
-REPO_ROOT=/nfs/home/jesseh/sparse_causal_jepa
+REPO_ROOT=${REPO_ROOT:-/nfs/home/jesseh/sparse_causal_jepa}
 CODE_DIR=${CODE_DIR:-$REPO_ROOT}
 PYTHON=$REPO_ROOT/.venv/bin/python
 BATCH=$REPO_ROOT/outputs/diagnostics/masked-mlp-restarts-$TAG
@@ -30,7 +36,8 @@ if [ -e "$BATCH/protocol.txt" ]; then
 fi
 printf '%s\n' "code=$CODE_DIR" "state_batch=$STATE_BATCH" "hosts=${HOSTS[*]}" \
   "first_attempt=$FIRST_ATTEMPT; previous_batch=$PREVIOUS_BATCH" \
-  "attempts=8; updates=100000; initialization_seed=1000+100*attempt+state_seed" \
+  "attempts=$POOL_ATTEMPTS; concurrent_waves=$CONCURRENT_WAVES" \
+  "updates=100000; initialization_seed=1000+100*attempt+state_seed" \
   "selection=mean logged TRAIN prediction, steps 95100..100000; maximum=0.025" \
   "no sparse launch; no test evaluation" > "$BATCH/protocol.txt"
 git -C "$CODE_DIR" rev-parse HEAD >> "$BATCH/protocol.txt"
@@ -71,56 +78,74 @@ if [ "$FIRST_ATTEMPT" -gt 0 ]; then
   done
 fi
 
-log "waiting for the assigned GPUs to be idle before the next wave"
-for ((attempt=FIRST_ATTEMPT; attempt<8; attempt++)); do
+group_first=$FIRST_ATTEMPT
+group_end=$FIRST_ATTEMPT
+stop_active_group() {
+  local other_attempt other other_job
+  for ((other_attempt=group_first; other_attempt<group_end; other_attempt++)); do
+    for other in {0..4}; do
+      other_job=$BATCH/attempt-$other_attempt-s$other
+      if [ -f "$other_job/session.txt" ]; then
+        on_host "${HOSTS[$other]}" \
+          "tmux kill-session -t '$(cat "$other_job/session.txt")'" || true
+      fi
+    done
+  done
+}
+trap 'batch_status=$?; if [ "$batch_status" -ne 0 ]; then stop_active_group; fi' EXIT
+
+log "waiting for the assigned GPUs to be idle before the next wave group"
+for ((group_first=FIRST_ATTEMPT; group_first<POOL_ATTEMPTS; group_first+=CONCURRENT_WAVES)); do
+  group_end=$((group_first + CONCURRENT_WAVES))
+  [ "$group_end" -le "$POOL_ATTEMPTS" ] || group_end=$POOL_ATTEMPTS
   while true; do
     ready=1
     for host in "${HOSTS[@]}"; do idle "$host" || ready=0; done
     [ "$ready" -eq 1 ] && break
     sleep 30
   done
-  log "starting acquisition wave $attempt on all five hosts"
-  for seed in {0..4}; do
-    host=${HOSTS[$seed]}
-    job=$BATCH/attempt-$attempt-s$seed
-    mkdir "$job"
-    session=scj-acquire-$TAG-a$attempt-s$seed
-    printf '%s\n' "$host" > "$job/host.txt"
-    printf '%s\n' "$session" > "$job/session.txt"
-    {
-      printf '#!/usr/bin/env bash\nset -uo pipefail\ncd %q\n' "$CODE_DIR"
-      printf 'export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1\n'
-      printf 'export PYTHONPATH=%q\n' "$CODE_DIR/src:$CODE_DIR"
-      printf '%q ' "$PYTHON" -u -m diagnostics.masked_mlp_learned.run train \
-        --condition dense --seed "$seed" --acquisition-seed "$((1000 + 100 * attempt + seed))" \
-        --steps 100000 --states-from "$STATE_BATCH/states-s$seed/results" \
-        --data-dir "$DATA" --output-dir "$job/results" --device cuda \
-        --wandb-mode online --wandb-project sparse_causal_jepa \
-        --wandb-entity jesse-hoekstra-university-of-oxford --wandb-group "masked-mlp-restarts-$TAG"
-      printf '> %q 2>&1\ncode=$?\nprintf "%%s\\n" "$code" > %q\nexit "$code"\n' \
-        "$job/stdout-stderr.log" "$job/exit-code.txt"
-    } > "$job/run.sh"
-    on_host "$host" "tmux new-session -d -s '$session' 'bash $job/run.sh'"
+  for ((attempt=group_first; attempt<group_end; attempt++)); do
+    log "starting acquisition wave $attempt with all five seeds"
+    for seed in {0..4}; do
+      host=${HOSTS[$seed]}
+      job=$BATCH/attempt-$attempt-s$seed
+      mkdir "$job"
+      session=scj-acquire-$TAG-a$attempt-s$seed
+      printf '%s\n' "$host" > "$job/host.txt"
+      printf '%s\n' "$session" > "$job/session.txt"
+      {
+        printf '#!/usr/bin/env bash\nset -uo pipefail\ncd %q\n' "$CODE_DIR"
+        printf 'export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1\n'
+        printf 'export PYTHONPATH=%q\n' "$CODE_DIR/src:$CODE_DIR"
+        printf '%q ' "$PYTHON" -u -m diagnostics.masked_mlp_learned.run train \
+          --condition dense --seed "$seed" --acquisition-seed "$((1000 + 100 * attempt + seed))" \
+          --steps 100000 --states-from "$STATE_BATCH/states-s$seed/results" \
+          --data-dir "$DATA" --output-dir "$job/results" --device cuda \
+          --wandb-mode online --wandb-project sparse_causal_jepa \
+          --wandb-entity jesse-hoekstra-university-of-oxford --wandb-group "masked-mlp-restarts-$TAG"
+        printf '> %q 2>&1\ncode=$?\nprintf "%%s\\n" "$code" > %q\nexit "$code"\n' \
+          "$job/stdout-stderr.log" "$job/exit-code.txt"
+      } > "$job/run.sh"
+      on_host "$host" "tmux new-session -d -s '$session' 'bash $job/run.sh'"
+    done
   done
   while true; do
     finished=1
-    for seed in {0..4}; do
-      job=$BATCH/attempt-$attempt-s$seed
-      if [ ! -f "$job/exit-code.txt" ]; then
-        finished=0
-      elif [ "$(cat "$job/exit-code.txt")" != 0 ]; then
-        log "failure in $job; stopping this batch and its remaining jobs"
-        for other in {0..4}; do
-          other_job=$BATCH/attempt-$attempt-s$other
-          on_host "${HOSTS[$other]}" "tmux kill-session -t '$(cat "$other_job/session.txt")'" || true
-        done
-        exit 1
-      fi
+    for ((attempt=group_first; attempt<group_end; attempt++)); do
+      for seed in {0..4}; do
+        job=$BATCH/attempt-$attempt-s$seed
+        if [ ! -f "$job/exit-code.txt" ]; then
+          finished=0
+        elif [ "$(cat "$job/exit-code.txt")" != 0 ]; then
+          log "failure in $job; stopping this batch and its remaining jobs"
+          exit 1
+        fi
+      done
     done
     [ "$finished" -eq 1 ] && break
     sleep 30
   done
-  log "wave $attempt completed"
+  log "waves $group_first..$((group_end - 1)) completed"
 done
 
 cd "$CODE_DIR"
@@ -128,7 +153,9 @@ export PYTHONPATH="$CODE_DIR/src:$CODE_DIR"
 admitted=1
 for seed in {0..4}; do
   candidates=()
-  for attempt in {0..7}; do candidates+=("$BATCH/attempt-$attempt-s$seed/results"); done
+  for ((attempt=0; attempt<POOL_ATTEMPTS; attempt++)); do
+    candidates+=("$BATCH/attempt-$attempt-s$seed/results")
+  done
   "$PYTHON" -m diagnostics.masked_mlp_learned.selection --runs "${candidates[@]}" \
     --output "$BATCH/selection-s$seed.json" --window 5000 --maximum-loss 0.025 \
     > "$BATCH/selection-s$seed.log" 2>&1 || admitted=0
