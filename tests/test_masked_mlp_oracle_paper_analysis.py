@@ -5,6 +5,7 @@ import json
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -37,6 +38,45 @@ def test_sign_flip_test_is_exact() -> None:
     assert result["mean"] == pytest.approx(np.mean([0.2, 0.05, 0.15]))  # pyright: ignore[reportUnknownMemberType]
     tied = paper_analysis.paired([0.5, 0.5], [0.5, 0.5])
     assert tied["p_one_sided"] == 1.0
+
+
+def test_retention_figure_displays_every_seed_including_failed_outliers() -> None:
+    seeds = list(range(5))
+    runs: dict[str, dict[int, paper_analysis.Run]] = {}
+    expected: list[float] = []
+    for arm in paper_analysis.ARMS:
+        runs[arm] = {}
+        for seed in seeds:
+            scores = [0.92 + 0.005 * seed - 0.001 * k for k in range(6)]
+            if arm == "full" and seed < 2:
+                scores[0] = (-0.2, 0.75)[seed]
+            expected.extend(scores)
+            runs[arm][seed] = paper_analysis.Run(
+                arm=arm,
+                seed=seed,
+                directory=Path("unused"),
+                metrics={f"code_r2/theta_{k + 1}": value for k, value in enumerate(scores)},
+                start=None,
+                curve=[],
+                penalty=[],
+                columns=list(range(6)),
+                correlation=np.eye(6),
+                graphs={},
+                group_moments=np.zeros((1, 31)),
+                physical_samples_sha256="unused",
+                data_identity="unused",
+            )
+    figure = paper_analysis.figure_code_retention(runs, seeds)
+    axis: Any = figure.axes[0]
+    points = cast(
+        paper_analysis.Array,
+        np.concatenate([np.asarray(c.get_offsets()) for c in axis.collections]),
+    )
+    assert len(points) == 90
+    np.testing.assert_array_equal(np.sort(points[:, 1]), np.sort(expected))
+    low, high = axis.get_ylim()
+    assert low < min(expected) < max(expected) < high
+    paper_analysis.plt.close(figure)
 
 
 def test_group_bootstrap_matches_explicit_resampling_with_fixed_coordinate_matches() -> None:

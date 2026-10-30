@@ -576,6 +576,7 @@ def figure_curves(
 
 def figure_graphs(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
     """Edge-recovery frequency of the aligned learned graphs."""
+    learned_codes = runs["full"][seeds[0]].code_columns is not None
     truth = true_graphs()
     expected = {"state": truth.state[:, 0].numpy(), "parameter": truth.parameter.numpy()}
     figure, axes = cast(
@@ -608,11 +609,11 @@ def figure_graphs(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
                             fontsize=6,
                             color="white" if matrix[i, j] > 0.6 else INK2,
                         )
-            labels = (
-                [f"z{k + 1}" for k in range(6)]
-                if block == "state"
-                else [f"θ{k + 1}" for k in range(6)]
-            )
+            symbol = "z" if block == "state" else "θ"
+            if block == "parameter" and source != "truth" and learned_codes:
+                symbol = "q"
+                axis.set_xlabel("Matched code positions", fontsize=7)
+            labels = [f"{symbol}{k + 1}" for k in range(6)]
             axis.set_xticks(range(6), labels, fontsize=6.5)
             axis.set_yticks(range(6), [f"z{k + 1}'" for k in range(6)], fontsize=6.5)
             axis.tick_params(length=0)
@@ -621,8 +622,13 @@ def figure_graphs(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
             axis.set_title(f"{row_title}, {title}", loc="left", color=INK, fontsize=8)
     if image is not None:
         figure.colorbar(image, ax=axes, shrink=0.6, label="Fraction of seeds with the edge")
+    heading = (
+        "Aligned input masks; q denotes code positions matched to parameter pairs."
+        if learned_codes
+        else "Aligned state and oracle-parameter input masks."
+    )
     figure.suptitle(
-        "Learned global graphs aligned to the true coordinates. Rows: next state; "
+        heading + "\nRows: next state; "
         f"outlined: true edges; numbers: seeds (of {len(seeds)}) with the edge",
         x=0.02,
         ha="left",
@@ -692,7 +698,7 @@ def figure_penalty(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
 
 
 def figure_code_retention(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
-    """Whole-code retention R² per parameter, one box per model."""
+    """Whole-code retention R² per parameter, with every seed visible, including outliers."""
     figure, axis = cast(tuple[Any, Any], plt.subplots(figsize=(6.4, 2.8)))
     width = 0.24
     for offset, arm in zip((-width, 0.0, width), ARMS, strict=True):
@@ -714,6 +720,17 @@ def figure_code_retention(runs: dict[str, dict[int, Run]], seeds: list[int]) -> 
         for patch in box["boxes"]:
             patch.set_facecolor(COLORS[arm])
             patch.set_alpha(0.45)
+        jitter = np.linspace(-0.07, 0.07, len(seeds)) if len(seeds) > 1 else np.zeros(1)
+        for position, scores in zip(positions, values, strict=True):
+            axis.scatter(
+                position + jitter,
+                scores,
+                s=12,
+                color=COLORS[arm],
+                edgecolor="white",
+                linewidth=0.4,
+                zorder=3,
+            )
         axis.plot([], [], color=COLORS[arm], lw=6, alpha=0.6, label=SHORT[arm])
     axis.set_xticks(range(6), [f"θ{k + 1}" for k in range(6)])
     axis.set_ylabel("Whole-code retention R² (validation)")
@@ -721,9 +738,9 @@ def figure_code_retention(runs: dict[str, dict[int, Run]], seeds: list[int]) -> 
     axis.text(5.55, 0.8, "  0.8", color=INK2, fontsize=6.8, va="center")
     axis.grid(axis="y", color=GRID, lw=0.6)
     axis.set_axisbelow(True)
-    axis.legend(loc="lower left", frameon=False, ncol=3)
+    axis.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), frameon=False, ncol=3)
     axis.set_title(
-        "Physical parameters recoverable from the learned code (probe per parameter)",
+        "Parameter retention from one context (dots: individual training seeds)",
         loc="left",
         color=INK,
     )
@@ -1252,8 +1269,8 @@ Full - baseline MCC: {fb["mean"]:+.3f} (s.d. {fb["sd"]:.3f}), positive in
   averaged; 1 means every learned coordinate depends on one true block only.
 - `fig_mcc_curves` — Validation MCC during sparse training from each seed's dense
   endpoint; thin lines are seeds, thick lines medians.
-- `fig_graph_recovery` — Thresholded learned state and parameter graphs aligned to
-  the true coordinates by the MCC matching; numbers count seeds with each edge.
+- `fig_graph_recovery` — Thresholded input masks with state rows/columns aligned
+  by the calibration MCC matching; numbers count seeds with each edge.
 - `fig_correlations_median_seed` — |Pearson| between true and matched learned
   coordinates for the seed with the median full-model MCC (seed {result["representative_seed"]}).
 - `fig_forecast_quality` — Forecast error and whole-code state information per model,
@@ -1268,13 +1285,15 @@ Full - baseline MCC: {fb["mean"]:+.3f} (s.d. {fb["sd"]:.3f}), positive in
 """
         + (
             """- `fig_code_retention_box` — Whole-code retention R² of each true parameter, per
-  model; the dashed line marks the repo's 0.8 retention criterion.
+  model; dots show every training seed, including outliers, and the dashed line
+  marks the repo's 0.8 retention criterion.
 - `fig_code_correlations_median_seed` — |Pearson| between true parameters (grouped by
   pair) and matched code coordinates; complementary parameter graphs identify codes
   only up to mixing within each pair.
 - In `fig_graph_recovery`, `table_main.tex` and `per_run.csv`
   (`masks/parameter_code_aligned_*`), the full model's parameter-graph columns are code
-  coordinates matched to the true parameter pairs by linear pair R²; the runner's own
+  coordinates matched to the true parameter pairs by validation linear pair R².
+  The q labels denote matched positions, not pure physical parameters; the runner's own
   `masks/parameter_aligned_shd` aligns only the state rows.
 - `table_codes.tex` — Code retention, pair purity, code MCC and predictive use.
 
