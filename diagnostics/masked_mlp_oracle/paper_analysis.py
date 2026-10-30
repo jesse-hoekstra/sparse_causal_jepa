@@ -1,4 +1,4 @@
-"""Paper figures and tables for a multi-seed masked-MLP oracle batch.
+"""Paper figures and tables for a multi-seed masked-MLP batch.
 
 Read-only: it authenticates completed run directories and reads their saved
 validation endpoints, learning curves, matchings and final mask logits. It loads
@@ -532,7 +532,7 @@ def figure_mcc(runs: dict[str, dict[int, Run]], seeds: list[int], chance: dict[s
     figure, axis = cast(tuple[Any, Any], plt.subplots(figsize=(4.4, 3.0)))
     _chance_reference(axis, 2.5, 2.72, chance["any_rotation"], "chance:\nany rotation")
     _chance_reference(axis, 2.62, 2.72, chance["within_block"], "chance:\nwithin-block\nrotation")
-    _box_panel(axis, runs, "state_mcc", seeds, "State MCC (validation)")
+    _box_panel(axis, runs, "state_mcc", seeds, r"State MCC $(\hat z^t,z^t)$ (validation)")
     axis.set_ylim(0.5, 1.01)
     axis.set_xlim(-0.5, 2.68)
     axis.spines["bottom"].set_bounds(-0.5, 2.4)
@@ -548,7 +548,7 @@ def figure_purity(
     level = chance["any_rotation"]["purity_mean"]
     axis.axhline(level, color=INK2, lw=0.8, ls=(0, (3, 2)), zorder=0)
     axis.text(2.42, level, "chance:\nany rotation", color=INK2, fontsize=6.8, va="center")
-    _box_panel(axis, runs, "block_purity", seeds, "Block purity (validation R²)")
+    _box_panel(axis, runs, "block_purity", seeds, r"Block purity of $\hat z^t$ (validation $R^2$)")
     axis.set_ylim(0.5, 1.01)
     axis.set_xlim(-0.5, 2.4)
     axis.set_title("Separation of the two state blocks", loc="left", color=INK)
@@ -595,7 +595,7 @@ def figure_curves(
     axis.set_xlim(0, last_step / 1000 * 1.1)
     axis.set_ylim(0.5, 1.01)
     axis.set_xlabel("Sparse updates (thousands), starting from each seed's dense endpoint")
-    axis.set_ylabel("State MCC (validation)")
+    axis.set_ylabel(r"State MCC $(\hat z^t,z^t)$ (validation)")
     axis.grid(axis="y", color=GRID, lw=0.6)
     axis.legend(loc="lower right", frameon=False)
     axis.set_title("Learning curves (thin: individual seeds)", loc="left", color=INK)
@@ -608,7 +608,7 @@ def figure_graphs(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
     truth = true_graphs()
     expected = {"state": truth.state[:, 0].numpy(), "parameter": truth.parameter.numpy()}
     figure, axes = cast(
-        tuple[Any, Any], plt.subplots(2, 3, figsize=(6.4, 4.4), constrained_layout=True)
+        tuple[Any, Any], plt.subplots(2, 3, figsize=(7.2, 4.8), constrained_layout=True)
     )
     columns = (("truth", "true"), ("baseline", "baseline"), ("full", "full"))
     names = (("state", "State graph"), ("parameter", "Parameter graph"))
@@ -637,13 +637,20 @@ def figure_graphs(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
                             fontsize=6,
                             color="white" if matrix[i, j] > 0.6 else INK2,
                         )
-            symbol = "z" if block == "state" else "θ"
+            state_symbol = "z" if source == "truth" else r"\hat z"
+            if block == "state":
+                labels = [rf"${state_symbol}_{{{k + 1}}}^t$" for k in range(6)]
+            else:
+                labels = [rf"$\theta_{{{k + 1}}}$" for k in range(6)]
             if block == "parameter" and source != "truth" and learned_codes:
-                symbol = "q"
-                axis.set_xlabel("Matched code positions", fontsize=7)
-            labels = [f"{symbol}{k + 1}" for k in range(6)]
+                labels = [rf"$\hat\theta_{{{k + 1}}}$" for k in range(6)]
+                axis.set_xlabel(r"Pair-aligned $\hat\theta$ positions", fontsize=7)
             axis.set_xticks(range(6), labels, fontsize=6.5)
-            axis.set_yticks(range(6), [f"z{k + 1}'" for k in range(6)], fontsize=6.5)
+            axis.set_yticks(
+                range(6),
+                [rf"${state_symbol}_{{{k + 1}}}^{{t+1}}$" for k in range(6)],
+                fontsize=6.5,
+            )
             axis.tick_params(length=0)
             for spine in axis.spines.values():
                 spine.set_visible(False)
@@ -651,7 +658,7 @@ def figure_graphs(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
     if image is not None:
         figure.colorbar(image, ax=axes, shrink=0.6, label="Fraction of seeds with the edge")
     heading = (
-        "Aligned input masks; q denotes code positions matched to parameter pairs."
+        r"Aligned input masks; $\hat\theta$ positions are matched to parameter pairs."
         if learned_codes
         else "Aligned state and oracle-parameter input masks."
     )
@@ -677,8 +684,8 @@ def figure_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figure:
         image = axis.imshow(np.abs(run_.correlation), vmin=0, vmax=1, cmap="Blues")
         axis.axhline(2.5, color=INK2, lw=0.6)
         axis.axvline(2.5, color=INK2, lw=0.6)
-        axis.set_xticks(range(6), [f"ẑ{k + 1}" for k in range(6)], fontsize=6.5)
-        axis.set_yticks(range(6), [f"z{k + 1}" for k in range(6)], fontsize=6.5)
+        axis.set_xticks(range(6), [rf"$\hat z_{{{k + 1}}}^t$" for k in range(6)], fontsize=6.5)
+        axis.set_yticks(range(6), [rf"$z_{{{k + 1}}}^t$" for k in range(6)], fontsize=6.5)
         axis.tick_params(length=0)
         for spine in axis.spines.values():
             spine.set_visible(False)
@@ -688,7 +695,7 @@ def figure_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figure:
     if image is not None:
         figure.colorbar(image, ax=axes, shrink=0.8, label="|Pearson correlation|")
     figure.suptitle(
-        f"Learned vs true states, seed {seed} (learned coordinates ordered by the matching)",
+        rf"Learned $\hat z^t$ vs true $z^t$, seed {seed} (matched learned coordinates)",
         x=0.02,
         ha="left",
         color=INK,
@@ -700,8 +707,10 @@ def figure_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figure:
 def figure_quality(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
     """Forecast error and whole-state information per arm."""
     figure, axes = cast(tuple[Any, Any], plt.subplots(1, 2, figsize=(6.4, 2.7)))
-    _box_panel(axes[0], runs, "normalized_prediction_mse", seeds, "Normalized forecast MSE")
-    _box_panel(axes[1], runs, "online_state_probe/r2", seeds, "Whole-state linear R²")
+    _box_panel(axes[0], runs, "normalized_prediction_mse", seeds, r"Forecast NMSE in $\hat z$")
+    _box_panel(
+        axes[1], runs, "online_state_probe/r2", seeds, r"State probe $R^2$ ($\hat z^t\to z^t$)"
+    )
     axes[0].set_title("Forecast error (two-step)", loc="left", color=INK)
     axes[1].set_title("Retained state information", loc="left", color=INK)
     figure.tight_layout()
@@ -717,7 +726,7 @@ def figure_penalty(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
         for seed in seeds:
             steps, values = zip(*runs[arm][seed].penalty, strict=True)
             axis.plot(np.asarray(steps) / 1000, values, color=COLORS[arm], lw=0.6, alpha=0.6)
-        axis.set_ylabel("log10 penalty weight")
+        axis.set_ylabel(r"$\log_{10}$ sparsity weight $\lambda^{-1}$")
         axis.set_title(f"{SHORT[arm]}: GECO multiplier, all seeds", loc="left", color=INK)
         axis.grid(axis="y", color=GRID, lw=0.6)
     axes[-1].set_xlabel("Sparse updates (thousands)")
@@ -760,15 +769,15 @@ def figure_code_retention(runs: dict[str, dict[int, Run]], seeds: list[int]) -> 
                 zorder=3,
             )
         axis.plot([], [], color=COLORS[arm], lw=6, alpha=0.6, label=SHORT[arm])
-    axis.set_xticks(range(6), [f"θ{k + 1}" for k in range(6)])
-    axis.set_ylabel("Whole-code retention R² (validation)")
+    axis.set_xticks(range(6), [rf"$\theta_{{{k + 1}}}$" for k in range(6)])
+    axis.set_ylabel(r"Retention $R^2$ from $\hat\theta$ (validation)")
     axis.axhline(0.8, color=INK2, lw=0.7, ls=(0, (3, 2)))
     axis.text(5.55, 0.8, "  0.8", color=INK2, fontsize=6.8, va="center")
     axis.grid(axis="y", color=GRID, lw=0.6)
     axis.set_axisbelow(True)
     axis.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), frameon=False, ncol=3)
     axis.set_title(
-        "Parameter retention from one context (dots: individual training seeds)",
+        r"Parameter retention from one context's $\hat\theta$ (dots: training seeds)",
         loc="left",
         color=INK,
     )
@@ -780,7 +789,7 @@ def figure_code_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figu
     figure, axes = cast(
         tuple[Any, Any], plt.subplots(1, 3, figsize=(6.4, 2.4), constrained_layout=True)
     )
-    labels = [f"θ{k + 1}" for k in PAIR_ORDER]
+    labels = [rf"$\theta_{{{k + 1}}}$" for k in PAIR_ORDER]
     image = None
     for axis, arm in zip(axes, ARMS, strict=True):
         matrix = runs[arm][seed].code_correlation
@@ -791,7 +800,7 @@ def figure_code_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figu
             axis.axhline(boundary, color=INK2, lw=0.6)
             axis.axvline(boundary, color=INK2, lw=0.6)
         columns = runs[arm][seed].code_columns or list(range(6))
-        axis.set_xticks(range(6), [f"q{j + 1}" for j in columns], fontsize=6.5)
+        axis.set_xticks(range(6), [rf"$\hat\theta_{{{j + 1}}}$" for j in columns], fontsize=6.5)
         axis.set_yticks(range(6), labels, fontsize=6.5)
         axis.tick_params(length=0)
         for spine in axis.spines.values():
@@ -804,7 +813,7 @@ def figure_code_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figu
     if image is not None:
         figure.colorbar(image, ax=axes, shrink=0.8, label="|Pearson correlation|")
     figure.suptitle(
-        f"Learned code vs true parameters, seed {seed} (rows grouped by parameter pair)",
+        rf"Learned $\hat\theta$ vs true $\theta$, seed {seed} (rows grouped by parameter pair)",
         x=0.02,
         ha="left",
         color=INK,
