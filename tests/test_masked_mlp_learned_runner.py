@@ -2,7 +2,7 @@
 
 import math
 from collections.abc import Iterator
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,7 +14,7 @@ from diagnostics.balanced_action_oracle.data import PrepareConfig, prepare
 from diagnostics.isotropic_oracle.data import PrepareConfig as SourcePrepareConfig
 from diagnostics.isotropic_oracle.data import StateData
 from diagnostics.isotropic_oracle.data import prepare as prepare_source
-from diagnostics.masked_mlp_learned import acquisition, bound_control
+from diagnostics.masked_mlp_learned import acquisition, bound_control, budget_control
 from diagnostics.masked_mlp_learned import run as runner
 from diagnostics.masked_mlp_oracle.model import INITIAL_LOGIT
 from diagnostics.oracle_state_learning.core import EvaluationResult
@@ -295,6 +295,58 @@ def test_codes_can_be_reacquired_on_frozen_trained_states(
         )
     with pytest.raises(ValueError, match="frozen states"):
         replace(_config(tmp_path, "full"), states_from="u")
+
+
+def test_budget_control_preserves_ordinary_protocol_guards() -> None:
+    config = budget_control.BudgetConfig(
+        "unused", "unused", "full", calibration_dir="unused", init_dir="unused"
+    )
+    assert config.steps == 300_000
+    with pytest.raises(ValueError, match="exploratory budget"):
+        runner.TrainConfig(
+            "unused", "unused", "full", steps=300_000, calibration_dir="u", init_dir="u"
+        )
+    with pytest.raises(ValueError, match="matched sparse"):
+        budget_control.BudgetConfig("unused", "unused", "dense")
+    with pytest.raises(ValueError, match="exactly 300000"):
+        replace(config, steps=200_000)
+    with pytest.raises(ValueError, match="optimizer settings"):
+        replace(config, lr=0.002)
+    with pytest.raises(ValueError, match="calibration and a dense"):
+        replace(config, init_dir=None)
+    with pytest.raises(ValueError, match="only dense"):
+        replace(config, states_from="unused")
+
+
+def test_budget_control_binds_source_and_preserves_exact_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare(tmp_path)
+    _dense_and_bound(tmp_path)
+    config = budget_control.BudgetConfig(**asdict(_config(tmp_path, "full")))
+    _check_resume(tmp_path, config, monkeypatch)
+    record = read_json(tmp_path / "full-s0/config.json")
+    scientific = record["scientific_config"]
+    assert scientific["steps"] == 4
+    assert scientific["budget_control_schema"] == budget_control.SCHEMA
+    assert scientific["budget_control_sha256"] == runner.sha(Path(budget_control.__file__))
+    assert record["code_identity"] == runner.code_identity()
+    initial = _checkpoint(tmp_path / "full-s0/initial.pt")["model"]
+    dense = _checkpoint(tmp_path / "projected-s0/last.pt")["model"]
+    for key, value in dense.items():
+        if isinstance(value, Tensor):
+            torch.testing.assert_close(initial[key], value, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="checkpoint configuration"):
+        runner.train(_config(tmp_path, "full"), resume=True)
+
+    def changed_source(_: Path) -> str:
+        return "changed control source"
+
+    with monkeypatch.context() as patch:
+        patch.setattr(budget_control, "sha", changed_source)
+        changed = replace(config)
+    with pytest.raises(ValueError, match="checkpoint configuration"):
+        runner.train(changed, resume=True)
 
 
 def test_projection_is_exact_for_a_six_dimensional_code() -> None:
