@@ -472,7 +472,7 @@ def _save(figure: Figure, output: Path, name: str) -> list[str]:
 def _box_panel(
     target: Axes, runs: dict[str, dict[int, Run]], key: str, seeds: list[int], ylabel: str
 ) -> None:
-    """Box per arm, seed points, and thin lines joining the same seed across arms."""
+    """Quartile boxes, min-max whiskers, and points joining matched training seeds."""
     axis: Any = target
     values = {arm: [_metric(runs[arm][s], key) for s in seeds] for arm in ARMS}
     positions = list(range(len(ARMS)))
@@ -489,6 +489,7 @@ def _box_panel(
         [values[arm] for arm in ARMS],
         positions=positions,
         widths=0.5,
+        whis=(0, 100),
         showfliers=False,
         patch_artist=True,
         medianprops={"color": INK, "lw": 1.2},
@@ -530,13 +531,35 @@ def _chance_reference(
 def figure_mcc(runs: dict[str, dict[int, Run]], seeds: list[int], chance: dict[str, Any]) -> Figure:
     """State MCC per arm with seed pairing and chance references."""
     figure, axis = cast(tuple[Any, Any], plt.subplots(figsize=(4.4, 3.0)))
-    _chance_reference(axis, 2.5, 2.72, chance["any_rotation"], "chance:\nany rotation")
-    _chance_reference(axis, 2.62, 2.72, chance["within_block"], "chance:\nwithin-block\nrotation")
+    _chance_reference(
+        axis,
+        2.5,
+        2.72,
+        chance["any_rotation"],
+        "Unrestricted\nrandom rotations\n5th-95th percentiles",
+    )
+    _chance_reference(
+        axis,
+        2.62,
+        2.72,
+        chance["within_block"],
+        "Within-block\nrandom rotations\n5th-95th percentiles",
+    )
     _box_panel(axis, runs, "state_mcc", seeds, r"State MCC $(\hat z^t,z^t)$ (validation)")
     axis.set_ylim(0.5, 1.01)
     axis.set_xlim(-0.5, 2.68)
     axis.spines["bottom"].set_bounds(-0.5, 2.4)
     axis.set_title(f"State recovery, {len(seeds)} training seeds per model", loc="left", color=INK)
+    figure.text(
+        0.125,
+        -0.06,
+        "Boxes: middle 50% and median; whiskers: min-max across seeds.\n"
+        "Rotation bars: middle 90%; dashed lines: means.\n"
+        "Values outside the rotation bars are possible.",
+        fontsize=6.2,
+        color=INK2,
+        va="top",
+    )
     return figure
 
 
@@ -547,7 +570,14 @@ def figure_purity(
     figure, axis = cast(tuple[Any, Any], plt.subplots(figsize=(4.2, 3.0)))
     level = chance["any_rotation"]["purity_mean"]
     axis.axhline(level, color=INK2, lw=0.8, ls=(0, (3, 2)), zorder=0)
-    axis.text(2.42, level, "chance:\nany rotation", color=INK2, fontsize=6.8, va="center")
+    axis.text(
+        2.42,
+        level,
+        "Unrestricted\nrandom rotations\n(mean)",
+        color=INK2,
+        fontsize=6.8,
+        va="center",
+    )
     _box_panel(axis, runs, "block_purity", seeds, r"Block purity of $\hat z^t$ (validation $R^2$)")
     axis.set_ylim(0.5, 1.01)
     axis.set_xlim(-0.5, 2.4)
@@ -750,6 +780,7 @@ def figure_code_retention(runs: dict[str, dict[int, Run]], seeds: list[int]) -> 
             values,
             positions=positions,
             widths=width * 0.85,
+            whis=(0, 100),
             showfliers=False,
             patch_artist=True,
             medianprops={"color": INK, "lw": 1.0},
@@ -1286,10 +1317,14 @@ Source batch: `{result["batch"]}` ({n} training seeds per model, validation endp
         )
         + f"""
 
-Chance MCC: any rotation {chance["any_rotation"]["mcc_mean"]:.3f}
+Random-rotation reference MCC: unrestricted {chance["any_rotation"]["mcc_mean"]:.3f}
 (5-95% {chance["any_rotation"]["mcc_p05"]:.3f}-{chance["any_rotation"]["mcc_p95"]:.3f});
-within-block rotation {chance["within_block"]["mcc_mean"]:.3f}
+within-block {chance["within_block"]["mcc_mean"]:.3f}
 ({chance["within_block"]["mcc_p05"]:.3f}-{chance["within_block"]["mcc_p95"]:.3f}).
+These are descriptive 5th-95th percentile ranges over 5,000 random orthogonal
+rotations. They contain the middle 90%; values outside are possible.
+In model box plots, boxes show quartiles and the median, whiskers show the full
+minimum-to-maximum range across training seeds, and every seed is plotted.
 
 Full - baseline MCC: {fb["mean"]:+.3f} (s.d. {fb["sd"]:.3f}), positive in
 {fb["positive"]:.0f}/{fb["n"]:.0f} seeds, exact one-sided sign-flip p = {fb["p_one_sided"]:.3f}.
@@ -1297,8 +1332,9 @@ Full - baseline MCC: {fb["mean"]:+.3f} (s.d. {fb["sd"]:.3f}), positive in
 ## Files and draft captions
 
 - `fig_mcc_box` — State MCC per model; boxes over seeds, dots are seeds, grey lines
-  join the same seed across models. Bands: 5-95% range of the MCC of a random
-  rotation of the true states, either arbitrary (O(6)) or within the two state blocks.
+  join the same seed across models. Whiskers span all seeds. Reference bars show
+  the middle 90% of MCC under random orthogonal rotations of the true states,
+  either unrestricted (O(6)) or within the two state blocks; dashed lines show means.
 - `fig_block_purity_box` — Best single-block linear R² per learned coordinate,
   averaged; 1 means every learned coordinate depends on one true block only.
 - `fig_mcc_curves` — Validation MCC during sparse training from each seed's dense
