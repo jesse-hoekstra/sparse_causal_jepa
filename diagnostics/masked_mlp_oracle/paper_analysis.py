@@ -472,7 +472,7 @@ def _save(figure: Figure, output: Path, name: str) -> list[str]:
 def _box_panel(
     target: Axes, runs: dict[str, dict[int, Run]], key: str, seeds: list[int], ylabel: str
 ) -> None:
-    """Quartile boxes, min-max whiskers, and points joining matched training seeds."""
+    """Quartile boxes, 1.5-IQR whiskers, and points joining matched training seeds."""
     axis: Any = target
     values = {arm: [_metric(runs[arm][s], key) for s in seeds] for arm in ARMS}
     positions = list(range(len(ARMS)))
@@ -489,7 +489,7 @@ def _box_panel(
         [values[arm] for arm in ARMS],
         positions=positions,
         widths=0.5,
-        whis=(0, 100),
+        whis=1.5,
         showfliers=False,
         patch_artist=True,
         medianprops={"color": INK, "lw": 1.2},
@@ -553,7 +553,7 @@ def figure_mcc(runs: dict[str, dict[int, Run]], seeds: list[int], chance: dict[s
     figure.text(
         0.125,
         -0.06,
-        "Boxes: middle 50% and median; whiskers: min-max across seeds.\n"
+        "Boxes: middle 50% and median; whiskers: 1.5 IQR rule.\n"
         "Rotation bars: middle 90%; dashed lines: means.\n"
         "Values outside the rotation bars are possible.",
         fontsize=6.2,
@@ -780,7 +780,7 @@ def figure_code_retention(runs: dict[str, dict[int, Run]], seeds: list[int]) -> 
             values,
             positions=positions,
             widths=width * 0.85,
-            whis=(0, 100),
+            whis=1.5,
             showfliers=False,
             patch_artist=True,
             medianprops={"color": INK, "lw": 1.0},
@@ -1323,8 +1323,9 @@ within-block {chance["within_block"]["mcc_mean"]:.3f}
 ({chance["within_block"]["mcc_p05"]:.3f}-{chance["within_block"]["mcc_p95"]:.3f}).
 These are descriptive 5th-95th percentile ranges over 5,000 random orthogonal
 rotations. They contain the middle 90%; values outside are possible.
-In model box plots, boxes show quartiles and the median, whiskers show the full
-minimum-to-maximum range across training seeds, and every seed is plotted.
+In model box plots, boxes show quartiles and the median. Whiskers reach the most
+extreme observations within 1.5 interquartile ranges of the respective quartiles;
+every seed is plotted, including those outside the whiskers.
 
 Full - baseline MCC: {fb["mean"]:+.3f} (s.d. {fb["sd"]:.3f}), positive in
 {fb["positive"]:.0f}/{fb["n"]:.0f} seeds, exact one-sided sign-flip p = {fb["p_one_sided"]:.3f}.
@@ -1332,7 +1333,7 @@ Full - baseline MCC: {fb["mean"]:+.3f} (s.d. {fb["sd"]:.3f}), positive in
 ## Files and draft captions
 
 - `fig_mcc_box` — State MCC per model; boxes over seeds, dots are seeds, grey lines
-  join the same seed across models. Whiskers span all seeds. Reference bars show
+  join the same seed across models. Whiskers use the 1.5 IQR rule. Reference bars show
   the middle 90% of MCC under random orthogonal rotations of the true states,
   either unrestricted (O(6)) or within the two state blocks; dashed lines show means.
 - `fig_block_purity_box` — Best single-block linear R² per learned coordinate,
