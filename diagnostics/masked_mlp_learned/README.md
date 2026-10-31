@@ -6,6 +6,7 @@ Masked-MLP training with a context-derived parameter code.
 - `acquisition.py`, `selection.py`: initialization and training-loss selection.
 - `bound_control.py`, `budget_control.py`: explicit calibration and budget settings.
 - `physical_response.py`: evaluation utilities.
+- `frozen_test.py`: declared test evaluation of immutable final checkpoints.
 - `acquisition_batch.sh`, `experiment_batch.sh`: server batch orchestration.
 
 Use each Python entry point's `--help` for command-line options.

@@ -1,4 +1,4 @@
-"""Validation-only physical-response assay for the Paley24 experiment.
+"""Frozen physical-response assay, defaulting to validation, for the Paley24 experiment.
 
 True parameters and physical states enter only this frozen-model evaluation.
 The donor context is regenerated after changing one physical parameter; its
@@ -6,6 +6,7 @@ entire inferred code predicts the unchanged recipient history and actions.
 No code coordinate is assumed to correspond to a physical parameter.
 The explicit oracle-control mode supplies true parameters and bypasses the
 unused parameter encoder; it does not fit or modify any model.
+The separate test evaluator must explicitly request ``expected_split="test"``.
 """
 
 import argparse
@@ -44,10 +45,14 @@ def matched_batch(
     data: StateData,
     observation: VectorObservationMap,
     indices: tuple[int, ...],
+    *,
+    expected_split: Literal["validation", "test"] = "validation",
 ) -> MatchedBatch:
-    """Regenerate matched donor0/query5-9 responses on explicit validation groups."""
-    if data.split != "validation" or data.states is None:
-        raise ValueError("Physical responses require validation physical references")
+    """Regenerate donor0/query5-9 responses only on the explicitly requested cohort."""
+    if expected_split not in {"validation", "test"} or (
+        data.split != expected_split or data.states is None
+    ):
+        raise ValueError(f"Physical responses require {expected_split} physical references")
     if (
         model.training
         or model.context_len != 10
@@ -62,7 +67,7 @@ def matched_batch(
         or max(indices) >= len(data)
         or len(set(indices)) != len(indices)
     ):
-        raise ValueError("Require distinct in-range validation group indices")
+        raise ValueError("Require distinct in-range held-out group indices")
     if data.metadata["action_mix"] != "paley24":
         raise ValueError("Require the balanced Paley24 action chart")
     reference = next(model.parameters())
@@ -146,7 +151,7 @@ def matched_batch(
         indices,
         (0,),
         queries.cpu(),
-        "validation",
+        data.split,
         0,
         error,
     )
@@ -203,8 +208,9 @@ def assess(
     *,
     chunk_size: int = 16,
     parameter_source: Literal["learned", "oracle"] = "learned",
+    expected_split: Literal["validation", "test"] = "validation",
 ) -> tuple[dict[str, Any], dict[str, Tensor]]:
-    """Assess all existing validation groups with one fixed independent-group bootstrap."""
+    """Assess the declared cohort with the fixed independent-group bootstrap."""
     if chunk_size < 1:
         raise ValueError("Chunk size must be positive")
     if parameter_source not in {"learned", "oracle"}:
@@ -214,7 +220,11 @@ def assess(
     changes: list[Tensor] = []
     for start in range(0, len(data), chunk_size):
         batch = matched_batch(
-            model, data, observation, tuple(range(start, min(start + chunk_size, len(data))))
+            model,
+            data,
+            observation,
+            tuple(range(start, min(start + chunk_size, len(data)))),
+            expected_split=expected_split,
         )
         parameters = (
             data.tensors["oracle_parameters"][list(batch.group_indices)]
@@ -236,7 +246,7 @@ def assess(
         for error, scale in zip(report["ordinary_mse_by_horizon"], variance, strict=True)
     ]
     report["target_variance_definition"] = (
-        "Mean per-coordinate population variance across validation groups and recipients"
+        f"Mean per-coordinate population variance across {data.split} groups and recipients"
     )
     decomposition = direct_decomposition(base, changed, joined.targets, joined.changed_targets)
     torch.testing.assert_close(
@@ -263,7 +273,7 @@ def assess(
             key: [float(value) for value in tensor.mean(0)] for key, tensor in decomposition.items()
         },
         interpretation=(
-            "Frozen final-budget checkpoint; validation only. "
+            f"Frozen final-budget checkpoint; {data.split} only. "
             + (
                 "Complete single-context learned codes. "
                 if parameter_source == "learned"

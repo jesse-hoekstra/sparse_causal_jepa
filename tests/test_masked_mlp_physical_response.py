@@ -103,6 +103,24 @@ def test_physical_predictions_are_invariant_to_invertible_complete_code_mixing(w
     )
 
 
+def test_explicit_test_cohort_preserves_response_calculation() -> None:
+    data, observation = _data()
+    model = build_control("dense", 0).double().eval()
+    test_data = replace(data, split="test")
+    with pytest.raises(ValueError, match="validation"):
+        assay.assess(model, test_data, observation)
+    validation, original = assay.assess(model, data, observation)
+    report, held = assay.assess(model, test_data, observation, expected_split="test")
+    assert report["split"] == "test"
+    assert report["per_parameter"] == validation["per_parameter"]
+    for name in original:
+        torch.testing.assert_close(original[name], held[name], atol=0, rtol=0)
+    for split in ("train", "calibration", "validation"):
+        wrong = replace(data, split=split, states=None if split == "train" else data.states)
+        with pytest.raises(ValueError, match="test"):
+            assay.assess(model, wrong, observation, expected_split="test")
+
+
 def test_frozen_predictor_transmits_the_second_forecast_gradient_to_codes() -> None:
     data, observation = _data()
     model = build_control("dense", 0).double().eval()
