@@ -357,9 +357,9 @@ def main() -> None:
             "evaluation_dependency_sha256": {
                 name: sha(Path(__file__).resolve().parents[1] / name)
                 for name in (
-                    "joint_acquisition/baseline.py",
-                    "overcomplete_use_precision/evaluation.py",
-                    "signal_path/geometry.py",
+                    "shared/responses.py",
+                    "shared/geometry.py",
+                    "shared/source_geometry.py",
                 )
             },
             "responses_sha256": sha(output / "responses.pt"),

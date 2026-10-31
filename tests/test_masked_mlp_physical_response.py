@@ -1,8 +1,10 @@
 """Matched physical changes preserve recipient inputs and allow mixed complete codes."""
 
 import copy
+import sys
 from collections.abc import Iterator
 from dataclasses import replace
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -14,7 +16,10 @@ from diagnostics.masked_mlp_learned.run import build_control
 from diagnostics.masked_mlp_oracle.model import MaskedTrunkPredictor
 from diagnostics.masked_mlp_oracle.model import build_control as build_oracle
 from diagnostics.shared import geometry as dgp
-from diagnostics.shared.data import StateData
+from diagnostics.shared.data import PrepareConfig, StateData, prepare
+from diagnostics.shared.io import read_json, sha
+from diagnostics.shared.source_data import PrepareConfig as SourcePrepareConfig
+from diagnostics.shared.source_data import prepare as prepare_source
 from scjepa.data.observations import VectorObservationMap
 
 
@@ -167,3 +172,52 @@ def test_oracle_reference_rejects_wrong_dimensions_or_split() -> None:
     overcomplete = build_control("dense", 0, 12).double().eval()
     with pytest.raises(ValueError, match="six parameters per validation group"):
         assay.predict_matched(overcomplete, batch, oracle_parameters=theta)
+
+
+def test_cli_exports_an_authenticated_response_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepare_source(
+        SourcePrepareConfig(
+            str(tmp_path / "source"),
+            train_groups=4,
+            calibration_groups=4,
+            validation_groups=2,
+            test_groups=2,
+            profile="smoke",
+        )
+    )
+    data = tmp_path / "data"
+    prepare(PrepareConfig(str(data), str(tmp_path / "source"), profile="smoke"))
+    endpoint = tmp_path / "model"
+    completion = assay.run.train(
+        assay.run.TrainConfig(
+            str(endpoint), str(data), "dense", profile="smoke", steps=1, batch_size=2
+        )
+    )
+    output = tmp_path / "response"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "physical_response",
+            "--run-dir",
+            str(endpoint),
+            "--data-dir",
+            str(data),
+            "--output-dir",
+            str(output),
+        ],
+    )
+    assay.main()
+    report = read_json(output / "report.json")
+    assert report["source_identity"] == completion["identity"]
+    assert report["checkpoint_sha256"] == sha(endpoint / "last.pt")
+    assert report["responses_sha256"] == sha(output / "responses.pt")
+    assert report["split"] == "validation"
+    assert len(report["response"]["per_parameter"]) == 6
+    dependencies = report["evaluation_dependency_sha256"]
+    assert "shared/responses.py" in dependencies
+    for name, digest in dependencies.items():
+        assert sha(Path(assay.__file__).resolve().parents[1] / name) == digest
+    assert (output / "wandb.json").is_file()
