@@ -2,12 +2,14 @@
 
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import numpy as np
 import pytest
 import torch
 
 from diagnostics.masked_mlp_learned import frozen_test, run
+from diagnostics.masked_mlp_oracle import paper_analysis
 from diagnostics.shared.data import PrepareConfig, prepare
 from diagnostics.shared.io import read_json, sha
 from diagnostics.shared.source_data import PrepareConfig as SourcePrepareConfig
@@ -104,6 +106,35 @@ def test_declaration_does_not_load_test_and_evaluation_preserves_endpoints(
         tmp_path / "batch/full-s0/results/matching.json"
     )
     assert "masks/parameter_code_aligned_shd" in report["metrics"]
+
+    def forbidden(*_args: object) -> None:
+        raise AssertionError("Plot export must not fit coordinate assignments on test data")
+
+    monkeypatch.setattr(paper_analysis, "_code_order", forbidden)
+    monkeypatch.setattr(paper_analysis, "_matched_code_correlation", forbidden)
+    plotted, declaration = paper_analysis.load_test_batch(output)
+    assert declaration == protocol
+    for frozen in protocol["runs"]:
+        item = plotted[frozen["arm"]][frozen["seed"]]
+        assert item.code_columns == [
+            frozen["parameter_columns"][k] for k in paper_analysis.PAIR_ORDER
+        ]
+        assert item.columns == frozen["matching"]["online_columns"]
+    chance = {
+        name: {"mcc_mean": 0.8, "mcc_p05": 0.6, "mcc_p95": 0.9}
+        for name in ("any_rotation", "within_block")
+    }
+    figure = paper_analysis.figure_mcc(plotted, [0], chance, split="test")
+    axis: Any = figure.axes[0]
+    assert "(test)" in axis.get_ylabel()
+    points = cast(
+        paper_analysis.Array,
+        np.concatenate([np.asarray(c.get_offsets()) for c in axis.collections]),
+    )
+    np.testing.assert_array_equal(
+        points[:, 1], [plotted[arm][0].metrics["state_mcc"] for arm in paper_analysis.ARMS]
+    )
+    paper_analysis.plt.close(figure)
     for path, digest in before.items():
         assert sha(Path(path)) == digest
     with pytest.raises(FileExistsError):

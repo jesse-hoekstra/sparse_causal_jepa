@@ -1,8 +1,10 @@
 """Paper figures and tables for a multi-seed masked-MLP batch.
 
-Read-only: it authenticates completed run directories and reads their saved
-validation endpoints, learning curves, matchings and final mask logits. It loads
-no model for inference and never touches test data. Excluded from numerical
+Read-only: the default path authenticates completed run directories and reads
+saved validation endpoints, learning curves, matchings and final mask logits.
+The explicit ``--test-dir`` path exports an already completed, authorized test
+assessment, preserving its frozen coordinate assignments. Neither path loads
+a model for inference or fits a new probe. Excluded from numerical
 identity. Layout expected under ``--batch-dir``: ``{dense,baseline,full}-s{seed}/results``,
 plus ``projected-s{seed}/results`` when initialization includes a learned-code projection.
 An adapted dense endpoint additionally reports its authenticated projection-to-adaptation
@@ -18,9 +20,10 @@ import argparse
 import csv
 import json
 import math
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import matplotlib
 import numpy as np
@@ -31,8 +34,9 @@ from scipy.optimize import linear_sum_assignment  # pyright: ignore[reportUnknow
 from diagnostics.masked_mlp_learned import run as learned
 from diagnostics.masked_mlp_oracle import from_dense, run
 from diagnostics.shared.io import read_json, sha
+from diagnostics.shared.io import verify_completion as verify_artifacts
 from diagnostics.shared.source_geometry import graphs as true_graphs
-from scjepa.data.datasets import tensor_fingerprint
+from scjepa.data.datasets import canonical_fingerprint, tensor_fingerprint
 from scjepa.eval.recovery import pearson_matrix
 
 matplotlib.use("Agg")
@@ -78,6 +82,7 @@ COLORS = {"dense": "#2a78d6", "baseline": "#eb6834", "full": "#1baf7a"}
 INK, INK2, GRID, BAND = "#0b0b0b", "#52514e", "#e4e3df", "#d9d8d3"
 BLOCKS = ((0, 1, 2), (3, 4, 5))
 type Array = NDArray[np.float64]
+type Split = Literal["validation", "test"]
 
 plt.rcParams.update(
     {
@@ -286,6 +291,69 @@ def load_batch(batch: Path) -> dict[str, dict[int, Run]]:
     if not seeds["dense"] or any(value != seeds["dense"] for value in seeds.values()):
         raise ValueError(f"arms must share a nonempty seed set, found {seeds}")
     return runs
+
+
+def load_test_batch(directory: Path) -> tuple[dict[str, dict[int, Run]], dict[str, Any]]:
+    """Read authenticated saved test scores with pre-test state and code assignments."""
+    protocol = read_json(directory / "protocol.json")
+    if protocol.get("split") != "test" or protocol["identity"] != canonical_fingerprint(
+        {key: value for key, value in protocol.items() if key != "identity"}
+    ):
+        raise ValueError("Require the unchanged reserved-test declaration")
+    runs: dict[str, dict[int, Run]] = {arm: {} for arm in ARMS}
+    for frozen in protocol["runs"]:
+        arm, seed = str(frozen["arm"]), int(frozen["seed"])
+        path = directory / f"seed{seed}" / arm
+        completion = verify_artifacts(path)
+        report = read_json(path / "report.json")
+        if (
+            completion["protocol_identity"] != protocol["identity"]
+            or report["protocol_identity"] != protocol["identity"]
+            or report["source"] != frozen
+            or report["split"] != "test"
+            or report["groups"] != protocol["test_groups"]
+            or report["arm"] != arm
+            or report["seed"] != seed
+        ):
+            raise ValueError("Test report differs from its frozen declaration")
+        payload = cast(
+            dict[str, Any], torch.load(path / "test.pt", map_location="cpu", weights_only=False)
+        )
+        if payload["metrics"] != report["metrics"]:
+            raise ValueError("Test metrics and saved representations differ")
+        samples = cast(dict[str, torch.Tensor], payload["samples"])
+        columns = [int(c) for c in frozen["matching"]["online_columns"]]
+        states, truth = samples["online_states"], samples["states"]
+        correlation = pearson_matrix(states.reshape(-1, 6), truth.reshape(-1, 6))[:, columns]
+        codes = samples["codes"].double()
+        theta = samples["theta"].double()[:, None].expand_as(codes)
+        code_columns = [int(frozen["parameter_columns"][k]) for k in PAIR_ORDER]
+        code_correlation = pearson_matrix(codes.flatten(0, 1), theta.flatten(0, 1))
+        physical_hash = tensor_fingerprint(truth)
+        if physical_hash != report["physical_samples_sha256"]:
+            raise ValueError("Test physical samples changed")
+        runs[arm][seed] = Run(
+            arm=arm,
+            seed=seed,
+            directory=path,
+            metrics=report["metrics"],
+            start=None,
+            curve=[],
+            penalty=[],
+            columns=columns,
+            correlation=correlation.numpy(),
+            graphs={
+                name: np.asarray(value, dtype=bool) for name, value in report["graphs"].items()
+            },
+            group_moments=matched_group_moments(states, truth, columns),
+            physical_samples_sha256=physical_hash,
+            data_identity=protocol["data_identity"],
+            code_correlation=code_correlation[list(PAIR_ORDER)][:, code_columns].abs().numpy(),
+            code_columns=code_columns,
+        )
+    if any(sorted(found) != protocol["seeds"] for found in runs.values()):
+        raise ValueError("Require every declared seed and arm")
+    return runs, protocol
 
 
 def random_block_rotation(sizes: tuple[int, ...], rng: np.random.Generator) -> Array:
@@ -528,7 +596,13 @@ def _chance_reference(
     axis.text(label_x, levels["mcc_mean"], text, color=INK2, fontsize=6.8, va="center")
 
 
-def figure_mcc(runs: dict[str, dict[int, Run]], seeds: list[int], chance: dict[str, Any]) -> Figure:
+def figure_mcc(
+    runs: dict[str, dict[int, Run]],
+    seeds: list[int],
+    chance: dict[str, Any],
+    *,
+    split: Split = "validation",
+) -> Figure:
     """State MCC per arm with seed pairing and chance references."""
     figure, axis = cast(tuple[Any, Any], plt.subplots(figsize=(4.4, 3.0)))
     _chance_reference(
@@ -545,7 +619,7 @@ def figure_mcc(runs: dict[str, dict[int, Run]], seeds: list[int], chance: dict[s
         chance["within_block"],
         "Within-block\nrandom rotations\n5th-95th percentiles",
     )
-    _box_panel(axis, runs, "state_mcc", seeds, r"State MCC $(\hat z^t,z^t)$ (validation)")
+    _box_panel(axis, runs, "state_mcc", seeds, rf"State MCC $(\hat z^t,z^t)$ ({split})")
     axis.set_ylim(0.5, 1.01)
     axis.set_xlim(-0.5, 2.68)
     axis.spines["bottom"].set_bounds(-0.5, 2.4)
@@ -564,7 +638,11 @@ def figure_mcc(runs: dict[str, dict[int, Run]], seeds: list[int], chance: dict[s
 
 
 def figure_purity(
-    runs: dict[str, dict[int, Run]], seeds: list[int], chance: dict[str, Any]
+    runs: dict[str, dict[int, Run]],
+    seeds: list[int],
+    chance: dict[str, Any],
+    *,
+    split: Split = "validation",
 ) -> Figure:
     """Block purity per arm with the any-rotation chance level."""
     figure, axis = cast(tuple[Any, Any], plt.subplots(figsize=(4.2, 3.0)))
@@ -578,7 +656,7 @@ def figure_purity(
         fontsize=6.8,
         va="center",
     )
-    _box_panel(axis, runs, "block_purity", seeds, r"Block purity of $\hat z^t$ (validation $R^2$)")
+    _box_panel(axis, runs, "block_purity", seeds, rf"Block purity of $\hat z^t$ ({split} $R^2$)")
     axis.set_ylim(0.5, 1.01)
     axis.set_xlim(-0.5, 2.4)
     axis.set_title("Separation of the two state blocks", loc="left", color=INK)
@@ -706,7 +784,9 @@ def figure_graphs(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
     return figure
 
 
-def figure_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figure:
+def figure_correlations(
+    runs: dict[str, dict[int, Run]], seed: int, *, split: Split = "validation"
+) -> Figure:
     """Matched |correlation| matrices for one seed of every arm."""
     figure, axes = cast(
         tuple[Any, Any], plt.subplots(1, 3, figsize=(6.4, 2.4), constrained_layout=True)
@@ -728,7 +808,7 @@ def figure_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figure:
     if image is not None:
         figure.colorbar(image, ax=axes, shrink=0.8, label="|Pearson correlation|")
     figure.suptitle(
-        rf"Learned $\hat z^t$ vs true $z^t$, seed {seed} (matched learned coordinates)",
+        rf"Learned $\hat z^t$ vs true $z^t$, seed {seed} ({split}; calibration-matched)",
         x=0.02,
         ha="left",
         color=INK,
@@ -737,15 +817,17 @@ def figure_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figure:
     return figure
 
 
-def figure_quality(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
+def figure_quality(
+    runs: dict[str, dict[int, Run]], seeds: list[int], *, split: Split = "validation"
+) -> Figure:
     """Forecast error and whole-state information per arm."""
     figure, axes = cast(tuple[Any, Any], plt.subplots(1, 2, figsize=(6.4, 2.7)))
     _box_panel(axes[0], runs, "normalized_prediction_mse", seeds, r"Forecast NMSE in $\hat z$")
     _box_panel(
         axes[1], runs, "online_state_probe/r2", seeds, r"State probe $R^2$ ($\hat z^t\to z^t$)"
     )
-    axes[0].set_title("Forecast error (two-step)", loc="left", color=INK)
-    axes[1].set_title("Retained state information", loc="left", color=INK)
+    axes[0].set_title(f"Forecast error (two-step, {split})", loc="left", color=INK)
+    axes[1].set_title(f"Retained state information ({split})", loc="left", color=INK)
     figure.tight_layout()
     return figure
 
@@ -767,7 +849,9 @@ def figure_penalty(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
     return figure
 
 
-def figure_code_retention(runs: dict[str, dict[int, Run]], seeds: list[int]) -> Figure:
+def figure_code_retention(
+    runs: dict[str, dict[int, Run]], seeds: list[int], *, split: Split = "validation"
+) -> Figure:
     """Whole-code retention R² per parameter, with every seed visible, including outliers."""
     figure, axis = cast(tuple[Any, Any], plt.subplots(figsize=(6.4, 2.8)))
     width = 0.24
@@ -804,7 +888,7 @@ def figure_code_retention(runs: dict[str, dict[int, Run]], seeds: list[int]) -> 
             )
         axis.plot([], [], color=COLORS[arm], lw=6, alpha=0.6, label=SHORT[arm])
     axis.set_xticks(range(6), [rf"$\theta_{{{k + 1}}}$" for k in range(6)])
-    axis.set_ylabel(r"Retention $R^2$ from $\hat\theta$ (validation)")
+    axis.set_ylabel(rf"Retention $R^2$ from $\hat\theta$ ({split})")
     axis.axhline(0.8, color=INK2, lw=0.7, ls=(0, (3, 2)))
     axis.text(5.55, 0.8, "  0.8", color=INK2, fontsize=6.8, va="center")
     axis.grid(axis="y", color=GRID, lw=0.6)
@@ -818,7 +902,9 @@ def figure_code_retention(runs: dict[str, dict[int, Run]], seeds: list[int]) -> 
     return figure
 
 
-def figure_code_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figure:
+def figure_code_correlations(
+    runs: dict[str, dict[int, Run]], seed: int, *, split: Split = "validation"
+) -> Figure:
     """Matched |corr(theta, code)| for one seed; theta rows grouped by parameter pair."""
     figure, axes = cast(
         tuple[Any, Any], plt.subplots(1, 3, figsize=(6.4, 2.4), constrained_layout=True)
@@ -839,15 +925,15 @@ def figure_code_correlations(runs: dict[str, dict[int, Run]], seed: int) -> Figu
         axis.tick_params(length=0)
         for spine in axis.spines.values():
             spine.set_visible(False)
-        axis.set_title(
-            f"{SHORT[arm]}  (code MCC {runs[arm][seed].metrics['code_mcc']:.3f})",
-            loc="left",
-            color=INK,
-        )
+        title = SHORT[arm]
+        if split == "validation":
+            title += f"  (code MCC {runs[arm][seed].metrics['code_mcc']:.3f})"
+        axis.set_title(title, loc="left", color=INK)
     if image is not None:
         figure.colorbar(image, ax=axes, shrink=0.8, label="|Pearson correlation|")
+    order_note = "order fixed on validation" if split == "test" else "rows grouped by pair"
     figure.suptitle(
-        rf"Learned $\hat\theta$ vs true $\theta$, seed {seed} (rows grouped by parameter pair)",
+        rf"Learned $\hat\theta$ vs true $\theta$, seed {seed} ({split}; {order_note})",
         x=0.02,
         ha="left",
         color=INK,
@@ -1011,7 +1097,13 @@ def write_adaptation_table(adaptations: dict[int, dict[str, float]], output: Pat
     (output / "table_adaptation.tex").write_text(table)
 
 
-def write_code_table(runs: dict[str, dict[int, Run]], seeds: list[int], output: Path) -> None:
+def write_code_table(
+    runs: dict[str, dict[int, Run]],
+    seeds: list[int],
+    output: Path,
+    *,
+    split: Split = "validation",
+) -> None:
     """LaTeX table of code retention, alignment and predictive use per model."""
     keys = {
         "code_r2_min": "Min.\\ retention $R^2$",
@@ -1041,7 +1133,7 @@ def write_code_table(runs: dict[str, dict[int, Run]], seeds: list[int], output: 
             r"\end{tabular}",
             r"\caption{Learned parameter codes, mean $\pm$ s.d.\ over "
             + str(len(seeds))
-            + r" seeds (validation). Retention: linear or cubic probe of each true parameter "
+            + f" seeds ({split}). Retention: linear or cubic probe of each true parameter "
             r"from the whole code, fitted and selected on calibration halves. Pair purity: "
             r"best single-pair linear $R^2$ of each code coordinate (pairs (1,4), (2,5), (3,6)). "
             r"Shuffled/factual: forecast error with codes from another parameter group, "
@@ -1062,7 +1154,12 @@ def _fmt(stats: dict[str, float], digits: int = 3) -> str:
 
 
 def write_tables(
-    runs: dict[str, dict[int, Run]], seeds: list[int], output: Path, chance: dict[str, Any]
+    runs: dict[str, dict[int, Run]],
+    seeds: list[int],
+    output: Path,
+    chance: dict[str, Any],
+    *,
+    split: Split = "validation",
 ) -> dict[str, Any]:
     """LaTeX tables of per-arm summaries and seed-paired MCC tests."""
     keys = {
@@ -1103,6 +1200,8 @@ def write_tables(
                 cells.append(f"{stats['mean']:.1f} $\\pm$ {stats['sd']:.1f}")
             elif key == "normalized_prediction_mse":
                 cells.append(_fmt(stats, 4))
+            elif key == "state_mcc" and split == "test":
+                cells.append(_fmt(stats, 5))
             else:
                 cells.append(_fmt(stats))
         rows.append(" & ".join(cells) + r" \\")
@@ -1124,7 +1223,7 @@ def write_tables(
             f"Chance (within-block) & {within['mcc_mean']:.3f} & 1.000 & & & & " + r"\\",
             r"\bottomrule",
             r"\end{tabular}",
-            r"\caption{Validation endpoints, mean $\pm$ s.d.\ over "
+            rf"\caption{{{split.capitalize()} endpoints, mean $\pm$ s.d.\ over "
             + str(len(seeds))
             + r" training seeds. SHD: structural Hamming distance of the thresholded learned "
             r"graph to the true graph after the MCC matching; ``open'': the block is not "
@@ -1133,7 +1232,7 @@ def write_tables(
                 r"The learned code's coordinates are first matched to the true parameter "
                 r"pairs by linear pair $R^2$ (complementary graphs identify codes only up to "
                 r"mixing within a pair, which leaves the parameter graph unchanged). "
-                r"This descriptive code matching uses validation samples. "
+                r"This descriptive code matching uses validation samples and is fixed for test. "
                 if code_aligned
                 else ""
             )
@@ -1149,6 +1248,8 @@ def write_tables(
         "baseline - dense": ("baseline", "dense"),
         "full - dense": ("full", "dense"),
     }
+    if split == "test":
+        del comparisons["full - dense"]  # Only the two predeclared test contrasts.
     tests = {
         name: paired(
             [_metric(runs[a][s], "state_mcc") for s in seeds],
@@ -1286,6 +1387,180 @@ def analyse(batch: Path, output: Path) -> dict[str, Any]:
     return result
 
 
+def write_test_responses(directory: Path, runs: dict[str, dict[int, Run]], output: Path) -> None:
+    """Export the saved test response and retention values without recomputing responses."""
+    rows: list[dict[str, Any]] = []
+    for arm in ARMS:
+        for seed, item in runs[arm].items():
+            response = read_json(directory / f"seed{seed}" / arm / "physical_response.json")
+            for factor in response["per_parameter"]:
+                row: dict[str, Any] = {
+                    "arm": arm,
+                    "seed": seed,
+                    "parameter": factor["parameter"],
+                    "retention_r2": item.metrics[f"code_r2/theta_{factor['parameter']}"],
+                    "response_fidelity_pass": factor["response_fidelity_pass"],
+                    "positive_benefit_pass": factor["positive_benefit_pass"],
+                }
+                for key in (
+                    "normalized_response_error",
+                    "predictive_benefit",
+                    "normalized_predictive_benefit",
+                    "response_energy_ratio",
+                ):
+                    row[key] = factor[key]["estimate"]
+                    row[f"{key}_low95"], row[f"{key}_high95"] = factor[key]["interval_95"]
+                rows.append(row)
+    with (output / "response_per_parameter.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    factors: list[dict[str, Any]] = []
+    table = [
+        r"% Test results; all coordinate/probe choices fixed before test evaluation.",
+        r"\begin{tabular}{lrrrr}",
+        r"\toprule",
+        r"Parameter & Min. retention $R^2$ & NRE range & Max. NRE upper95 & Positive benefit \\",
+        r"\midrule",
+    ]
+    for parameter in range(1, 7):
+        values = [row for row in rows if row["arm"] == "full" and row["parameter"] == parameter]
+        factor = {
+            "parameter": parameter,
+            "minimum_retention_r2": min(row["retention_r2"] for row in values),
+            "response_nre_min": min(row["normalized_response_error"] for row in values),
+            "response_nre_max": max(row["normalized_response_error"] for row in values),
+            "maximum_nre_upper95": max(row["normalized_response_error_high95"] for row in values),
+            "positive_benefit_seeds": sum(row["positive_benefit_pass"] for row in values),
+        }
+        factors.append(factor)
+        table.append(
+            rf"$\theta_{{{parameter}}}$ & {factor['minimum_retention_r2']:.3f} & "
+            f"{factor['response_nre_min']:.3f}--{factor['response_nre_max']:.3f} & "
+            f"{factor['maximum_nre_upper95']:.3f} & "
+            f"{factor['positive_benefit_seeds']}/{len(values)}" + r" \\"
+        )
+    table += [r"\bottomrule", r"\end{tabular}"]
+    (output / "table_responses.tex").write_text("\n".join(table) + "\n")
+    (output / "response_summary.json").write_text(
+        json.dumps({"split": "test", "full_per_parameter": factors}, indent=2) + "\n"
+    )
+
+
+def analyse_test(directory: Path, validation: Path, output: Path) -> dict[str, Any]:
+    """Render saved test endpoints and preserve labelled validation/training histories."""
+    runs, protocol = load_test_batch(directory)
+    source = read_json(directory / "summary.json")
+    earlier = read_json(validation / "summary.json")
+    if source["protocol_identity"] != protocol["identity"] or (
+        earlier["batch"] != protocol["batch_dir"] or earlier["seeds"] != protocol["seeds"]
+    ):
+        raise ValueError("Test and validation exports must refer to the same fixed batch")
+    output.mkdir(parents=True, exist_ok=True)
+    seeds = sorted(runs["full"])
+    chance, representative = earlier["chance"], int(earlier["representative_seed"])
+    figures = {
+        "fig_mcc_box": figure_mcc(runs, seeds, chance, split="test"),
+        "fig_block_purity_box": figure_purity(runs, seeds, chance, split="test"),
+        "fig_graph_recovery": figure_graphs(runs, seeds),
+        "fig_correlations_median_seed": figure_correlations(runs, representative, split="test"),
+        "fig_forecast_quality": figure_quality(runs, seeds, split="test"),
+        "fig_code_retention_box": figure_code_retention(runs, seeds, split="test"),
+        "fig_code_correlations_median_seed": figure_code_correlations(
+            runs, representative, split="test"
+        ),
+    }
+    files = {name: _save(figure, output, name) for name, figure in figures.items()}
+    inherited: dict[str, str] = {}
+    for name in ("fig_mcc_curves", "fig_geco_multiplier"):
+        files[name] = []
+        for suffix in ("pdf", "png"):
+            filename = f"{name}.{suffix}"
+            shutil.copy2(validation / filename, output / filename)
+            files[name].append(filename)
+            inherited[filename] = sha(validation / filename)
+    for name in ("table_projection.tex", "table_adaptation.tex"):
+        shutil.copy2(validation / name, output / name)
+        inherited[name] = sha(validation / name)
+    tables = write_tables(runs, seeds, output, chance, split="test")
+    write_code_table(runs, seeds, output, split="test")
+    write_test_responses(directory, runs, output)
+    contrasts = group_mcc_contrasts(runs, seeds)
+    for arm in ARMS:
+        for key, stats in tables["summary"][arm].items():
+            if not math.isclose(stats["mean"], source["summary"][arm][key]["mean"], abs_tol=1e-12):
+                raise ValueError("Plotted endpoint summary differs from saved test results")
+    if contrasts != source["paired_groups"] or tables["paired"] != source["paired"]:
+        raise ValueError("Plotted comparisons differ from the declared test assessment")
+    shutil.copy2(directory / "per_run.csv", output / "per_run.csv")
+    result: dict[str, Any] = {
+        **source,
+        "batch": protocol["batch_dir"],
+        "seeds": seeds,
+        "representative_seed": representative,
+        "representative_seed_selection": "Frozen from median full-model validation MCC",
+        "chance": chance,
+        "figures": files,
+        "figure_splits": {
+            name: "validation"
+            if name == "fig_mcc_curves"
+            else "training"
+            if name == "fig_geco_multiplier"
+            else "fixed learned masks"
+            if name == "fig_graph_recovery"
+            else "test"
+            for name in files
+        },
+        "parameter_graph_metric": CODE_ALIGNED_SHD,
+        "per_run": {arm: {str(s): runs[arm][s].metrics for s in seeds} for arm in ARMS},
+        "exporter_sha256": sha(Path(__file__)),
+        "source_test_protocol_sha256": sha(directory / "protocol.json"),
+        "source_test_summary_sha256": sha(directory / "summary.json"),
+        "inherited_validation_training_artifacts": inherited,
+    }
+    (output / "summary.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    (output / "group_mcc_contrasts.json").write_text(json.dumps(contrasts, indent=2) + "\n")
+    lines = [
+        "# Experiment 1: confirmed test figures and tables",
+        "",
+        "Endpoint plots and scores use all 512 test groups and all five fixed training seeds.",
+        "State matching, probes and parameter-graph ordering were fixed before test access.",
+        f"Correlation panels retain seed {representative}, chosen using validation before testing.",
+        "No model inference, fitting, selection or retraining is performed by this exporter.",
+        "",
+        "| Model | Test state MCC, mean ± sample SD | Test block purity | Test forecast NMSE |",
+        "|---|---:|---:|---:|",
+    ]
+    for arm in ARMS:
+        stats = source["summary"][arm]
+        lines.append(
+            f"| {SHORT[arm]} | {stats['state_mcc']['mean']:.6f} ± {stats['state_mcc']['sd']:.6f} | "
+            f"{stats['block_purity']['mean']:.6f} | "
+            f"{stats['normalized_prediction_mse']['mean']:.6f} |"
+        )
+    lines += [
+        "",
+        "All nine figures are provided as vector PDF and 300-dpi PNG.",
+        "",
+        "- MCC, block purity, forecast, state/code correlations and parameter-retention "
+        "panels use test data.",
+        "- Graph panels show the fixed learned masks with their pre-test assignments.",
+        "- `fig_mcc_curves` retains the recorded validation learning curves; "
+        "`fig_geco_multiplier` is a training trace. Both are unchanged, not relabelled as test.",
+        "- `table_projection.tex` and `table_adaptation.tex` retain explicitly labelled "
+        "validation initialization diagnostics. No additional checkpoints were evaluated on test.",
+        "- `table_main.tex`, `table_paired.tex`, `table_codes.tex` and `table_responses.tex` "
+        "report test endpoint and response results.",
+        "- `per_run.csv`, `summary.json`, `group_mcc_contrasts.json` and "
+        "`response_per_parameter.csv` preserve the plotted values and uncertainty.",
+        "- Model whiskers use 1.5 IQR; every seed remains visible. Rotation-reference bars "
+        "show the middle 90%, not bounds on possible outcomes.",
+        "- [Full test report and protocol](../README.md). All artifacts remain private.",
+    ]
+    (output / "README.md").write_text("\n".join(lines) + "\n")
+    return result
+
+
 def write_readme(result: dict[str, Any], output: Path) -> None:
     """README with the headline numbers and draft figure captions."""
     summary, tests, chance = result["summary"], result["paired"], result["chance"]
@@ -1398,10 +1673,22 @@ Code summary (mean over seeds): """
 def main() -> None:
     """Write the paper outputs for one completed batch directory."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--batch-dir", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--batch-dir")
+    source.add_argument("--test-dir")
+    parser.add_argument(
+        "--validation-dir", help="Existing validation paper outputs for test export"
+    )
     parser.add_argument("--output-dir", required=True)
     arguments = parser.parse_args()
-    result = analyse(Path(arguments.batch_dir), Path(arguments.output_dir))
+    if arguments.test_dir:
+        if not arguments.validation_dir:
+            parser.error("--test-dir requires --validation-dir for the recorded training traces")
+        result = analyse_test(
+            Path(arguments.test_dir), Path(arguments.validation_dir), Path(arguments.output_dir)
+        )
+    else:
+        result = analyse(Path(arguments.batch_dir), Path(arguments.output_dir))
     print(json.dumps({"figures": result["figures"], "paired": result["paired"]}, indent=2))
 
 
