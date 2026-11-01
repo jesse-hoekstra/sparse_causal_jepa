@@ -3,6 +3,8 @@
 ``declare`` authenticates every endpoint and freezes graph alignment without
 loading test tensors. ``evaluate`` scores one seed using saved calibration
 representations. ``summarize`` collects all seeds without selecting any model.
+``align`` records a calibration-only alignment revision for an existing declaration,
+without loading validation/test tensors or changing the original assessment.
 This module is separate from the numerical training identity.
 """
 
@@ -60,7 +62,7 @@ def declare(
     dense_steps: int = 50_000,
     sparse_steps: int = 300_000,
 ) -> dict[str, Any]:
-    """Freeze endpoints and existing validation graph orders before opening test tensors."""
+    """Freeze endpoints and calibration graph orders before opening test tensors."""
     if output.exists():
         raise FileExistsError(output)
     cache = verify_artifacts(data_dir)
@@ -80,7 +82,7 @@ def declare(
                 or completion["data_identity"] != cache["identity"]
             ):
                 raise ValueError("Endpoint differs from the declared fixed-budget comparison")
-            samples = _load(directory / "validation.pt")["samples"]
+            samples = _load(directory / "calibration.pt")["samples"]
             codes = cast(Tensor, samples["codes"]).double()
             theta = cast(Tensor, samples["theta"]).double()[:, None].expand_as(codes)
             order = analysis._code_order(  # pyright: ignore[reportPrivateUsage]
@@ -100,7 +102,7 @@ def declare(
                     "validation_sha256": completion["hashes"]["validation.pt"],
                     "matching": read_json(directory / "matching.json"),
                     "parameter_columns": order,
-                    "parameter_alignment_fit_split": "validation",
+                    "parameter_alignment_fit_split": "calibration",
                     "batch_size": config["config"]["batch_size"],
                     "tau_prediction": completion["tau_prediction"],
                 }
@@ -123,7 +125,7 @@ def declare(
             "training": False,
             "test_selection": False,
             "calibration": "Reuse saved calibration encodings; fit/select probes only there",
-            "graph_alignment": "Saved calibration state match and validation-frozen code order",
+            "graph_alignment": "State and parameter-column orders fitted on calibration",
             "forecast": "Unchanged two-step evaluator, forward seed 42, saved group batch size",
             "comparisons": ["full - baseline", "baseline - dense"],
             "paired_test": "Exact seed-level sign flips; report one- and two-sided p-values",
@@ -140,6 +142,54 @@ def declare(
     output.mkdir(parents=True)
     write_json(output / "protocol.json", protocol)
     return protocol
+
+
+def align_parameters(protocol_path: Path, output: Path) -> dict[str, Any]:
+    """Freeze a separate calibration-only revision, reading no held-out tensors."""
+    if output.exists():
+        raise FileExistsError(output)
+    protocol = read_json(protocol_path)
+    if protocol.get("split") != "test" or protocol["identity"] != canonical_fingerprint(
+        {key: value for key, value in protocol.items() if key != "identity"}
+    ):
+        raise ValueError("Source test declaration changed")
+    records: list[dict[str, Any]] = []
+    for frozen in protocol["runs"]:
+        path = Path(frozen["directory"]) / "calibration.pt"
+        if sha(path) != frozen["calibration_sha256"]:
+            raise ValueError("Calibration differs from the frozen endpoint")
+        samples = _load(path)["samples"]
+        codes = cast(Tensor, samples["codes"]).double()
+        theta = cast(Tensor, samples["theta"]).double()[:, None].expand_as(codes)
+        order = analysis._code_order(  # pyright: ignore[reportPrivateUsage]
+            codes.flatten(0, 1), theta.flatten(0, 1)
+        )
+        records.append(
+            {
+                "arm": frozen["arm"],
+                "seed": frozen["seed"],
+                "endpoint_identity": frozen["identity"],
+                "calibration_sha256": frozen["calibration_sha256"],
+                "parameter_columns": order,
+                "previous_parameter_columns": frozen["parameter_columns"],
+                "previous_fit_split": frozen["parameter_alignment_fit_split"],
+            }
+        )
+    result: dict[str, Any] = {
+        "schema": "masked-mlp-parameter-alignment-v1",
+        "created_utc": datetime.now(UTC).isoformat(),
+        "fit_split": "calibration",
+        "source_protocol_identity": protocol["identity"],
+        "source_protocol_sha256": sha(protocol_path),
+        "revision": "Separate alignment revision; original declaration is unchanged",
+        "fitter_sha256": sha(Path(__file__)),
+        "algorithm_sha256": sha(Path(analysis.__file__)),
+        "runs": records,
+    }
+    result["identity"] = canonical_fingerprint(result)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    write_json(output, result)
+    return result
 
 
 def score_result(
@@ -444,6 +494,9 @@ def main() -> None:
     evaluation.add_argument("--wandb-entity")
     collection = commands.add_parser("summarize")
     collection.add_argument("--protocol", type=Path, required=True)
+    alignment = commands.add_parser("align")
+    alignment.add_argument("--protocol", type=Path, required=True)
+    alignment.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     torch.set_num_threads(1)
     if args.command == "declare":
@@ -457,6 +510,9 @@ def main() -> None:
             wandb_mode=args.wandb_mode,
             wandb_entity=args.wandb_entity,
         )
+    elif args.command == "align":
+        result = align_parameters(args.protocol, args.output)
+        print(f"Froze {len(result['runs'])} calibration-only parameter orders")
     else:
         summarize(args.protocol)
         print("Collected all declared test results")

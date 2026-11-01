@@ -206,7 +206,15 @@ def load_run(directory: Path, arm: str, seed: int) -> Run:
         )
         if "predictor.parameter_logits" in state:
             # The runner aligns only the state rows; a learned code's columns are unordered.
-            order = _code_order(codes.flatten(0, 1), theta.flatten(0, 1))
+            calibration = cast(
+                dict[str, Any],
+                torch.load(directory / "calibration.pt", map_location="cpu", weights_only=False),
+            )["samples"]
+            fit_codes = cast(torch.Tensor, calibration["codes"]).double()
+            fit_theta = cast(torch.Tensor, calibration["theta"]).double()[:, None]
+            order = _code_order(
+                fit_codes.flatten(0, 1), fit_theta.expand_as(fit_codes).flatten(0, 1)
+            )
             graphs["parameter"] = graphs["parameter"][:, order]
             metrics = metrics | _code_aligned_metrics(graphs["parameter"])
     return Run(
@@ -293,13 +301,31 @@ def load_batch(batch: Path) -> dict[str, dict[int, Run]]:
     return runs
 
 
-def load_test_batch(directory: Path) -> tuple[dict[str, dict[int, Run]], dict[str, Any]]:
-    """Read authenticated saved test scores with pre-test state and code assignments."""
+def load_test_batch(
+    directory: Path, *, parameter_alignment: Path | None = None
+) -> tuple[dict[str, dict[int, Run]], dict[str, Any]]:
+    """Read saved test scores; optionally apply an authenticated calibration-only revision."""
     protocol = read_json(directory / "protocol.json")
     if protocol.get("split") != "test" or protocol["identity"] != canonical_fingerprint(
         {key: value for key, value in protocol.items() if key != "identity"}
     ):
         raise ValueError("Require the unchanged reserved-test declaration")
+    revisions: dict[tuple[str, int], dict[str, Any]] = {}
+    if parameter_alignment is not None:
+        revision = read_json(parameter_alignment)
+        if (
+            revision.get("schema") != "masked-mlp-parameter-alignment-v1"
+            or revision.get("fit_split") != "calibration"
+            or revision["identity"]
+            != canonical_fingerprint({k: v for k, v in revision.items() if k != "identity"})
+            or revision["source_protocol_identity"] != protocol["identity"]
+            or revision["source_protocol_sha256"] != sha(directory / "protocol.json")
+        ):
+            raise ValueError("Parameter alignment revision does not match the test declaration")
+        revisions = {(str(r["arm"]), int(r["seed"])): r for r in revision["runs"]}
+        expected = {(str(r["arm"]), int(r["seed"])) for r in protocol["runs"]}
+        if set(revisions) != expected or len(revisions) != len(revision["runs"]):
+            raise ValueError("Alignment revision must contain every endpoint exactly once")
     runs: dict[str, dict[int, Run]] = {arm: {} for arm in ARMS}
     for frozen in protocol["runs"]:
         arm, seed = str(frozen["arm"]), int(frozen["seed"])
@@ -321,13 +347,30 @@ def load_test_batch(directory: Path) -> tuple[dict[str, dict[int, Run]], dict[st
         )
         if payload["metrics"] != report["metrics"]:
             raise ValueError("Test metrics and saved representations differ")
+        order = [int(c) for c in frozen["parameter_columns"]]
+        graphs = {name: np.asarray(value, dtype=bool) for name, value in report["graphs"].items()}
+        metrics = dict(report["metrics"])
+        if revisions:
+            revised = revisions[(arm, seed)]
+            updated = [int(c) for c in revised["parameter_columns"]]
+            if (
+                revised["endpoint_identity"] != frozen["identity"]
+                or revised["calibration_sha256"] != frozen["calibration_sha256"]
+                or revised["previous_parameter_columns"] != order
+                or revised["previous_fit_split"] != frozen["parameter_alignment_fit_split"]
+                or sorted(updated) != list(range(6))
+            ):
+                raise ValueError("Alignment revision differs from the frozen endpoint")
+            graphs["parameter"] = graphs["parameter"][:, [order.index(c) for c in updated]]
+            metrics |= _code_aligned_metrics(graphs["parameter"])
+            order = updated
         samples = cast(dict[str, torch.Tensor], payload["samples"])
         columns = [int(c) for c in frozen["matching"]["online_columns"]]
         states, truth = samples["online_states"], samples["states"]
         correlation = pearson_matrix(states.reshape(-1, 6), truth.reshape(-1, 6))[:, columns]
         codes = samples["codes"].double()
         theta = samples["theta"].double()[:, None].expand_as(codes)
-        code_columns = [int(frozen["parameter_columns"][k]) for k in PAIR_ORDER]
+        code_columns = [order[k] for k in PAIR_ORDER]
         code_correlation = pearson_matrix(codes.flatten(0, 1), theta.flatten(0, 1))
         physical_hash = tensor_fingerprint(truth)
         if physical_hash != report["physical_samples_sha256"]:
@@ -336,15 +379,13 @@ def load_test_batch(directory: Path) -> tuple[dict[str, dict[int, Run]], dict[st
             arm=arm,
             seed=seed,
             directory=path,
-            metrics=report["metrics"],
+            metrics=metrics,
             start=None,
             curve=[],
             penalty=[],
             columns=columns,
             correlation=correlation.numpy(),
-            graphs={
-                name: np.asarray(value, dtype=bool) for name, value in report["graphs"].items()
-            },
+            graphs=graphs,
             group_moments=matched_group_moments(states, truth, columns),
             physical_samples_sha256=physical_hash,
             data_identity=protocol["data_identity"],
@@ -903,7 +944,11 @@ def figure_code_retention(
 
 
 def figure_code_correlations(
-    runs: dict[str, dict[int, Run]], seed: int, *, split: Split = "validation"
+    runs: dict[str, dict[int, Run]],
+    seed: int,
+    *,
+    split: Split = "validation",
+    alignment_split: str = "calibration",
 ) -> Figure:
     """Matched |corr(theta, code)| for one seed; theta rows grouped by parameter pair."""
     figure, axes = cast(
@@ -931,7 +976,7 @@ def figure_code_correlations(
         axis.set_title(title, loc="left", color=INK)
     if image is not None:
         figure.colorbar(image, ax=axes, shrink=0.8, label="|Pearson correlation|")
-    order_note = "order fixed on validation" if split == "test" else "rows grouped by pair"
+    order_note = f"order fitted on {alignment_split}" if split == "test" else "rows grouped by pair"
     figure.suptitle(
         rf"Learned $\hat\theta$ vs true $\theta$, seed {seed} ({split}; {order_note})",
         x=0.02,
@@ -1160,6 +1205,7 @@ def write_tables(
     chance: dict[str, Any],
     *,
     split: Split = "validation",
+    alignment_split: str = "calibration",
 ) -> dict[str, Any]:
     """LaTeX tables of per-arm summaries and seed-paired MCC tests."""
     keys = {
@@ -1232,7 +1278,8 @@ def write_tables(
                 r"The learned code's coordinates are first matched to the true parameter "
                 r"pairs by linear pair $R^2$ (complementary graphs identify codes only up to "
                 r"mixing within a pair, which leaves the parameter graph unchanged). "
-                r"This descriptive code matching uses validation samples and is fixed for test. "
+                f"This descriptive code matching uses {alignment_split} samples "
+                "and is fixed for scoring. "
                 if code_aligned
                 else ""
             )
@@ -1447,10 +1494,28 @@ def write_test_responses(directory: Path, runs: dict[str, dict[int, Run]], outpu
     )
 
 
-def analyse_test(directory: Path, validation: Path, output: Path) -> dict[str, Any]:
+def analyse_test(
+    directory: Path,
+    validation: Path,
+    output: Path,
+    *,
+    parameter_alignment: Path | None = None,
+) -> dict[str, Any]:
     """Render saved test endpoints and preserve labelled validation/training histories."""
-    runs, protocol = load_test_batch(directory)
+    runs, protocol = load_test_batch(directory, parameter_alignment=parameter_alignment)
     source = read_json(directory / "summary.json")
+    alignment_split = (
+        "calibration"
+        if parameter_alignment is not None
+        else str(protocol["runs"][0]["parameter_alignment_fit_split"])
+    )
+    if parameter_alignment is not None:
+        for arm in ARMS:
+            for key in source["summary"][arm]:
+                if key.startswith("masks/parameter_code_aligned_"):
+                    source["summary"][arm][key] = describe(
+                        [item.metrics[key] for item in runs[arm].values()]
+                    )
     earlier = read_json(validation / "summary.json")
     if source["protocol_identity"] != protocol["identity"] or (
         earlier["batch"] != protocol["batch_dir"] or earlier["seeds"] != protocol["seeds"]
@@ -1467,7 +1532,7 @@ def analyse_test(directory: Path, validation: Path, output: Path) -> dict[str, A
         "fig_forecast_quality": figure_quality(runs, seeds, split="test"),
         "fig_code_retention_box": figure_code_retention(runs, seeds, split="test"),
         "fig_code_correlations_median_seed": figure_code_correlations(
-            runs, representative, split="test"
+            runs, representative, split="test", alignment_split=alignment_split
         ),
     }
     files = {name: _save(figure, output, name) for name, figure in figures.items()}
@@ -1482,7 +1547,9 @@ def analyse_test(directory: Path, validation: Path, output: Path) -> dict[str, A
     for name in ("table_projection.tex", "table_adaptation.tex"):
         shutil.copy2(validation / name, output / name)
         inherited[name] = sha(validation / name)
-    tables = write_tables(runs, seeds, output, chance, split="test")
+    tables = write_tables(
+        runs, seeds, output, chance, split="test", alignment_split=alignment_split
+    )
     write_code_table(runs, seeds, output, split="test")
     write_test_responses(directory, runs, output)
     contrasts = group_mcc_contrasts(runs, seeds)
@@ -1492,7 +1559,23 @@ def analyse_test(directory: Path, validation: Path, output: Path) -> dict[str, A
                 raise ValueError("Plotted endpoint summary differs from saved test results")
     if contrasts != source["paired_groups"] or tables["paired"] != source["paired"]:
         raise ValueError("Plotted comparisons differ from the declared test assessment")
-    shutil.copy2(directory / "per_run.csv", output / "per_run.csv")
+    if parameter_alignment is None:
+        shutil.copy2(directory / "per_run.csv", output / "per_run.csv")
+    else:
+        with (directory / "per_run.csv").open(newline="") as stream:
+            reader = csv.DictReader(stream)
+            fields, rows = reader.fieldnames, list(reader)
+        if fields is None:
+            raise ValueError("Missing saved test CSV header")
+        for row in rows:
+            item = runs[row["arm"]][int(row["seed"])]
+            for key in fields:
+                if key.startswith("masks/parameter_code_aligned_"):
+                    row[key] = str(item.metrics[key])
+        with (output / "per_run.csv").open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
     result: dict[str, Any] = {
         **source,
         "batch": protocol["batch_dir"],
@@ -1512,6 +1595,10 @@ def analyse_test(directory: Path, validation: Path, output: Path) -> dict[str, A
             for name in files
         },
         "parameter_graph_metric": CODE_ALIGNED_SHD,
+        "parameter_alignment_fit_split": alignment_split,
+        "parameter_alignment_revision": (
+            read_json(parameter_alignment) if parameter_alignment is not None else None
+        ),
         "per_run": {arm: {str(s): runs[arm][s].metrics for s in seeds} for arm in ARMS},
         "exporter_sha256": sha(Path(__file__)),
         "source_test_protocol_sha256": sha(directory / "protocol.json"),
@@ -1524,7 +1611,13 @@ def analyse_test(directory: Path, validation: Path, output: Path) -> dict[str, A
         "# Experiment 1: confirmed test figures and tables",
         "",
         "Endpoint plots and scores use all 512 test groups and all five fixed training seeds.",
-        "State matching, probes and parameter-graph ordering were fixed before test access.",
+        (
+            "State matching and probes retain the original pre-test protocol. Parameter-column "
+            "matching was subsequently refitted on calibration data in a separately recorded "
+            "revision; its ordering was fixed before this export, using no test data."
+            if parameter_alignment is not None
+            else "State matching, probes and parameter ordering were fixed before test access."
+        ),
         f"Correlation panels retain seed {representative}, chosen using validation before testing.",
         "No model inference, fitting, selection or retraining is performed by this exporter.",
         "",
@@ -1544,7 +1637,7 @@ def analyse_test(directory: Path, validation: Path, output: Path) -> dict[str, A
         "",
         "- MCC, block purity, forecast, state/code correlations and parameter-retention "
         "panels use test data.",
-        "- Graph panels show the fixed learned masks with their pre-test assignments.",
+        "- Graph panels show the fixed learned masks with the recorded coordinate assignments.",
         "- `fig_mcc_curves` retains the recorded validation learning curves; "
         "`fig_geco_multiplier` is a training trace. Both are unchanged, not relabelled as test.",
         "- `table_projection.tex` and `table_adaptation.tex` retain explicitly labelled "
@@ -1638,7 +1731,7 @@ Full - baseline MCC: {fb["mean"]:+.3f} (s.d. {fb["sd"]:.3f}), positive in
   only up to mixing within each pair.
 - In `fig_graph_recovery`, `table_main.tex` and `per_run.csv`
   (`masks/parameter_code_aligned_*`), the full model's parameter-graph columns are code
-  coordinates matched to the true parameter pairs by validation linear pair R².
+  coordinates matched to the true parameter pairs by calibration linear pair R².
   The q labels denote matched positions, not pure physical parameters; the runner's own
   `masks/parameter_aligned_shd` aligns only the state rows.
 - `table_codes.tex` — Code retention, pair purity, code MCC and predictive use.
@@ -1679,15 +1772,23 @@ def main() -> None:
     parser.add_argument(
         "--validation-dir", help="Existing validation paper outputs for test export"
     )
+    parser.add_argument(
+        "--parameter-alignment", type=Path, help="Separate calibration-only alignment revision"
+    )
     parser.add_argument("--output-dir", required=True)
     arguments = parser.parse_args()
     if arguments.test_dir:
         if not arguments.validation_dir:
             parser.error("--test-dir requires --validation-dir for the recorded training traces")
         result = analyse_test(
-            Path(arguments.test_dir), Path(arguments.validation_dir), Path(arguments.output_dir)
+            Path(arguments.test_dir),
+            Path(arguments.validation_dir),
+            Path(arguments.output_dir),
+            parameter_alignment=arguments.parameter_alignment,
         )
     else:
+        if arguments.parameter_alignment is not None:
+            parser.error("--parameter-alignment requires --test-dir")
         result = analyse(Path(arguments.batch_dir), Path(arguments.output_dir))
     print(json.dumps({"figures": result["figures"], "paired": result["paired"]}, indent=2))
 

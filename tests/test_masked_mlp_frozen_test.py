@@ -14,6 +14,7 @@ from diagnostics.shared.data import PrepareConfig, prepare
 from diagnostics.shared.io import read_json, sha
 from diagnostics.shared.source_data import PrepareConfig as SourcePrepareConfig
 from diagnostics.shared.source_data import prepare as prepare_source
+from scjepa.data.datasets import canonical_fingerprint
 from scjepa.experiments.storage import write_json
 
 
@@ -91,9 +92,19 @@ def test_declaration_does_not_load_test_and_evaluation_preserves_endpoints(
         dense_steps=1,
         sparse_steps=1,
     )
-    assert not any(Path(path).name in {"test.pt", "test_states.pt"} for path in loaded)
+    assert not any(
+        Path(path).name in {"validation.pt", "test.pt", "test_states.pt"} for path in loaded
+    )
     assert len(protocol["runs"]) == 3
-    assert all(item["parameter_alignment_fit_split"] == "validation" for item in protocol["runs"])
+    assert all(item["parameter_alignment_fit_split"] == "calibration" for item in protocol["runs"])
+    alignment_path = tmp_path / "revision/alignment.json"
+    loaded.clear()
+    revision = frozen_test.align_parameters(output / "protocol.json", alignment_path)
+    assert loaded
+    assert all(Path(path).name == "calibration.pt" for path in loaded)
+    for frozen, revised in zip(protocol["runs"], revision["runs"], strict=True):
+        assert revised["parameter_columns"] == frozen["parameter_columns"]
+    assert read_json(output / "protocol.json") == protocol
     frozen_test.evaluate_seed(output / "protocol.json", 0, device="cpu", wandb_mode="disabled")
     assert any(Path(path).name == "test.pt" for path in loaded)
     result = frozen_test.summarize(output / "protocol.json")
@@ -114,12 +125,17 @@ def test_declaration_does_not_load_test_and_evaluation_preserves_endpoints(
     monkeypatch.setattr(paper_analysis, "_matched_code_correlation", forbidden)
     plotted, declaration = paper_analysis.load_test_batch(output)
     assert declaration == protocol
+    revised_plots, _ = paper_analysis.load_test_batch(output, parameter_alignment=alignment_path)
     for frozen in protocol["runs"]:
         item = plotted[frozen["arm"]][frozen["seed"]]
         assert item.code_columns == [
             frozen["parameter_columns"][k] for k in paper_analysis.PAIR_ORDER
         ]
         assert item.columns == frozen["matching"]["online_columns"]
+        updated = revised_plots[frozen["arm"]][frozen["seed"]]
+        assert updated.metrics == item.metrics
+        np.testing.assert_array_equal(updated.code_correlation, item.code_correlation)
+        np.testing.assert_array_equal(updated.graphs["parameter"], item.graphs["parameter"])
     chance = {
         name: {"mcc_mean": 0.8, "mcc_p05": 0.6, "mcc_p95": 0.9}
         for name in ("any_rotation", "within_block")
@@ -143,3 +159,25 @@ def test_declaration_does_not_load_test_and_evaluation_preserves_endpoints(
     write_json(output / "altered.json", altered)
     with pytest.raises(ValueError, match="declaration changed"):
         frozen_test.evaluate_seed(output / "altered.json", 0, device="cpu", wandb_mode="disabled")
+    # A separately recorded permutation must reorder existing columns, never refit on test.
+    revised = revision["runs"][-1]
+    first, second = revised["parameter_columns"][:2]
+    revised["parameter_columns"][:2] = [second, first]
+    revision["identity"] = canonical_fingerprint(
+        {k: v for k, v in revision.items() if k != "identity"}
+    )
+    write_json(alignment_path, revision)
+    remapped, _ = paper_analysis.load_test_batch(output, parameter_alignment=alignment_path)
+    expected = plotted["full"][0].code_correlation
+    assert expected is not None
+    # Display order is (theta1, theta4, theta2, theta5, theta3, theta6).
+    np.testing.assert_array_equal(
+        remapped["full"][0].code_correlation, expected[:, [2, 1, 0, 3, 4, 5]]
+    )
+    revision["runs"].pop()
+    revision["identity"] = canonical_fingerprint(
+        {k: v for k, v in revision.items() if k != "identity"}
+    )
+    write_json(alignment_path, revision)
+    with pytest.raises(ValueError, match="every endpoint"):
+        paper_analysis.load_test_batch(output, parameter_alignment=alignment_path)
