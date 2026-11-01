@@ -7,6 +7,7 @@ import torch
 from torch import Tensor, nn
 
 from diagnostics.masked_mlp_oracle.model import (
+    Activation,
     MaskedTrunkPredictor,
     build_control,
     build_predictor,
@@ -36,6 +37,7 @@ def _with_block_state_masks(predictor: MaskedTrunkPredictor) -> MaskedTrunkPredi
 def _recharted(predictor: MaskedTrunkPredictor, rotation: Tensor) -> MaskedTrunkPredictor:
     """Absorb z' = M z into the trunk's state columns and the per-output readouts."""
     copy = MaskedTrunkPredictor(
+        activation=predictor.activation,
         learn_state=predictor.state_logits is not None,
         learn_action=predictor.action_logits is not None,
         learn_parameter=predictor.parameter_logits is not None,
@@ -98,17 +100,22 @@ def test_dense_is_the_parameter_matched_global_mlp_and_arms_are_paired() -> None
     assert not torch.equal(other.first.weight, reference.first.weight)
 
 
-def test_baseline_is_exactly_equivariant_and_complementary_theta_masks_break_it() -> None:
+@pytest.mark.parametrize("activation", ["relu", "gelu"])
+def test_baseline_is_exactly_equivariant_and_complementary_theta_masks_break_it(
+    activation: Activation,
+) -> None:
     rotation = _block_orthogonal(3)
     states, parameters, actions = _inputs()
-    baseline = _with_block_state_masks(build_predictor("baseline").double()).eval()
+    baseline = _with_block_state_masks(
+        build_predictor("baseline", activation=activation).double()
+    ).eval()
     moved = _recharted(baseline, rotation)
     with torch.no_grad():
         expected = baseline(states, parameters, actions).prediction @ rotation.T
         actual = moved(states @ rotation.T, parameters, actions).prediction
     torch.testing.assert_close(actual, expected, rtol=0, atol=1e-12)
 
-    full = _with_block_state_masks(build_predictor("full").double()).eval()
+    full = _with_block_state_masks(build_predictor("full", activation=activation).double()).eval()
     assert full.parameter_logits is not None
     own_or_partner = torch.eye(6, dtype=torch.bool) | torch.eye(6, dtype=torch.bool).roll(3, 1)
     with torch.no_grad():
@@ -161,3 +168,30 @@ def test_shapes_are_validated() -> None:
         predictor(states, parameters, None)
     with pytest.raises(ValueError, match="states"):
         predictor(states[:, :, :5], parameters, actions)
+
+
+def test_gelu_is_differentiable_through_zero_and_closed_inputs_stay_excluded() -> None:
+    predictor = (
+        MaskedTrunkPredictor(
+            state_dim=2, action_dim=1, param_dim=2, hidden_dim=3, activation="gelu"
+        )
+        .double()
+        .eval()
+    )
+    assert predictor.parameter_logits is not None
+    with torch.no_grad():
+        predictor.first.bias.zero_()
+        predictor.second.bias.zero_()
+        predictor.parameter_logits[:, 0] = -3
+    states = torch.zeros(1, 1, 2, dtype=torch.float64, requires_grad=True)
+    codes = torch.zeros(1, 2, dtype=torch.float64, requires_grad=True)
+    actions = torch.zeros(1, 1, 1, dtype=torch.float64, requires_grad=True)
+
+    def predict(z: Tensor, theta: Tensor, a: Tensor) -> Tensor:
+        return predictor(z, theta, a).prediction
+
+    assert torch.autograd.gradcheck(predict, (states, codes, actions))
+    assert torch.autograd.gradgradcheck(predict, (states, codes, actions))
+    gradient = torch.autograd.grad(predict(states, codes, actions).sum(), codes)[0]
+    assert float(gradient[0, 0]) == 0
+    assert float(gradient[0, 1]) != 0

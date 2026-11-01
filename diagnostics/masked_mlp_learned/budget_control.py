@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from diagnostics.masked_mlp_learned.run import TrainConfig, train
+from diagnostics.masked_mlp_oracle.model import ACTIVATIONS
 from diagnostics.shared.io import sha
 
 SCHEMA = "masked-mlp-sparse-budget-control-v1"
@@ -53,6 +54,7 @@ def main() -> None:
     parser.add_argument("--calibration-dir", required=True)
     parser.add_argument("--init-dir", required=True)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--predictor-activation", choices=ACTIVATIONS, default="relu")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--wandb-mode", default="disabled")
     parser.add_argument("--wandb-project", default="sparse_causal_jepa")

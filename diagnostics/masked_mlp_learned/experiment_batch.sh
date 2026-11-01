@@ -11,6 +11,11 @@ log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 run_job() {
   local name=$1 status=0
   shift
+  local free
+  free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)
+  [[ "$free" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]] && [ "$free" -ge 6144 ] || {
+    log "insufficient GPU memory before $name: $free MiB"; exit 2;
+  }
   mkdir "$BATCH/$name"
   printf '%q ' "$PYTHON" -u -m "$@" > "$BATCH/$name/command.sh"
   printf '\n' >> "$BATCH/$name/command.sh"
@@ -23,14 +28,16 @@ run_job() {
 
 if [ "${1:-}" = worker ]; then
   PHASE=$2 BATCH=$3 DATA=$4 SEED=$5
+  ACTIVATION=${6:-relu}
   trap 'status=$?; printf "%s\n" "$status" > "$BATCH/$PHASE-s$SEED.exit"' EXIT
-  LOGGING=(--wandb-mode online --wandb-project sparse_causal_jepa
+  TRAIN_OPTIONS=(--predictor-activation "$ACTIVATION"
+    --wandb-mode online --wandb-project sparse_causal_jepa
     --wandb-entity jesse-hoekstra-university-of-oxford --wandb-group "$(basename "$BATCH")")
   if [ "$PHASE" = warmup ]; then
     run_job "states-s$SEED" diagnostics.masked_mlp_learned.run train \
       --data-dir "$DATA" --output-dir "$BATCH/states-s$SEED/results" \
       --condition dense --seed "$SEED" --steps 100000 --code-dim 12 \
-      --initializer shared_feature --device cuda "${LOGGING[@]}"
+      --initializer shared_feature --device cuda "${TRAIN_OPTIONS[@]}"
     CANDIDATES=()
     for ATTEMPT in {0..15}; do
       NAME=acquisition-$ATTEMPT-s$SEED
@@ -38,7 +45,7 @@ if [ "${1:-}" = worker ]; then
         --data-dir "$DATA" --output-dir "$BATCH/$NAME/results" \
         --condition dense --seed "$SEED" --steps 100000 --code-dim 12 \
         --initializer shared_feature --states-from "$BATCH/states-s$SEED/results" \
-        --acquisition-seed "$((1000 + 100 * ATTEMPT + SEED))" --device cuda "${LOGGING[@]}"
+        --acquisition-seed "$((1000 + 100 * ATTEMPT + SEED))" --device cuda "${TRAIN_OPTIONS[@]}"
       CANDIDATES+=("$BATCH/$NAME/results")
     done
     "$PYTHON" -m diagnostics.masked_mlp_learned.selection --runs "${CANDIDATES[@]}" \
@@ -53,13 +60,13 @@ if [ "${1:-}" = worker ]; then
     run_job "dense-s$SEED" diagnostics.masked_mlp_learned.run train \
       --data-dir "$DATA" --output-dir "$BATCH/dense-s$SEED/results" \
       --condition dense --seed "$SEED" --steps 50000 \
-      --adapt-from "$BATCH/projected-s$SEED/results" --device cuda "${LOGGING[@]}"
+      --adapt-from "$BATCH/projected-s$SEED/results" --device cuda "${TRAIN_OPTIONS[@]}"
   elif [ "$PHASE" = sparse ]; then
     for CONDITION in baseline full; do
       run_job "$CONDITION-s$SEED" diagnostics.masked_mlp_learned.budget_control \
         --data-dir "$DATA" --output-dir "$BATCH/$CONDITION-s$SEED/results" \
         --condition "$CONDITION" --seed "$SEED" --init-dir "$BATCH/dense-s$SEED/results" \
-        --calibration-dir "$BATCH/calibration" --device cuda "${LOGGING[@]}"
+        --calibration-dir "$BATCH/calibration" --device cuda "${TRAIN_OPTIONS[@]}"
     done
   else
     log "unknown worker phase: $PHASE"
@@ -73,6 +80,10 @@ if [ "$#" -ne 9 ]; then
   exit 2
 fi
 BATCH=$1 DATA=$2 SIGMA=$3 TAU_FACTOR=$4
+ACTIVATION=${PREDICTOR_ACTIVATION:-relu}
+[[ "$ACTIVATION" = relu || "$ACTIVATION" = gelu ]] || {
+  echo "PREDICTOR_ACTIVATION must be relu or gelu" >&2; exit 2;
+}
 shift 4
 HOSTS=("$@")
 [[ "$BATCH" = /* && "$DATA" = /* ]] || { echo "paths must be absolute" >&2; exit 2; }
@@ -84,14 +95,16 @@ HOSTS=("$@")
 }
 mkdir -p "$BATCH"
 cp "$0" "$BATCH/launch-source.sh"
-printf '%q ' bash "$CODE_DIR/diagnostics/masked_mlp_learned/experiment_batch.sh" \
+printf '%q ' env "PREDICTOR_ACTIVATION=$ACTIVATION" \
+  bash "$CODE_DIR/diagnostics/masked_mlp_learned/experiment_batch.sh" \
   "$BATCH" "$DATA" "$SIGMA" "$TAU_FACTOR" "${HOSTS[@]}" > "$BATCH/launch-command.sh"
 printf '\n' >> "$BATCH/launch-command.sh"
 git rev-parse HEAD > "$BATCH/source-commit.txt"
 cat > "$BATCH/protocol.txt" <<EOF
-Hypothesis: the five-seed state/graph recovery result persists with sigma=$SIGMA
-and tau=$TAU_FACTOR times the adapted seed-zero calibration MSE.
-Only these two scientific settings change. Data seed=0; observation seed=1729.
+Hypothesis: the five-seed state/graph recovery result persists with predictor
+activation=$ACTIVATION, sigma=$SIGMA, and tau=$TAU_FACTOR times the adapted
+seed-zero calibration MSE. Other scientific settings remain fixed.
+Data seed=0; observation seed=1729.
 Seeds=0..4; hosts=${HOSTS[*]}; code=$CODE_DIR; data=$DATA.
 Warm-up=joint12-code100k;16 frozen-state restarts100k;TRAIN-only selection;
 last5000 mean <=.025;12-to-6 shared-covariance projection;adapt50k.
@@ -156,7 +169,7 @@ for PHASE in warmup sparse; do
     "$PYTHON" -m diagnostics.masked_mlp_learned.bound_control \
       --calibration-dir "$BATCH/calibration-original" --output-dir "$BATCH/calibration" \
       --tau-factor "$TAU_FACTOR" \
-      --hypothesis "Recovery persists with sigma=$SIGMA and tau=$TAU_FACTOR times calibration MSE; all other settings fixed." \
+      --hypothesis "Recovery persists with activation=$ACTIVATION, sigma=$SIGMA and tau=$TAU_FACTOR times calibration MSE; all other settings fixed." \
       > "$BATCH/calibration.log" 2>&1
   fi
   for seed in {0..4}; do
@@ -166,7 +179,7 @@ for PHASE in warmup sparse; do
     {
       printf '#!/usr/bin/env bash\nexec '
       printf '%q ' bash "$CODE_DIR/diagnostics/masked_mlp_learned/experiment_batch.sh" \
-        worker "$PHASE" "$BATCH" "$DATA" "$seed"
+        worker "$PHASE" "$BATCH" "$DATA" "$seed" "$ACTIVATION"
       printf '> %q 2>&1\n' "$BATCH/$PHASE-s$seed.log"
     } > "$worker"
     printf '%s\t%s\n' "$host" "$session" >> "$BATCH/sessions.tsv"

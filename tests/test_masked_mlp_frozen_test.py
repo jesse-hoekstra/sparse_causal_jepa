@@ -10,6 +10,7 @@ import torch
 
 from diagnostics.masked_mlp_learned import frozen_test, run
 from diagnostics.masked_mlp_oracle import paper_analysis
+from diagnostics.masked_mlp_oracle.model import Activation
 from diagnostics.shared.data import PrepareConfig, prepare
 from diagnostics.shared.io import read_json, sha
 from diagnostics.shared.source_data import PrepareConfig as SourcePrepareConfig
@@ -28,7 +29,7 @@ def one_thread() -> Iterator[None]:
         torch.set_num_threads(previous)
 
 
-def _batch(root: Path) -> None:
+def _batch(root: Path, activation: Activation) -> None:
     prepare_source(
         SourcePrepareConfig(
             str(root / "source"),
@@ -51,6 +52,7 @@ def _batch(root: Path) -> None:
             batch_size=2,
             code_dim=6,
             initializer="native",
+            predictor_activation=activation,
         )
     )
     bound = root / "bound"
@@ -66,14 +68,16 @@ def _batch(root: Path) -> None:
                 batch_size=2,
                 calibration_dir=str(bound),
                 init_dir=str(dense),
+                predictor_activation=activation,
             )
         )
 
 
+@pytest.mark.parametrize("activation", ["relu", "gelu"])
 def test_declaration_does_not_load_test_and_evaluation_preserves_endpoints(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, activation: Activation
 ) -> None:
-    _batch(tmp_path)
+    _batch(tmp_path, activation)
     before = {str(path): sha(path) for path in (tmp_path / "batch").rglob("*") if path.is_file()}
     loaded: list[str] = []
     original = torch.load
@@ -96,6 +100,7 @@ def test_declaration_does_not_load_test_and_evaluation_preserves_endpoints(
         Path(path).name in {"validation.pt", "test.pt", "test_states.pt"} for path in loaded
     )
     assert len(protocol["runs"]) == 3
+    assert all(item["predictor_activation"] == activation for item in protocol["runs"])
     assert all(item["parameter_alignment_fit_split"] == "calibration" for item in protocol["runs"])
     alignment_path = tmp_path / "revision/alignment.json"
     loaded.clear()

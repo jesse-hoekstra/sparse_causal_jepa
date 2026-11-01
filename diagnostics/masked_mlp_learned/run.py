@@ -9,8 +9,8 @@ no parameter regularizer or consistency loss.
 The final protocol uses joint dense twelve-code training, sixteen frozen-state
 acquisition restarts selected by TRAIN loss, shared-covariance projection to six
 codes, and frozen-state forecast adaptation. Baseline and full share the adapted
-endpoint. The explicit ``bound_control`` and ``budget_control`` entry points fix
-the final .8 calibration factor and 300k sparse budget, preserving the original
+endpoint. The explicit ``bound_control`` and ``budget_control`` entry points declare
+the calibration factor and 300k sparse budget, preserving the original
 runner's configuration guards and authenticated ancestry. See README.md for the
 complete schedule and publication/REPRODUCING.md for commands.
 """
@@ -38,6 +38,8 @@ from diagnostics.masked_mlp_learned.acquisition import (
 )
 from diagnostics.masked_mlp_oracle import run as oracle
 from diagnostics.masked_mlp_oracle.model import (
+    ACTIVATIONS,
+    Activation,
     MaskedTrunkPredictor,
     _gaussian_,  # pyright: ignore[reportPrivateUsage]
     trunk_width,
@@ -87,6 +89,7 @@ def build_control(
     seed: int,
     code_dim: int = SPARSE_CODE_DIM,
     initializer: Initializer = "native",
+    predictor_activation: Activation = "relu",
 ) -> SCJEPA:
     """Pair encoder, parameter encoder, trunk and readouts across conditions for one seed.
 
@@ -135,6 +138,7 @@ def build_control(
             raise ValueError("Unknown masked MLP condition")
         sparse = condition != "dense"
         predictor = MaskedTrunkPredictor(
+            activation=predictor_activation,
             param_dim=code_dim,
             learn_state=sparse,
             learn_action=sparse,
@@ -395,6 +399,7 @@ class TrainConfig:
     geco_step_size: float = 0.1
     code_dim: int | None = None
     initializer: Initializer | None = None
+    predictor_activation: Activation = "relu"
     device: str = "cpu"
     threads: int = 1
     log_every: int = 100
@@ -437,6 +442,8 @@ class TrainConfig:
             raise ValueError(f"code dimension must be one of {CODE_DIMS}")
         if self.initializer is not None and self.initializer not in INITIALIZERS:
             raise ValueError(f"initializer must be one of {INITIALIZERS}")
+        if self.predictor_activation not in ACTIVATIONS:
+            raise ValueError(f"predictor_activation must be one of {ACTIVATIONS}")
         if self.profile == "exploratory":
             if (self.batch_size, self.lr, self.grad_clip) != (16, 0.001, 1.0):
                 raise ValueError("exploratory optimizer settings are fixed")
@@ -501,6 +508,19 @@ def verify_completion(
         if Path(name).name != name or sha(directory / name) != expected:
             raise ValueError(f"artifact hash differs: {name}")
     return result
+
+
+def endpoint_activation(completion: Mapping[str, Any]) -> Activation:
+    """Read the recorded activation; historical endpoints without the field use ReLU."""
+    value = completion.get("predictor_activation", "relu")
+    if value not in ACTIVATIONS:
+        raise ValueError("unknown endpoint predictor activation")
+    return value
+
+
+def _check_activation(completion: Mapping[str, Any], config: TrainConfig) -> None:
+    if endpoint_activation(completion) != config.predictor_activation:
+        raise ValueError("source and requested predictor activation differ")
 
 
 def _fresh_output(output: Path) -> None:
@@ -581,6 +601,7 @@ def calibrate(config: CalibrateConfig) -> dict[str, Any]:
             "data_identity": completion["data_identity"],
             "tau_prediction": config.tau_factor * prediction,
             "tau_factor": config.tau_factor,
+            "predictor_activation": endpoint_activation(completion),
             "reference": {
                 "directory": str(directory),
                 "kind": completion["kind"],
@@ -606,6 +627,7 @@ def _calibration(config: TrainConfig, data_identity: str) -> dict[str, Any] | No
     directory = Path(config.calibration_dir)
     completion = verify_completion(directory, kind="calibration", require_current_source=True)
     record = read_json(directory / "calibration.json")
+    _check_activation(record, config)
     if record["identity"] != completion["identity"] or record["profile"] != config.profile:
         raise ValueError("calibration identity or profile differs")
     if record["data_identity"] != data_identity:
@@ -621,6 +643,7 @@ def _dense_endpoint(config: TrainConfig, data_identity: str) -> dict[str, Any] |
         return None
     directory = Path(config.init_dir).resolve()
     completion = _six_code_dense(directory, config.profile)
+    _check_activation(completion, config)
     if completion["seed"] != config.seed:
         raise ValueError("initialization must be the seed-matched dense endpoint")
     if completion["data_identity"] != data_identity:
@@ -659,6 +682,7 @@ def _adaptation_source(config: TrainConfig, data_identity: str) -> dict[str, Any
         return None
     directory = Path(config.adapt_from).resolve()
     completion = verify_completion(directory, kind="projection")
+    _check_activation(completion, config)
     if (
         completion["condition"] != "dense"
         or completion["code_dim"] != SPARSE_CODE_DIM
@@ -695,6 +719,7 @@ def _state_source(config: TrainConfig, data_identity: str) -> dict[str, Any] | N
         return None
     directory = Path(config.states_from).resolve()
     completion = verify_completion(directory, kind="train")
+    _check_activation(completion, config)
     if completion["condition"] != "dense" or completion["seed"] != config.seed:
         raise ValueError("state encoders must come from the seed-matched dense endpoint")
     if completion["profile"] != config.profile or completion["data_identity"] != data_identity:
@@ -866,7 +891,8 @@ def _scientific_config(config: TrainConfig) -> dict[str, Any]:
         "ema_decay": 0.996,
         "weight_decay": 0.0,
         "predictor": (
-            f"shared {30 + code_dim}-{trunk_width()}-{trunk_width()} ReLU trunk, "
+            f"shared {30 + code_dim}-{trunk_width()}-{trunk_width()} "
+            f"{config.predictor_activation} trunk, "
             "per-output readouts"
         ),
         "forecast": "attached two-step prediction from online state 9; EMA targets 10/11",
@@ -917,6 +943,7 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
         config.initialization_seed,
         config.model_code_dim,
         config.model_initializer,
+        config.predictor_activation,
     ).to(device)
     initialization: dict[str, Any] | None = None
     if resume:
@@ -1167,6 +1194,7 @@ def _train(config: TrainConfig, output: Path, *, resume: bool) -> dict[str, Any]
             "condition": config.condition,
             "seed": config.seed,
             "code_dim": config.model_code_dim,
+            "predictor_activation": config.predictor_activation,
             "steps": config.steps,
             "successful_updates": config.steps,
             "skipped_updates": 0,
@@ -1237,9 +1265,14 @@ def project(config: ProjectConfig) -> dict[str, Any]:
         if int(checkpoint["step"]) != int(completion["steps"]):
             raise ValueError("dense checkpoint is not the final endpoint")
         seed = int(completion["seed"])
-        source = build_control("dense", seed, int(completion["code_dim"])).to(device)
+        activation = endpoint_activation(completion)
+        source = build_control(
+            "dense", seed, int(completion["code_dim"]), predictor_activation=activation
+        ).to(device)
         source.load_state_dict(checkpoint["model"], strict=True)
-        model = build_control("dense", seed, SPARSE_CODE_DIM).to(device)
+        model = build_control("dense", seed, SPARSE_CODE_DIM, predictor_activation=activation).to(
+            device
+        )
         receipt = project_code(source, model, data["train"], device)
         objective = TrainingObjective(objective_config("dense", 0.0), GECOConfig()).to(device)
         results, matching = _collect(model, data, config.batch_size, device, objective, None)
@@ -1255,6 +1288,7 @@ def project(config: ProjectConfig) -> dict[str, Any]:
                 "code_dim": completion["code_dim"],
             },
             "projection": receipt,
+            "predictor_activation": activation,
             "policy": (
                 "top six TRAIN shared modes of the twelve-dimensional code; encoder output "
                 "rows composed with the projection, predictor code columns with its "
@@ -1299,6 +1333,7 @@ def project(config: ProjectConfig) -> dict[str, Any]:
             "condition": "dense",
             "seed": seed,
             "code_dim": SPARSE_CODE_DIM,
+            "predictor_activation": activation,
             "steps": completion["steps"],
             "data_identity": completion["data_identity"],
             "source": specification["source"],
@@ -1372,6 +1407,7 @@ def main() -> None:
     train_parser.add_argument("--geco-step-size", type=float, default=0.1)
     train_parser.add_argument("--code-dim", type=int, choices=CODE_DIMS)
     train_parser.add_argument("--initializer", choices=INITIALIZERS)
+    train_parser.add_argument("--predictor-activation", choices=ACTIVATIONS, default="relu")
     train_parser.add_argument("--device", default="cpu")
     train_parser.add_argument("--threads", type=int, default=1)
     train_parser.add_argument("--resume", action="store_true")
@@ -1414,6 +1450,7 @@ def main() -> None:
                 geco_step_size=arguments.geco_step_size,
                 code_dim=arguments.code_dim,
                 initializer=arguments.initializer,
+                predictor_activation=arguments.predictor_activation,
                 device=arguments.device,
                 threads=arguments.threads,
                 wandb_mode=arguments.wandb_mode,

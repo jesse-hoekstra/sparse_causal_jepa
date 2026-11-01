@@ -16,7 +16,7 @@ from diagnostics.masked_mlp_learned import (
     budget_control,
 )
 from diagnostics.masked_mlp_learned import run as runner
-from diagnostics.masked_mlp_oracle.model import INITIAL_LOGIT
+from diagnostics.masked_mlp_oracle.model import INITIAL_LOGIT, Activation
 from diagnostics.shared.data import PrepareConfig, prepare
 from diagnostics.shared.io import read_json
 from diagnostics.shared.oracle import EvaluationResult
@@ -73,8 +73,8 @@ def _checkpoint(path: Path) -> dict[str, Any]:
     return cast(dict[str, Any], torch.load(path, weights_only=False, map_location="cpu"))
 
 
-def _dense_and_bound(root: Path) -> None:
-    runner.train(_config(root, "dense"))
+def _dense_and_bound(root: Path, activation: Activation = "relu") -> None:
+    runner.train(replace(_config(root, "dense"), predictor_activation=activation))
     runner.project(
         runner.ProjectConfig(
             str(root / "projected-s0"), str(root / "dense-s0"), str(root / "data"), profile="smoke"
@@ -354,15 +354,16 @@ def test_budget_control_binds_source_and_preserves_exact_resume(
         runner.train(changed, resume=True)
 
 
-def test_projection_is_exact_for_a_six_dimensional_code() -> None:
-    source = runner.build_control("dense", 0, 12, "gain")
+@pytest.mark.parametrize("activation", ["relu", "gelu"])
+def test_projection_is_exact_for_a_six_dimensional_code(activation: Activation) -> None:
+    source = runner.build_control("dense", 0, 12, "gain", activation)
     output = cast(torch.nn.Sequential, source.parameter_encoder.head)[4]
     assert isinstance(output, torch.nn.Linear)
     mixing = torch.randn(6, 6, generator=torch.Generator().manual_seed(2))
     with torch.no_grad():
         output.weight[6:] = mixing @ output.weight[:6]
         output.bias[6:] = mixing @ output.bias[:6] + 0.3
-    target = runner.build_control("dense", 0, 6)
+    target = runner.build_control("dense", 0, 6, predictor_activation=activation)
     train = _train_split()
     receipt = acquisition.project_code(source, target, train, torch.device("cpu"))
     assert receipt["reconstructed_variance_fraction"] > 1 - 1e-6
@@ -380,11 +381,12 @@ def test_projection_is_exact_for_a_six_dimensional_code() -> None:
         )
 
 
+@pytest.mark.parametrize("activation", ["relu", "gelu"])
 def test_projected_adaptation_preserves_states_and_supports_exact_resume_and_sparse_transfer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, activation: Activation
 ) -> None:
     _prepare(tmp_path)
-    _dense_and_bound(tmp_path)
+    _dense_and_bound(tmp_path, activation)
     projected = tmp_path / "projected-s0"
     source = _checkpoint(projected / "last.pt")["model"]
     original_identity = runner.verify_completion(projected)["code_identity"]
@@ -392,7 +394,15 @@ def test_projected_adaptation_preserves_states_and_supports_exact_resume_and_spa
         _config(tmp_path, "dense"),
         output_dir=str(tmp_path / "adapted-s0"),
         adapt_from=str(projected),
+        predictor_activation=activation,
     )
+    wrong_activation = replace(
+        config,
+        output_dir=str(tmp_path / "wrong-activation"),
+        predictor_activation="relu" if activation == "gelu" else "gelu",
+    )
+    with pytest.raises(ValueError, match="predictor activation differ"):
+        runner.train(wrong_activation)
     seen: list[set[str]] = []
     actual = runner.forward_loss
 
@@ -424,6 +434,7 @@ def test_projected_adaptation_preserves_states_and_supports_exact_resume_and_spa
         assert completion["adaptation_source"]["code_identity"] == original_identity
         assert completion["code_identity"] == "f" * 64
         assert completion["code_dim"] == 6
+        assert completion["predictor_activation"] == activation
         initial = _checkpoint(tmp_path / "adapted-s0/initial.pt")["model"]
         final = _checkpoint(tmp_path / "adapted-s0/last.pt")["model"]
         torch.testing.assert_close(initial, source, rtol=0, atol=0)
@@ -447,9 +458,14 @@ def test_projected_adaptation_preserves_states_and_supports_exact_resume_and_spa
         bound = tmp_path / "adapted-bound"
         runner.calibrate(runner.CalibrateConfig(str(bound), config.output_dir, profile="smoke"))
         full = replace(
-            _config(tmp_path, "full"), init_dir=config.output_dir, calibration_dir=str(bound)
+            _config(tmp_path, "full"),
+            init_dir=config.output_dir,
+            calibration_dir=str(bound),
+            predictor_activation=activation,
         )
         runner.train(full)
+        assert runner.endpoint_activation(runner.verify_completion(projected)) == activation
+        assert runner.endpoint_activation(runner.verify_completion(bound)) == activation
         sparse_initial = _checkpoint(tmp_path / "full-s0/initial.pt")["model"]
         sparse_final = _checkpoint(tmp_path / "full-s0/last.pt")["model"]
         for key, value in final.items():
@@ -526,6 +542,20 @@ def test_acquisition_restart_changes_initialization_not_states_or_sampling(
         replace(config, states_from=None)
     with pytest.raises(ValueError, match="integer"):
         replace(config, acquisition_seed=-1)
+
+
+def test_activation_changes_only_the_predictor_function_not_initial_weights() -> None:
+    relu = runner.build_control("dense", 0, 12, "shared_feature", "relu").eval()
+    gelu = runner.build_control("dense", 0, 12, "shared_feature", "gelu").eval()
+    torch.testing.assert_close(relu.state_dict(), gelu.state_dict(), rtol=0, atol=0)
+    batch = _train_split(4).batch(torch.arange(4), "cpu")
+    with torch.no_grad():
+        left = relu(batch["observations"], batch["actions"]).predictions
+        right = gelu(batch["observations"], batch["actions"]).predictions
+    assert not torch.equal(left, right)
+    assert runner.endpoint_activation({}) == "relu"
+    with pytest.raises(ValueError, match="unknown endpoint predictor activation"):
+        runner.endpoint_activation({"predictor_activation": "unknown"})
 
 
 def test_acquisition_initializers_keep_everything_else() -> None:

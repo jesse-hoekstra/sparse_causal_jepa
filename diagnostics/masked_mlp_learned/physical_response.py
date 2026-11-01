@@ -338,7 +338,12 @@ def main() -> None:
     model = (
         oracle_run.build_control(completion["condition"], completion["seed"])
         if args.parameter_source == "oracle"
-        else run.build_control(completion["condition"], completion["seed"], completion["code_dim"])
+        else run.build_control(
+            completion["condition"],
+            completion["seed"],
+            completion["code_dim"],
+            predictor_activation=run.endpoint_activation(completion),
+        )
     )
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device=args.device, dtype=torch.float64).requires_grad_(False).eval()

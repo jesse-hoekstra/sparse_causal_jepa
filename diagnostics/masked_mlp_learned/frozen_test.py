@@ -105,6 +105,7 @@ def declare(
                     "parameter_alignment_fit_split": "calibration",
                     "batch_size": config["config"]["batch_size"],
                     "tau_prediction": completion["tau_prediction"],
+                    "predictor_activation": run.endpoint_activation(completion),
                 }
             )
     protocol: dict[str, Any] = {
@@ -264,7 +265,10 @@ def _evaluate_run(
     ):
         raise ValueError("Checkpoint or calibration differs from the declaration")
     condition = cast(run.Condition, frozen["arm"])
-    model = run.build_control(condition, frozen["seed"], 6)
+    activation = run.endpoint_activation(completion)
+    if activation != run.endpoint_activation(frozen):
+        raise ValueError("Predictor activation differs from the declaration")
+    model = run.build_control(condition, frozen["seed"], 6, predictor_activation=activation)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device).requires_grad_(False).eval()
     config = read_json(directory / "config.json")

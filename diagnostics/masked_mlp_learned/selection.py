@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from diagnostics.masked_mlp_learned.run import verify_completion
+from diagnostics.masked_mlp_learned.run import endpoint_activation, verify_completion
 from diagnostics.shared.io import read_json, sha
 from scjepa.data.datasets import canonical_fingerprint
 from scjepa.experiments.storage import write_json
@@ -58,7 +58,10 @@ def select(
         specification = {
             key: completion[key]
             for key in ("seed", "code_dim", "steps", "data_identity", "code_identity", "profile")
-        } | {"state_source_identity": source["identity"]}
+        } | {
+            "state_source_identity": source["identity"],
+            "predictor_activation": endpoint_activation(completion),
+        }
         if common is not None and common != specification:
             raise ValueError("acquisition candidates differ in parent, data, source or budget")
         common = specification

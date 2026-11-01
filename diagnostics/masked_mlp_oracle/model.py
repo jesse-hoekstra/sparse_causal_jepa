@@ -29,6 +29,8 @@ from scjepa.models.spartan import GraphBlocks, GraphPenalties, Spartan, SpartanO
 from scjepa.training.rng import preserve_rng
 
 type Condition = Literal["dense", "baseline", "full"]
+type Activation = Literal["relu", "gelu"]
+ACTIVATIONS: tuple[Activation, ...] = ("relu", "gelu")
 
 STATE_DIMENSION = 6
 PARAMETER_DIMENSION = 6
@@ -74,6 +76,7 @@ class MaskedTrunkPredictor(nn.Module):
         learn_parameter: bool = True,
         initial_logit: float = INITIAL_LOGIT,
         temperature: float = 1.0,
+        activation: Activation = "relu",
     ) -> None:
         """Build the trunk, per-output readouts and the selected learned mask blocks."""
         super().__init__()
@@ -83,6 +86,9 @@ class MaskedTrunkPredictor(nn.Module):
             raise ValueError("temperature must be finite and positive")
         if not math.isfinite(initial_logit):
             raise ValueError("initial_logit must be finite")
+        if activation not in ACTIVATIONS:
+            raise ValueError(f"activation must be one of {ACTIVATIONS}")
+        self.activation: Activation = activation
         hidden = trunk_width() if hidden_dim is None else hidden_dim
         if hidden < 1:
             raise ValueError("hidden_dim must be positive")
@@ -165,7 +171,8 @@ class MaskedTrunkPredictor(nn.Module):
             ),
             dim=-1,
         )
-        features = F.relu(self.second(F.relu(self.first(inputs))))
+        activate = F.gelu if self.activation == "gelu" else F.relu
+        features = activate(self.second(activate(self.first(inputs))))
         prediction = (features * self.readout_weight).sum(-1) + self.readout_bias
         rows = torch.cat((state_gates, action_gates, parameter_gates), dim=-1)
         tokens = rows.shape[-1]
@@ -195,13 +202,18 @@ class MaskedTrunkPredictor(nn.Module):
         )
 
 
-def build_predictor(condition: Condition) -> MaskedTrunkPredictor:
+def build_predictor(
+    condition: Condition, *, activation: Activation = "relu"
+) -> MaskedTrunkPredictor:
     """Dense opens every mask; baseline learns state/action; full learns all three."""
     if condition not in {"dense", "baseline", "full"}:
         raise ValueError("Unknown masked MLP condition")
     sparse = condition != "dense"
     return MaskedTrunkPredictor(
-        learn_state=sparse, learn_action=sparse, learn_parameter=condition == "full"
+        learn_state=sparse,
+        learn_action=sparse,
+        learn_parameter=condition == "full",
+        activation=activation,
     )
 
 
@@ -231,7 +243,9 @@ def build_control(condition: Condition, seed: int) -> SCJEPA:
 
 
 __all__ = [
+    "ACTIVATIONS",
     "INITIAL_LOGIT",
+    "Activation",
     "Condition",
     "MaskedTrunkPredictor",
     "build_control",

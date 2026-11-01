@@ -187,6 +187,11 @@ def project_code(
         raise TypeError("expected the masked MLP predictor")
     if predictor.learned_logits():
         raise ValueError("project the dense endpoint, before any mask is learned")
+    target_predictor = cast(nn.Module, target.predictor)
+    if not isinstance(target_predictor, MaskedTrunkPredictor):
+        raise TypeError("expected the masked MLP target predictor")
+    if predictor.activation != target_predictor.activation:
+        raise ValueError("projection must preserve the predictor activation")
     codes = train_contexts(source, data, device, codes=True)
     rows = codes.flatten(0, 1)
     mean = rows.mean(0)
