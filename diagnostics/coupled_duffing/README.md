@@ -10,6 +10,11 @@ python -m diagnostics.coupled_duffing.run prepare --output-dir DATA
 python -m diagnostics.coupled_duffing.run train --data-dir DATA --output-dir RUN --seed 0
 ```
 
+`experiment.py` provides the complete staged acquisition procedure: shared-feature
+initialization, an overcomplete code, fixed-budget acquisition restarts selected
+by training forecast loss, projection, adaptation and baseline training. Use its
+`prepare`, `train`, `select` and `project` subcommands for separately recorded stages.
+
 Use an immutable checkout for each batch. Model settings, calibration,
 checkpoints, source identity and evaluation assignments are retained with the
 run. A low state MCC is informative only alongside successful state retention,

@@ -140,18 +140,21 @@ def metrics(
     )
     output["parameter_retention/min_r2"] = float(code_scores.min())
     output["parameter_retention/mean_r2"] = float(code_scores.mean())
-    cal_theta = (
-        calibration_labels["theta"][:cal_n, None].expand_as(calibration["codes"]).reshape(-1, 4)
-    )
-    val_theta = (
-        validation_labels["theta"][:val_n, None].expand_as(validation["codes"]).reshape(-1, 4)
-    )
-    code_match = fit_coordinate_match(
-        calibration["codes"].reshape(-1, 4), cal_theta, method="pearson"
-    )
-    output["parameter_mcc"] = mean_correlation_coefficient(
-        code_match, validation["codes"].reshape(-1, 4), val_theta
-    )
+    # The overcomplete acquisition code has no square coordinate assignment.
+    # Complete-code retention is measured at both widths; MCC only after projection.
+    if calibration["codes"].shape[-1] == 4:
+        cal_theta = (
+            calibration_labels["theta"][:cal_n, None].expand_as(calibration["codes"]).reshape(-1, 4)
+        )
+        val_theta = (
+            validation_labels["theta"][:val_n, None].expand_as(validation["codes"]).reshape(-1, 4)
+        )
+        code_match = fit_coordinate_match(
+            calibration["codes"].reshape(-1, 4), cal_theta, method="pearson"
+        )
+        output["parameter_mcc"] = mean_correlation_coefficient(
+            code_match, validation["codes"].reshape(-1, 4), val_theta
+        )
     predictions, targets = validation["predictions"], validation["targets"]
     variance = float(targets.reshape(-1, 2).var(0, correction=0).mean())
     output["forecast/mse"] = prediction_mse(validation)
