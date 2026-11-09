@@ -6,7 +6,7 @@ import math
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 from torch import Tensor
@@ -14,7 +14,7 @@ from torch import Tensor
 from diagnostics.coupled_duffing.acquisition import initialize_shared_output, project
 from diagnostics.coupled_duffing.data import DataConfig, prepare
 from diagnostics.coupled_duffing.evaluate import collect, metrics, prediction_mse
-from diagnostics.coupled_duffing.model import LaggedPredictor, build_model
+from diagnostics.coupled_duffing.model import LaggedPredictor, ParameterArchitecture, build_model
 from diagnostics.coupled_duffing.run import code_identity, forward_loss, objective_for
 from diagnostics.masked_mlp_learned.selection import training_score
 from diagnostics.shared.io import read_json, save_torch, sha
@@ -53,11 +53,17 @@ class StageConfig:
     threads: int = 1
     wandb_mode: str = "online"
     wandb_group: str = "coupled-duffing-experiment1-20261108"
+    parameter_encoder: ParameterArchitecture = "mlp"
+    cache_device: Literal["model", "cpu"] = "model"
 
     def __post_init__(self) -> None:
         """Reject ambiguous stages or invalid fixed budgets before opening an output."""
         if self.phase not in BUDGETS:
             raise ValueError("unknown training phase")
+        if self.parameter_encoder not in {"mlp", "temporal-cnn"}:
+            raise ValueError("unknown parameter encoder architecture")
+        if self.cache_device not in {"model", "cpu"}:
+            raise ValueError("cache_device must be model or cpu")
         if (self.phase == "joint") != (self.source_dir is None):
             raise ValueError("only joint training starts without a source endpoint")
         if (self.phase == "acquisition") != (self.acquisition_seed is not None):
@@ -115,7 +121,11 @@ def load_model(
     """Load an authenticated model for a named next stage without using evaluation labels."""
     record = verify(directory)
     model = build_model(
-        record["seed"], context, code_dim=record["code_dim"], sparse=record["phase"] == "baseline"
+        record["seed"],
+        context,
+        code_dim=record["code_dim"],
+        sparse=record["phase"] == "baseline",
+        parameter_encoder=record.get("parameter_encoder", "mlp"),
     ).to(device)
     state = cast(
         dict[str, Any], torch.load(directory / "last.pt", map_location=device, weights_only=False)
@@ -156,10 +166,14 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     device = resolve_device(config.device)
     seed_everything(config.seed)
     data_dir, output = Path(config.data_dir), Path(config.output_dir)
-    data_record, inputs = load_data(data_dir, device)
+    data_record, inputs = load_data(
+        data_dir, torch.device("cpu") if config.cache_device == "cpu" else device
+    )
     context = int(data_record["config"]["context"])
     frozen = config.phase in {"acquisition", "adaptation"}
     model = build_model(
@@ -167,6 +181,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         context,
         code_dim=config.code_dim,
         sparse=config.phase == "baseline",
+        parameter_encoder=config.parameter_encoder,
     ).to(device)
     source: dict[str, Any] | None = None
     if config.source_dir is not None:
@@ -178,8 +193,9 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             record["phase"] != expected
             or record["seed"] != config.seed
             or record["data_identity"] != data_record["identity"]
+            or record.get("parameter_encoder", "mlp") != config.parameter_encoder
         ):
-            raise ValueError("source phase, training seed or data differs from this stage")
+            raise ValueError("source phase, training seed, architecture or data differs")
         source = _parent(record, config.source_dir)
         if config.phase == "acquisition":
             model.online_encoder.load_state_dict(inherited.online_encoder.state_dict())
@@ -205,6 +221,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "seed": config.seed,
         "steps": config.updates,
         "code_dim": config.code_dim,
+        "parameter_encoder": config.parameter_encoder,
         "code_identity": code_identity(),
         "data_identity": data_record["identity"],
         "source": source,
@@ -300,7 +317,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             name=f"duffing-{config.phase}-s{config.seed}"
             + (f"-a{config.acquisition_seed}" if config.acquisition_seed is not None else ""),
             job_type=config.phase,
-            tags=["duffing", "experiment1-protocol", "validation-only"],
+            tags=["duffing", "experiment1-protocol", "validation-only", config.parameter_encoder],
         ),
         resolved_config=cast(dict[str, object], specification),
         dataset_identity=data_record["identity"],
@@ -358,8 +375,8 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             model.train()
             if frozen:
                 model.online_encoder.eval()
-            indices = sampler.next().to(device)
-            batch = {name: values[indices] for name, values in inputs["train"].items()}
+            indices = sampler.next().to(inputs["train"]["observations"].device)
+            batch = {name: values[indices].to(device) for name, values in inputs["train"].items()}
             optimizer.zero_grad(set_to_none=True)
             torch.manual_seed((1 << 40) + config.seed + step)  # pyright: ignore[reportUnknownMemberType]
             with preserve_rng(device):
@@ -448,6 +465,7 @@ def select(
             key: record[key]
             for key in ("source", "seed", "steps", "code_dim", "data_identity", "code_identity")
         }
+        specification["parameter_encoder"] = record.get("parameter_encoder", "mlp")
         if common is not None and specification != common:
             raise ValueError("candidate budgets, source or data differ")
         common = specification
@@ -484,11 +502,17 @@ def select(
 
 
 def project_endpoint(
-    data_dir: Path, source_dir: Path, output_dir: Path, device_name: str = "cuda:0"
+    data_dir: Path,
+    source_dir: Path,
+    output_dir: Path,
+    device_name: str = "cuda:0",
+    cache_device: str = "model",
 ) -> None:
     """Project only the selected acquisition, preserving its source and an exact transfer record."""
     device = resolve_device(device_name)
-    record, inputs = load_data(data_dir, device)
+    if cache_device not in {"model", "cpu"}:
+        raise ValueError("cache_device must be model or cpu")
+    record, inputs = load_data(data_dir, torch.device("cpu") if cache_device == "cpu" else device)
     context = int(record["config"]["context"])
     source, inherited = load_model(source_dir, context, device)
     if (
@@ -497,7 +521,10 @@ def project_endpoint(
         or inherited["data_identity"] != record["identity"]
     ):
         raise ValueError("projection requires a matched eight-code acquisition endpoint")
-    target = build_model(inherited["seed"], context, code_dim=4).to(device)
+    architecture = inherited.get("parameter_encoder", "mlp")
+    target = build_model(inherited["seed"], context, code_dim=4, parameter_encoder=architecture).to(
+        device
+    )
     if output_dir.exists():
         raise FileExistsError(output_dir)
     output_dir.mkdir(parents=True)
@@ -507,6 +534,7 @@ def project_endpoint(
         "phase": "projection",
         "seed": inherited["seed"],
         "code_dim": 4,
+        "parameter_encoder": architecture,
         "code_identity": code_identity(),
         "data_identity": record["identity"],
         "source": _parent(inherited, str(source_dir)),
@@ -538,6 +566,8 @@ def main() -> None:
     run.add_argument("--device", default="cuda:0")
     run.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     run.add_argument("--wandb-group", default="coupled-duffing-experiment1-20261108")
+    run.add_argument("--parameter-encoder", choices=("mlp", "temporal-cnn"), default="mlp")
+    run.add_argument("--cache-device", choices=("model", "cpu"), default="model")
     run.add_argument("--resume", action="store_true")
     selection = sub.add_parser("select")
     selection.add_argument("--runs", nargs="+", type=Path, required=True)
@@ -546,6 +576,7 @@ def main() -> None:
     for name in ("data-dir", "source-dir", "output-dir"):
         projection.add_argument(f"--{name}", type=Path, required=True)
     projection.add_argument("--device-name", default="cuda:0")
+    projection.add_argument("--cache-device", choices=("model", "cpu"), default="model")
     args = vars(parser.parse_args())
     command = args.pop("command")
     torch.set_num_threads(1)

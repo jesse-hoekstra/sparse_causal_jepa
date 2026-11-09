@@ -21,6 +21,7 @@ def training_features(
     encoder = model.parameter_encoder
     if not isinstance(encoder, LaggedParameterEncoder):
         raise TypeError("expected a lagged transition encoder")
+    device = next(model.parameters()).device
     modes = [(module, module.training) for module in model.modules()]
     model.eval()
     pieces: list[Tensor] = []
@@ -29,6 +30,7 @@ def training_features(
             x = inputs["observations"][start : start + chunk, :, : model.context_len]
             a = inputs["actions"][start : start + chunk, :, : model.context_len - 1]
             groups, views = x.shape[:2]
+            x, a = x.to(device), a.to(device)
             states = model.online_encoder.encode_sequence(x.flatten(0, 1))
             features = encoder.features(states, a.flatten(0, 1))
             values = encoder.head[-1](features) if codes else features

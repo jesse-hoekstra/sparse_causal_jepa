@@ -14,6 +14,10 @@ python -m diagnostics.coupled_duffing.run train --data-dir DATA --output-dir RUN
 initialization, an overcomplete code, fixed-budget acquisition restarts selected
 by training forecast loss, projection, adaptation and baseline training. Use its
 `prepare`, `train`, `select` and `project` subcommands for separately recorded stages.
+The staged runner accepts `--parameter-encoder temporal-cnn` for temporal context
+features and `--cache-device cpu` for image caches larger than GPU memory.
+`python -m diagnostics.coupled_duffing.visual_data --source-dir PHYSICAL --output-dir IMAGES`
+renders an existing physical diagnostic cache without changing its trajectories.
 
 Use an immutable checkout for each batch. Model settings, calibration,
 checkpoints, source identity and evaluation assignments are retained with the

@@ -6,7 +6,7 @@ import torch
 from torch import Tensor, nn
 
 from diagnostics.coupled_duffing.data import DataConfig, generate, prepare, render
-from diagnostics.coupled_duffing.model import LaggedPredictor, build_model
+from diagnostics.coupled_duffing.model import LaggedPredictor, ParameterArchitecture, build_model
 from diagnostics.coupled_duffing.run import (
     TrainConfig,
     forward_loss,
@@ -77,10 +77,13 @@ def test_shared_coordinate_gate_closes_both_state_lags() -> None:
     assert bool(model.thresholded_graphs()["parameter"].all())
 
 
-def test_labels_rejected_and_attached_multistep_gradients(small_config: DataConfig) -> None:
+@pytest.mark.parametrize("architecture", ["mlp", "temporal-cnn"])
+def test_labels_rejected_and_attached_multistep_gradients(
+    small_config: DataConfig, architecture: ParameterArchitecture
+) -> None:
     inputs, labels = generate(4, 0, small_config)
     batch = {key: inputs[key] for key in ("observations", "actions")}
-    model = build_model(0, small_config.context)
+    model = build_model(0, small_config.context, parameter_encoder=architecture)
     objective = objective_for("joint", 0.4, torch.device("cpu"))
     with pytest.raises(ValueError, match="only observations and actions"):
         forward_loss(model, {**batch, "theta": labels["theta"]}, objective)
@@ -107,9 +110,12 @@ def test_labels_rejected_and_attached_multistep_gradients(small_config: DataConf
     assert all(p.grad is None for p in model.target_encoder.parameters())
 
 
-def test_context_has_no_future_leakage(small_config: DataConfig) -> None:
+@pytest.mark.parametrize("architecture", ["mlp", "temporal-cnn"])
+def test_context_has_no_future_leakage(
+    small_config: DataConfig, architecture: ParameterArchitecture
+) -> None:
     inputs, _ = generate(3, 0, small_config)
-    model = build_model(3, small_config.context).eval()
+    model = build_model(3, small_config.context, parameter_encoder=architecture).eval()
     with torch.no_grad():
         original = cast(ModelOutput, model(inputs["observations"], inputs["actions"]))
         images = inputs["observations"].clone()

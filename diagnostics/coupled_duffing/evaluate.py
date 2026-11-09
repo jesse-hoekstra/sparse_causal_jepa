@@ -32,6 +32,7 @@ def collect(
 ) -> dict[str, Tensor]:
     """Collect predictions and single-context codes without reading any reference labels."""
     model.eval()
+    device = next(model.parameters()).device
     count = (
         len(inputs["observations"]) if limit is None else min(limit, len(inputs["observations"]))
     )
@@ -39,8 +40,8 @@ def collect(
         name: [] for name in ("states", "codes", "targets", "predictions")
     }
     for start in range(0, count, batch_size):
-        x = inputs["observations"][start : start + batch_size]
-        a = inputs["actions"][start : start + batch_size]
+        x = inputs["observations"][start : start + batch_size].to(device)
+        a = inputs["actions"][start : start + batch_size].to(device)
         if shuffle:
             with shuffled_codes(model, x.shape[1]):
                 output = cast(ModelOutput, model(x, a))
@@ -189,5 +190,7 @@ def metrics(
     output["state_std/min"] = float(val_s.std(0).min())
     eigenvalues = cast(Tensor, torch.linalg.eigvalsh(torch.cov(val_s.T)))  # pyright: ignore[reportUnknownMemberType]
     output["state_covariance/min_eigenvalue"] = float(eigenvalues.min())
-    output["code_std/min"] = float(validation["codes"].reshape(-1, 4).std(0).min())
+    output["code_std/min"] = float(
+        validation["codes"].reshape(-1, validation["codes"].shape[-1]).std(0).min()
+    )
     return output
