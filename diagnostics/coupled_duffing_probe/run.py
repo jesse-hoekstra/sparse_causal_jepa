@@ -5,7 +5,7 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 from torch import Tensor
@@ -15,6 +15,7 @@ from diagnostics.coupled_duffing.evaluate import collect, prediction_mse, select
 from diagnostics.coupled_duffing.model import LaggedParameterEncoder, LaggedPredictor
 from diagnostics.coupled_duffing.run import code_identity as parent_identity
 from diagnostics.coupled_duffing_probe.data import window
+from diagnostics.coupled_duffing_probe.model import TemporalParameterEncoder
 from diagnostics.shared.io import read_json, save_torch, sha
 from diagnostics.shared.sampling import GroupSampler, resolve_device
 from scjepa.data.datasets import canonical_fingerprint
@@ -40,13 +41,27 @@ class PhysicalEncoder(FramewiseEncoder):
         return observations
 
 
-def build_model(seed: int, context: int, code_dim: int = 8) -> SCJEPA:
-    """Use the existing parameter/predictor modules with fixed exact online/target states."""
+ParameterArchitecture = Literal["mlp", "temporal-cnn"]
+
+
+def build_model(
+    seed: int,
+    context: int,
+    code_dim: int = 8,
+    *,
+    parameter_encoder: ParameterArchitecture = "mlp",
+) -> SCJEPA:
+    """Change only the context architecture while preserving predictor initialization."""
+    if parameter_encoder not in {"mlp", "temporal-cnn"}:
+        raise ValueError("unknown parameter encoder architecture")
+    encoder_type = (
+        LaggedParameterEncoder if parameter_encoder == "mlp" else TemporalParameterEncoder
+    )
     with preserve_rng(torch.device("cpu")):
         torch.default_generator.manual_seed(seed)
         return SCJEPA(
             PhysicalEncoder(),
-            LaggedParameterEncoder(context, code_dim),
+            encoder_type(context, code_dim),
             cast(Spartan, LaggedPredictor(sparse=False, code_dim=code_dim)),
             context,
             autoregressive=True,
@@ -80,11 +95,13 @@ class ProbeConfig:
     threads: int = 1
     wandb_mode: str = "online"
     wandb_group: str = "duffing-acquisition-screen-20261109"
+    parameter_encoder: ParameterArchitecture = "mlp"
 
     def __post_init__(self) -> None:
         """Reject invalid diagnostic windows and budgets."""
         if (
             self.context < 3
+            or self.parameter_encoder not in {"mlp", "temporal-cnn"}
             or min(
                 self.horizon,
                 self.steps,
@@ -133,11 +150,15 @@ def train(config: ProbeConfig, *, resume: bool = False) -> None:
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     device = resolve_device(config.device)
     seed_everything(config.seed)
     data_dir, output_dir = Path(config.data_dir), Path(config.output_dir)
     record, inputs = load_data(data_dir, config.context, config.horizon, device)
-    model = build_model(config.seed, config.context).to(device)
+    model = build_model(config.seed, config.context, parameter_encoder=config.parameter_encoder).to(
+        device
+    )
     specification: dict[str, Any] = {
         "schema": "duffing-physical-acquisition-v1",
         "config": asdict(config),
@@ -147,6 +168,12 @@ def train(config: ProbeConfig, *, resume: bool = False) -> None:
         "training_parameter_labels": False,
         "test_evaluation": False,
         "code_dim": 8,
+        "parameter_encoder_architecture": config.parameter_encoder,
+        "parameter_encoder_parameters": sum(
+            p.numel() for p in model.parameter_encoder.parameters()
+        ),
+        "predictor_parameters": sum(p.numel() for p in model.predictor.parameters()),
+        "cudnn_deterministic": True,
         "state_encoder": "fixed identity, no learned or lost physical state information",
         "objective": "mean physical-position forecast MSE",
         "state_regularization": "none: state encoder is fixed",
@@ -201,15 +228,26 @@ def train(config: ProbeConfig, *, resume: bool = False) -> None:
         labels[split] = cast(dict[str, Tensor], torch.load(data_dir / name, weights_only=True))[
             "theta"
         ]
+    suffix = "" if config.parameter_encoder == "mlp" else "-temporal-cnn"
+    run_name = (
+        f"physical-{specification['forcing']}-c{config.context}-h{config.horizon}-s{config.seed}"
+        f"{suffix}"
+    )
     logger = WandbLogger(
         WandbConfig(
             mode=config.wandb_mode,
             entity="jesse-hoekstra-university-of-oxford",
             project="sparse_causal_jepa",
             group=config.wandb_group,
-            name=f"physical-{specification['forcing']}-c{config.context}-h{config.horizon}-s{config.seed}",
+            name=run_name,
             job_type="oracle-state-acquisition-diagnostic",
-            tags=["duffing", "oracle-state-control", "learned-parameters", "validation-only"],
+            tags=[
+                "duffing",
+                "oracle-state-control",
+                "learned-parameters",
+                "validation-only",
+                config.parameter_encoder,
+            ],
         ),
         resolved_config=cast(dict[str, object], specification),
         dataset_identity=record["identity"],
@@ -355,6 +393,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
     parser.add_argument("--wandb-group", default="duffing-acquisition-screen-20261109")
+    parser.add_argument("--parameter-encoder", choices=("mlp", "temporal-cnn"), default="mlp")
     parser.add_argument("--resume", action="store_true")
     args = vars(parser.parse_args())
     resume = args.pop("resume")
