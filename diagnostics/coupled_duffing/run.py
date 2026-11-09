@@ -14,6 +14,10 @@ from torch import Tensor, nn
 from diagnostics.coupled_duffing.data import DataConfig, prepare
 from diagnostics.coupled_duffing.evaluate import collect, metrics, prediction_mse
 from diagnostics.coupled_duffing.model import LaggedPredictor, build_model
+from diagnostics.coupled_duffing.regularization import (
+    STATE_REGULARIZATIONS,
+    StateRegularizationObjective,
+)
 from diagnostics.masked_mlp_learned.run import code_identity as parent_identity
 from diagnostics.shared.io import read_json, save_torch, sha
 from diagnostics.shared.sampling import GroupSampler, resolve_device
@@ -90,19 +94,31 @@ def phase_model(model: SCJEPA, phase: str, seed: int, device: torch.device) -> S
     return model
 
 
-def objective_for(phase: str, weight: float, device: torch.device) -> TrainingObjective:
+def objective_for(
+    phase: str,
+    weight: float,
+    device: torch.device,
+    *,
+    state_regularization: str = "aligned",
+    seed: int = 0,
+) -> TrainingObjective:
     """Use the existing SIGReg and prediction-calibrated GECO convention."""
+    if state_regularization not in STATE_REGULARIZATIONS:
+        raise ValueError("unknown state regularization")
     sparse = phase == "baseline"
-    return TrainingObjective(
-        ObjectiveConfig(
-            state_sparsity_weight=float(sparse),
-            action_sparsity_weight=float(sparse),
-            state_regularizer="sigreg",
-            state_regularizer_weight=weight,
-            regularizer_num_projections=256,
-        ),
-        GECOConfig(enabled=True, tau=1.0) if sparse else None,
-    ).to(device)
+    config = ObjectiveConfig(
+        state_sparsity_weight=float(sparse),
+        action_sparsity_weight=float(sparse),
+        state_regularizer="sigreg",
+        state_regularizer_weight=weight,
+        regularizer_num_projections=256,
+    )
+    geco = GECOConfig(enabled=True, tau=1.0) if sparse else None
+    if state_regularization == "aligned":
+        return TrainingObjective(config, geco).to(device)
+    return StateRegularizationObjective(config, geco, mode=state_regularization, seed=seed).to(
+        device
+    )
 
 
 def _load_inputs(directory: Path, split: str, device: torch.device) -> dict[str, Tensor]:

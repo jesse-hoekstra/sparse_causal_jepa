@@ -20,6 +20,7 @@ from diagnostics.coupled_duffing.experiment import (
     verify,
 )
 from diagnostics.coupled_duffing.model import ParameterArchitecture, build_model
+from diagnostics.coupled_duffing.regularization import StateRegularization
 from diagnostics.coupled_duffing.visual_data import prepare as prepare_visual
 from diagnostics.coupled_duffing_probe.data import ProbeDataConfig
 from diagnostics.coupled_duffing_probe.data import prepare as prepare_physical
@@ -96,9 +97,16 @@ def test_projection_preserves_affine_code_transfer_and_predictor_function(
         torch.testing.assert_close(value, target.online_encoder.state_dict()[key], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("architecture", ["mlp", "temporal-cnn"])
+@pytest.mark.parametrize(
+    ("architecture", "state_regularization"),
+    [
+        ("mlp", "aligned"),
+        ("temporal-cnn", "aligned"),
+        ("temporal-cnn", "projected-mixture-variance"),
+    ],
+)
 def test_complete_stages_label_free_selection_and_exact_resume(
-    tmp_path: Path, architecture: ParameterArchitecture
+    tmp_path: Path, architecture: ParameterArchitecture, state_regularization: StateRegularization
 ) -> None:
     torch.set_num_threads(1)
     data = tmp_path / "data"
@@ -148,6 +156,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
             wandb_mode="disabled",
             parameter_encoder=architecture,
             cache_device="cpu",
+            state_regularization=state_regularization,
         )
         train(config)
         return config
@@ -178,11 +187,23 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     source = cast(
         dict[str, Any], torch.load(Path(joint.output_dir) / "last.pt", weights_only=False)
     )
+    if state_regularization == "projected-mixture-variance":
+        initial = cast(
+            dict[str, Any], torch.load(Path(joint.output_dir) / "initial.pt", weights_only=False)
+        )
+        assert any(
+            not torch.equal(value, initial["objective"][key])
+            for key, value in source["objective"].items()
+            if key.startswith("projector.")
+        )
     for path in (*candidates, Path(adapted.output_dir)):
         frozen = cast(dict[str, Any], torch.load(path / "last.pt", weights_only=False))
         for key, value in source["model"].items():
             if key.startswith(("online_encoder.", "target_encoder.")):
                 torch.testing.assert_close(value, frozen["model"][key], rtol=0, atol=0)
+        for key, value in source["objective"].items():
+            if key.startswith("projector."):
+                torch.testing.assert_close(value, frozen["objective"][key], rtol=0, atol=0)
     directory = Path(baseline.output_dir)
     complete = cast(dict[str, Any], torch.load(directory / "last.pt", weights_only=False))
     (directory / "last.pt").write_bytes((directory / "initial.pt").read_bytes())
@@ -192,6 +213,8 @@ def test_complete_stages_label_free_selection_and_exact_resume(
         if isinstance(value, torch.Tensor):
             torch.testing.assert_close(value, resumed["model"][key], rtol=0, atol=0)
     assert resumed["objective"]["geco.num_updates"] == 2
+    for key, value in complete["objective"].items():
+        torch.testing.assert_close(value, resumed["objective"][key], rtol=0, atol=0)
     assert complete["tau"] == resumed["tau"]
     assert not list(data.glob("test*"))
     verify(directory)

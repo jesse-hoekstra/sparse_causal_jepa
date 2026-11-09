@@ -15,6 +15,11 @@ from diagnostics.coupled_duffing.acquisition import initialize_shared_output, pr
 from diagnostics.coupled_duffing.data import DataConfig, prepare
 from diagnostics.coupled_duffing.evaluate import collect, metrics, prediction_mse
 from diagnostics.coupled_duffing.model import LaggedPredictor, ParameterArchitecture, build_model
+from diagnostics.coupled_duffing.regularization import (
+    STATE_REGULARIZATIONS,
+    StateRegularization,
+    StateRegularizationObjective,
+)
 from diagnostics.coupled_duffing.run import code_identity, forward_loss, objective_for
 from diagnostics.masked_mlp_learned.selection import training_score
 from diagnostics.shared.io import read_json, save_torch, sha
@@ -55,6 +60,7 @@ class StageConfig:
     wandb_group: str = "coupled-duffing-experiment1-20261108"
     parameter_encoder: ParameterArchitecture = "mlp"
     cache_device: Literal["model", "cpu"] = "model"
+    state_regularization: StateRegularization = "aligned"
 
     def __post_init__(self) -> None:
         """Reject ambiguous stages or invalid fixed budgets before opening an output."""
@@ -64,6 +70,8 @@ class StageConfig:
             raise ValueError("unknown parameter encoder architecture")
         if self.cache_device not in {"model", "cpu"}:
             raise ValueError("cache_device must be model or cpu")
+        if self.state_regularization not in STATE_REGULARIZATIONS:
+            raise ValueError("unknown state regularization")
         if (self.phase == "joint") != (self.source_dir is None):
             raise ValueError("only joint training starts without a source endpoint")
         if (self.phase == "acquisition") != (self.acquisition_seed is not None):
@@ -194,6 +202,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             or record["seed"] != config.seed
             or record["data_identity"] != data_record["identity"]
             or record.get("parameter_encoder", "mlp") != config.parameter_encoder
+            or record.get("state_regularization", "aligned") != config.state_regularization
         ):
             raise ValueError("source phase, training seed, architecture or data differs")
         source = _parent(record, config.source_dir)
@@ -222,6 +231,18 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "steps": config.updates,
         "code_dim": config.code_dim,
         "parameter_encoder": config.parameter_encoder,
+        "state_regularization": config.state_regularization,
+        "state_projector": [2, 128, 128, 2]
+        if config.state_regularization == "projected-mixture-variance"
+        else None,
+        "state_variance_floor_weight": 0.4
+        if config.state_regularization.endswith("-variance")
+        else 0.0,
+        "state_variance_floor_std": 1.0,
+        "state_variance_floor_epsilon": 1e-4,
+        "sigreg_sampling": "absolute_time"
+        if config.state_regularization == "aligned"
+        else "within_system_time_view_mixture",
         "code_identity": code_identity(),
         "data_identity": data_record["identity"],
         "source": source,
@@ -279,8 +300,33 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
                     "weight_updates": 0,
                 },
             )
-    objective = objective_for("baseline" if config.phase == "baseline" else "joint", 0.4, device)
-    parameters = [p for p in model.parameters() if p.requires_grad]
+    objective = objective_for(
+        "baseline" if config.phase == "baseline" else "joint",
+        0.4,
+        device,
+        state_regularization=config.state_regularization,
+        seed=config.seed,
+    )
+    if isinstance(objective, StateRegularizationObjective) and config.source_dir is not None:
+        parent_checkpoint = cast(
+            dict[str, Any],
+            torch.load(
+                Path(config.source_dir) / "last.pt", map_location=device, weights_only=False
+            ),
+        )
+        objective.projector.load_state_dict(
+            {
+                key.removeprefix("projector."): value
+                for key, value in parent_checkpoint["objective"].items()
+                if key.startswith("projector.")
+            },
+            strict=True,
+        )
+        del parent_checkpoint
+    objective.requires_grad_(not frozen)
+    parameters = [
+        p for module in (model, objective) for p in module.parameters() if p.requires_grad
+    ]
     optimizer = torch.optim.AdamW(parameters, lr=0.001, weight_decay=0.0)
     sampler = GroupSampler(len(inputs["train"]["observations"]), config.batch_size, config.seed)
     if resume:
@@ -317,7 +363,13 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             name=f"duffing-{config.phase}-s{config.seed}"
             + (f"-a{config.acquisition_seed}" if config.acquisition_seed is not None else ""),
             job_type=config.phase,
-            tags=["duffing", "experiment1-protocol", "validation-only", config.parameter_encoder],
+            tags=[
+                "duffing",
+                "experiment1-protocol",
+                "validation-only",
+                config.parameter_encoder,
+                config.state_regularization,
+            ],
         ),
         resolved_config=cast(dict[str, object], specification),
         dataset_identity=data_record["identity"],
@@ -466,6 +518,7 @@ def select(
             for key in ("source", "seed", "steps", "code_dim", "data_identity", "code_identity")
         }
         specification["parameter_encoder"] = record.get("parameter_encoder", "mlp")
+        specification["state_regularization"] = record.get("state_regularization", "aligned")
         if common is not None and specification != common:
             raise ValueError("candidate budgets, source or data differ")
         common = specification
@@ -535,6 +588,7 @@ def project_endpoint(
         "seed": inherited["seed"],
         "code_dim": 4,
         "parameter_encoder": architecture,
+        "state_regularization": inherited.get("state_regularization", "aligned"),
         "code_identity": code_identity(),
         "data_identity": record["identity"],
         "source": _parent(inherited, str(source_dir)),
@@ -543,9 +597,17 @@ def project_endpoint(
     specification["identity"] = canonical_fingerprint(specification)
     write_json(output_dir / "config.json", specification)
     save_torch(output_dir / "matrices.pt", matrices)
+    source_checkpoint = cast(
+        dict[str, Any],
+        torch.load(source_dir / "last.pt", map_location="cpu", weights_only=False),
+    )
     save_torch(
         output_dir / "last.pt",
-        {"identity": specification["identity"], "model": target.state_dict()},
+        {
+            "identity": specification["identity"],
+            "model": target.state_dict(),
+            "objective": source_checkpoint["objective"],
+        },
     )
     _complete(output_dir, specification, ["config.json", "matrices.pt", "last.pt"])
 
@@ -568,6 +630,9 @@ def main() -> None:
     run.add_argument("--wandb-group", default="coupled-duffing-experiment1-20261108")
     run.add_argument("--parameter-encoder", choices=("mlp", "temporal-cnn"), default="mlp")
     run.add_argument("--cache-device", choices=("model", "cpu"), default="model")
+    run.add_argument("--state-regularization", choices=STATE_REGULARIZATIONS, default="aligned")
+    run.add_argument("--eval-every", type=int, default=5000)
+    run.add_argument("--log-every", type=int, default=100)
     run.add_argument("--resume", action="store_true")
     selection = sub.add_parser("select")
     selection.add_argument("--runs", nargs="+", type=Path, required=True)
