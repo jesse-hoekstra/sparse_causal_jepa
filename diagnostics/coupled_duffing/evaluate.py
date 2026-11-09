@@ -94,8 +94,10 @@ def metrics(
 ) -> dict[str, float]:
     """Score fixed assignments, state/code retention and nontrivial forecasting on validation."""
     cal_n, val_n = len(calibration["states"]), len(validation["states"])
-    cal_z = calibration_labels["states"][:cal_n].reshape(-1, 2)
-    val_z = validation_labels["states"][:val_n].reshape(-1, 2)
+    cal_reference = calibration_labels["states"][:cal_n].double()
+    val_reference = validation_labels["states"][:val_n].double()
+    cal_z = cal_reference.reshape(-1, 2)
+    val_z = val_reference.reshape(-1, 2)
     cal_s, val_s = calibration["states"].reshape(-1, 2), validation["states"].reshape(-1, 2)
     output: dict[str, float] = {}
     for method in ("pearson", "spearman"):
@@ -164,7 +166,7 @@ def metrics(
         output[f"forecast/nmse_step_{time + 1}"] = float(
             (predictions[:, :, time] - targets[:, :, time]).square().mean()
         ) / max(variance, 1e-12)
-    raw = validation_labels["states"][:val_n]
+    raw = val_reference
     future = raw[:, :, context:]
     prediction_rows = predictions.reshape(-1, 2)
     cal_targets = calibration["targets"].reshape(-1, 2)
@@ -172,7 +174,7 @@ def metrics(
     target_std = cal_targets.std(0).clamp_min(1e-8)
     forecast_weights = _ridge(
         _design((cal_targets - target_mean) / target_std, "cubic"),
-        calibration_labels["states"][:cal_n, :, context:].reshape(-1, 2),
+        cal_reference[:, :, context:].reshape(-1, 2),
     )
     decoded_forecast = (
         _design((prediction_rows - target_mean) / target_std, "cubic") @ forecast_weights

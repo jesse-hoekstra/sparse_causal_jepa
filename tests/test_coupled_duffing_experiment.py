@@ -102,17 +102,33 @@ def test_complete_stages_label_free_selection_and_exact_resume(
 ) -> None:
     torch.set_num_threads(1)
     data = tmp_path / "data"
-    prepare(
-        data,
-        DataConfig(
-            train_groups=12,
-            calibration_groups=8,
-            validation_groups=8,
-            views=3,
-            context=6,
-            forecast=2,
-        ),
-    )
+    if architecture == "temporal-cnn":
+        physical = tmp_path / "physical"
+        prepare_physical(
+            physical,
+            ProbeDataConfig(
+                train_groups=12,
+                calibration_groups=8,
+                validation_groups=8,
+                views=3,
+                context=6,
+                forecast=4,
+                forcing="driven",
+            ),
+        )
+        prepare_visual(data, physical)
+    else:
+        prepare(
+            data,
+            DataConfig(
+                train_groups=12,
+                calibration_groups=8,
+                validation_groups=8,
+                views=3,
+                context=6,
+                forecast=2,
+            ),
+        )
     (data / "train-labels.pt").unlink()
 
     def stage(
