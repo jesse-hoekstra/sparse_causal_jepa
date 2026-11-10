@@ -69,6 +69,7 @@ class StageConfig:
     state_regularization: StateRegularization = "aligned"
     source_code_identity: str | None = None
     calibration_file: str | None = None
+    learning_rate: float = 0.001
 
     def __post_init__(self) -> None:
         """Reject ambiguous stages or invalid fixed budgets before opening an output."""
@@ -88,6 +89,8 @@ class StageConfig:
             raise ValueError("an expected historical source requires a source endpoint")
         if self.calibration_file is not None and self.phase not in {"baseline", "full"}:
             raise ValueError("shared calibration applies only to sparse training")
+        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
+            raise ValueError("learning_rate must be finite and positive")
         if min(self.updates, self.batch_size, self.log_every, self.eval_every, self.threads) < 1:
             raise ValueError("budgets, intervals, batch size and threads must be positive")
 
@@ -341,7 +344,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "parameter_gates": "learned" if config.phase == "full" else "fixed_open",
         "shared_calibration": calibration,
         "test_evaluation": False,
-        "learning_rate": 0.001,
+        "learning_rate": config.learning_rate,
         "weight_decay": 0.0,
         "gradient_clip": 1.0,
         "ema_decay": 0.996,
@@ -426,7 +429,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
     parameters = [
         p for module in (model, objective) for p in module.parameters() if p.requires_grad
     ]
-    optimizer = torch.optim.AdamW(parameters, lr=0.001, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(parameters, lr=config.learning_rate, weight_decay=0.0)
     sampler = GroupSampler(len(inputs["train"]["observations"]), config.batch_size, config.seed)
     if resume:
         optimizer.load_state_dict(saved["optimizer"])
@@ -729,6 +732,7 @@ def main() -> None:
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--acquisition-seed", type=int)
     run.add_argument("--steps", type=int)
+    run.add_argument("--learning-rate", type=float, default=0.001)
     run.add_argument("--device", default="cuda:0")
     run.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     run.add_argument("--wandb-group", default="coupled-duffing-experiment1-20261108")

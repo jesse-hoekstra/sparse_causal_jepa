@@ -48,6 +48,12 @@ def test_successful_experiment1_counts_and_budgets_are_preserved() -> None:
     assert StageConfig("data", "out", "baseline", source_dir="parent").code_dim == 4
 
 
+@pytest.mark.parametrize("learning_rate", [0.0, -0.001, float("nan"), float("inf")])
+def test_invalid_optimizer_rate_is_rejected(learning_rate: float) -> None:
+    with pytest.raises(ValueError, match="learning_rate"):
+        StageConfig("data", "out", "joint", learning_rate=learning_rate)
+
+
 @pytest.mark.parametrize("architecture", ["mlp", "temporal-cnn"])
 def test_shared_feature_initialization_preserves_mean_and_centered_rms(
     architecture: ParameterArchitecture,
@@ -165,6 +171,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
             cache_device="cpu",
             state_regularization=state_regularization,
             calibration_file=str(calibration_file) if calibration_file else None,
+            learning_rate=0.0001 if state_regularization == "projected-aligned" else 0.001,
         )
         train(config)
         return config
@@ -254,6 +261,9 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     for key, value in complete["objective"].items():
         torch.testing.assert_close(value, resumed["objective"][key], rtol=0, atol=0)
     assert complete["tau"] == resumed["tau"]
+    assert complete["optimizer"]["param_groups"][0]["lr"] == full.learning_rate
+    assert resumed["optimizer"]["param_groups"][0]["lr"] == full.learning_rate
+    assert read_json(directory / "completion.json")["learning_rate"] == full.learning_rate
     assert not list(data.glob("test*"))
     verify(directory)
     with pytest.raises(ValueError, match="different numerical implementation"):
