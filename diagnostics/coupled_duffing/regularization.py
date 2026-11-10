@@ -11,9 +11,15 @@ from scjepa.training.loop import ObjectiveConfig, TrainingObjective
 from scjepa.training.rng import preserve_rng
 
 StateRegularization = Literal[
-    "aligned", "mixture", "mixture-variance", "projected-mixture-variance"
+    "aligned", "mixture", "mixture-variance", "projected-mixture-variance", "projected-aligned"
 ]
-STATE_REGULARIZATIONS = ("aligned", "mixture", "mixture-variance", "projected-mixture-variance")
+STATE_REGULARIZATIONS = (
+    "aligned",
+    "mixture",
+    "mixture-variance",
+    "projected-mixture-variance",
+    "projected-aligned",
+)
 
 
 def mix_state_samples(states: Tensor) -> Tensor:
@@ -46,14 +52,15 @@ def state_variance_floor(states: Tensor) -> Tensor:
 
 
 class StateRegularizationObjective(TrainingObjective):
-    """Apply SIGReg to a time mixture, optionally through an auxiliary smooth head.
+    """Control SIGReg sampling and an optional auxiliary smooth head independently.
 
     The predictor, context encoder, autoregressive feedback, stopped EMA targets
     and prediction MSE always use the original two-dimensional state. The head
     serves only SIGReg and can be discarded at inference. It has two outputs:
     a smooth map of a two-dimensional state cannot fill a higher-dimensional
-    isotropic Gaussian. A raw-state variance floor prevents an arbitrarily small
-    state scale from being hidden by amplification in this auxiliary head.
+    isotropic Gaussian. The optional raw-state variance floor penalizes shrinking
+    states whose scale could otherwise be amplified in this auxiliary head.
+    The projector-only control retains aligned statistics and adds no floor.
     """
 
     def __init__(
@@ -66,11 +73,11 @@ class StateRegularizationObjective(TrainingObjective):
     ) -> None:
         """Keep optional-head initialization independent of scientific model weights."""
         if mode not in STATE_REGULARIZATIONS or mode == "aligned":
-            raise ValueError("unknown mixture state regularization")
+            raise ValueError("unknown auxiliary state regularization")
         super().__init__(config, geco)
         self.mode = mode
         self.projector: nn.Module = nn.Identity()
-        if mode == "projected-mixture-variance":
+        if mode.startswith("projected-"):
             with preserve_rng(torch.device("cpu")):
                 torch.default_generator.manual_seed(seed + 104729)
                 self.projector = nn.Sequential(
@@ -88,12 +95,12 @@ class StateRegularizationObjective(TrainingObjective):
             states = states.flatten(1, 2)
         if states.shape[-1] != 2:
             raise ValueError("this physical-state control requires two state coordinates")
-        mixed = mix_state_samples(states)
-        projected: Tensor = self.projector(mixed)
+        samples = mix_state_samples(states) if "mixture" in self.mode else states
+        projected: Tensor = self.projector(samples)
         total, terms = super().forward(output._replace(online_states=projected))
-        terms["state_std_min"] = mixed.var(0, correction=1).mean(0).sqrt().min().detach()
+        terms["state_std_min"] = samples.var(0, correction=1).mean(0).sqrt().min().detach()
         if self.mode.endswith("-variance"):
-            terms["state_variance_floor"] = state_variance_floor(mixed)
+            terms["state_variance_floor"] = state_variance_floor(samples)
             penalty = self.config.state_regularizer_weight * terms["state_variance_floor"]
             total = total + penalty
             terms["base"] = terms["base"] + penalty

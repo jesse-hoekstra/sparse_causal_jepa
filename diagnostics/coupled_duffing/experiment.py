@@ -233,7 +233,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "parameter_encoder": config.parameter_encoder,
         "state_regularization": config.state_regularization,
         "state_projector": [2, 128, 128, 2]
-        if config.state_regularization == "projected-mixture-variance"
+        if config.state_regularization.startswith("projected-")
         else None,
         "state_variance_floor_weight": 0.4
         if config.state_regularization.endswith("-variance")
@@ -241,7 +241,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "state_variance_floor_std": 1.0,
         "state_variance_floor_epsilon": 1e-4,
         "sigreg_sampling": "absolute_time"
-        if config.state_regularization == "aligned"
+        if "mixture" not in config.state_regularization
         else "within_system_time_view_mixture",
         "code_identity": code_identity(),
         "data_identity": data_record["identity"],

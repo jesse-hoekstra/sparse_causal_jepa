@@ -39,7 +39,9 @@ def test_variance_floor_anchors_scale_without_penalizing_dependent_coordinates()
     assert bool((small.grad * small).sum() < 0)
 
 
-@pytest.mark.parametrize("mode", ["mixture", "mixture-variance", "projected-mixture-variance"])
+@pytest.mark.parametrize(
+    "mode", ["mixture", "mixture-variance", "projected-mixture-variance", "projected-aligned"]
+)
 def test_auxiliary_head_cannot_bypass_raw_state_prediction_or_context(mode: str) -> None:
     torch.set_num_threads(1)
     model = build_model(0, 6, code_dim=8, parameter_encoder="temporal-cnn")
@@ -63,9 +65,35 @@ def test_auxiliary_head_cannot_bypass_raw_state_prediction_or_context(mode: str)
     for module in (model.online_encoder, model.parameter_encoder, model.predictor):
         assert any(p.grad is not None and bool(p.grad.abs().sum() > 0) for p in module.parameters())
     assert all(p.grad is None for p in model.target_encoder.parameters())
-    if mode == "projected-mixture-variance":
+    if mode.startswith("projected-"):
         assert objective.projector(output.online_states).shape == output.online_states.shape
         assert all(p.grad is not None for p in objective.projector.parameters())
+
+
+def test_projector_only_preserves_aligned_statistics_without_a_variance_floor() -> None:
+    torch.set_num_threads(1)
+    model = build_model(0, 6, code_dim=8, parameter_encoder="temporal-cnn")
+    inputs = {"observations": torch.randn(4, 3, 8, 1, 16, 32), "actions": torch.randn(4, 3, 7, 1)}
+    before = torch.get_rng_state().clone()
+    objective = objective_for(
+        "joint", 0.4, torch.device("cpu"), state_regularization="projected-aligned", seed=0
+    )
+    assert torch.equal(torch.get_rng_state(), before)
+    assert isinstance(objective, StateRegularizationObjective)
+    assert len(list(objective.projector.parameters())) == 6
+    output = model(inputs["observations"], inputs["actions"])
+    with preserve_rng(torch.device("cpu")):
+        loss, terms = objective(output)
+    with preserve_rng(torch.device("cpu")):
+        aligned = objective.projector(output.online_states.flatten(1, 2)).transpose(0, 1)
+        expected = objective.state_regularizer(aligned)
+    torch.testing.assert_close(terms["state_regularizer"], expected, rtol=0, atol=0)
+    torch.testing.assert_close(loss, terms["prediction"] + 0.4 * expected, rtol=0, atol=0)
+    assert "state_variance_floor" not in terms
+    parameters = tuple(model.online_encoder.parameters()) + tuple(objective.projector.parameters())
+    gradients = torch.autograd.grad(terms["state_regularizer"], parameters)
+    assert all(bool(torch.isfinite(gradient).all()) for gradient in gradients)
+    assert all(bool(gradient.abs().sum() > 0) for gradient in gradients)
 
 
 def test_unknown_regularization_mode_is_rejected() -> None:

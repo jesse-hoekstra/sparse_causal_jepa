@@ -103,6 +103,7 @@ def test_projection_preserves_affine_code_transfer_and_predictor_function(
         ("mlp", "aligned"),
         ("temporal-cnn", "aligned"),
         ("temporal-cnn", "projected-mixture-variance"),
+        ("temporal-cnn", "projected-aligned"),
     ],
 )
 def test_complete_stages_label_free_selection_and_exact_resume(
@@ -162,6 +163,11 @@ def test_complete_stages_label_free_selection_and_exact_resume(
         return config
 
     joint = stage("joint", "joint")
+    if state_regularization == "projected-aligned":
+        specification = read_json(Path(joint.output_dir) / "completion.json")
+        assert specification["state_projector"] == [2, 128, 128, 2]
+        assert specification["sigreg_sampling"] == "absolute_time"
+        assert specification["state_variance_floor_weight"] == 0.0
     joint_samples = cast(
         dict[str, torch.Tensor],
         torch.load(Path(joint.output_dir) / "validation.pt", weights_only=True),
@@ -187,7 +193,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     source = cast(
         dict[str, Any], torch.load(Path(joint.output_dir) / "last.pt", weights_only=False)
     )
-    if state_regularization == "projected-mixture-variance":
+    if state_regularization.startswith("projected-"):
         initial = cast(
             dict[str, Any], torch.load(Path(joint.output_dir) / "initial.pt", weights_only=False)
         )
