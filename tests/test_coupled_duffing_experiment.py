@@ -13,6 +13,7 @@ from diagnostics.coupled_duffing.data import DataConfig, generate, prepare, rend
 from diagnostics.coupled_duffing.experiment import (
     BUDGETS,
     StageConfig,
+    calibrate_endpoint,
     experiment_data,
     project_endpoint,
     select,
@@ -41,6 +42,7 @@ def test_successful_experiment1_counts_and_budgets_are_preserved() -> None:
         "acquisition": 100000,
         "adaptation": 50000,
         "baseline": 350000,
+        "full": 350000,
     }
     assert StageConfig("data", "out", "joint").code_dim == 8
     assert StageConfig("data", "out", "baseline", source_dir="parent").code_dim == 4
@@ -141,7 +143,11 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     (data / "train-labels.pt").unlink()
 
     def stage(
-        name: str, phase: str, source: Path | None = None, initialization: int | None = None
+        name: str,
+        phase: str,
+        source: Path | None = None,
+        initialization: int | None = None,
+        calibration_file: Path | None = None,
     ) -> StageConfig:
         config = StageConfig(
             str(data),
@@ -158,6 +164,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
             parameter_encoder=architecture,
             cache_device="cpu",
             state_regularization=state_regularization,
+            calibration_file=str(calibration_file) if calibration_file else None,
         )
         train(config)
         return config
@@ -189,7 +196,32 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     project_endpoint(data, Path(selection["selected"]["directory"]), projected, "cpu", "cpu")
     assert read_json(projected / "completion.json")["parameter_encoder"] == architecture
     adapted = stage("adapted", "adaptation", projected)
-    baseline = stage("baseline", "baseline", Path(adapted.output_dir))
+    calibration_file = tmp_path / "shared-calibration.json"
+    calibration = calibrate_endpoint(Path(adapted.output_dir), calibration_file)
+    baseline = stage(
+        "baseline", "baseline", Path(adapted.output_dir), calibration_file=calibration_file
+    )
+    full = stage("full", "full", Path(adapted.output_dir), calibration_file=calibration_file)
+    initial_pair = [
+        cast(dict[str, Any], torch.load(Path(c.output_dir) / "initial.pt", weights_only=False))
+        for c in (baseline, full)
+    ]
+    for name, value in initial_pair[0]["model"].items():
+        torch.testing.assert_close(value, initial_pair[1]["model"][name], rtol=0, atol=0)
+    assert initial_pair[0]["tau"] == initial_pair[1]["tau"] == calibration["tau"]
+    full_final = cast(
+        dict[str, Any], torch.load(Path(full.output_dir) / "last.pt", weights_only=False)
+    )
+    assert not torch.equal(
+        initial_pair[1]["model"]["predictor.parameter_logits"],
+        full_final["model"]["predictor.parameter_logits"],
+    )
+    for prefix in ("online_encoder.", "target_encoder.", "parameter_encoder."):
+        assert any(
+            not torch.equal(value, full_final["model"][name])
+            for name, value in initial_pair[1]["model"].items()
+            if name.startswith(prefix)
+        )
     source = cast(
         dict[str, Any], torch.load(Path(joint.output_dir) / "last.pt", weights_only=False)
     )
@@ -210,10 +242,10 @@ def test_complete_stages_label_free_selection_and_exact_resume(
         for key, value in source["objective"].items():
             if key.startswith("projector."):
                 torch.testing.assert_close(value, frozen["objective"][key], rtol=0, atol=0)
-    directory = Path(baseline.output_dir)
+    directory = Path(full.output_dir)
     complete = cast(dict[str, Any], torch.load(directory / "last.pt", weights_only=False))
     (directory / "last.pt").write_bytes((directory / "initial.pt").read_bytes())
-    train(baseline, resume=True)
+    train(full, resume=True)
     resumed = cast(dict[str, Any], torch.load(directory / "last.pt", weights_only=False))
     for key, value in complete["model"].items():
         if isinstance(value, torch.Tensor):
@@ -224,6 +256,11 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     assert complete["tau"] == resumed["tau"]
     assert not list(data.glob("test*"))
     verify(directory)
+    with pytest.raises(ValueError, match="different numerical implementation"):
+        verify(directory, expected_code_identity="0" * 64)
+    verify(
+        directory, expected_code_identity=read_json(directory / "completion.json")["code_identity"]
+    )
 
 
 def test_visual_cache_preserves_physical_trajectories_and_separates_labels(tmp_path: Path) -> None:

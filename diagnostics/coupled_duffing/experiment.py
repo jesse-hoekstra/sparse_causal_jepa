@@ -13,7 +13,7 @@ from torch import Tensor
 
 from diagnostics.coupled_duffing.acquisition import initialize_shared_output, project
 from diagnostics.coupled_duffing.data import DataConfig, prepare
-from diagnostics.coupled_duffing.evaluate import collect, metrics, prediction_mse
+from diagnostics.coupled_duffing.evaluate import collect, graph_metrics, metrics, prediction_mse
 from diagnostics.coupled_duffing.model import LaggedPredictor, ParameterArchitecture, build_model
 from diagnostics.coupled_duffing.regularization import (
     STATE_REGULARIZATIONS,
@@ -32,7 +32,13 @@ from scjepa.training.loop import seed_everything
 from scjepa.training.rng import preserve_rng
 
 SCHEMA = "duffing-experiment1-protocol-v1"
-BUDGETS = {"joint": 100000, "acquisition": 100000, "adaptation": 50000, "baseline": 350000}
+BUDGETS = {
+    "joint": 100000,
+    "acquisition": 100000,
+    "adaptation": 50000,
+    "baseline": 350000,
+    "full": 350000,
+}
 
 
 def experiment_data() -> DataConfig:
@@ -61,6 +67,8 @@ class StageConfig:
     parameter_encoder: ParameterArchitecture = "mlp"
     cache_device: Literal["model", "cpu"] = "model"
     state_regularization: StateRegularization = "aligned"
+    source_code_identity: str | None = None
+    calibration_file: str | None = None
 
     def __post_init__(self) -> None:
         """Reject ambiguous stages or invalid fixed budgets before opening an output."""
@@ -76,6 +84,10 @@ class StageConfig:
             raise ValueError("only joint training starts without a source endpoint")
         if (self.phase == "acquisition") != (self.acquisition_seed is not None):
             raise ValueError("only acquisition requires a distinct initialization seed")
+        if self.source_code_identity is not None and self.source_dir is None:
+            raise ValueError("an expected historical source requires a source endpoint")
+        if self.calibration_file is not None and self.phase not in {"baseline", "full"}:
+            raise ValueError("shared calibration applies only to sparse training")
         if min(self.updates, self.batch_size, self.log_every, self.eval_every, self.threads) < 1:
             raise ValueError("budgets, intervals, batch size and threads must be positive")
 
@@ -112,10 +124,11 @@ def load_data(
     return record, inputs
 
 
-def verify(directory: Path) -> dict[str, Any]:
+def verify(directory: Path, *, expected_code_identity: str | None = None) -> dict[str, Any]:
     """Authenticate a finished stage without opening metrics, tensors or physical labels."""
     record = read_json(directory / "completion.json")
-    if record["schema"] != SCHEMA or record["code_identity"] != code_identity():
+    expected = code_identity() if expected_code_identity is None else expected_code_identity
+    if record["schema"] != SCHEMA or record["code_identity"] != expected:
         raise ValueError("source endpoint belongs to a different numerical implementation")
     for name, digest in record["hashes"].items():
         if sha(directory / name) != digest:
@@ -124,16 +137,21 @@ def verify(directory: Path) -> dict[str, Any]:
 
 
 def load_model(
-    directory: Path, context: int, device: torch.device
+    directory: Path,
+    context: int,
+    device: torch.device,
+    *,
+    expected_code_identity: str | None = None,
 ) -> tuple[SCJEPA, dict[str, Any]]:
     """Load an authenticated model for a named next stage without using evaluation labels."""
-    record = verify(directory)
+    record = verify(directory, expected_code_identity=expected_code_identity)
     model = build_model(
         record["seed"],
         context,
         code_dim=record["code_dim"],
-        sparse=record["phase"] == "baseline",
+        sparse=record["phase"] in {"baseline", "full"},
         parameter_encoder=record.get("parameter_encoder", "mlp"),
+        parameter_sparsity=record["phase"] == "full",
     ).to(device)
     state = cast(
         dict[str, Any], torch.load(directory / "last.pt", map_location=device, weights_only=False)
@@ -150,7 +168,65 @@ def _parent(record: dict[str, Any], directory: str) -> dict[str, Any]:
         "identity": record["identity"],
         "checkpoint_sha256": record["hashes"]["last.pt"],
         "phase": record["phase"],
+        "code_identity": record["code_identity"],
     }
+
+
+def calibrate_endpoint(
+    source_dir: Path, output: Path, source_code_identity: str | None = None
+) -> dict[str, Any]:
+    """Set one tolerance from the authenticated adapted seed-zero calibration forecasts."""
+    if output.exists():
+        raise FileExistsError(output)
+    source = verify(source_dir, expected_code_identity=source_code_identity)
+    if source["phase"] != "adaptation" or source["seed"] != 0 or source["code_dim"] != 4:
+        raise ValueError("shared calibration requires the adapted four-code seed-zero endpoint")
+    samples = cast(dict[str, Tensor], torch.load(source_dir / "calibration.pt", weights_only=True))
+    tau = prediction_mse(samples)
+    if not math.isfinite(tau) or tau <= 0:
+        raise ValueError("invalid calibration prediction MSE")
+    result = {
+        "schema": "duffing-shared-calibration-v1",
+        "code_identity": code_identity(),
+        "source": _parent(source, str(source_dir)),
+        "data_identity": source["data_identity"],
+        "parameter_encoder": source["parameter_encoder"],
+        "state_regularization": source["state_regularization"],
+        "tau": tau,
+        "factor": 1.0,
+        "groups": len(samples["states"]),
+        "weight_updates": 0,
+        "test_evaluation": False,
+    }
+    result["identity"] = canonical_fingerprint(result)
+    write_json(output, result)
+    return result
+
+
+def _shared_calibration(config: StageConfig, data_identity: str) -> dict[str, Any] | None:
+    if config.calibration_file is None:
+        return None
+    record = read_json(Path(config.calibration_file))
+    if (
+        record["schema"] != "duffing-shared-calibration-v1"
+        or record["identity"]
+        != canonical_fingerprint({key: value for key, value in record.items() if key != "identity"})
+        or record["code_identity"] != code_identity()
+        or record["data_identity"] != data_identity
+        or record["parameter_encoder"] != config.parameter_encoder
+        or record["state_regularization"] != config.state_regularization
+        or record["factor"] != 1.0
+        or not math.isfinite(record["tau"])
+        or record["tau"] <= 0
+    ):
+        raise ValueError("shared calibration identity or scientific settings differ")
+    source = verify(
+        Path(record["source"]["directory"]),
+        expected_code_identity=record["source"]["code_identity"],
+    )
+    if source["identity"] != record["source"]["identity"]:
+        raise ValueError("shared calibration source differs")
+    return record
 
 
 def _complete(
@@ -184,19 +260,30 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
     )
     context = int(data_record["config"]["context"])
     frozen = config.phase in {"acquisition", "adaptation"}
+    sparse = config.phase in {"baseline", "full"}
+    calibration = _shared_calibration(config, data_record["identity"])
     model = build_model(
         config.acquisition_seed if config.acquisition_seed is not None else config.seed,
         context,
         code_dim=config.code_dim,
-        sparse=config.phase == "baseline",
+        sparse=sparse,
         parameter_encoder=config.parameter_encoder,
+        parameter_sparsity=config.phase == "full",
     ).to(device)
     source: dict[str, Any] | None = None
     if config.source_dir is not None:
-        inherited, record = load_model(Path(config.source_dir), context, device)
-        expected = {"acquisition": "joint", "adaptation": "projection", "baseline": "adaptation"}[
-            config.phase
-        ]
+        inherited, record = load_model(
+            Path(config.source_dir),
+            context,
+            device,
+            expected_code_identity=config.source_code_identity,
+        )
+        expected = {
+            "acquisition": "joint",
+            "adaptation": "projection",
+            "baseline": "adaptation",
+            "full": "adaptation",
+        }[config.phase]
         if (
             record["phase"] != expected
             or record["seed"] != config.seed
@@ -216,8 +303,11 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
                 tuple[list[str], list[str]],
                 model.load_state_dict(inherited.state_dict(), strict=False),
             )
-            if set(missing) != {"predictor.state_logits", "predictor.action_logits"} or unexpected:
-                raise ValueError("baseline initialization changed inherited tensors")
+            expected_missing = {"predictor.state_logits", "predictor.action_logits"}
+            if config.phase == "full":
+                expected_missing.add("predictor.parameter_logits")
+            if set(missing) != expected_missing or unexpected:
+                raise ValueError("sparse initialization changed inherited tensors")
         del inherited
     model.online_encoder.requires_grad_(not frozen)
     if output.exists() and not resume:
@@ -248,7 +338,8 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "source": source,
         "true_parameter_training": False,
         "true_state_training": False,
-        "parameter_gates": "fixed_open",
+        "parameter_gates": "learned" if config.phase == "full" else "fixed_open",
+        "shared_calibration": calibration,
         "test_evaluation": False,
         "learning_rate": 0.001,
         "weight_decay": 0.0,
@@ -279,13 +370,21 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         write_json(output / "initialization.json", initialize_shared_output(model, inputs["train"]))
     write_json(output / "config.json", specification)
     tau: float | None = None
-    if config.phase == "baseline":
+    if sparse:
         if resume:
             tau = float(saved["tau"])
+        elif calibration is not None:
+            tau = float(calibration["tau"])
+            write_json(output / "calibration.json", calibration)
         else:
             with preserve_rng(device):
                 # Calibrate the dense initializer, before adding stochastic gates.
-                dense, _ = load_model(Path(cast(str, config.source_dir)), context, device)
+                dense, _ = load_model(
+                    Path(cast(str, config.source_dir)),
+                    context,
+                    device,
+                    expected_code_identity=config.source_code_identity,
+                )
                 tau = prediction_mse(collect(dense, inputs["calibration"], config.batch_size))
                 del dense
             if not math.isfinite(tau) or tau <= 0:
@@ -301,7 +400,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
                 },
             )
     objective = objective_for(
-        "baseline" if config.phase == "baseline" else "joint",
+        config.phase if sparse else "joint",
         0.4,
         device,
         state_regularization=config.state_regularization,
@@ -406,8 +505,11 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             )
             if tau is not None:
                 scores["geco/relative_prediction"] = prediction_mse(val) / tau
-            for name, graph in cast(LaggedPredictor, model.predictor).thresholded_graphs().items():
+            graphs = cast(LaggedPredictor, model.predictor).thresholded_graphs()
+            for name, graph in graphs.items():
                 scores[f"gates/{name}_open"] = float(graph.sum())
+            if config.code_dim == 4:
+                scores.update(graph_metrics(graphs, cal, labels["calibration"]))
             with (output / "validation.jsonl").open("a") as stream:
                 stream.write(json.dumps({"step": step, **scores}) + "\n")
             logger.log(step, {f"validation/{key}": value for key, value in scores.items()})
@@ -476,7 +578,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             "calibration.pt",
             "validation.pt",
         ]
-        if config.phase == "baseline":
+        if sparse:
             names.append("calibration.json")
         if config.phase in {"joint", "acquisition"}:
             names.append("initialization.json")
@@ -622,6 +724,8 @@ def main() -> None:
     for name in ("data-dir", "output-dir", "phase"):
         run.add_argument(f"--{name}", required=True)
     run.add_argument("--source-dir")
+    run.add_argument("--source-code-identity")
+    run.add_argument("--calibration-file")
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--acquisition-seed", type=int)
     run.add_argument("--steps", type=int)
@@ -642,6 +746,10 @@ def main() -> None:
         projection.add_argument(f"--{name}", type=Path, required=True)
     projection.add_argument("--device-name", default="cuda:0")
     projection.add_argument("--cache-device", choices=("model", "cpu"), default="model")
+    calibration = sub.add_parser("calibrate")
+    calibration.add_argument("--source-dir", type=Path, required=True)
+    calibration.add_argument("--output", type=Path, required=True)
+    calibration.add_argument("--source-code-identity")
     args = vars(parser.parse_args())
     command = args.pop("command")
     torch.set_num_threads(1)
@@ -652,6 +760,8 @@ def main() -> None:
         train(StageConfig(**args), resume=resume)
     elif command == "project":
         project_endpoint(**args)
+    elif command == "calibrate":
+        print(json.dumps(calibrate_endpoint(**args), indent=2))
     else:
         if args["output"].exists():
             raise FileExistsError(args["output"])

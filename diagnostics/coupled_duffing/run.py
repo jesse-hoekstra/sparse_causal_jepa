@@ -105,10 +105,11 @@ def objective_for(
     """Use the existing SIGReg and prediction-calibrated GECO convention."""
     if state_regularization not in STATE_REGULARIZATIONS:
         raise ValueError("unknown state regularization")
-    sparse = phase == "baseline"
+    sparse = phase in {"baseline", "full"}
     config = ObjectiveConfig(
         state_sparsity_weight=float(sparse),
         action_sparsity_weight=float(sparse),
+        parameter_sparsity_weight=float(phase == "full"),
         state_regularizer="sigreg",
         state_regularizer_weight=weight,
         regularizer_num_projections=256,

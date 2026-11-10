@@ -100,8 +100,12 @@ class LaggedPredictor(MaskedTrunkPredictor):
 
     history_len = 2
 
-    def __init__(self, *, sparse: bool, code_dim: int = 4) -> None:
-        """Keep parameter gates fixed open in every phase of the baseline screen."""
+    def __init__(
+        self, *, sparse: bool, code_dim: int = 4, parameter_sparsity: bool = False
+    ) -> None:
+        """Learn parameter gates only for the full sparse condition."""
+        if parameter_sparsity and not sparse:
+            raise ValueError("parameter sparsity requires the sparse predictor")
         super().__init__(
             state_dim=2,
             action_dim=1,
@@ -109,7 +113,7 @@ class LaggedPredictor(MaskedTrunkPredictor):
             hidden_dim=209,
             learn_state=sparse,
             learn_action=sparse,
-            learn_parameter=False,
+            learn_parameter=parameter_sparsity,
             activation="gelu",
         )
         self.first = nn.Linear(6 + code_dim, self.hidden_dim)
@@ -170,6 +174,7 @@ def build_model(
     sparse: bool = False,
     code_dim: int = 4,
     parameter_encoder: ParameterArchitecture = "mlp",
+    parameter_sparsity: bool = False,
 ) -> SCJEPA:
     """Construct the visual model without physical-state or parameter inputs."""
     if parameter_encoder not in {"mlp", "temporal-cnn"}:
@@ -183,7 +188,9 @@ def build_model(
         _gaussian_(encoder.head.weight, encoder.head.in_features)
         _gaussian_(encoder.head.bias, encoder.head.in_features)
         context_encoder = encoder_type(context, code_dim)
-        predictor = LaggedPredictor(sparse=sparse, code_dim=code_dim)
+        predictor = LaggedPredictor(
+            sparse=sparse, code_dim=code_dim, parameter_sparsity=parameter_sparsity
+        )
         return SCJEPA(
             encoder,
             context_encoder,

@@ -1,7 +1,7 @@
-# Coupled Duffing baseline screen
+# Coupled Duffing diagnostic
 
 Validation-only visual dynamics diagnostic with two state/action lags, learned
-single-context parameter codes, and fixed-open parameter gates. Input and
+single-context parameter codes, and matched baseline/full masked predictors. Input and
 reference-label files are stored separately. The runner never opens training
 labels or generates/evaluates a test set.
 
@@ -12,8 +12,8 @@ python -m diagnostics.coupled_duffing.run train --data-dir DATA --output-dir RUN
 
 `experiment.py` provides the complete staged acquisition procedure: shared-feature
 initialization, an overcomplete code, fixed-budget acquisition restarts selected
-by training forecast loss, projection, adaptation and baseline training. Use its
-`prepare`, `train`, `select` and `project` subcommands for separately recorded stages.
+by training forecast loss, projection, adaptation and sparse training. Use its
+`prepare`, `train`, `select`, `project` and `calibrate` subcommands for separately recorded stages.
 The staged runner accepts `--parameter-encoder temporal-cnn` for temporal context
 features and `--cache-device cpu` for image caches larger than GPU memory.
 `python -m diagnostics.coupled_duffing.visual_data --source-dir PHYSICAL --output-dir IMAGES`
@@ -23,6 +23,10 @@ Use an immutable checkout for each batch. Model settings, calibration,
 checkpoints, source identity and evaluation assignments are retained with the
 run. A low state MCC is informative only alongside successful state retention,
 parameter acquisition and forecasting.
+
+Baseline learns state/action gates; full also learns parameter gates. Both can
+use one authenticated calibration file. Historical initializers require an
+explicit expected source fingerprint; historical resumes retain their original checkout.
 
 The discrete physical model follows the central-acceleration/forward-damping
 construction described by [Kouw (2020)](https://arxiv.org/abs/2009.00845), extended

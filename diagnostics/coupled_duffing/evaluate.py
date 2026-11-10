@@ -1,5 +1,6 @@
 """Calibration-fitted validation measurements for the mechanical baseline screen."""
 
+from itertools import permutations
 from typing import cast
 
 import torch
@@ -83,6 +84,60 @@ def selected_retention(
         scored.append(_r2(_design(test_x, family) @ weights, test_y))
     choice = torch.stack(selection).argmax(0)
     return torch.stack(scored)[choice, torch.arange(truth.shape[-1])]
+
+
+def parameter_order(codes: Tensor, theta: Tensor) -> list[int]:
+    """Match four code columns to physical child pairs using calibration rows only."""
+    if codes.ndim != 2 or codes.shape != theta.shape or codes.shape[1] != 4:
+        raise ValueError("parameter alignment requires matched four-coordinate matrices")
+    codes = codes.detach().cpu().double()
+    theta = theta.detach().cpu().double()
+    codes = (codes - codes.mean(0)) / codes.std(0).clamp_min(1e-10)
+    theta = (theta - theta.mean(0)) / theta.std(0).clamp_min(1e-10)
+    scores = torch.zeros(4, 4, dtype=torch.float64)
+    for pair in ((0, 1), (2, 3)):
+        design = torch.cat((theta[:, list(pair)], torch.ones(len(theta), 1)), 1)
+        weights = cast(
+            Tensor,
+            torch.linalg.solve(design.T @ design, design.T @ codes),  # pyright: ignore[reportUnknownMemberType]
+        )
+        explained = 1 - (design @ weights - codes).square().mean(0)
+        scores[list(pair)] = explained
+    scores += 1e-3 * pearson_matrix(codes, theta)
+    order = max(permutations(range(4)), key=lambda p: float(scores[range(4), list(p)].sum()))
+    return list(order)
+
+
+def graph_metrics(
+    graphs: dict[str, Tensor], calibration: dict[str, Tensor], labels: dict[str, Tensor]
+) -> dict[str, float]:
+    """Align graph rows and code columns on calibration, then count directed edge errors."""
+    rows = list(
+        fit_coordinate_match(
+            calibration["states"].reshape(-1, 2),
+            labels["states"].reshape(-1, 2),
+            method="pearson",
+        ).columns
+    )
+    theta = labels["theta"][:, None].expand_as(calibration["codes"]).reshape(-1, 4)
+    columns = parameter_order(calibration["codes"].reshape(-1, 4), theta)
+    aligned = {
+        "state": graphs["state"].detach().cpu().bool()[rows][:, rows],
+        "action": graphs["action"].detach().cpu().bool()[rows],
+        "parameter_code": graphs["parameter"].detach().cpu().bool()[rows][:, columns],
+    }
+    expected = {
+        "state": torch.ones(2, 2, dtype=torch.bool),
+        "action": torch.ones(2, 1, dtype=torch.bool),
+        "parameter_code": torch.tensor([[1, 1, 0, 0], [0, 0, 1, 1]], dtype=torch.bool),
+    }
+    output = {f"calibration/parameter_column_{i + 1}": float(c) for i, c in enumerate(columns)}
+    for name, graph in aligned.items():
+        truth = expected[name]
+        output[f"masks/{name}_aligned_shd"] = float((graph != truth).sum())
+        output[f"masks/{name}_aligned_missing_true_edges"] = float((~graph & truth).sum())
+        output[f"masks/{name}_aligned_false_edges"] = float((graph & ~truth).sum())
+    return output
 
 
 def metrics(
