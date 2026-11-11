@@ -14,17 +14,19 @@ from scjepa.data.datasets import canonical_fingerprint
 from scjepa.experiments.storage import write_json
 
 
-def prepare(directory: Path, source_dir: Path) -> dict[str, Any]:
+def prepare(directory: Path, source_dir: Path, *, forecast: int = 2) -> dict[str, Any]:
     """Write image/action inputs and separate reference labels for the same three splits."""
+    if forecast < 2:
+        raise ValueError("visual forecasts require at least two attached steps")
     source = read_json(source_dir / "manifest.json")
     if (
         source.get("schema") != "duffing-physical-acquisition-data-v1"
         or canonical_fingerprint({k: v for k, v in source.items() if k != "identity"})
         != source["identity"]
         or source["test_generated"]
-        or source["config"]["forecast"] < 2
+        or source["config"]["forecast"] < forecast
     ):
-        raise ValueError("expected an authenticated physical acquisition cache with two futures")
+        raise ValueError("expected an authenticated physical cache with enough future frames")
     settings = source["config"]
     config = DataConfig(
         **{
@@ -38,7 +40,7 @@ def prepare(directory: Path, source_dir: Path) -> dict[str, Any]:
                 "context",
             )
         },
-        forecast=2,
+        forecast=forecast,
     )
     if directory.exists():
         record = read_json(directory / "manifest.json")
@@ -102,9 +104,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--forecast", type=int, default=2)
     args = parser.parse_args()
     torch.set_num_threads(1)
-    prepare(args.output_dir, args.source_dir)
+    prepare(args.output_dir, args.source_dir, forecast=args.forecast)
 
 
 if __name__ == "__main__":

@@ -70,12 +70,16 @@ class StateRegularizationObjective(TrainingObjective):
         *,
         mode: str,
         seed: int = 0,
+        state_frames: int | None = None,
     ) -> None:
         """Keep optional-head initialization independent of scientific model weights."""
         if mode not in STATE_REGULARIZATIONS or mode == "aligned":
             raise ValueError("unknown auxiliary state regularization")
         super().__init__(config, geco)
         self.mode = mode
+        if state_frames is not None and state_frames < 1:
+            raise ValueError("state_frames must be positive")
+        self.state_frames = state_frames
         self.projector: nn.Module = nn.Identity()
         if mode.startswith("projected-"):
             with preserve_rng(torch.device("cpu")):
@@ -91,6 +95,10 @@ class StateRegularizationObjective(TrainingObjective):
     def forward(self, output: ModelOutput) -> tuple[Tensor, dict[str, Tensor]]:
         """Change regularization only; preserve raw prediction and all attached paths."""
         states = output.online_states
+        if self.state_frames is not None:
+            if self.state_frames > states.shape[-2]:
+                raise ValueError("state_frames exceeds the observed sequence")
+            states = states[..., : self.state_frames, :]
         if states.ndim == 4:
             states = states.flatten(1, 2)
         if states.shape[-1] != 2:

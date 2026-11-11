@@ -79,6 +79,9 @@ class StageConfig:
     gradient_accumulation: int = 1
     joint_adaptation: bool = False
     ema_decay: float | None = None
+    forecast_steps: int = 2
+    state_frames: int | None = None
+    source_data_dir: str | None = None
 
     def __post_init__(self) -> None:
         """Reject ambiguous stages or invalid fixed budgets before opening an output."""
@@ -96,6 +99,16 @@ class StageConfig:
             raise ValueError("only acquisition requires a distinct initialization seed")
         if self.source_code_identity is not None and self.source_dir is None:
             raise ValueError("an expected historical source requires a source endpoint")
+        if self.forecast_steps < 2:
+            raise ValueError("forecast_steps must be at least two")
+        if self.state_frames is not None and (
+            self.state_frames < 1 or self.state_regularization == "aligned"
+        ):
+            raise ValueError("state_frames requires a positive prefix and auxiliary objective")
+        if self.source_data_dir is not None and (
+            self.phase != "adaptation" or self.forecast_steps <= 2
+        ):
+            raise ValueError("source_data_dir is only for an extended-forecast adaptation")
         if self.calibration_file is not None and self.phase not in {"baseline", "full"}:
             raise ValueError("shared calibration applies only to sparse training")
         if self.joint_adaptation and self.phase != "adaptation":
@@ -156,7 +169,7 @@ class StageConfig:
 
 
 def load_data(
-    directory: Path, device: torch.device
+    directory: Path, device: torch.device, *, forecast_steps: int = 2
 ) -> tuple[dict[str, Any], dict[str, dict[str, Tensor]]]:
     """Authenticate input caches only; never read the training reference labels."""
     record = read_json(directory / "manifest.json")
@@ -165,8 +178,8 @@ def load_data(
         != record["identity"]
     ):
         raise ValueError("changed data manifest")
-    if record["config"]["forecast"] != 2:
-        raise ValueError("the matched protocol requires exactly two attached forecast steps")
+    if record["config"]["forecast"] != forecast_steps:
+        raise ValueError("data forecast length differs from the declared attached forecast steps")
     inputs: dict[str, dict[str, Tensor]] = {}
     for split in ("train", "calibration", "validation"):
         name = f"{split}-inputs.pt"
@@ -174,7 +187,56 @@ def load_data(
             raise ValueError(f"changed input cache: {name}")
         payload = cast(dict[str, Tensor], torch.load(directory / name, weights_only=True))
         inputs[split] = {key: payload[key].to(device) for key in ("observations", "actions")}
+        if (
+            inputs[split]["observations"].shape[2] != record["config"]["context"] + forecast_steps
+            or inputs[split]["actions"].shape[2] != inputs[split]["observations"].shape[2] - 1
+        ):
+            raise ValueError("input sequence lengths differ from the data manifest")
     return record, inputs
+
+
+def verify_forecast_extension(
+    source_directory: Path,
+    source_identity: str,
+    record: dict[str, Any],
+    inputs: dict[str, dict[str, Tensor]],
+) -> dict[str, Any]:
+    """Authenticate an unchanged input prefix before transferring to a longer forecast.
+
+    Only adaptation may invoke this explicit migration. Ordinary labels are
+    never opened, and every original image/action is compared bit for bit.
+    """
+    prior_manifest = read_json(source_directory / "manifest.json")
+    prior, previous = load_data(
+        source_directory,
+        torch.device("cpu"),
+        forecast_steps=int(prior_manifest["config"]["forecast"]),
+    )
+    if (
+        prior["identity"] != source_identity
+        or prior.get("schema") != "duffing-rendered-physical-data-v1"
+        or record.get("schema") != prior["schema"]
+        or prior["source_identity"] != record["source_identity"]
+        or prior["test_generated"]
+        or record["test_generated"]
+        or prior["config"]["forecast"] >= record["config"]["forecast"]
+        or {k: v for k, v in prior["config"].items() if k != "forecast"}
+        != {k: v for k, v in record["config"].items() if k != "forecast"}
+    ):
+        raise ValueError("forecast extension changed source systems or physical settings")
+    for split, values in previous.items():
+        for name, reference in values.items():
+            prefix = inputs[split][name][:, :, : reference.shape[2]].cpu()
+            if prefix.dtype != reference.dtype or not torch.equal(prefix, reference):
+                raise ValueError(f"forecast extension changed the {split} {name} prefix")
+    return {
+        "directory": str(source_directory.resolve()),
+        "identity": prior["identity"],
+        "manifest_sha256": sha(source_directory / "manifest.json"),
+        "forecast_steps": prior["config"]["forecast"],
+        "all_input_prefixes_exact": True,
+        "training_labels_opened": False,
+    }
 
 
 def verify(directory: Path, *, expected_code_identity: str | None = None) -> dict[str, Any]:
@@ -309,9 +371,15 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
     seed_everything(config.seed)
     data_dir, output = Path(config.data_dir), Path(config.output_dir)
     data_record, inputs = load_data(
-        data_dir, torch.device("cpu") if config.cache_device == "cpu" else device
+        data_dir,
+        torch.device("cpu") if config.cache_device == "cpu" else device,
+        forecast_steps=config.forecast_steps,
     )
     context = int(data_record["config"]["context"])
+    if config.state_frames is not None and not (
+        context <= config.state_frames <= context + config.forecast_steps
+    ):
+        raise ValueError("state_frames must cover the context and fit the observed sequence")
     frozen = config.frozen_states
     sparse = config.phase in {"baseline", "full"}
     calibration = _shared_calibration(config, data_record["identity"])
@@ -328,6 +396,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             for value in cast(LaggedPredictor, model.predictor).learned_logits().values():
                 value.fill_(config.initial_gate_logit)
     source: dict[str, Any] | None = None
+    source_extension: dict[str, Any] | None = None
     if config.source_dir is not None:
         inherited, record = load_model(
             Path(config.source_dir),
@@ -341,10 +410,17 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             "baseline": "adaptation",
             "full": "adaptation",
         }[config.phase]
+        if record["data_identity"] != data_record["identity"]:
+            if config.source_data_dir is None:
+                raise ValueError("source data differs without an explicit forecast extension")
+            source_extension = verify_forecast_extension(
+                Path(config.source_data_dir), record["data_identity"], data_record, inputs
+            )
+        elif config.source_data_dir is not None:
+            raise ValueError("source_data_dir requires an actual forecast extension")
         if (
             record["phase"] != expected
             or record["seed"] != config.seed
-            or record["data_identity"] != data_record["identity"]
             or record.get("parameter_encoder", "mlp") != config.parameter_encoder
             or record.get("state_regularization", "aligned") != config.state_regularization
         ):
@@ -397,6 +473,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "code_identity": code_identity(),
         "data_identity": data_record["identity"],
         "source": source,
+        "source_forecast_extension": source_extension,
         "true_parameter_training": False,
         "true_state_training": False,
         "parameter_gates": "learned" if config.phase == "full" else "fixed_open",
@@ -427,7 +504,8 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         if config.phase in {"joint", "acquisition"}
         else "inherited",
         "history_len": 2,
-        "forecast_steps": 2,
+        "forecast_steps": config.forecast_steps,
+        "state_frames": config.state_frames,
         "initial_gate_logit": config.initial_gate_logit,
     }
     specification["identity"] = canonical_fingerprint(specification)
@@ -480,6 +558,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         device,
         state_regularization=config.state_regularization,
         seed=config.seed,
+        state_frames=config.state_frames,
     )
     if isinstance(objective, StateRegularizationObjective) and config.source_dir is not None:
         parent_checkpoint = cast(
@@ -591,7 +670,14 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         with preserve_rng(device):
             cal = collect(model, inputs["calibration"], config.batch_size)
             val = collect(model, inputs["validation"], config.batch_size)
-            scores = metrics(cal, val, labels["calibration"], labels["validation"], context)
+            scores = metrics(
+                cal,
+                val,
+                labels["calibration"],
+                labels["validation"],
+                context,
+                state_frames=config.state_frames,
+            )
             shuffled = collect(model, inputs["validation"], config.batch_size, shuffle=True)
             scores["code_shuffle/mse_ratio"] = prediction_mse(shuffled) / max(
                 prediction_mse(val), 1e-12
@@ -602,7 +688,11 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             for name, graph in graphs.items():
                 scores[f"gates/{name}_open"] = float(graph.sum())
             if config.code_dim == 4:
-                scores.update(graph_metrics(graphs, cal, labels["calibration"]))
+                scores.update(
+                    graph_metrics(
+                        graphs, cal, labels["calibration"], state_frames=config.state_frames
+                    )
+                )
             with (output / "validation.jsonl").open("a") as stream:
                 stream.write(json.dumps({"step": step, **scores}) + "\n")
             logger.log(step, {f"validation/{key}": value for key, value in scores.items()})
@@ -651,8 +741,8 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
                         if frozen_replay is None
                         else frozen_replay.forward_loss(batch, objective)
                     )
-                if len(result.dynamics) != 2 or not bool(torch.isfinite(loss)):
-                    raise FloatingPointError("expected two finite attached forecast steps")
+                if len(result.dynamics) != config.forecast_steps or not bool(torch.isfinite(loss)):
+                    raise FloatingPointError("expected the declared finite attached forecast steps")
                 backward_loss = loss / config.gradient_accumulation
                 backward_loss.backward()  # pyright: ignore[reportUnknownMemberType]
                 accumulated_loss += backward_loss.detach()
@@ -861,6 +951,9 @@ def main() -> None:
     run.add_argument("--gradient-accumulation", type=int, default=1)
     run.add_argument("--joint-adaptation", action="store_true")
     run.add_argument("--ema-decay", type=float)
+    run.add_argument("--forecast-steps", type=int, default=2)
+    run.add_argument("--state-frames", type=int)
+    run.add_argument("--source-data-dir")
     run.add_argument("--device", default="cuda:0")
     run.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     run.add_argument("--wandb-group", default="coupled-duffing-experiment1-20261108")

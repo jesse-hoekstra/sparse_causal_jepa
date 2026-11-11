@@ -108,14 +108,24 @@ def parameter_order(codes: Tensor, theta: Tensor) -> list[int]:
     return list(order)
 
 
+def _state_rows(states: Tensor, state_frames: int | None) -> Tensor:
+    if state_frames is not None and not 1 <= state_frames <= states.shape[-2]:
+        raise ValueError("state evaluation prefix is outside the observed sequence")
+    return states[..., :state_frames, :].reshape(-1, 2)
+
+
 def graph_metrics(
-    graphs: dict[str, Tensor], calibration: dict[str, Tensor], labels: dict[str, Tensor]
+    graphs: dict[str, Tensor],
+    calibration: dict[str, Tensor],
+    labels: dict[str, Tensor],
+    *,
+    state_frames: int | None = None,
 ) -> dict[str, float]:
     """Align graph rows and code columns on calibration, then count directed edge errors."""
     rows = list(
         fit_coordinate_match(
-            calibration["states"].reshape(-1, 2),
-            labels["states"].reshape(-1, 2),
+            _state_rows(calibration["states"], state_frames),
+            _state_rows(labels["states"], state_frames),
             method="pearson",
         ).columns
     )
@@ -146,14 +156,17 @@ def metrics(
     calibration_labels: dict[str, Tensor],
     validation_labels: dict[str, Tensor],
     context: int,
+    *,
+    state_frames: int | None = None,
 ) -> dict[str, float]:
     """Score fixed assignments, state/code retention and nontrivial forecasting on validation."""
     cal_n, val_n = len(calibration["states"]), len(validation["states"])
     cal_reference = calibration_labels["states"][:cal_n].double()
     val_reference = validation_labels["states"][:val_n].double()
-    cal_z = cal_reference.reshape(-1, 2)
-    val_z = val_reference.reshape(-1, 2)
-    cal_s, val_s = calibration["states"].reshape(-1, 2), validation["states"].reshape(-1, 2)
+    cal_z = _state_rows(cal_reference, state_frames)
+    val_z = _state_rows(val_reference, state_frames)
+    cal_s = _state_rows(calibration["states"], state_frames)
+    val_s = _state_rows(validation["states"], state_frames)
     output: dict[str, float] = {}
     for method in ("pearson", "spearman"):
         match = fit_coordinate_match(cal_s, cal_z, method=method)

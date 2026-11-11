@@ -101,6 +101,7 @@ def objective_for(
     *,
     state_regularization: str = "aligned",
     seed: int = 0,
+    state_frames: int | None = None,
 ) -> TrainingObjective:
     """Use the existing SIGReg and prediction-calibrated GECO convention."""
     if state_regularization not in STATE_REGULARIZATIONS:
@@ -116,10 +117,12 @@ def objective_for(
     )
     geco = GECOConfig(enabled=True, tau=1.0) if sparse else None
     if state_regularization == "aligned":
+        if state_frames is not None:
+            raise ValueError("a fixed state-frame prefix requires an auxiliary objective")
         return TrainingObjective(config, geco).to(device)
-    return StateRegularizationObjective(config, geco, mode=state_regularization, seed=seed).to(
-        device
-    )
+    return StateRegularizationObjective(
+        config, geco, mode=state_regularization, seed=seed, state_frames=state_frames
+    ).to(device)
 
 
 def _load_inputs(directory: Path, split: str, device: torch.device) -> dict[str, Tensor]:
