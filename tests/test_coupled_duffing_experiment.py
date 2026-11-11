@@ -62,6 +62,19 @@ def test_invalid_gate_optimizer_rate_is_rejected(gate_learning_rate: float) -> N
         )
 
 
+@pytest.mark.parametrize("initial_gate_logit", [float("inf"), float("nan")])
+def test_invalid_gate_initialization_is_rejected(initial_gate_logit: float) -> None:
+    with pytest.raises(ValueError, match="initial_gate_logit"):
+        StageConfig(
+            "data", "out", "full", source_dir="source", initial_gate_logit=initial_gate_logit
+        )
+
+
+def test_custom_gate_initialization_requires_a_sparse_stage() -> None:
+    with pytest.raises(ValueError, match="sparse stages"):
+        StageConfig("data", "out", "joint", initial_gate_logit=10.0)
+
+
 @pytest.mark.parametrize("phase", ["joint", "acquisition", "adaptation"])
 def test_separate_gate_rate_requires_a_sparse_stage(phase: str) -> None:
     with pytest.raises(ValueError, match="sparse stages"):
@@ -151,15 +164,22 @@ def test_projection_preserves_affine_code_transfer_and_predictor_function(
 
 
 @pytest.mark.parametrize(
-    ("architecture", "state_regularization", "synchronize_target", "cache_frozen_states"),
+    (
+        "architecture",
+        "state_regularization",
+        "synchronize_target",
+        "cache_frozen_states",
+        "initial_gate_logit",
+    ),
     [
-        ("mlp", "aligned", False, False),
-        ("temporal-cnn", "aligned", False, False),
-        ("temporal-cnn", "projected-mixture-variance", False, False),
-        ("temporal-cnn", "projected-aligned", False, False),
-        ("temporal-cnn", "projected-aligned", True, False),
-        ("temporal-cnn", "projected-aligned", False, True),
-        ("temporal-cnn", "projected-aligned", True, True),
+        ("mlp", "aligned", False, False, 3.0),
+        ("temporal-cnn", "aligned", False, False, 3.0),
+        ("temporal-cnn", "projected-mixture-variance", False, False, 3.0),
+        ("temporal-cnn", "projected-aligned", False, False, 3.0),
+        ("temporal-cnn", "projected-aligned", True, False, 3.0),
+        ("temporal-cnn", "projected-aligned", False, True, 3.0),
+        ("temporal-cnn", "projected-aligned", True, True, 3.0),
+        ("temporal-cnn", "projected-aligned", True, True, 10.0),
     ],
 )
 def test_complete_stages_label_free_selection_and_exact_resume(
@@ -168,6 +188,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     state_regularization: StateRegularization,
     synchronize_target: bool,
     cache_frozen_states: bool,
+    initial_gate_logit: float,
 ) -> None:
     torch.set_num_threads(1)
     data = tmp_path / "data"
@@ -231,6 +252,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
             else None,
             synchronize_target=synchronize_target and phase in {"acquisition", "adaptation"},
             cache_frozen_states=cache_frozen_states and phase in {"acquisition", "adaptation"},
+            initial_gate_logit=initial_gate_logit if phase in {"baseline", "full"} else 3.0,
         )
         train(config)
         return config
@@ -288,6 +310,19 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     for name, value in initial_pair[0]["model"].items():
         torch.testing.assert_close(value, initial_pair[1]["model"][name], rtol=0, atol=0)
     assert initial_pair[0]["tau"] == initial_pair[1]["tau"] == calibration["tau"]
+    adapted_state = cast(
+        dict[str, Any], torch.load(Path(adapted.output_dir) / "last.pt", weights_only=False)
+    )
+    for name, value in adapted_state["model"].items():
+        torch.testing.assert_close(value, initial_pair[1]["model"][name], rtol=0, atol=0)
+    for name in ("state", "action", "parameter"):
+        value = initial_pair[1]["model"][f"predictor.{name}_logits"]
+        torch.testing.assert_close(
+            value, torch.full_like(value, initial_gate_logit), rtol=0, atol=0
+        )
+    assert read_json(Path(full.output_dir) / "completion.json")["initial_gate_logit"] == (
+        initial_gate_logit
+    )
     full_final = cast(
         dict[str, Any], torch.load(Path(full.output_dir) / "last.pt", weights_only=False)
     )

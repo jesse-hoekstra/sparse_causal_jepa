@@ -74,6 +74,7 @@ class StageConfig:
     gate_learning_rate: float | None = None
     synchronize_target: bool = False
     cache_frozen_states: bool = False
+    initial_gate_logit: float = 3.0
 
     def __post_init__(self) -> None:
         """Reject ambiguous stages or invalid fixed budgets before opening an output."""
@@ -104,6 +105,10 @@ class StageConfig:
             raise ValueError("synchronize_target is restricted to frozen-state stages")
         if self.cache_frozen_states and self.phase not in {"acquisition", "adaptation"}:
             raise ValueError("state caching is restricted to frozen-state stages")
+        if not math.isfinite(self.initial_gate_logit):
+            raise ValueError("initial_gate_logit must be finite")
+        if self.initial_gate_logit != 3.0 and self.phase not in {"baseline", "full"}:
+            raise ValueError("custom gate initialization applies only to sparse stages")
         if min(self.updates, self.batch_size, self.log_every, self.eval_every, self.threads) < 1:
             raise ValueError("budgets, intervals, batch size and threads must be positive")
 
@@ -286,6 +291,10 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         parameter_encoder=config.parameter_encoder,
         parameter_sparsity=config.phase == "full",
     ).to(device)
+    if sparse and config.initial_gate_logit != 3.0:
+        with torch.no_grad():
+            for value in cast(LaggedPredictor, model.predictor).learned_logits().values():
+                value.fill_(config.initial_gate_logit)
     source: dict[str, Any] | None = None
     if config.source_dir is not None:
         inherited, record = load_model(
@@ -376,7 +385,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         else "inherited",
         "history_len": 2,
         "forecast_steps": 2,
-        "initial_gate_logit": 3.0,
+        "initial_gate_logit": config.initial_gate_logit,
     }
     specification["identity"] = canonical_fingerprint(specification)
     saved: dict[str, Any] = {}
@@ -778,6 +787,7 @@ def main() -> None:
     run.add_argument("--gate-learning-rate", type=float)
     run.add_argument("--synchronize-target", action="store_true")
     run.add_argument("--cache-frozen-states", action="store_true")
+    run.add_argument("--initial-gate-logit", type=float, default=3.0)
     run.add_argument("--device", default="cuda:0")
     run.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     run.add_argument("--wandb-group", default="coupled-duffing-experiment1-20261108")
