@@ -70,6 +70,7 @@ class StageConfig:
     source_code_identity: str | None = None
     calibration_file: str | None = None
     learning_rate: float = 0.001
+    gate_learning_rate: float | None = None
     synchronize_target: bool = False
 
     def __post_init__(self) -> None:
@@ -92,6 +93,11 @@ class StageConfig:
             raise ValueError("shared calibration applies only to sparse training")
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
             raise ValueError("learning_rate must be finite and positive")
+        if self.gate_learning_rate is not None:
+            if not math.isfinite(self.gate_learning_rate) or self.gate_learning_rate <= 0:
+                raise ValueError("gate_learning_rate must be finite and positive")
+            if self.phase not in {"baseline", "full"}:
+                raise ValueError("a separate gate rate applies only to sparse stages")
         if self.synchronize_target and self.phase not in {"acquisition", "adaptation"}:
             raise ValueError("synchronize_target is restricted to frozen-state stages")
         if min(self.updates, self.batch_size, self.log_every, self.eval_every, self.threads) < 1:
@@ -350,6 +356,9 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "shared_calibration": calibration,
         "test_evaluation": False,
         "learning_rate": config.learning_rate,
+        "gate_learning_rate": (config.gate_learning_rate or config.learning_rate)
+        if sparse
+        else None,
         "weight_decay": 0.0,
         "gradient_clip": 1.0,
         "ema_decay": 0.996,
@@ -435,7 +444,19 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
     parameters = [
         p for module in (model, objective) for p in module.parameters() if p.requires_grad
     ]
-    optimizer = torch.optim.AdamW(parameters, lr=config.learning_rate, weight_decay=0.0)
+    if config.gate_learning_rate is None:
+        optimizer = torch.optim.AdamW(parameters, lr=config.learning_rate, weight_decay=0.0)
+    else:
+        gates = list(cast(LaggedPredictor, model.predictor).learned_logits().values())
+        gate_ids = {id(parameter) for parameter in gates}
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": [p for p in parameters if id(p) not in gate_ids], "role": "continuous"},
+                {"params": gates, "lr": config.gate_learning_rate, "role": "gates"},
+            ],
+            lr=config.learning_rate,
+            weight_decay=0.0,
+        )
     sampler = GroupSampler(len(inputs["train"]["observations"]), config.batch_size, config.seed)
     if resume:
         optimizer.load_state_dict(saved["optimizer"])
@@ -739,6 +760,7 @@ def main() -> None:
     run.add_argument("--acquisition-seed", type=int)
     run.add_argument("--steps", type=int)
     run.add_argument("--learning-rate", type=float, default=0.001)
+    run.add_argument("--gate-learning-rate", type=float)
     run.add_argument("--synchronize-target", action="store_true")
     run.add_argument("--device", default="cuda:0")
     run.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))

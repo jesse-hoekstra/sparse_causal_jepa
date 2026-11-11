@@ -54,6 +54,27 @@ def test_invalid_optimizer_rate_is_rejected(learning_rate: float) -> None:
         StageConfig("data", "out", "joint", learning_rate=learning_rate)
 
 
+@pytest.mark.parametrize("gate_learning_rate", [0.0, -0.001, float("inf"), float("nan")])
+def test_invalid_gate_optimizer_rate_is_rejected(gate_learning_rate: float) -> None:
+    with pytest.raises(ValueError, match="gate_learning_rate"):
+        StageConfig(
+            "data", "out", "full", source_dir="source", gate_learning_rate=gate_learning_rate
+        )
+
+
+@pytest.mark.parametrize("phase", ["joint", "acquisition", "adaptation"])
+def test_separate_gate_rate_requires_a_sparse_stage(phase: str) -> None:
+    with pytest.raises(ValueError, match="sparse stages"):
+        StageConfig(
+            "data",
+            "out",
+            phase,
+            source_dir=None if phase == "joint" else "source",
+            acquisition_seed=1000 if phase == "acquisition" else None,
+            gate_learning_rate=0.001,
+        )
+
+
 @pytest.mark.parametrize("phase", ["joint", "baseline", "full"])
 def test_target_synchronization_is_only_allowed_when_states_are_frozen(phase: str) -> None:
     with pytest.raises(ValueError, match="frozen-state"):
@@ -188,6 +209,11 @@ def test_complete_stages_label_free_selection_and_exact_resume(
             state_regularization=state_regularization,
             calibration_file=str(calibration_file) if calibration_file else None,
             learning_rate=0.0001 if state_regularization == "projected-aligned" else 0.001,
+            gate_learning_rate=0.001
+            if state_regularization == "projected-aligned"
+            and not synchronize_target
+            and phase in {"baseline", "full"}
+            else None,
             synchronize_target=synchronize_target and phase in {"acquisition", "adaptation"},
         )
         train(config)
@@ -293,6 +319,24 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     assert complete["tau"] == resumed["tau"]
     assert complete["optimizer"]["param_groups"][0]["lr"] == full.learning_rate
     assert resumed["optimizer"]["param_groups"][0]["lr"] == full.learning_rate
+    if full.gate_learning_rate is not None:
+        groups = complete["optimizer"]["param_groups"]
+        resumed_groups = resumed["optimizer"]["param_groups"]
+        assert len(groups) == 2
+        assert groups[0]["role"] == "continuous"
+        assert groups[1]["role"] == "gates"
+        assert len(groups[1]["params"]) == 3
+        assert groups[1]["lr"] == full.gate_learning_rate
+        assert resumed_groups == groups
+        initial = cast(dict[str, Any], torch.load(directory / "initial.pt", weights_only=False))
+        for name in ("state", "action", "parameter"):
+            key = f"predictor.{name}_logits"
+            assert not torch.equal(initial["model"][key], complete["model"][key])
+        assert not torch.equal(
+            initial["model"]["predictor.first.weight"], complete["model"]["predictor.first.weight"]
+        )
+    else:
+        assert len(complete["optimizer"]["param_groups"]) == 1
     assert read_json(directory / "completion.json")["learning_rate"] == full.learning_rate
     assert not list(data.glob("test*"))
     verify(directory)
