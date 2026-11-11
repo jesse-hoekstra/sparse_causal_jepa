@@ -54,6 +54,18 @@ def test_invalid_optimizer_rate_is_rejected(learning_rate: float) -> None:
         StageConfig("data", "out", "joint", learning_rate=learning_rate)
 
 
+@pytest.mark.parametrize("phase", ["joint", "baseline", "full"])
+def test_target_synchronization_is_only_allowed_when_states_are_frozen(phase: str) -> None:
+    with pytest.raises(ValueError, match="frozen-state"):
+        StageConfig(
+            "data",
+            "out",
+            phase,
+            source_dir=None if phase == "joint" else "source",
+            synchronize_target=True,
+        )
+
+
 @pytest.mark.parametrize("architecture", ["mlp", "temporal-cnn"])
 def test_shared_feature_initialization_preserves_mean_and_centered_rms(
     architecture: ParameterArchitecture,
@@ -106,16 +118,20 @@ def test_projection_preserves_affine_code_transfer_and_predictor_function(
 
 
 @pytest.mark.parametrize(
-    ("architecture", "state_regularization"),
+    ("architecture", "state_regularization", "synchronize_target"),
     [
-        ("mlp", "aligned"),
-        ("temporal-cnn", "aligned"),
-        ("temporal-cnn", "projected-mixture-variance"),
-        ("temporal-cnn", "projected-aligned"),
+        ("mlp", "aligned", False),
+        ("temporal-cnn", "aligned", False),
+        ("temporal-cnn", "projected-mixture-variance", False),
+        ("temporal-cnn", "projected-aligned", False),
+        ("temporal-cnn", "projected-aligned", True),
     ],
 )
 def test_complete_stages_label_free_selection_and_exact_resume(
-    tmp_path: Path, architecture: ParameterArchitecture, state_regularization: StateRegularization
+    tmp_path: Path,
+    architecture: ParameterArchitecture,
+    state_regularization: StateRegularization,
+    synchronize_target: bool,
 ) -> None:
     torch.set_num_threads(1)
     data = tmp_path / "data"
@@ -172,6 +188,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
             state_regularization=state_regularization,
             calibration_file=str(calibration_file) if calibration_file else None,
             learning_rate=0.0001 if state_regularization == "projected-aligned" else 0.001,
+            synchronize_target=synchronize_target and phase in {"acquisition", "adaptation"},
         )
         train(config)
         return config
@@ -232,6 +249,14 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     source = cast(
         dict[str, Any], torch.load(Path(joint.output_dir) / "last.pt", weights_only=False)
     )
+    if synchronize_target:
+        assert any(
+            not torch.equal(
+                value, source["model"][key.replace("target_encoder.", "online_encoder.")]
+            )
+            for key, value in source["model"].items()
+            if key.startswith("target_encoder.")
+        )
     if state_regularization.startswith("projected-"):
         initial = cast(
             dict[str, Any], torch.load(Path(joint.output_dir) / "initial.pt", weights_only=False)
@@ -245,7 +270,12 @@ def test_complete_stages_label_free_selection_and_exact_resume(
         frozen = cast(dict[str, Any], torch.load(path / "last.pt", weights_only=False))
         for key, value in source["model"].items():
             if key.startswith(("online_encoder.", "target_encoder.")):
-                torch.testing.assert_close(value, frozen["model"][key], rtol=0, atol=0)
+                expected = (
+                    source["model"][key.replace("target_encoder.", "online_encoder.")]
+                    if synchronize_target
+                    else value
+                )
+                torch.testing.assert_close(expected, frozen["model"][key], rtol=0, atol=0)
         for key, value in source["objective"].items():
             if key.startswith("projector."):
                 torch.testing.assert_close(value, frozen["objective"][key], rtol=0, atol=0)
@@ -266,6 +296,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     assert read_json(directory / "completion.json")["learning_rate"] == full.learning_rate
     assert not list(data.glob("test*"))
     verify(directory)
+    verify(Path(joint.output_dir))
     with pytest.raises(ValueError, match="different numerical implementation"):
         verify(directory, expected_code_identity="0" * 64)
     verify(

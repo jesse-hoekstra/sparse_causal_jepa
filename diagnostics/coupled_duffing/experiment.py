@@ -70,6 +70,7 @@ class StageConfig:
     source_code_identity: str | None = None
     calibration_file: str | None = None
     learning_rate: float = 0.001
+    synchronize_target: bool = False
 
     def __post_init__(self) -> None:
         """Reject ambiguous stages or invalid fixed budgets before opening an output."""
@@ -91,6 +92,8 @@ class StageConfig:
             raise ValueError("shared calibration applies only to sparse training")
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
             raise ValueError("learning_rate must be finite and positive")
+        if self.synchronize_target and self.phase not in {"acquisition", "adaptation"}:
+            raise ValueError("synchronize_target is restricted to frozen-state stages")
         if min(self.updates, self.batch_size, self.log_every, self.eval_every, self.threads) < 1:
             raise ValueError("budgets, intervals, batch size and threads must be positive")
 
@@ -312,6 +315,8 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             if set(missing) != expected_missing or unexpected:
                 raise ValueError("sparse initialization changed inherited tensors")
         del inherited
+    if config.synchronize_target:
+        model.target_encoder.load_state_dict(model.online_encoder.state_dict(), strict=True)
     model.online_encoder.requires_grad_(not frozen)
     if output.exists() and not resume:
         raise FileExistsError(output)
@@ -348,6 +353,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "weight_decay": 0.0,
         "gradient_clip": 1.0,
         "ema_decay": 0.996,
+        "target_initialization": "online_copy" if config.synchronize_target else "inherited",
         "sigreg_weight": 0.4,
         "sigreg_directions": 256,
         "parameter_auxiliary_loss": False,
@@ -733,6 +739,7 @@ def main() -> None:
     run.add_argument("--acquisition-seed", type=int)
     run.add_argument("--steps", type=int)
     run.add_argument("--learning-rate", type=float, default=0.001)
+    run.add_argument("--synchronize-target", action="store_true")
     run.add_argument("--device", default="cuda:0")
     run.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     run.add_argument("--wandb-group", default="coupled-duffing-experiment1-20261108")
