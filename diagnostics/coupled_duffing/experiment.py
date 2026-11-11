@@ -76,6 +76,7 @@ class StageConfig:
     cache_frozen_states: bool = False
     initial_gate_logit: float = 3.0
     final_learning_rate: float | None = None
+    gradient_accumulation: int = 1
 
     def __post_init__(self) -> None:
         """Reject ambiguous stages or invalid fixed budgets before opening an output."""
@@ -120,6 +121,10 @@ class StageConfig:
                 )
             if self.phase not in {"acquisition", "adaptation"} or self.updates < 2:
                 raise ValueError("cosine decay requires a frozen stage with at least two updates")
+        if self.gradient_accumulation < 1:
+            raise ValueError("gradient_accumulation must be positive")
+        if self.gradient_accumulation != 1 and self.phase not in {"baseline", "full"}:
+            raise ValueError("gradient accumulation is restricted to sparse stages")
         if min(self.updates, self.batch_size, self.log_every, self.eval_every, self.threads) < 1:
             raise ValueError("budgets, intervals, batch size and threads must be positive")
 
@@ -389,6 +394,9 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         else None,
         "weight_decay": 0.0,
         "gradient_clip": 1.0,
+        "gradient_accumulation": config.gradient_accumulation,
+        "systems_per_optimizer_step": config.batch_size * config.gradient_accumulation,
+        "sigreg_systems_per_statistic": config.batch_size,
         "ema_decay": 0.996,
         "target_initialization": "online_copy" if config.synchronize_target else "inherited",
         "frozen_state_cache": config.cache_frozen_states,
@@ -604,22 +612,36 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             model.train()
             if frozen:
                 model.online_encoder.eval()
-            indices = sampler.next().to(training_inputs["actions"].device)
-            batch = {name: values[indices].to(device) for name, values in training_inputs.items()}
             optimizer.zero_grad(set_to_none=True)
             torch.manual_seed((1 << 40) + config.seed + step)  # pyright: ignore[reportUnknownMemberType]
-            with preserve_rng(device):
-                torch.default_generator.manual_seed(config.seed + step)
-                if device.type == "cuda":
-                    torch.cuda.manual_seed(config.seed + step)
-                loss, terms, result = (
-                    forward_loss(model, batch, objective)
-                    if frozen_replay is None
-                    else frozen_replay.forward_loss(batch, objective)
-                )
-            if len(result.dynamics) != 2 or not bool(torch.isfinite(loss)):
-                raise FloatingPointError("expected two finite attached forecast steps")
-            loss.backward()  # pyright: ignore[reportUnknownMemberType]
+            accumulated_loss = torch.zeros((), device=device)
+            accumulated_terms: dict[str, Tensor] = {}
+            for microbatch in range(config.gradient_accumulation):
+                indices = sampler.next().to(training_inputs["actions"].device)
+                batch = {
+                    name: values[indices].to(device) for name, values in training_inputs.items()
+                }
+                with preserve_rng(device):
+                    micro_seed = config.seed + step + 1_000_003 * microbatch
+                    torch.default_generator.manual_seed(micro_seed)
+                    if device.type == "cuda":
+                        torch.cuda.manual_seed(micro_seed)
+                    loss, terms, result = (
+                        forward_loss(model, batch, objective)
+                        if frozen_replay is None
+                        else frozen_replay.forward_loss(batch, objective)
+                    )
+                if len(result.dynamics) != 2 or not bool(torch.isfinite(loss)):
+                    raise FloatingPointError("expected two finite attached forecast steps")
+                backward_loss = loss / config.gradient_accumulation
+                backward_loss.backward()  # pyright: ignore[reportUnknownMemberType]
+                accumulated_loss += backward_loss.detach()
+                for key, value in terms.items():
+                    scaled = value.detach() / config.gradient_accumulation
+                    accumulated_terms[key] = (
+                        accumulated_terms.get(key, torch.zeros_like(scaled)) + scaled
+                    )
+            loss, terms = accumulated_loss, accumulated_terms
             gradient = torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
             optimizer.step()  # pyright: ignore[reportUnknownMemberType]
             if not frozen:
@@ -635,6 +657,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
                         "train/gradient_norm": float(gradient),
                         "runtime/seconds_per_step": (time.monotonic() - started) / (step - start),
                         "optimizer/learning_rate": float(optimizer.param_groups[0]["lr"]),
+                        "optimizer/minibatches_per_step": float(config.gradient_accumulation),
                     }
                 )
                 if objective.geco is not None:
@@ -815,6 +838,7 @@ def main() -> None:
     run.add_argument("--cache-frozen-states", action="store_true")
     run.add_argument("--initial-gate-logit", type=float, default=3.0)
     run.add_argument("--final-learning-rate", type=float)
+    run.add_argument("--gradient-accumulation", type=int, default=1)
     run.add_argument("--device", default="cuda:0")
     run.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     run.add_argument("--wandb-group", default="coupled-duffing-experiment1-20261108")

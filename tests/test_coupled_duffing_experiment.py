@@ -1,10 +1,12 @@
 import json
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 import torch
 
+from diagnostics.coupled_duffing import experiment
 from diagnostics.coupled_duffing.acquisition import (
     initialize_shared_output,
     project,
@@ -28,6 +30,9 @@ from diagnostics.coupled_duffing_probe.data import ProbeDataConfig
 from diagnostics.coupled_duffing_probe.data import prepare as prepare_physical
 from diagnostics.masked_mlp_learned.selection import training_score
 from diagnostics.shared.io import read_json
+from diagnostics.shared.sampling import GroupSampler
+from scjepa.models.model import SCJEPA, ModelOutput
+from scjepa.training.loop import TrainingObjective
 
 
 def test_successful_experiment1_counts_and_budgets_are_preserved() -> None:
@@ -89,6 +94,17 @@ def test_cosine_schedule_requires_a_frozen_multi_update_stage() -> None:
         StageConfig(
             "data", "out", "adaptation", source_dir="source", steps=1, final_learning_rate=0.0001
         )
+
+
+@pytest.mark.parametrize("count", [0, -1])
+def test_gradient_accumulation_requires_positive_count(count: int) -> None:
+    with pytest.raises(ValueError, match="gradient_accumulation"):
+        StageConfig("data", "out", "full", source_dir="source", gradient_accumulation=count)
+
+
+def test_gradient_accumulation_requires_a_sparse_stage() -> None:
+    with pytest.raises(ValueError, match="sparse stages"):
+        StageConfig("data", "out", "joint", gradient_accumulation=8)
 
 
 @pytest.mark.parametrize("phase", ["joint", "acquisition", "adaptation"])
@@ -187,27 +203,31 @@ def test_projection_preserves_affine_code_transfer_and_predictor_function(
         "cache_frozen_states",
         "initial_gate_logit",
         "cosine_adaptation",
+        "gradient_accumulation",
     ),
     [
-        ("mlp", "aligned", False, False, 3.0, False),
-        ("temporal-cnn", "aligned", False, False, 3.0, False),
-        ("temporal-cnn", "projected-mixture-variance", False, False, 3.0, False),
-        ("temporal-cnn", "projected-aligned", False, False, 3.0, False),
-        ("temporal-cnn", "projected-aligned", True, False, 3.0, False),
-        ("temporal-cnn", "projected-aligned", False, True, 3.0, False),
-        ("temporal-cnn", "projected-aligned", True, True, 3.0, False),
-        ("temporal-cnn", "projected-aligned", True, True, 10.0, False),
-        ("temporal-cnn", "projected-aligned", True, True, 3.0, True),
+        ("mlp", "aligned", False, False, 3.0, False, 1),
+        ("temporal-cnn", "aligned", False, False, 3.0, False, 1),
+        ("temporal-cnn", "projected-mixture-variance", False, False, 3.0, False, 1),
+        ("temporal-cnn", "projected-aligned", False, False, 3.0, False, 1),
+        ("temporal-cnn", "projected-aligned", True, False, 3.0, False, 1),
+        ("temporal-cnn", "projected-aligned", False, True, 3.0, False, 1),
+        ("temporal-cnn", "projected-aligned", True, True, 3.0, False, 1),
+        ("temporal-cnn", "projected-aligned", True, True, 10.0, False, 1),
+        ("temporal-cnn", "projected-aligned", True, True, 3.0, True, 1),
+        ("temporal-cnn", "projected-aligned", True, True, 3.0, False, 8),
     ],
 )
 def test_complete_stages_label_free_selection_and_exact_resume(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     architecture: ParameterArchitecture,
     state_regularization: StateRegularization,
     synchronize_target: bool,
     cache_frozen_states: bool,
     initial_gate_logit: float,
     cosine_adaptation: bool,
+    gradient_accumulation: int,
 ) -> None:
     torch.set_num_threads(1)
     data = tmp_path / "data"
@@ -273,8 +293,48 @@ def test_complete_stages_label_free_selection_and_exact_resume(
             cache_frozen_states=cache_frozen_states and phase in {"acquisition", "adaptation"},
             initial_gate_logit=initial_gate_logit if phase in {"baseline", "full"} else 3.0,
             final_learning_rate=0.00001 if cosine_adaptation and phase == "adaptation" else None,
+            gradient_accumulation=gradient_accumulation if phase in {"baseline", "full"} else 1,
         )
-        train(config)
+        if phase == "full" and gradient_accumulation > 1:
+            recorded: list[tuple[torch.Tensor, ...]] = []
+            original_forward = experiment.forward_loss
+            original_clip = torch.nn.utils.clip_grad_norm_
+
+            def observe_minibatch(
+                model: SCJEPA, batch: dict[str, torch.Tensor], objective: TrainingObjective
+            ) -> tuple[torch.Tensor, dict[str, torch.Tensor], ModelOutput]:
+                result = original_forward(model, batch, objective)
+                parameters = [
+                    p
+                    for module in (model, objective)
+                    for p in module.parameters()
+                    if p.requires_grad
+                ]
+                recorded.append(torch.autograd.grad(result[0], parameters, retain_graph=True))
+                return result
+
+            def check_unclipped_mean(
+                parameters: Iterable[torch.Tensor],
+                max_norm: float,
+                *,
+                error_if_nonfinite: bool = False,
+            ) -> torch.Tensor:
+                supplied = list(parameters)
+                assert len(recorded) == gradient_accumulation
+                for index, parameter in enumerate(supplied):
+                    expected = torch.stack([row[index] for row in recorded]).mean(0)
+                    assert parameter.grad is not None
+                    torch.testing.assert_close(parameter.grad, expected, rtol=1e-5, atol=1e-7)
+                recorded.clear()
+                return original_clip(supplied, max_norm, error_if_nonfinite=error_if_nonfinite)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(experiment, "forward_loss", observe_minibatch)
+                patch.setattr(torch.nn.utils, "clip_grad_norm_", check_unclipped_mean)
+                train(config)
+            assert not recorded
+        else:
+            train(config)
         return config
 
     joint = stage("joint", "joint")
@@ -406,6 +466,18 @@ def test_complete_stages_label_free_selection_and_exact_resume(
         if isinstance(value, torch.Tensor):
             torch.testing.assert_close(value, resumed["model"][key], rtol=0, atol=0)
     assert resumed["objective"]["geco.num_updates"] == 2
+    sampler = GroupSampler(12, full.batch_size, full.seed)
+    for _ in range(full.updates * full.gradient_accumulation):
+        sampler.next()
+    for key, value in sampler.state_dict().items():
+        actual = resumed["sampler"][key]
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(value, actual)
+        else:
+            assert value == actual
+    specification = read_json(directory / "completion.json")
+    assert specification["sigreg_systems_per_statistic"] == full.batch_size
+    assert specification["systems_per_optimizer_step"] == full.batch_size * gradient_accumulation
     for key, value in complete["objective"].items():
         torch.testing.assert_close(value, resumed["objective"][key], rtol=0, atol=0)
     assert complete["tau"] == resumed["tau"]
