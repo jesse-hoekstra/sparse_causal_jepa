@@ -82,11 +82,17 @@ class StageConfig:
     forecast_steps: int = 2
     state_frames: int | None = None
     source_data_dir: str | None = None
+    continuation_dir: str | None = None
+    continuation_code_identity: str | None = None
 
     def __post_init__(self) -> None:
         """Reject ambiguous stages or invalid fixed budgets before opening an output."""
         if self.phase not in BUDGETS:
             raise ValueError("unknown training phase")
+        if self.continuation_dir is not None and self.phase not in {"baseline", "full"}:
+            raise ValueError("completed-stage continuation is limited to sparse stages")
+        if self.continuation_code_identity is not None and self.continuation_dir is None:
+            raise ValueError("continuation_code_identity requires continuation_dir")
         if self.parameter_encoder not in {"mlp", "temporal-cnn"}:
             raise ValueError("unknown parameter encoder architecture")
         if self.cache_device not in {"model", "cpu"}:
@@ -318,7 +324,12 @@ def calibrate_endpoint(
     return result
 
 
-def _shared_calibration(config: StageConfig, data_identity: str) -> dict[str, Any] | None:
+def _shared_calibration(
+    config: StageConfig,
+    data_identity: str,
+    *,
+    compatible_code_identity: str | None = None,
+) -> dict[str, Any] | None:
     if config.calibration_file is None:
         return None
     record = read_json(Path(config.calibration_file))
@@ -326,7 +337,7 @@ def _shared_calibration(config: StageConfig, data_identity: str) -> dict[str, An
         record["schema"] != "duffing-shared-calibration-v1"
         or record["identity"]
         != canonical_fingerprint({key: value for key, value in record.items() if key != "identity"})
-        or record["code_identity"] != code_identity()
+        or record["code_identity"] not in {code_identity(), compatible_code_identity}
         or record["data_identity"] != data_identity
         or record["parameter_encoder"] != config.parameter_encoder
         or record["state_regularization"] != config.state_regularization
@@ -359,6 +370,39 @@ def _complete(
     )
 
 
+def _continuation(config: StageConfig, data_identity: str) -> dict[str, Any] | None:
+    """Authenticate a completed sparse stage for an explicitly larger, separately stored budget."""
+    if config.continuation_dir is None:
+        return None
+    directory = Path(config.continuation_dir)
+    if directory.resolve() == Path(config.output_dir).resolve():
+        raise ValueError("continuation must preserve the source in a separate directory")
+    record = verify(directory, expected_code_identity=config.continuation_code_identity)
+    if (
+        record["data_identity"] != data_identity
+        or record["phase"] != config.phase
+        or record["true_parameter_training"]
+        or record["true_state_training"]
+    ):
+        raise ValueError("continuation requires the same ordinary sparse stage and data")
+    previous = asdict(StageConfig(**record["config"]))
+    current = asdict(config)
+    mutable = {
+        "output_dir",
+        "steps",
+        "wandb_mode",
+        "wandb_group",
+        "continuation_dir",
+        "continuation_code_identity",
+    }
+    changed = [key for key in previous if key not in mutable and previous[key] != current[key]]
+    if changed:
+        raise ValueError(f"continuation changed training settings: {changed}")
+    if config.updates <= record["steps"]:
+        raise ValueError("continuation requires a larger total update budget")
+    return {**_parent(record, str(directory)), "steps": record["steps"]}
+
+
 def train(config: StageConfig, *, resume: bool = False) -> None:
     """Train one phase with the original optimizer, donor RNG, objective and EMA conventions."""
     torch.set_num_threads(config.threads)
@@ -382,7 +426,16 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         raise ValueError("state_frames must cover the context and fit the observed sequence")
     frozen = config.frozen_states
     sparse = config.phase in {"baseline", "full"}
-    calibration = _shared_calibration(config, data_record["identity"])
+    continuation = _continuation(config, data_record["identity"])
+    calibration = _shared_calibration(
+        config,
+        data_record["identity"],
+        compatible_code_identity=None if continuation is None else continuation["code_identity"],
+    )
+    if continuation is not None and calibration is not None:
+        previous_calibration = read_json(Path(continuation["directory"]) / "calibration.json")
+        if calibration != previous_calibration:
+            raise ValueError("continuation changed the shared calibration")
     model = build_model(
         config.acquisition_seed if config.acquisition_seed is not None else config.seed,
         context,
@@ -474,6 +527,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "data_identity": data_record["identity"],
         "source": source,
         "source_forecast_extension": source_extension,
+        "continuation": continuation,
         "true_parameter_training": False,
         "true_state_training": False,
         "parameter_gates": "learned" if config.phase == "full" else "fixed_open",
@@ -519,13 +573,32 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             raise ValueError("resume configuration, source or data changed")
         model.load_state_dict(saved["model"], strict=True)
         start = int(saved["step"])
+    elif continuation is not None:
+        saved = cast(
+            dict[str, Any],
+            torch.load(
+                Path(continuation["directory"]) / "last.pt",
+                map_location="cpu",
+                weights_only=False,
+            ),
+        )
+        if saved["identity"] != continuation["identity"] or saved["step"] != continuation["steps"]:
+            raise ValueError("continuation checkpoint differs from the completed source")
+        model.load_state_dict(saved["model"], strict=True)
+        start = int(saved["step"])
     elif config.phase in {"joint", "acquisition"}:
         write_json(output / "initialization.json", initialize_shared_output(model, inputs["train"]))
     write_json(output / "config.json", specification)
     tau: float | None = None
     if sparse:
-        if resume:
+        if resume or continuation is not None:
             tau = float(saved["tau"])
+            if not resume:
+                assert continuation is not None
+                write_json(
+                    output / "calibration.json",
+                    read_json(Path(continuation["directory"]) / "calibration.json"),
+                )
         elif calibration is not None:
             tau = float(calibration["tau"])
             write_json(output / "calibration.json", calibration)
@@ -600,13 +673,14 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             weight_decay=0.0,
         )
     sampler = GroupSampler(len(inputs["train"]["observations"]), config.batch_size, config.seed)
-    if resume:
+    if resume or continuation is not None:
         optimizer.load_state_dict(saved["optimizer"])
         objective.load_state_dict(saved["objective"])
         sampler.load_state_dict(saved["sampler"])
         torch.set_rng_state(saved["torch_rng"])
         if device.type == "cuda":
             torch.cuda.set_rng_state(saved["cuda_rng"], device)
+    if resume:
         # Drop events newer than the resumed checkpoint; preserve the original full log.
         for name in ("history.jsonl", "validation.jsonl"):
             path = output / name
@@ -645,7 +719,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         resolved_config=cast(dict[str, object], specification),
         dataset_identity=data_record["identity"],
         out_dir=output,
-        resume_state=saved.get("wandb"),
+        resume_state=saved.get("wandb") if resume else None,
     )
     write_json(output / "wandb.json", logger.metadata)
 
@@ -704,9 +778,9 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
     started, status = time.monotonic(), 1
     try:
         if not resume:
-            save(0, "initial.pt")
-            save(0)
-            evaluate(0)
+            save(start, "initial.pt")
+            save(start)
+            evaluate(start)
         final_metrics: dict[str, float] = {}
         for step in range(start + 1, config.updates + 1):
             if config.final_learning_rate is not None:
@@ -954,6 +1028,8 @@ def main() -> None:
     run.add_argument("--forecast-steps", type=int, default=2)
     run.add_argument("--state-frames", type=int)
     run.add_argument("--source-data-dir")
+    run.add_argument("--continuation-dir")
+    run.add_argument("--continuation-code-identity")
     run.add_argument("--device", default="cuda:0")
     run.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     run.add_argument("--wandb-group", default="coupled-duffing-experiment1-20261108")
