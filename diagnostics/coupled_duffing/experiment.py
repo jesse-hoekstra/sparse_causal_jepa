@@ -77,6 +77,7 @@ class StageConfig:
     initial_gate_logit: float = 3.0
     final_learning_rate: float | None = None
     gradient_accumulation: int = 1
+    joint_adaptation: bool = False
 
     def __post_init__(self) -> None:
         """Reject ambiguous stages or invalid fixed budgets before opening an output."""
@@ -96,6 +97,8 @@ class StageConfig:
             raise ValueError("an expected historical source requires a source endpoint")
         if self.calibration_file is not None and self.phase not in {"baseline", "full"}:
             raise ValueError("shared calibration applies only to sparse training")
+        if self.joint_adaptation and self.phase != "adaptation":
+            raise ValueError("joint_adaptation applies only to post-projection adaptation")
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
             raise ValueError("learning_rate must be finite and positive")
         if self.gate_learning_rate is not None:
@@ -104,8 +107,8 @@ class StageConfig:
             if self.phase not in {"baseline", "full"}:
                 raise ValueError("a separate gate rate applies only to sparse stages")
         if self.synchronize_target and self.phase not in {"acquisition", "adaptation"}:
-            raise ValueError("synchronize_target is restricted to frozen-state stages")
-        if self.cache_frozen_states and self.phase not in {"acquisition", "adaptation"}:
+            raise ValueError("synchronize_target is restricted to acquisition/adaptation stages")
+        if self.cache_frozen_states and not self.frozen_states:
             raise ValueError("state caching is restricted to frozen-state stages")
         if not math.isfinite(self.initial_gate_logit):
             raise ValueError("initial_gate_logit must be finite")
@@ -119,7 +122,7 @@ class StageConfig:
                 raise ValueError(
                     "final_learning_rate must be positive and no larger than the start"
                 )
-            if self.phase not in {"acquisition", "adaptation"} or self.updates < 2:
+            if not self.frozen_states or self.updates < 2:
                 raise ValueError("cosine decay requires a frozen stage with at least two updates")
         if self.gradient_accumulation < 1:
             raise ValueError("gradient_accumulation must be positive")
@@ -137,6 +140,13 @@ class StageConfig:
     def code_dim(self) -> int:
         """Use an overcomplete eight-code warm-up, then four projected coordinates."""
         return 8 if self.phase in {"joint", "acquisition"} else 4
+
+    @property
+    def frozen_states(self) -> bool:
+        """Freeze acquisition; optionally allow online state/head updates after projection."""
+        return self.phase == "acquisition" or (
+            self.phase == "adaptation" and not self.joint_adaptation
+        )
 
 
 def load_data(
@@ -296,7 +306,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         data_dir, torch.device("cpu") if config.cache_device == "cpu" else device
     )
     context = int(data_record["config"]["context"])
-    frozen = config.phase in {"acquisition", "adaptation"}
+    frozen = config.frozen_states
     sparse = config.phase in {"baseline", "full"}
     calibration = _shared_calibration(config, data_record["identity"])
     model = build_model(
@@ -400,6 +410,8 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "ema_decay": 0.996,
         "target_initialization": "online_copy" if config.synchronize_target else "inherited",
         "frozen_state_cache": config.cache_frozen_states,
+        "state_encoders_frozen": frozen,
+        "state_projector_frozen": frozen,
         "sigreg_weight": 0.4,
         "sigreg_directions": 256,
         "parameter_auxiliary_loss": False,
@@ -839,6 +851,7 @@ def main() -> None:
     run.add_argument("--initial-gate-logit", type=float, default=3.0)
     run.add_argument("--final-learning-rate", type=float)
     run.add_argument("--gradient-accumulation", type=int, default=1)
+    run.add_argument("--joint-adaptation", action="store_true")
     run.add_argument("--device", default="cuda:0")
     run.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     run.add_argument("--wandb-group", default="coupled-duffing-experiment1-20261108")

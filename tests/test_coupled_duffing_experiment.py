@@ -121,8 +121,8 @@ def test_separate_gate_rate_requires_a_sparse_stage(phase: str) -> None:
 
 
 @pytest.mark.parametrize("phase", ["joint", "baseline", "full"])
-def test_target_synchronization_is_only_allowed_when_states_are_frozen(phase: str) -> None:
-    with pytest.raises(ValueError, match="frozen-state"):
+def test_target_synchronization_is_only_allowed_at_acquisition_or_adaptation(phase: str) -> None:
+    with pytest.raises(ValueError, match="acquisition/adaptation"):
         StageConfig(
             "data",
             "out",
@@ -141,6 +141,29 @@ def test_state_caching_requires_frozen_state_encoders(phase: str) -> None:
             phase,
             source_dir=None if phase == "joint" else "source",
             cache_frozen_states=True,
+        )
+
+
+def test_joint_adaptation_requires_adaptation_and_disallows_fixed_state_replay() -> None:
+    with pytest.raises(ValueError, match="post-projection adaptation"):
+        StageConfig("data", "out", "joint", joint_adaptation=True)
+    with pytest.raises(ValueError, match="frozen-state stages"):
+        StageConfig(
+            "data",
+            "out",
+            "adaptation",
+            source_dir="source",
+            joint_adaptation=True,
+            cache_frozen_states=True,
+        )
+    with pytest.raises(ValueError, match="frozen stage"):
+        StageConfig(
+            "data",
+            "out",
+            "adaptation",
+            source_dir="source",
+            joint_adaptation=True,
+            final_learning_rate=0.0001,
         )
 
 
@@ -204,18 +227,20 @@ def test_projection_preserves_affine_code_transfer_and_predictor_function(
         "initial_gate_logit",
         "cosine_adaptation",
         "gradient_accumulation",
+        "joint_adaptation",
     ),
     [
-        ("mlp", "aligned", False, False, 3.0, False, 1),
-        ("temporal-cnn", "aligned", False, False, 3.0, False, 1),
-        ("temporal-cnn", "projected-mixture-variance", False, False, 3.0, False, 1),
-        ("temporal-cnn", "projected-aligned", False, False, 3.0, False, 1),
-        ("temporal-cnn", "projected-aligned", True, False, 3.0, False, 1),
-        ("temporal-cnn", "projected-aligned", False, True, 3.0, False, 1),
-        ("temporal-cnn", "projected-aligned", True, True, 3.0, False, 1),
-        ("temporal-cnn", "projected-aligned", True, True, 10.0, False, 1),
-        ("temporal-cnn", "projected-aligned", True, True, 3.0, True, 1),
-        ("temporal-cnn", "projected-aligned", True, True, 3.0, False, 8),
+        ("mlp", "aligned", False, False, 3.0, False, 1, False),
+        ("temporal-cnn", "aligned", False, False, 3.0, False, 1, False),
+        ("temporal-cnn", "projected-mixture-variance", False, False, 3.0, False, 1, False),
+        ("temporal-cnn", "projected-aligned", False, False, 3.0, False, 1, False),
+        ("temporal-cnn", "projected-aligned", True, False, 3.0, False, 1, False),
+        ("temporal-cnn", "projected-aligned", False, True, 3.0, False, 1, False),
+        ("temporal-cnn", "projected-aligned", True, True, 3.0, False, 1, False),
+        ("temporal-cnn", "projected-aligned", True, True, 10.0, False, 1, False),
+        ("temporal-cnn", "projected-aligned", True, True, 3.0, True, 1, False),
+        ("temporal-cnn", "projected-aligned", True, True, 3.0, False, 8, False),
+        ("temporal-cnn", "projected-aligned", True, False, 3.0, False, 1, True),
     ],
 )
 def test_complete_stages_label_free_selection_and_exact_resume(
@@ -228,6 +253,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     initial_gate_logit: float,
     cosine_adaptation: bool,
     gradient_accumulation: int,
+    joint_adaptation: bool,
 ) -> None:
     torch.set_num_threads(1)
     data = tmp_path / "data"
@@ -294,6 +320,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
             initial_gate_logit=initial_gate_logit if phase in {"baseline", "full"} else 3.0,
             final_learning_rate=0.00001 if cosine_adaptation and phase == "adaptation" else None,
             gradient_accumulation=gradient_accumulation if phase in {"baseline", "full"} else 1,
+            joint_adaptation=joint_adaptation and phase == "adaptation",
         )
         if phase == "full" and gradient_accumulation > 1:
             recorded: list[tuple[torch.Tensor, ...]] = []
@@ -364,7 +391,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     project_endpoint(data, Path(selection["selected"]["directory"]), projected, "cpu", "cpu")
     assert read_json(projected / "completion.json")["parameter_encoder"] == architecture
     adapted = stage("adapted", "adaptation", projected)
-    if cache_frozen_states:
+    if cache_frozen_states or joint_adaptation:
         adapted_directory = Path(adapted.output_dir)
         before_resume = cast(
             dict[str, Any], torch.load(adapted_directory / "last.pt", weights_only=False)
@@ -376,7 +403,11 @@ def test_complete_stages_label_free_selection_and_exact_resume(
         )
         for key, value in before_resume["model"].items():
             torch.testing.assert_close(value, after_resume["model"][key], rtol=0, atol=0)
-        assert read_json(adapted_directory / "completion.json")["frozen_state_cache"] is True
+        assert read_json(adapted_directory / "completion.json")["frozen_state_cache"] == (
+            cache_frozen_states
+        )
+        for key, value in before_resume["objective"].items():
+            torch.testing.assert_close(value, after_resume["objective"][key], rtol=0, atol=0)
         if cosine_adaptation:
             assert before_resume["optimizer"]["param_groups"][0]["lr"] == 0.00001
             assert after_resume["optimizer"]["param_groups"][0]["lr"] == 0.00001
@@ -446,6 +477,33 @@ def test_complete_stages_label_free_selection_and_exact_resume(
         )
     for path in (*candidates, Path(adapted.output_dir)):
         frozen = cast(dict[str, Any], torch.load(path / "last.pt", weights_only=False))
+        if joint_adaptation and path == Path(adapted.output_dir):
+            initial = cast(dict[str, Any], torch.load(path / "initial.pt", weights_only=False))
+            for prefix in (
+                "online_encoder.",
+                "target_encoder.",
+                "parameter_encoder.",
+                "predictor.",
+            ):
+                assert any(
+                    not torch.equal(value, frozen["model"][key])
+                    for key, value in initial["model"].items()
+                    if key.startswith(prefix)
+                )
+            assert any(
+                not torch.equal(value, frozen["objective"][key])
+                for key, value in initial["objective"].items()
+                if key.startswith("projector.")
+            )
+            assert read_json(path / "completion.json")["state_encoders_frozen"] is False
+            assert any(
+                not torch.equal(
+                    value, frozen["model"][key.replace("target_encoder.", "online_encoder.")]
+                )
+                for key, value in frozen["model"].items()
+                if key.startswith("target_encoder.")
+            )
+            continue
         for key, value in source["model"].items():
             if key.startswith(("online_encoder.", "target_encoder.")):
                 expected = (
