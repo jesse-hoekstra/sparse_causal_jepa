@@ -107,6 +107,17 @@ def test_gradient_accumulation_requires_a_sparse_stage() -> None:
         StageConfig("data", "out", "joint", gradient_accumulation=8)
 
 
+@pytest.mark.parametrize("decay", [-0.1, 1.0, float("nan"), float("inf")])
+def test_invalid_target_decay_is_rejected(decay: float) -> None:
+    with pytest.raises(ValueError, match="ema_decay"):
+        StageConfig("data", "out", "full", source_dir="source", ema_decay=decay)
+
+
+def test_target_decay_override_requires_a_sparse_stage() -> None:
+    with pytest.raises(ValueError, match="sparse stages"):
+        StageConfig("data", "out", "adaptation", source_dir="source", ema_decay=0.99)
+
+
 @pytest.mark.parametrize("phase", ["joint", "acquisition", "adaptation"])
 def test_separate_gate_rate_requires_a_sparse_stage(phase: str) -> None:
     with pytest.raises(ValueError, match="sparse stages"):
@@ -228,19 +239,21 @@ def test_projection_preserves_affine_code_transfer_and_predictor_function(
         "cosine_adaptation",
         "gradient_accumulation",
         "joint_adaptation",
+        "ema_decay",
     ),
     [
-        ("mlp", "aligned", False, False, 3.0, False, 1, False),
-        ("temporal-cnn", "aligned", False, False, 3.0, False, 1, False),
-        ("temporal-cnn", "projected-mixture-variance", False, False, 3.0, False, 1, False),
-        ("temporal-cnn", "projected-aligned", False, False, 3.0, False, 1, False),
-        ("temporal-cnn", "projected-aligned", True, False, 3.0, False, 1, False),
-        ("temporal-cnn", "projected-aligned", False, True, 3.0, False, 1, False),
-        ("temporal-cnn", "projected-aligned", True, True, 3.0, False, 1, False),
-        ("temporal-cnn", "projected-aligned", True, True, 10.0, False, 1, False),
-        ("temporal-cnn", "projected-aligned", True, True, 3.0, True, 1, False),
-        ("temporal-cnn", "projected-aligned", True, True, 3.0, False, 8, False),
-        ("temporal-cnn", "projected-aligned", True, False, 3.0, False, 1, True),
+        ("mlp", "aligned", False, False, 3.0, False, 1, False, None),
+        ("temporal-cnn", "aligned", False, False, 3.0, False, 1, False, None),
+        ("temporal-cnn", "projected-mixture-variance", False, False, 3.0, False, 1, False, None),
+        ("temporal-cnn", "projected-aligned", False, False, 3.0, False, 1, False, None),
+        ("temporal-cnn", "projected-aligned", True, False, 3.0, False, 1, False, None),
+        ("temporal-cnn", "projected-aligned", False, True, 3.0, False, 1, False, None),
+        ("temporal-cnn", "projected-aligned", True, True, 3.0, False, 1, False, None),
+        ("temporal-cnn", "projected-aligned", True, True, 10.0, False, 1, False, None),
+        ("temporal-cnn", "projected-aligned", True, True, 3.0, True, 1, False, None),
+        ("temporal-cnn", "projected-aligned", True, True, 3.0, False, 8, False, None),
+        ("temporal-cnn", "projected-aligned", True, False, 3.0, False, 1, True, None),
+        ("temporal-cnn", "projected-aligned", True, True, 3.0, False, 1, False, 0.99),
     ],
 )
 def test_complete_stages_label_free_selection_and_exact_resume(
@@ -254,6 +267,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     cosine_adaptation: bool,
     gradient_accumulation: int,
     joint_adaptation: bool,
+    ema_decay: float | None,
 ) -> None:
     torch.set_num_threads(1)
     data = tmp_path / "data"
@@ -321,7 +335,30 @@ def test_complete_stages_label_free_selection_and_exact_resume(
             final_learning_rate=0.00001 if cosine_adaptation and phase == "adaptation" else None,
             gradient_accumulation=gradient_accumulation if phase in {"baseline", "full"} else 1,
             joint_adaptation=joint_adaptation and phase == "adaptation",
+            ema_decay=ema_decay if phase in {"baseline", "full"} else None,
         )
+        if phase == "full" and ema_decay is not None:
+            original_update = SCJEPA.update_target
+
+            def observe_target_update(model: SCJEPA) -> None:
+                assert ema_decay is not None
+                assert model.ema_decay == ema_decay
+                expected = [
+                    target.detach()
+                    .clone()
+                    .mul_(ema_decay)
+                    .add_(online.detach(), alpha=1 - ema_decay)
+                    for target, online in zip(
+                        model.target_encoder.parameters(),
+                        model.online_encoder.parameters(),
+                        strict=True,
+                    )
+                ]
+                original_update(model)
+                for target, value in zip(model.target_encoder.parameters(), expected, strict=True):
+                    torch.testing.assert_close(target, value, rtol=0, atol=0)
+
+            monkeypatch.setattr(SCJEPA, "update_target", observe_target_update)
         if phase == "full" and gradient_accumulation > 1:
             recorded: list[tuple[torch.Tensor, ...]] = []
             original_forward = experiment.forward_loss
@@ -433,7 +470,12 @@ def test_complete_stages_label_free_selection_and_exact_resume(
         dict[str, Any], torch.load(Path(adapted.output_dir) / "last.pt", weights_only=False)
     )
     for name, value in adapted_state["model"].items():
-        torch.testing.assert_close(value, initial_pair[1]["model"][name], rtol=0, atol=0)
+        expected = (
+            {**value, "ema_decay": ema_decay}
+            if name == "_extra_state" and ema_decay is not None
+            else value
+        )
+        torch.testing.assert_close(expected, initial_pair[1]["model"][name], rtol=0, atol=0)
     for name in ("state", "action", "parameter"):
         value = initial_pair[1]["model"][f"predictor.{name}_logits"]
         torch.testing.assert_close(
@@ -536,6 +578,8 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     specification = read_json(directory / "completion.json")
     assert specification["sigreg_systems_per_statistic"] == full.batch_size
     assert specification["systems_per_optimizer_step"] == full.batch_size * gradient_accumulation
+    assert specification["ema_decay"] == (0.996 if ema_decay is None else ema_decay)
+    assert resumed["model"]["_extra_state"]["ema_decay"] == specification["ema_decay"]
     for key, value in complete["objective"].items():
         torch.testing.assert_close(value, resumed["objective"][key], rtol=0, atol=0)
     assert complete["tau"] == resumed["tau"]

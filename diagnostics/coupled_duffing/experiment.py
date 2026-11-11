@@ -78,6 +78,7 @@ class StageConfig:
     final_learning_rate: float | None = None
     gradient_accumulation: int = 1
     joint_adaptation: bool = False
+    ema_decay: float | None = None
 
     def __post_init__(self) -> None:
         """Reject ambiguous stages or invalid fixed budgets before opening an output."""
@@ -99,6 +100,11 @@ class StageConfig:
             raise ValueError("shared calibration applies only to sparse training")
         if self.joint_adaptation and self.phase != "adaptation":
             raise ValueError("joint_adaptation applies only to post-projection adaptation")
+        if self.ema_decay is not None:
+            if not math.isfinite(self.ema_decay) or not 0 <= self.ema_decay < 1:
+                raise ValueError("ema_decay must be finite and in [0,1)")
+            if self.phase not in {"baseline", "full"}:
+                raise ValueError("an EMA decay override applies only to sparse stages")
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
             raise ValueError("learning_rate must be finite and positive")
         if self.gate_learning_rate is not None:
@@ -362,6 +368,8 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         del inherited
     if config.synchronize_target:
         model.target_encoder.load_state_dict(model.online_encoder.state_dict(), strict=True)
+    if config.ema_decay is not None:
+        model.ema_decay = config.ema_decay
     model.online_encoder.requires_grad_(not frozen)
     if output.exists() and not resume:
         raise FileExistsError(output)
@@ -407,7 +415,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "gradient_accumulation": config.gradient_accumulation,
         "systems_per_optimizer_step": config.batch_size * config.gradient_accumulation,
         "sigreg_systems_per_statistic": config.batch_size,
-        "ema_decay": 0.996,
+        "ema_decay": model.ema_decay,
         "target_initialization": "online_copy" if config.synchronize_target else "inherited",
         "frozen_state_cache": config.cache_frozen_states,
         "state_encoders_frozen": frozen,
@@ -852,6 +860,7 @@ def main() -> None:
     run.add_argument("--final-learning-rate", type=float)
     run.add_argument("--gradient-accumulation", type=int, default=1)
     run.add_argument("--joint-adaptation", action="store_true")
+    run.add_argument("--ema-decay", type=float)
     run.add_argument("--device", default="cuda:0")
     run.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     run.add_argument("--wandb-group", default="coupled-duffing-experiment1-20261108")
