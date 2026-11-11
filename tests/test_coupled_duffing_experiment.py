@@ -87,6 +87,18 @@ def test_target_synchronization_is_only_allowed_when_states_are_frozen(phase: st
         )
 
 
+@pytest.mark.parametrize("phase", ["joint", "baseline", "full"])
+def test_state_caching_requires_frozen_state_encoders(phase: str) -> None:
+    with pytest.raises(ValueError, match="frozen-state stages"):
+        StageConfig(
+            "data",
+            "out",
+            phase,
+            source_dir=None if phase == "joint" else "source",
+            cache_frozen_states=True,
+        )
+
+
 @pytest.mark.parametrize("architecture", ["mlp", "temporal-cnn"])
 def test_shared_feature_initialization_preserves_mean_and_centered_rms(
     architecture: ParameterArchitecture,
@@ -139,13 +151,15 @@ def test_projection_preserves_affine_code_transfer_and_predictor_function(
 
 
 @pytest.mark.parametrize(
-    ("architecture", "state_regularization", "synchronize_target"),
+    ("architecture", "state_regularization", "synchronize_target", "cache_frozen_states"),
     [
-        ("mlp", "aligned", False),
-        ("temporal-cnn", "aligned", False),
-        ("temporal-cnn", "projected-mixture-variance", False),
-        ("temporal-cnn", "projected-aligned", False),
-        ("temporal-cnn", "projected-aligned", True),
+        ("mlp", "aligned", False, False),
+        ("temporal-cnn", "aligned", False, False),
+        ("temporal-cnn", "projected-mixture-variance", False, False),
+        ("temporal-cnn", "projected-aligned", False, False),
+        ("temporal-cnn", "projected-aligned", True, False),
+        ("temporal-cnn", "projected-aligned", False, True),
+        ("temporal-cnn", "projected-aligned", True, True),
     ],
 )
 def test_complete_stages_label_free_selection_and_exact_resume(
@@ -153,6 +167,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     architecture: ParameterArchitecture,
     state_regularization: StateRegularization,
     synchronize_target: bool,
+    cache_frozen_states: bool,
 ) -> None:
     torch.set_num_threads(1)
     data = tmp_path / "data"
@@ -215,6 +230,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
             and phase in {"baseline", "full"}
             else None,
             synchronize_target=synchronize_target and phase in {"acquisition", "adaptation"},
+            cache_frozen_states=cache_frozen_states and phase in {"acquisition", "adaptation"},
         )
         train(config)
         return config
@@ -246,6 +262,19 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     project_endpoint(data, Path(selection["selected"]["directory"]), projected, "cpu", "cpu")
     assert read_json(projected / "completion.json")["parameter_encoder"] == architecture
     adapted = stage("adapted", "adaptation", projected)
+    if cache_frozen_states:
+        adapted_directory = Path(adapted.output_dir)
+        before_resume = cast(
+            dict[str, Any], torch.load(adapted_directory / "last.pt", weights_only=False)
+        )
+        (adapted_directory / "last.pt").write_bytes((adapted_directory / "initial.pt").read_bytes())
+        train(adapted, resume=True)
+        after_resume = cast(
+            dict[str, Any], torch.load(adapted_directory / "last.pt", weights_only=False)
+        )
+        for key, value in before_resume["model"].items():
+            torch.testing.assert_close(value, after_resume["model"][key], rtol=0, atol=0)
+        assert read_json(adapted_directory / "completion.json")["frozen_state_cache"] is True
     calibration_file = tmp_path / "shared-calibration.json"
     calibration = calibrate_endpoint(Path(adapted.output_dir), calibration_file)
     baseline = stage(

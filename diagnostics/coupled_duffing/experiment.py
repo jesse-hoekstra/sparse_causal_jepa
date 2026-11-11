@@ -14,6 +14,7 @@ from torch import Tensor
 from diagnostics.coupled_duffing.acquisition import initialize_shared_output, project
 from diagnostics.coupled_duffing.data import DataConfig, prepare
 from diagnostics.coupled_duffing.evaluate import collect, graph_metrics, metrics, prediction_mse
+from diagnostics.coupled_duffing.frozen import FrozenStateReplay
 from diagnostics.coupled_duffing.model import LaggedPredictor, ParameterArchitecture, build_model
 from diagnostics.coupled_duffing.regularization import (
     STATE_REGULARIZATIONS,
@@ -72,6 +73,7 @@ class StageConfig:
     learning_rate: float = 0.001
     gate_learning_rate: float | None = None
     synchronize_target: bool = False
+    cache_frozen_states: bool = False
 
     def __post_init__(self) -> None:
         """Reject ambiguous stages or invalid fixed budgets before opening an output."""
@@ -100,6 +102,8 @@ class StageConfig:
                 raise ValueError("a separate gate rate applies only to sparse stages")
         if self.synchronize_target and self.phase not in {"acquisition", "adaptation"}:
             raise ValueError("synchronize_target is restricted to frozen-state stages")
+        if self.cache_frozen_states and self.phase not in {"acquisition", "adaptation"}:
+            raise ValueError("state caching is restricted to frozen-state stages")
         if min(self.updates, self.batch_size, self.log_every, self.eval_every, self.threads) < 1:
             raise ValueError("budgets, intervals, batch size and threads must be positive")
 
@@ -363,6 +367,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "gradient_clip": 1.0,
         "ema_decay": 0.996,
         "target_initialization": "online_copy" if config.synchronize_target else "inherited",
+        "frozen_state_cache": config.cache_frozen_states,
         "sigreg_weight": 0.4,
         "sigreg_directions": 256,
         "parameter_auxiliary_loss": False,
@@ -441,6 +446,12 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         )
         del parent_checkpoint
     objective.requires_grad_(not frozen)
+    frozen_replay = (
+        FrozenStateReplay(model, inputs["train"], config.batch_size)
+        if config.cache_frozen_states
+        else None
+    )
+    training_inputs = inputs["train"] if frozen_replay is None else frozen_replay.inputs
     parameters = [
         p for module in (model, objective) for p in module.parameters() if p.requires_grad
     ]
@@ -559,15 +570,19 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             model.train()
             if frozen:
                 model.online_encoder.eval()
-            indices = sampler.next().to(inputs["train"]["observations"].device)
-            batch = {name: values[indices].to(device) for name, values in inputs["train"].items()}
+            indices = sampler.next().to(training_inputs["actions"].device)
+            batch = {name: values[indices].to(device) for name, values in training_inputs.items()}
             optimizer.zero_grad(set_to_none=True)
             torch.manual_seed((1 << 40) + config.seed + step)  # pyright: ignore[reportUnknownMemberType]
             with preserve_rng(device):
                 torch.default_generator.manual_seed(config.seed + step)
                 if device.type == "cuda":
                     torch.cuda.manual_seed(config.seed + step)
-                loss, terms, result = forward_loss(model, batch, objective)
+                loss, terms, result = (
+                    forward_loss(model, batch, objective)
+                    if frozen_replay is None
+                    else frozen_replay.forward_loss(batch, objective)
+                )
             if len(result.dynamics) != 2 or not bool(torch.isfinite(loss)):
                 raise FloatingPointError("expected two finite attached forecast steps")
             loss.backward()  # pyright: ignore[reportUnknownMemberType]
@@ -762,6 +777,7 @@ def main() -> None:
     run.add_argument("--learning-rate", type=float, default=0.001)
     run.add_argument("--gate-learning-rate", type=float)
     run.add_argument("--synchronize-target", action="store_true")
+    run.add_argument("--cache-frozen-states", action="store_true")
     run.add_argument("--device", default="cuda:0")
     run.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     run.add_argument("--wandb-group", default="coupled-duffing-experiment1-20261108")
