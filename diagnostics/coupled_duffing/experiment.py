@@ -75,6 +75,7 @@ class StageConfig:
     synchronize_target: bool = False
     cache_frozen_states: bool = False
     initial_gate_logit: float = 3.0
+    final_learning_rate: float | None = None
 
     def __post_init__(self) -> None:
         """Reject ambiguous stages or invalid fixed budgets before opening an output."""
@@ -109,6 +110,16 @@ class StageConfig:
             raise ValueError("initial_gate_logit must be finite")
         if self.initial_gate_logit != 3.0 and self.phase not in {"baseline", "full"}:
             raise ValueError("custom gate initialization applies only to sparse stages")
+        if self.final_learning_rate is not None:
+            if (
+                not math.isfinite(self.final_learning_rate)
+                or not 0 < self.final_learning_rate <= self.learning_rate
+            ):
+                raise ValueError(
+                    "final_learning_rate must be positive and no larger than the start"
+                )
+            if self.phase not in {"acquisition", "adaptation"} or self.updates < 2:
+                raise ValueError("cosine decay requires a frozen stage with at least two updates")
         if min(self.updates, self.batch_size, self.log_every, self.eval_every, self.threads) < 1:
             raise ValueError("budgets, intervals, batch size and threads must be positive")
 
@@ -369,6 +380,10 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
         "shared_calibration": calibration,
         "test_evaluation": False,
         "learning_rate": config.learning_rate,
+        "learning_rate_schedule": "cosine"
+        if config.final_learning_rate is not None
+        else "constant",
+        "final_learning_rate": config.final_learning_rate,
         "gate_learning_rate": (config.gate_learning_rate or config.learning_rate)
         if sparse
         else None,
@@ -576,6 +591,16 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
             evaluate(0)
         final_metrics: dict[str, float] = {}
         for step in range(start + 1, config.updates + 1):
+            if config.final_learning_rate is not None:
+                progress = (step - 1) / (config.updates - 1)
+                rate = (
+                    config.final_learning_rate
+                    + (config.learning_rate - config.final_learning_rate)
+                    * (1 + math.cos(math.pi * progress))
+                    / 2
+                )
+                for group in optimizer.param_groups:
+                    group["lr"] = rate
             model.train()
             if frozen:
                 model.online_encoder.eval()
@@ -609,6 +634,7 @@ def train(config: StageConfig, *, resume: bool = False) -> None:
                         "loss/total": float(loss.detach()),
                         "train/gradient_norm": float(gradient),
                         "runtime/seconds_per_step": (time.monotonic() - started) / (step - start),
+                        "optimizer/learning_rate": float(optimizer.param_groups[0]["lr"]),
                     }
                 )
                 if objective.geco is not None:
@@ -788,6 +814,7 @@ def main() -> None:
     run.add_argument("--synchronize-target", action="store_true")
     run.add_argument("--cache-frozen-states", action="store_true")
     run.add_argument("--initial-gate-logit", type=float, default=3.0)
+    run.add_argument("--final-learning-rate", type=float)
     run.add_argument("--device", default="cuda:0")
     run.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     run.add_argument("--wandb-group", default="coupled-duffing-experiment1-20261108")

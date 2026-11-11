@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -73,6 +74,21 @@ def test_invalid_gate_initialization_is_rejected(initial_gate_logit: float) -> N
 def test_custom_gate_initialization_requires_a_sparse_stage() -> None:
     with pytest.raises(ValueError, match="sparse stages"):
         StageConfig("data", "out", "joint", initial_gate_logit=10.0)
+
+
+@pytest.mark.parametrize("rate", [0.0, -0.01, 0.002, float("nan"), float("inf")])
+def test_invalid_cosine_final_rate_is_rejected(rate: float) -> None:
+    with pytest.raises(ValueError, match="final_learning_rate"):
+        StageConfig("data", "out", "adaptation", source_dir="source", final_learning_rate=rate)
+
+
+def test_cosine_schedule_requires_a_frozen_multi_update_stage() -> None:
+    with pytest.raises(ValueError, match="frozen stage"):
+        StageConfig("data", "out", "full", source_dir="source", final_learning_rate=0.0001)
+    with pytest.raises(ValueError, match="at least two"):
+        StageConfig(
+            "data", "out", "adaptation", source_dir="source", steps=1, final_learning_rate=0.0001
+        )
 
 
 @pytest.mark.parametrize("phase", ["joint", "acquisition", "adaptation"])
@@ -170,16 +186,18 @@ def test_projection_preserves_affine_code_transfer_and_predictor_function(
         "synchronize_target",
         "cache_frozen_states",
         "initial_gate_logit",
+        "cosine_adaptation",
     ),
     [
-        ("mlp", "aligned", False, False, 3.0),
-        ("temporal-cnn", "aligned", False, False, 3.0),
-        ("temporal-cnn", "projected-mixture-variance", False, False, 3.0),
-        ("temporal-cnn", "projected-aligned", False, False, 3.0),
-        ("temporal-cnn", "projected-aligned", True, False, 3.0),
-        ("temporal-cnn", "projected-aligned", False, True, 3.0),
-        ("temporal-cnn", "projected-aligned", True, True, 3.0),
-        ("temporal-cnn", "projected-aligned", True, True, 10.0),
+        ("mlp", "aligned", False, False, 3.0, False),
+        ("temporal-cnn", "aligned", False, False, 3.0, False),
+        ("temporal-cnn", "projected-mixture-variance", False, False, 3.0, False),
+        ("temporal-cnn", "projected-aligned", False, False, 3.0, False),
+        ("temporal-cnn", "projected-aligned", True, False, 3.0, False),
+        ("temporal-cnn", "projected-aligned", False, True, 3.0, False),
+        ("temporal-cnn", "projected-aligned", True, True, 3.0, False),
+        ("temporal-cnn", "projected-aligned", True, True, 10.0, False),
+        ("temporal-cnn", "projected-aligned", True, True, 3.0, True),
     ],
 )
 def test_complete_stages_label_free_selection_and_exact_resume(
@@ -189,6 +207,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
     synchronize_target: bool,
     cache_frozen_states: bool,
     initial_gate_logit: float,
+    cosine_adaptation: bool,
 ) -> None:
     torch.set_num_threads(1)
     data = tmp_path / "data"
@@ -253,6 +272,7 @@ def test_complete_stages_label_free_selection_and_exact_resume(
             synchronize_target=synchronize_target and phase in {"acquisition", "adaptation"},
             cache_frozen_states=cache_frozen_states and phase in {"acquisition", "adaptation"},
             initial_gate_logit=initial_gate_logit if phase in {"baseline", "full"} else 3.0,
+            final_learning_rate=0.00001 if cosine_adaptation and phase == "adaptation" else None,
         )
         train(config)
         return config
@@ -297,6 +317,14 @@ def test_complete_stages_label_free_selection_and_exact_resume(
         for key, value in before_resume["model"].items():
             torch.testing.assert_close(value, after_resume["model"][key], rtol=0, atol=0)
         assert read_json(adapted_directory / "completion.json")["frozen_state_cache"] is True
+        if cosine_adaptation:
+            assert before_resume["optimizer"]["param_groups"][0]["lr"] == 0.00001
+            assert after_resume["optimizer"]["param_groups"][0]["lr"] == 0.00001
+            history = [
+                json.loads(line)
+                for line in (adapted_directory / "history.jsonl").read_text().splitlines()
+            ]
+            assert [row["optimizer/learning_rate"] for row in history[:2]] == [0.0001, 0.00001]
     calibration_file = tmp_path / "shared-calibration.json"
     calibration = calibrate_endpoint(Path(adapted.output_dir), calibration_file)
     baseline = stage(
