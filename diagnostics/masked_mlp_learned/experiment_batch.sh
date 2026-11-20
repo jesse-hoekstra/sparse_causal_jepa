@@ -3,6 +3,7 @@
 set -euo pipefail
 CODE_DIR=$(cd "$(dirname "$0")/../.." && pwd)
 PYTHON=${PYTHON:-$CODE_DIR/.venv/bin/python}
+NODE_PREFIX=${NODE_PREFIX:-omi-rapid-}  # worker hostnames are $NODE_PREFIX<host>
 export PYTHONPATH="$CODE_DIR/src:$CODE_DIR"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 cd "$CODE_DIR"
@@ -31,8 +32,7 @@ if [ "${1:-}" = worker ]; then
   ACTIVATION=${6:-relu}
   trap 'status=$?; printf "%s\n" "$status" > "$BATCH/$PHASE-s$SEED.exit"' EXIT
   TRAIN_OPTIONS=(--predictor-activation "$ACTIVATION"
-    --wandb-mode online --wandb-project sparse_causal_jepa
-    --wandb-entity jesse-hoekstra-university-of-oxford --wandb-group "$(basename "$BATCH")")
+    --wandb-mode online --wandb-project sparse_causal_jepa --wandb-group "$(basename "$BATCH")")
   if [ "$PHASE" = warmup ]; then
     run_job "states-s$SEED" diagnostics.masked_mlp_learned.run train \
       --data-dir "$DATA" --output-dir "$BATCH/states-s$SEED/results" \
@@ -121,10 +121,10 @@ EOF
 on_host() {
   local host=$1
   shift
-  if [ "$(hostname -s)" = "omi-rapid-$host" ]; then
+  if [ "$(hostname -s)" = "$NODE_PREFIX$host" ]; then
     bash -c "$*"
   else
-    ssh -n -o BatchMode=yes -o ConnectTimeout=10 "omi-rapid-$host" "$@"
+    ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$NODE_PREFIX$host" "$@"
   fi
 }
 stop_workers() {
@@ -157,8 +157,7 @@ done
 
 log "preparing sigma=$SIGMA data"
 "$PYTHON" -m diagnostics.shared.prepare --output-dir "$DATA" --rotation-scale "$SIGMA" \
-  --wandb-mode online --wandb-project sparse_causal_jepa \
-  --wandb-entity jesse-hoekstra-university-of-oxford --wandb-group "$(basename "$BATCH")" \
+  --wandb-mode online --wandb-project sparse_causal_jepa --wandb-group "$(basename "$BATCH")" \
   > "$BATCH/data-preparation.log" 2>&1
 
 for PHASE in warmup sparse; do

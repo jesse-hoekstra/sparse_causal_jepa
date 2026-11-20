@@ -24,7 +24,8 @@ if [[ ! "$POOL_ATTEMPTS" =~ ^(8|16)$ ]] || \
   echo "a continuation requires absolute PREVIOUS_BATCH; a fresh pool must omit it" >&2
   exit 2
 fi
-REPO_ROOT=${REPO_ROOT:-/nfs/home/jesseh/sparse_causal_jepa}
+REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
+NODE_PREFIX=${NODE_PREFIX:-omi-rapid-}  # worker hostnames are $NODE_PREFIX<host>
 CODE_DIR=${CODE_DIR:-$REPO_ROOT}
 PYTHON=$REPO_ROOT/.venv/bin/python
 BATCH=$REPO_ROOT/outputs/diagnostics/masked-mlp-restarts-$TAG
@@ -46,10 +47,10 @@ log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$BATCH/coordinator.
 on_host() {
   local host=$1
   shift
-  if [ "$(hostname -s)" = "omi-rapid-$host" ]; then
+  if [ "$(hostname -s)" = "$NODE_PREFIX$host" ]; then
     bash -c "$*"
   else
-    ssh -n -o BatchMode=yes -o ConnectTimeout=10 "omi-rapid-$host" "$@"
+    ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$NODE_PREFIX$host" "$@"
   fi
 }
 idle() {
@@ -122,7 +123,7 @@ for ((group_first=FIRST_ATTEMPT; group_first<POOL_ATTEMPTS; group_first+=CONCURR
           --steps 100000 --states-from "$STATE_BATCH/states-s$seed/results" \
           --data-dir "$DATA" --output-dir "$job/results" --device cuda \
           --wandb-mode online --wandb-project sparse_causal_jepa \
-          --wandb-entity jesse-hoekstra-university-of-oxford --wandb-group "masked-mlp-restarts-$TAG"
+          --wandb-group "masked-mlp-restarts-$TAG"
         printf '> %q 2>&1\ncode=$?\nprintf "%%s\\n" "$code" > %q\nexit "$code"\n' \
           "$job/stdout-stderr.log" "$job/exit-code.txt"
       } > "$job/run.sh"
