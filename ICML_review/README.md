@@ -39,3 +39,21 @@ bash ICML_review/code/single_queue.sh --first-admitted "$revision" "$worker_a" "
 ```
 
 This policy checks the archived acquisition candidates in initialization order until one passes the original training-loss cutoff or all candidates have been tried. It writes separate `single-admitted-s<seed>/` folders. For individual phases append `--first-admitted` to the Python command. A matching completed first-candidate run can supply both endpoint assessments after verification of its input hashes, stage ancestry and validation results. The new receipt identifies the original run and its commit.
+
+## Acquisition, excitation and loss comparisons
+
+The head audit reads summary JSON and training histories. It compares the vision joint head, acquisition zero, the original winning head, and the first head matching the joint head's calibration forecast error. It also examines train and deployed-mask forecast losses against the reported tolerance.
+
+```bash
+PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.vision_acquisition "$revision" 0 audit
+```
+
+Use `direct` in place of `audit` on a free server GPU to project the joint RGB model directly and run the adaptation screen. A qualifying initializer is trained through both full-length sparse arms. The historical per-seed tolerance is fixed. Seeds 1 through 4 require a qualifying pilot in the same mode. Training and audit records use distinct output directories.
+
+The controlled excitation assay fits least-squares predictors with a fixed support encoder and varies which action directions the training systems experience. It runs on CPU using generated observations and independent training, calibration and validation systems.
+
+```bash
+PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.excitation "$revision" ICML_review/outputs/excitation-s0 --seed 0
+```
+
+After a passing pilot, repeat with the remaining seeds, using a fresh output directory for each. Full experiment notes and interpretation are in the private review folder.
