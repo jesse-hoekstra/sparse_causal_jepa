@@ -31,3 +31,11 @@ bash ICML_review/code/single_queue.sh "$revision" "$worker_a" "$worker_b" "$work
 ```
 
 For individual phases use `PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.single_acquisition "$revision" 0 prepare` followed by `full` and `baseline` on distinct available GPUs, then `assess`. The phase names replace the final argument. The assessment reads both completed endpoints. The run folder contains the acquisition receipt, per-stage commands, checkpoint digests and paired decision.
+
+To test a sequential retry, run the same queue with the selection flag before the revision.
+
+```bash
+bash ICML_review/code/single_queue.sh --first-admitted "$revision" "$worker_a" "$worker_b" "$worker_c" "$worker_d"
+```
+
+This policy checks the archived acquisition candidates in initialization order until one passes the original training-loss cutoff or all candidates have been tried. It writes separate `single-admitted-s<seed>/` folders. For individual phases append `--first-admitted` to the Python command. A matching completed first-candidate run can supply both endpoint assessments after verification of its input hashes, stage ancestry and validation results. The new receipt identifies the original run and its commit.
