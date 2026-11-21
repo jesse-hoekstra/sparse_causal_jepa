@@ -14,8 +14,8 @@ from diagnostics.vision_dimer.train import load_checkpoint, model_from_checkpoin
 from scjepa.models.model import SCJEPA
 
 _REPO = Path(__file__).resolve().parents[2]
-_DATA = _REPO / "outputs/data/vision-dimer-rgb-v1"
-_RUNS = _REPO / "outputs/diagnostics/vision-dimer-rgb-v1-s05all"
+DATA = _REPO / "outputs/data/vision-dimer-rgb-v1"
+RUNS = _REPO / "outputs/diagnostics/vision-dimer-rgb-v1-s05all"
 
 
 @dataclass(frozen=True)
@@ -98,6 +98,25 @@ def _score(slopes: Tensor, truth: Tensor) -> dict[str, Any]:
     }
 
 
+def encode_endpoint(
+    checkpoint: Path,
+    arm: str,
+    device: torch.device,
+    calibration: data.RenderedInputs,
+    validation: data.RenderedInputs,
+) -> tuple[SCJEPA, Tensor, dict[str, Tensor]]:
+    """Return the frozen model, calibration frames and validation windows on CPU."""
+    payload = load_checkpoint(checkpoint)
+    model = model_from_checkpoint(payload, phase=arm).to(device).eval()
+    cal = (
+        downstream.encode(model, calibration, (0,), len(calibration))["online"].reshape(-1, 8).cpu()
+    )
+    encoded = downstream.encode(model, validation, downstream.STARTS, len(validation))
+    lat = {k: v.cpu() for k, v in encoded.items()}
+    model.cpu()
+    return model, cal, lat
+
+
 def _arm(
     seed: int,
     arm: str,
@@ -109,15 +128,8 @@ def _arm(
     grids: Tensor,
     truth_slopes: Tensor,
 ) -> dict[str, Any]:
-    checkpoint = _RUNS / f"seed{seed}/sparse-500k" / arm / "final.pt"
-    payload = load_checkpoint(checkpoint)
-    model = model_from_checkpoint(payload, phase=arm).to(device).eval()
-    cal = (
-        downstream.encode(model, calibration, (0,), len(calibration))["online"].reshape(-1, 8).cpu()
-    )
-    encoded = downstream.encode(model, validation, downstream.STARTS, len(validation))
-    lat = {k: v.cpu() for k, v in encoded.items()}
-    model.cpu()
+    checkpoint = RUNS / f"seed{seed}/sparse-500k" / arm / "final.pt"
+    model, cal, lat = encode_endpoint(checkpoint, arm, device, calibration, validation)
     scalar = downstream.Model(model, lat, cal, cal_truth)
     affine = AffineChart.fit(cal, cal_truth)
     current = lat["online"][:, downstream.T]
@@ -159,12 +171,12 @@ def run(seed: int) -> dict[str, Any]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    config = data.load_config(_DATA)
-    calibration = data.RenderedInputs(_DATA, "calibration", device)
-    validation = data.RenderedInputs(_DATA, "validation", device)
-    cal_truth = data.load_labels(_DATA, "calibration")["states"][:, :, : config.frames]
+    config = data.load_config(DATA)
+    calibration = data.RenderedInputs(DATA, "calibration", device)
+    validation = data.RenderedInputs(DATA, "validation", device)
+    cal_truth = data.load_labels(DATA, "calibration")["states"][:, :, : config.frames]
     cal_truth = cal_truth.reshape(-1, dgp.STATE_DIM).double()
-    val_data = data._load(_DATA, "validation")  # pyright: ignore[reportPrivateUsage]
+    val_data = data._load(DATA, "validation")  # pyright: ignore[reportPrivateUsage]
     ctx = downstream.truth_contexts(val_data, downstream.STARTS, len(validation))
     grids = torch.quantile(
         cal_truth, torch.tensor(downstream.QUANTILES, dtype=torch.float64), dim=0
@@ -177,7 +189,7 @@ def run(seed: int) -> dict[str, Any]:
         "calibration_groups": len(calibration),
         "validation_groups": len(validation),
         "validation_contexts": len(ctx["cur"]),
-        "data_sha256": {s: data.sha256(_DATA / f"{s}.pt") for s in ("calibration", "validation")},
+        "data_sha256": {s: data.sha256(DATA / f"{s}.pt") for s in ("calibration", "validation")},
         "hold_grids": downstream.as_list(grids),
         "truth_slopes_held_by_outcome": downstream.as_list(truth),
         "arms": {

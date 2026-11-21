@@ -12,10 +12,22 @@ bash ICML_review/code/launch.sh "$revision" donors 0 full
 bash ICML_review/code/launch.sh "$revision" donors 0 baseline
 bash ICML_review/code/launch.sh "$revision" chart 0 paired
 bash ICML_review/code/launch.sh "$revision" prune 0 full
+bash ICML_review/code/launch.sh "$revision" kicks 0 paired
+bash ICML_review/code/launch.sh "$revision" labels 0 paired
 bash ICML_review/code/launch.sh "$revision" halving 0 synthetic
 bash ICML_review/code/launch.sh "$revision" halving 0 vision
 ```
 
-For donor and chart diagnostics repeat for seeds 1 through 4. For acquisition replay extend each dataset separately only when its pilot retains the reported admitted winner. The pruning pilot tests one deterministic gate deletion at a time against the saved calibration tolerance. Extend it only when seed zero meets both declared validation criteria in its run note. Every launch takes a fresh output directory and writes its hypothesis, criterion, input identity and command before evaluation. The donor assay compares individual, pooled and other-system support on fixed queries. The chart control varies the calibration interface of a frozen dynamics model. The replay screens acquisitions on their archived midpoint training losses and audits the final choice. All comparisons use existing weights or logs.
+The kicks control extends the two calibration interfaces to the held-bead kick experiment. The labels control requires the completed chart output for the same seed and fixes its physical query grid. For donor, chart, kick and label-budget diagnostics repeat for seeds 1 through 4. For acquisition replay extend each dataset separately only when its pilot retains the reported admitted winner. The pruning pilot tests one deterministic gate deletion at a time against the saved calibration tolerance. Extend it only when seed zero meets both declared validation criteria in its run note. Every launch takes a fresh output directory and writes its hypothesis, criterion, input identity and command before evaluation. The donor assay compares individual, pooled and other-system support on fixed queries. The chart control varies the calibration interface of a frozen dynamics model. The replay screens acquisitions on their archived midpoint training losses and audits the final choice. All comparisons use existing weights or logs.
 
 Run `ruff format --check ICML_review/code`, `ruff check ICML_review/code`, `pyright ICML_review/code` and `pytest ICML_review/code` from the repository environment. Compile the local review from its own directory with `pdflatex --enable-installer icml_review.tex` on MiKTeX.
+
+## Single-acquisition training comparison
+
+From the same checkout on a gateway, the following command uses four named workers sharing the checkout. It trains the pilot on the first worker pair and admits any further seeds only after the recorded validation gate passes. The worker names are positional arguments. Each stage uses an idle GPU, a pinned commit, the reported numeric tolerance and the existing synthetic training modules.
+
+```bash
+bash ICML_review/code/single_queue.sh "$revision" "$worker_a" "$worker_b" "$worker_c" "$worker_d"
+```
+
+For individual phases use `PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.single_acquisition "$revision" 0 prepare` followed by `full` and `baseline` on distinct available GPUs, then `assess`. The phase names replace the final argument. The assessment reads both completed endpoints. The run folder contains the acquisition receipt, per-stage commands, checkpoint digests and paired decision.

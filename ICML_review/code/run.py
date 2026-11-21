@@ -9,7 +9,7 @@ from pathlib import Path
 def main() -> None:
     """Write outputs into the private directory created by the launch script."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("kind", choices=("donors", "chart", "halving", "prune"))
+    parser.add_argument("kind", choices=("donors", "chart", "halving", "prune", "kicks", "labels"))
     parser.add_argument("seed", type=int, choices=range(5))
     parser.add_argument("detail")
     parser.add_argument("output", type=Path)
@@ -23,6 +23,14 @@ def main() -> None:
         from .prune import run as prune
 
         record = prune(args.seed)
+    elif args.kind == "kicks":
+        from .kicks import run as kicks
+
+        record = kicks(args.seed)
+    elif args.kind == "labels":
+        from .label_budget import run as label_budget
+
+        record = label_budget(args.seed)
     elif args.kind == "chart":
         from .chart import run as chart
 
