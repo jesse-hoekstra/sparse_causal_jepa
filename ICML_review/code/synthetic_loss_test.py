@@ -39,6 +39,22 @@ def test_ratio_scales_and_constant_penalty() -> None:
     assert code_quality(group)["sixth_share"] > 0
 
 
+def test_directional_spread_survives_coordinate_shear() -> None:
+    """A nearly shared linear mixture can hide episodic variation in per-axis summaries."""
+    gen = torch.Generator().manual_seed(17)
+    stable = torch.randn(24, 1, 5, dtype=torch.float64, generator=gen).expand(-1, 10, -1)
+    noise = torch.randn(24, 10, 1, dtype=torch.float64, generator=gen)
+    original = code_quality(torch.cat((stable, noise), dim=-1))
+    sheared = code_quality(torch.cat((stable, stable[:, :, :1] + 0.01 * noise), dim=-1))
+    assert sheared["within_share"] < original["within_share"] / 100
+    assert isclose(
+        original["worst_within_fraction"], sheared["worst_within_fraction"], abs_tol=1e-9
+    )
+    collapsed = code_quality(torch.cat((stable, stable[:, :, :1]), dim=-1))
+    assert collapsed["total_numerical_rank"] == 5
+    assert collapsed["worst_within_fraction"] < 1e-12
+
+
 def test_loss_only_and_transfer_on_toy_cpu(tmp_path: Path) -> None:
     """Replay identical a0 tensors with a zero coefficient, then train and transfer treatment."""
     torch.set_num_threads(1)

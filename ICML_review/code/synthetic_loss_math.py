@@ -43,8 +43,26 @@ def code_quality(codes: Tensor) -> dict[str, Any]:
     shared = torch.cov(mu.T) - w / views
     total_trace = float(x.flatten(0, 1).var(0).sum())
     vals = cast(Tensor, torch.linalg.eigvalsh(shared)).flip(0)  # pyright: ignore[reportUnknownMemberType]
+    # Work on the resolved support of total covariance, including rank-deficient codes.
+    rows = x.flatten(0, 1)
+    centered = rows - rows.mean(0)
+    total = centered.T @ centered / len(rows)
+    spectrum, basis = cast(tuple[Tensor, Tensor], torch.linalg.eigh(total))  # pyright: ignore[reportUnknownMemberType]
+    cutoff = float(spectrum[-1]) * max(rows.shape) * torch.finfo(x.dtype).eps
+    positive = spectrum > cutoff
+    directional: list[float] = []
+    if bool(positive.any()):
+        whitened = (within @ basis[:, positive]) / spectrum[positive].sqrt()
+        normalized_within = whitened.T @ whitened / len(rows)
+        eig = cast(Tensor, torch.linalg.eigvalsh(normalized_within))  # pyright: ignore[reportUnknownMemberType]
+        directional = [float(v) for v in eig]
     shares = within_shares(x)
     return {
+        "total_covariance_eigenvalues": [float(v) for v in spectrum],
+        "total_rank_cutoff": cutoff,
+        "total_numerical_rank": len(directional),
+        "within_fraction_generalized_eigenvalues": directional,
+        "worst_within_fraction": max(directional) if directional else None,
         "within_share": float(shares.mean()),
         "within_share_per_coordinate": [float(x) for x in shares],
         "total_trace": total_trace,
