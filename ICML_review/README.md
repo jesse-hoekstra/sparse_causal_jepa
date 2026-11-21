@@ -57,3 +57,19 @@ PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.excitation "$revis
 ```
 
 After a passing pilot, repeat with the remaining seeds, using a fresh output directory for each. Full experiment notes and interpretation are in the private review folder.
+
+The vision loss pilot forks the reported full model at 300k and compares forecast losses for the sampled training mask and the deployed deterministic mask on the same recipient and donor. The synthetic loss pilot modifies only the first frozen-state acquisition, adding normalized within-system code disagreement to the original prediction objective. It uses a prespecified stress-case seed for the pilot. Scientific criteria, controls, exact invocations and outcomes are recorded per run.
+
+From a gateway with SSH access to the workers, run each queue in its own detached session. Assign distinct idle workers to concurrent queues. Each queue consults its own completed pilot before expansion.
+
+```bash
+bash ICML_review/code/loss_queue.sh "$revision" vision-loss "$vision_worker"
+bash ICML_review/code/loss_queue.sh "$revision" synthetic-loss "$synthetic_worker" "$second_synthetic_worker"
+bash ICML_review/code/loss_queue.sh "$revision" vision-direct "$direct_worker"
+```
+
+The noisy-support control fits a support encoder and a predictor on generated systems with two levels of support measurement error. It compares forecast-only fitting, normalized within-system regularization, and minimum disagreement subject to a calibration forecast budget. Run the pilot first, then use a fresh matching output directory for each qualified seed.
+
+```bash
+PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.noisy_support "$revision" ICML_review/outputs/noisy-support-s0 --seed 0
+```
