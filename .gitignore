@@ -47,3 +47,6 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+
+/ICML_review/outputs/
+/ICML_review/review/
