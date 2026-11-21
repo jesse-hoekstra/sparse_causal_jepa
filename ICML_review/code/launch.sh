@@ -8,7 +8,7 @@ seed=${3:?seed}
 detail=${4:?arm or experiment}
 [[ "$seed" =~ ^[0-4]$ ]]
 case "$kind/$detail" in
-  donors/full|donors/baseline|chart/paired|halving/synthetic|halving/vision) ;;
+  donors/full|donors/baseline|chart/paired|prune/full|halving/synthetic|halving/vision) ;;
   *) exit 2 ;;
 esac
 check_head() { [[ "$(git rev-parse HEAD)" == "$expected" ]]; }
@@ -27,6 +27,10 @@ case "$kind" in
     hypothesis="Some of the full-model advantage in the partner-bead hold is explained by the scalar intervention interface."
     change="Replace scalar assignment and isotonic change of units by an invertible multivariate affine chart fitted on the same calibration states. Fix the models, interventions, horizons and validation contexts."
     verdict="Use paired absolute partner-slope errors. If the mean full advantage shrinks by at least half and the affine baseline improves, narrow the causal claim to the scalar interface. Otherwise report the remaining error and whether the affine chart itself fits poorly. This control uses richer joint supervision." ;;
+  prune)
+    hypothesis="Calibration forecasts can identify dispensable edges in the frozen full vision predictor at the original tolerance."
+    change="Greedily delete the open gate with smallest deterministic calibration MSE, accepting each deletion only if the resulting MSE is within the recorded sparse tolerance. Preserve weights, assignments, original training budget and data."
+    verdict="Pilot on seed zero. Advance to seeds one through four only if final total validation graph SHD is at most three and validation forecast MSE at most 1.02 times the original. A smaller SHD that misses either criterion is partial. No accepted deletion means the procedure offers no repair under the original tolerance. Truth is for assessing the locked mask only." ;;
   halving)
     hypothesis="At half budget the upper half by training performance contains the original acquisition winner."
     change="Stop the eight worst training-loss candidates at 50k; complete the other eight with their original histories, seeds and per-survivor budget."
