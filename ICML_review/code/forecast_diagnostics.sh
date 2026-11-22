@@ -2,13 +2,14 @@
 # Run a reported-checkpoint diagnostic on one worker, starting with its technical pilot.
 set -euo pipefail
 revision=${1:?commit}
-suite=${2:?response-geometry or mask-windows}
+suite=${2:?response-geometry, mask-windows or changed-queries}
 worker=${3:?worker}
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 case "$suite" in
   response-geometry) module=response_geometry ;;
   mask-windows) module=mask_windows ;;
+  changed-queries) module=changed_queries ;;
   *) exit 2 ;;
 esac
 [[ "$(git rev-parse HEAD)" == "$revision" ]]

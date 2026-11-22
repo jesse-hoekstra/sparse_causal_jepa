@@ -117,8 +117,21 @@ def encode_endpoint(
     return model, cal, lat
 
 
+def endpoints(seed: int, checkpoints: dict[str, Path] | None = None) -> dict[str, Path]:
+    """Resolve the reported pair or the supplied sparse arms."""
+    if seed not in range(5):
+        raise ValueError("expected a reported seed")
+    if checkpoints is None:
+        return {
+            arm: RUNS / f"seed{seed}/sparse-500k" / arm / "final.pt" for arm in ("baseline", "full")
+        }
+    if not checkpoints or not checkpoints.keys() <= {"baseline", "full"}:
+        raise ValueError("expected at least one known sparse arm")
+    return {arm: path.resolve() for arm, path in checkpoints.items()}
+
+
 def _arm(
-    seed: int,
+    checkpoint: Path,
     arm: str,
     device: torch.device,
     calibration: data.RenderedInputs,
@@ -128,7 +141,6 @@ def _arm(
     grids: Tensor,
     truth_slopes: Tensor,
 ) -> dict[str, Any]:
-    checkpoint = RUNS / f"seed{seed}/sparse-500k" / arm / "final.pt"
     model, cal, lat = encode_endpoint(checkpoint, arm, device, calibration, validation)
     scalar = downstream.Model(model, lat, cal, cal_truth)
     affine = AffineChart.fit(cal, cal_truth)
@@ -164,10 +176,9 @@ def _arm(
 
 
 @torch.inference_mode()
-def run(seed: int) -> dict[str, Any]:
+def run(seed: int, checkpoints: dict[str, Path] | None = None) -> dict[str, Any]:
     """Evaluate one matched pair on all validation contexts, using calibration labels for units."""
-    if seed not in range(5):
-        raise ValueError("expected a reported seed")
+    selected = endpoints(seed, checkpoints)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -194,8 +205,16 @@ def run(seed: int) -> dict[str, Any]:
         "truth_slopes_held_by_outcome": downstream.as_list(truth),
         "arms": {
             arm: _arm(
-                seed, arm, device, calibration, validation, cal_truth, ctx["cur"], grids, truth
+                checkpoint,
+                arm,
+                device,
+                calibration,
+                validation,
+                cal_truth,
+                ctx["cur"],
+                grids,
+                truth,
             )
-            for arm in ("baseline", "full")
+            for arm, checkpoint in selected.items()
         },
     }

@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from statistics import mean
 from typing import Any, Protocol, cast
 
@@ -11,7 +12,7 @@ from torch import Tensor
 from diagnostics.vision_dimer import data, downstream
 from scjepa.models.model import SCJEPA
 
-from .chart import DATA, RUNS, AffineChart, encode_endpoint
+from .chart import DATA, AffineChart, encode_endpoint, endpoints
 
 
 class KickWorld(Protocol):
@@ -92,29 +93,35 @@ def responses(world: KickWorld) -> dict[str, dict[str, Tensor]]:
 
 
 def score(
-    predicted: dict[str, dict[str, Tensor]], truth: dict[str, dict[str, Tensor]]
+    predicted: dict[str, dict[str, Tensor]],
+    truth: dict[str, dict[str, Tensor]],
+    *,
+    allow_zero_prediction: bool = False,
 ) -> dict[str, Any]:
     """Score each bead's matrix and then average the four relative errors and cosines."""
-    by_bead: dict[str, dict[str, dict[str, float]]] = {}
+    by_bead: dict[str, dict[str, dict[str, float | None]]] = {}
     for bead, matrices in predicted.items():
         by_bead[bead] = {}
         for label, m in matrices.items():
             t = truth[bead][label]
             mt, tt = m.square().sum().sqrt(), t.square().sum().sqrt()
-            if float(mt) == 0 or float(tt) == 0:
+            if float(tt) == 0 or (float(mt) == 0 and not allow_zero_prediction):
                 raise ValueError(f"undefined relative matrix score for {bead} {label}")
             by_bead[bead][label] = {
                 "relative_error": float((m - t).square().sum().sqrt() / tt),
-                "cosine": float((m * t).sum() / (mt * tt)),
+                "cosine": None if float(mt) == 0 else float((m * t).sum() / (mt * tt)),
             }
+
+    def average(label: str, metric: str) -> float | None:
+        values = [row[label][metric] for row in by_bead.values()]
+        observed = [value for value in values if value is not None]
+        return mean(observed) if len(observed) == len(values) else None
+
     return {
         "matrices": _serialize(predicted),
         "per_bead": by_bead,
         "mean_across_beads": {
-            label: {
-                metric: mean(values[label][metric] for values in by_bead.values())
-                for metric in ("relative_error", "cosine")
-            }
+            label: {metric: average(label, metric) for metric in ("relative_error", "cosine")}
             for label in ("held", "free", "held_minus_free")
         },
     }
@@ -128,10 +135,9 @@ def _serialize(values: dict[str, dict[str, Tensor]]) -> dict[str, dict[str, list
 
 
 @torch.inference_mode()
-def run(seed: int) -> dict[str, Any]:
+def run(seed: int, checkpoints: dict[str, Path] | None = None) -> dict[str, Any]:
     """Compare two calibrators on both frozen sparse arms and the fixed validation queries."""
-    if seed not in range(5):
-        raise ValueError("expected a reported seed")
+    selected = endpoints(seed, checkpoints)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -145,8 +151,7 @@ def run(seed: int) -> dict[str, Any]:
     ctx = downstream.truth_contexts(val_tensors, downstream.STARTS, len(val))
     truth = responses(downstream.Truth(cfg.physics, ctx))
     arms: dict[str, Any] = {}
-    for arm in ("baseline", "full"):
-        ckpt = RUNS / f"seed{seed}/sparse-500k" / arm / "final.pt"
+    for arm, ckpt in selected.items():
         model, cal_latent, lat = encode_endpoint(ckpt, arm, device, cal, val)
         scalar = downstream.Model(model, lat, cal_latent, phys)
         chart = AffineChart.fit(cal_latent, phys)
@@ -165,8 +170,12 @@ def run(seed: int) -> dict[str, Any]:
             "stored_first_window_nmse": stored["nmse"],
             "assignment_matches_stored": stored["spearman_assignment"] == list(scalar.match),
             "affine_condition_number": float(condition),
-            "scalar": score(responses(scalar), truth),
-            "affine": score(responses(affine), truth),
+            "scalar": score(
+                responses(scalar), truth, allow_zero_prediction=checkpoints is not None
+            ),
+            "affine": score(
+                responses(affine), truth, allow_zero_prediction=checkpoints is not None
+            ),
         }
     return {
         "seed": seed,

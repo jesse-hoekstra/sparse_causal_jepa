@@ -96,3 +96,9 @@ Each diagnostic can run as a queue on its own idle worker from a gateway. The la
 bash ICML_review/code/forecast_diagnostics.sh "$revision" response-geometry "$geometry_worker"
 bash ICML_review/code/forecast_diagnostics.sh "$revision" mask-windows "$window_worker"
 ```
+
+Once the changed vision runs have finished, evaluate their available terminal checkpoints on the matched partner-hold and held-kick queries with both physical calibration interfaces. This uses labelled calibration frames for units and the simulator on validation for evaluation. It records any missing descendants. The training criteria are already fixed.
+
+```bash
+bash ICML_review/code/forecast_diagnostics.sh "$revision" changed-queries "$query_worker"
+```
