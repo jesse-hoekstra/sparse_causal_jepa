@@ -2,7 +2,7 @@
 # Run a reported-checkpoint diagnostic on one worker, starting with its technical pilot.
 set -euo pipefail
 revision=${1:?commit}
-suite=${2:?response-geometry, mask-windows or changed-queries}
+suite=${2:?response-geometry, mask-windows, changed-queries or one-head-queries}
 worker=${3:?worker}
 root=$(git rev-parse --show-toplevel)
 cd "$root"
@@ -10,6 +10,7 @@ case "$suite" in
   response-geometry) module=response_geometry ;;
   mask-windows) module=mask_windows ;;
   changed-queries) module=changed_queries ;;
+  one-head-queries) module=changed_queries ;;
   *) exit 2 ;;
 esac
 [[ "$(git rev-parse HEAD)" == "$revision" ]]
@@ -18,7 +19,9 @@ printf 'Starting %s on %s at %s, commit %s\n' "$suite" "$worker" "$(date -u +%FT
 status=0
 for seed in 0 1 2 3 4; do
   [[ "$(git rev-parse HEAD)" == "$revision" ]]
-  printf -v invocation '%q ' .venv/bin/python -m "ICML_review.code.$module" "$revision" "$seed"
+  args=(.venv/bin/python -m "ICML_review.code.$module" "$revision" "$seed")
+  if [[ "$suite" == one-head-queries ]]; then args+=(--one-head); fi
+  printf -v invocation '%q ' "${args[@]}"
   printf -v command 'set -eu; cd %q; test "$(git rev-parse HEAD)" = %q; ' "$root" "$revision"
   command+='while [[ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" || "$(nvidia-smi --id=0 --query-gpu=memory.free --format=csv,noheader,nounits)" -lt 8192 ]]; do sleep 45; done; '
   command+='export CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=2 PYTHONPATH="$PWD:$PWD/src"; '

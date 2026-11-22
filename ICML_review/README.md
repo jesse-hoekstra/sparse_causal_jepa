@@ -102,3 +102,19 @@ Once the changed vision runs have finished, evaluate their available terminal ch
 ```bash
 bash ICML_review/code/forecast_diagnostics.sh "$revision" changed-queries "$query_worker"
 ```
+
+## One-acquisition contingency
+
+If a completed direct-joint comparison fails its scientific criteria, test the original first acquisition by itself. The candidate's frozen encoders, final and resumable weights, training streams and archived forecast scores are checked before reuse. It is admitted by its calibration forecast error against the joint head. The original projection, adaptation, numerical tolerance and sparse budgets are retained. Technical corroboration and scientific qualification are recorded separately.
+
+From the pinned gateway checkout, supply one to four distinct workers. With four workers, two qualifying seeds can train concurrently and the sparse arms of each seed use separate GPUs. Seed zero must pass before other seeds start.
+
+```bash
+bash ICML_review/code/one_head_queue.sh "$revision" "$worker_a" "$worker_b" "$worker_c" "$worker_d"
+```
+
+The individual stage command is `.venv/bin/python -m ICML_review.code.vision_one_head "$revision" 0 prepare`, with `PYTHONPATH=$PWD:$PWD/src`. Use `full` and `baseline` after a qualifying preparation, followed by `assess`. Every stage records its data, source checkpoint and command. Once the queue closes, evaluate its available terminal checkpoints using the same physical hold and kick controls.
+
+```bash
+bash ICML_review/code/forecast_diagnostics.sh "$revision" one-head-queries "$query_worker"
+```

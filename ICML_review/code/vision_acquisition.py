@@ -246,6 +246,111 @@ def stage_run(rev: str, directory: Path, cmd: list[str], note: str, parent: Path
     return digest
 
 
+def adaptation_checks(measured: dict[str, Any], reference: dict[str, Any]) -> dict[str, bool]:
+    """Evaluate held-out forecast and physical retention at the dense initializer."""
+    checks = {
+        k: measured[k] <= 1.10 * reference[k]
+        for k in ("prediction_mse", "calibration_prediction_mse")
+    }
+    checks["retention"] = measured["parameter_r2_min"] >= 0.95
+    return checks
+
+
+def _config(
+    seed: int, stage: str, source: Path, destination: Path, parent: Path, data_dir: Path, group: str
+) -> StageConfig:
+    old = StageConfig.from_saved(read(source / "config.json")["config"])
+    if old.seed != seed or old.stage != stage:
+        raise RuntimeError("Wrong archived config")
+    return replace(
+        old,
+        data_dir=str(data_dir),
+        output_dir=str(destination),
+        parent=str(parent),
+        wandb_group=group,
+    )
+
+
+def project_adapt(
+    seed: int,
+    rev: str,
+    out: Path,
+    note: str,
+    source: Path,
+    *,
+    base: Path,
+    data_dir: Path,
+    group: str,
+) -> dict[str, Any]:
+    """Apply the reported projection and frozen adaptation to a specific overcomplete source."""
+    projected, adapted = out / "projected", out / "adapt"
+    cfg = _config(seed, "adapt", base / "adapt", adapted, projected / "final.pt", data_dir, group)
+    projected_sha = stage_run(
+        rev,
+        projected,
+        [
+            *TRAIN,
+            "project",
+            "--source",
+            str(source.parent),
+            "--data-dir",
+            str(data_dir),
+            "--output",
+            str(projected),
+            "--device",
+            cfg.device,
+        ],
+        note,
+        source,
+    )
+    adapted_sha = stage_run(
+        rev, adapted, [*TRAIN, "train", *stage_args(cfg)], note, projected / "final.pt"
+    )
+    measured, reference = read(adapted / "final.json"), read(base / "adapt/final.json")
+    return {
+        "seed": seed,
+        "adaptation_checks": adaptation_checks(measured, reference),
+        "adaptation": measured,
+        "reference_adaptation": reference,
+        "checkpoint_sha256": {"projected": projected_sha, "adapt": adapted_sha},
+    }
+
+
+def sparse_arm(
+    seed: int, rev: str, out: Path, note: str, arm: str, *, base: Path, data_dir: Path, group: str
+) -> dict[str, str]:
+    """Run one released sparse path and resume its optimizer to the archived second budget."""
+    first, final = out / f"sparse-300k/{arm}", out / f"sparse-500k/{arm}"
+    adapted = out / "adapt/final.pt"
+    cfg = _config(seed, arm, base / f"sparse-300k/{arm}", first, adapted, data_dir, group)
+    endpoint = _config(seed, arm, base / f"sparse-500k/{arm}", final, adapted, data_dir, group)
+    if replace(cfg, output_dir=endpoint.output_dir, steps=endpoint.steps) != endpoint:
+        raise ValueError("reference sparse arm changes numerical settings between budgets")
+    first_sha = stage_run(rev, first, [*TRAIN, "train", *stage_args(cfg)], note, adapted)
+    last = first / "last.pt"
+    final_sha = stage_run(
+        rev,
+        final,
+        [
+            *TRAIN,
+            "fork",
+            "--source",
+            str(last),
+            "--output-dir",
+            str(final),
+            "--steps",
+            str(endpoint.steps),
+            "--wandb-mode",
+            cfg.wandb_mode,
+            "--wandb-group",
+            group,
+        ],
+        note,
+        last,
+    )
+    return {f"300k/{arm}": first_sha, f"500k/{arm}": final_sha}
+
+
 def direct(seed: int, rev: str, out: Path, note: str) -> dict[str, Any]:
     """Run only qualifying stages of the zero-acquisition route."""
     base = ROOT / f"seed{seed}"
@@ -253,87 +358,21 @@ def direct(seed: int, rev: str, out: Path, note: str) -> dict[str, Any]:
         ["sha256sum", "-c", "--quiet", "reported-checkpoints.sha256"], cwd="outputs", check=True
     )
     joint = base / "joint/final.pt"
-    hashes = {"joint": checkpoint_hashes()[str(joint)]}
-    if sha(joint) != hashes["joint"]:
+    joint_sha = checkpoint_hashes()[str(joint)]
+    if sha(joint) != joint_sha:
         raise RuntimeError("Wrong joint initializer")
-    projected = out / "projected"
-    hashes["projected"] = stage_run(
-        rev,
-        projected,
-        [
-            *TRAIN,
-            "project",
-            "--source",
-            str(joint.parent),
-            "--data-dir",
-            str(DATA),
-            "--output",
-            str(projected),
-            "--device",
-            "cuda",
-        ],
-        note,
-        joint,
-    )
-
-    def config(stage: str, source: Path, destination: Path, parent: Path) -> StageConfig:
-        old = StageConfig.from_saved(read(source / "config.json")["config"])
-        if old.seed != seed or old.stage != stage:
-            raise RuntimeError("Wrong archived config")
-        return replace(
-            old,
-            data_dir=str(DATA),
-            output_dir=str(destination),
-            parent=str(parent),
-            wandb_group="icml-review-direct-joint",
-        )
-
-    adapted = out / "adapt"
-    ac = config("adapt", base / "adapt", adapted, projected / "final.pt")
-    hashes["adapt"] = stage_run(
-        rev, adapted, [*TRAIN, "train", *stage_args(ac)], note, projected / "final.pt"
-    )
-    a, ra = read(adapted / "final.json"), read(base / "adapt/final.json")
-    init = {k: a[k] <= 1.10 * ra[k] for k in ("prediction_mse", "calibration_prediction_mse")}
-    init["retention"] = a["parameter_r2_min"] >= 0.95
-    result: dict[str, Any] = {
-        "seed": seed,
-        "adaptation_checks": init,
-        "adaptation": a,
-        "reference_adaptation": ra,
-        "checkpoint_sha256": hashes,
-    }
-    if not all(init.values()):
+    group = "icml-review-direct-joint"
+    result = project_adapt(seed, rev, out, note, joint, base=base, data_dir=DATA, group=group)
+    result["checkpoint_sha256"]["joint"] = joint_sha
+    if not all(result["adaptation_checks"].values()):
         return result | {"passed": False, "reason": "adaptation"}
     arms: dict[str, dict[str, Any]] = {}
     reference: dict[str, dict[str, Any]] = {}
     for arm in ("full", "baseline"):
-        first, final = out / f"sparse-300k/{arm}", out / f"sparse-500k/{arm}"
-        cfg = config(arm, base / f"sparse-300k/{arm}", first, adapted / "final.pt")
-        hashes[f"300k/{arm}"] = stage_run(
-            rev, first, [*TRAIN, "train", *stage_args(cfg)], note, adapted / "final.pt"
+        result["checkpoint_sha256"].update(
+            sparse_arm(seed, rev, out, note, arm, base=base, data_dir=DATA, group=group)
         )
-        hashes[f"500k/{arm}"] = stage_run(
-            rev,
-            final,
-            [
-                *TRAIN,
-                "fork",
-                "--source",
-                str(first / "last.pt"),
-                "--output-dir",
-                str(final),
-                "--steps",
-                "500000",
-                "--wandb-mode",
-                "online",
-                "--wandb-group",
-                "icml-review-direct-joint",
-            ],
-            note,
-            first / "last.pt",
-        )
-        arms[arm] = read(final / "final.json")
+        arms[arm] = read(out / f"sparse-500k/{arm}/final.json")
         reference[arm] = read(base / f"sparse-500k/{arm}/final.json")
     checks = sparse_checks(arms, reference)
     return result | {
