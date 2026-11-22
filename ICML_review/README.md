@@ -118,3 +118,11 @@ The individual stage command is `.venv/bin/python -m ICML_review.code.vision_one
 ```bash
 bash ICML_review/code/forecast_diagnostics.sh "$revision" one-head-queries "$query_worker"
 ```
+
+## Intervention responses by system
+
+After the matched intervention queries have closed, compare the frozen models' responses on individual validation systems with the simulator. The reference prediction assigns every system the same simulator response estimated on calibration. Each system contributes equally. The analysis checks that averaging the individual responses reproduces the archived population results, then measures how well each model predicts differences between systems.
+
+```bash
+bash ICML_review/code/forecast_diagnostics.sh "$revision" system-effects "$query_worker"
+```
