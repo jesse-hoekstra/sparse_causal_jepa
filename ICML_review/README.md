@@ -73,3 +73,26 @@ The noisy-support control fits a support encoder and a predictor on generated sy
 ```bash
 PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.noisy_support "$revision" ICML_review/outputs/noisy-support-s0 --seed 0
 ```
+
+## Deployed forecast sensitivity
+
+On a free GPU, use the reported RGB endpoints to check whether reproducible code directions affect the two-step forecast on held-out systems. Both input and target units and the transported directions are fitted on calibration. The diagnostic verifies its donor routing against the native rollout before reporting any validation estimates. It uses both sparse arms and the first window of every calibration and validation episode.
+
+```bash
+PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.response_geometry "$revision" 0
+```
+
+After a verified seed-zero measurement, repeat for seeds 1 through 4. The run note and both checkpoints' identities are in each seed's output folder.
+
+To separate the effects of mask sampling and episode-window selection, run the four matched cells on the original full model. The first-window deterministic forecast is checked against both released development summaries.
+
+```bash
+PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.mask_windows "$revision" 0
+```
+
+Each diagnostic can run as a queue on its own idle worker from a gateway. The launcher verifies reported input hashes, the checkout revision and pilot validity before expansion.
+
+```bash
+bash ICML_review/code/forecast_diagnostics.sh "$revision" response-geometry "$geometry_worker"
+bash ICML_review/code/forecast_diagnostics.sh "$revision" mask-windows "$window_worker"
+```
