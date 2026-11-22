@@ -2,6 +2,8 @@
 
 Run from the repository root with its Python environment and the reported inputs listed in `outputs/REPORTED.md`. The Python package in `code/` reads the original models and training histories. Run notes, logs, exit status and metrics live in `outputs/`. The private manuscript and PDF live in `review/`.
 
+For an exact replay, use the checkout revision recorded with that run in its private `NOTE.md`. Dependent diagnostics verify their predecessors' original revisions and input hashes. The review ledger gives the sequence of revisions, commands and server paths. The commands below use `revision` for the commit of the checkpoint or diagnostic being reproduced.
+
 On a clean server checkout create `ICML_review/outputs` and run the following commands for seed zero. Verify the reported input hashes before the first job, check GPU availability for model evaluation, and keep the checkout at the same commit until every job exits.
 
 ```bash
@@ -117,6 +119,12 @@ The individual stage command is `.venv/bin/python -m ICML_review.code.vision_one
 
 ```bash
 bash ICML_review/code/forecast_diagnostics.sh "$revision" one-head-queries "$query_worker"
+```
+
+To quantify sampling uncertainty in the recorded seed-zero adaptation decisions, replay the three adapted models on the same calibration and validation systems. This computes paired system bootstrap intervals for each alternative's raw error relative to the reported initializer and its admission margin.
+
+```bash
+PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.adaptation_interval "$revision"
 ```
 
 ## Intervention responses by system
