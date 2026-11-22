@@ -24,11 +24,11 @@ RESTARTS = ("rgb-predictive", "synthetic-warm")
 TEACHERS = ("vision-invariant", "synthetic-consensus")
 # Prefer independent short controls when an appropriate device becomes free.
 METHODS = (*LINEAR, *TEACHERS, *RESTARTS)
-RGB = ("linear-consensus-vision", "vision-invariant", "rgb-predictive")
+RGB = ("linear-consensus-vision", "vision-invariant", "rgb-predictive", "rgb-four")
 PHASES = {
     "vision-invariant": ("prepare", "own", "sibling", "assess"),
     "synthetic-consensus": ("same", "other", "assess"),
-    **{m: ("prepare", "full", "baseline", "assess") for m in RESTARTS},
+    **{m: ("prepare", "full", "baseline", "assess") for m in (*RESTARTS, "rgb-four")},
     **{m: ("fit",) for m in LINEAR},
 }
 
@@ -44,7 +44,8 @@ class Task:
     @property
     def directory(self) -> Path:
         """Keep scheduling receipts apart from scientific endpoints."""
-        return QUEUE / f"{self.method}-s{self.seed}"
+        parent = OUTPUT / "four-queue" if self.method == "rgb-four" else QUEUE
+        return parent / f"{self.method}-s{self.seed}"
 
     def command(self, rev: str) -> list[str]:
         """Call the same public module documented in each scientific note."""
@@ -103,10 +104,10 @@ def receipt(method: str, seed: int, rev: str) -> dict[str, Any] | None:
     return value
 
 
-def pending(rev: str) -> list[Task]:
+def pending(rev: str, methods: tuple[str, ...] = METHODS) -> list[Task]:
     """Enumerate ready phases and respect every dataset-specific seed-zero decision."""
     tasks: list[Task] = []
-    for method in METHODS:
+    for method in methods:
         pilot = receipt(method, 0, rev)
         for seed in range(5 if pilot and pilot["passed"] else 1):
             completed = receipt(method, seed, rev)
@@ -130,7 +131,10 @@ def pending(rev: str) -> list[Task]:
                 task = Task(method, seed, phase)
                 if task.finished(rev):
                     if phase in ("assess", "fit") and receipt(method, seed, rev) is None:
-                        raise ValueError(f"Missing {method} seed {seed} terminal receipt")
+                        marker = task.directory / f"{phase}.ok.json"
+                        if time.time() - marker.stat().st_mtime > 120:
+                            raise ValueError(f"Missing {method} seed {seed} terminal receipt")
+                        tasks.append(task)
                     continue
                 if all(Task(method, seed, p).finished(rev) for p in task.predecessors()):
                     tasks.append(task)
@@ -164,7 +168,7 @@ def device() -> tuple[str, bool]:
     return name, not apps and int(free) >= 8192
 
 
-def attempt(task: Task, rev: str, gpu: str) -> bool:
+def attempt(task: Task, rev: str, gpu: str, methods: tuple[str, ...] = METHODS) -> bool:
     """Claim a ready phase, execute with a pinned checkout, and preserve all diagnostics."""
     root = task.directory
     phase = task.phase
@@ -172,7 +176,12 @@ def attempt(task: Task, rev: str, gpu: str) -> bool:
     if failed.exists() or not task.matches_gpu(gpu):
         return False
     with try_lock(root / f".{phase}.lock") as acquired:
-        if not acquired or task not in pending(rev) or failed.exists():
+        if (
+            not acquired
+            or task not in pending(rev, methods)
+            or failed.exists()
+            or (phase != "queries" and task.finished(rev))
+        ):
             return False
         if not device()[1]:
             return False
@@ -200,7 +209,11 @@ def main() -> None:
     """Work until all qualified training and causal evaluations have terminal receipts."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("commit")
-    rev: str = parser.parse_args().commit
+    parser.add_argument("--four", action="store_true", help="run the four-head campaign only")
+    args = parser.parse_args()
+    rev: str = args.commit
+    methods = ("rgb-four",) if args.four else METHODS
+    jobs = OUTPUT / "four-queue" if args.four else QUEUE
     os.environ.update(
         PYTHONPATH=f"{Path.cwd()}:{Path.cwd() / 'src'}",
         OMP_NUM_THREADS="1",
@@ -208,16 +221,16 @@ def main() -> None:
         PYTHONUNBUFFERED="1",
     )
     worker = socket.gethostname().split(".")[0]
-    with try_lock(QUEUE / f".worker-{worker}.lock") as acquired:
+    with try_lock(jobs / f".worker-{worker}.lock") as acquired:
         if not acquired:
             raise RuntimeError("A campaign worker is already active on this physical node")
         while True:
             check_head(rev)
-            tasks = pending(rev)
+            tasks = pending(rev, methods)
             if not tasks:
                 return
             gpu, free = device()
-            if free and any(attempt(t, rev, gpu) for t in tasks):
+            if free and any(attempt(t, rev, gpu, methods) for t in tasks):
                 continue
             if all((t.directory / f"{t.phase}.failure.json").exists() for t in tasks):
                 raise RuntimeError("Remaining eligible phases have a recorded technical failure")

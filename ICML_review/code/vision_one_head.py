@@ -149,10 +149,13 @@ def replay_forecasts(
     }
 
 
-def authenticate_candidate(seed: int) -> dict[str, Any]:
-    """Verify the unlisted candidate against its parent, metadata and archived forecasts."""
+def authenticate_candidate(seed: int, index: int | None = None) -> dict[str, Any]:
+    """Verify a candidate against its parent, metadata, archived forecasts and available hash."""
     base = ROOT / f"seed{seed}"
-    d = base / "acquire/a0"
+    if index is not None and index not in range(16):
+        raise ValueError("invalid acquisition index")
+    name = f"a{index if index is not None else 0}"
+    d = base / "acquire" / name
     j = base / "joint"
     a0, joint, last = d / "final.pt", j / "final.pt", d / "last.pt"
     manifest = checkpoint_hashes()
@@ -166,10 +169,11 @@ def authenticate_candidate(seed: int) -> dict[str, Any]:
         or audit["data_manifest_sha256"] != data_sha
         or sha(joint) != manifest[str(joint)]
         or audit["joint_checkpoint_sha256"] != manifest[str(joint)]
-        or str(a0) in manifest
+        or (index is None and str(a0) in manifest)
+        or (str(a0) in manifest and sha(a0) != manifest[str(a0)])
     ):
         raise ValueError("head audit, data, or manifest joint provenance differs")
-    summaries = {"a0": d / "final.json", "joint": j / "final.json"}
+    summaries = {name: d / "final.json", "joint": j / "final.json"}
     selection_path = base / "selection.json"
     for p in [*summaries.values(), selection_path]:
         if audit["input_sha256"][str(p)] != sha(p):
@@ -183,7 +187,7 @@ def authenticate_candidate(seed: int) -> dict[str, Any]:
     if (
         cfg.stage != "acquire"
         or cfg.seed != seed
-        or cfg.acquisition_seed != 1000 + seed
+        or cfg.acquisition_seed != 1000 + 100 * (index or 0) + seed
         or cfg.steps != 100000
         or cfg.code_dim != 8
         or cfg.parent is None
@@ -198,7 +202,7 @@ def authenticate_candidate(seed: int) -> dict[str, Any]:
         or parent["meta"]["seed"] != seed
         or parent["meta"]["stage"] != "joint"
     ):
-        raise ValueError("a0 stage, parent, dimension, budget or archived metadata differ")
+        raise ValueError("acquisition stage, parent, dimension, budget or archived metadata differ")
     cohort = data.load_config(DATA)
     required_meta = {
         "schema": train.SCHEMA,
@@ -235,23 +239,23 @@ def authenticate_candidate(seed: int) -> dict[str, Any]:
         raise ValueError("invalid historical training-score window")
     score = sum(float(row["prediction"]) for row in tail) / len(tail)
     if not math.isclose(score, selection["scores"][cfg.output_dir], rel_tol=1e-12, abs_tol=1e-15):
-        raise ValueError("a0 historical trailing training score differs")
+        raise ValueError("acquisition historical trailing training score differs")
     inputs = {split: data.RenderedInputs(DATA, split, device) for split in SCORES}
     references: dict[str, Any] = {}
-    for name, payload in (("joint", parent), ("a0", a)):
-        archive = read(summaries[name])
+    for label, payload in (("joint", parent), (name, a)):
+        archive = read(summaries[label])
         if archive["step"] != cfg.steps:
             raise ValueError("wrong archived summary update")
         truth = {s: archive[k] for s, k in SCORES.items()}
-        if any(truth[s] != audit["heads"][name][k] for s, k in SCORES.items()):
+        if any(truth[s] != audit["heads"][label][k] for s, k in SCORES.items()):
             raise ValueError("archived forecast values disagree with the head audit")
         actual = replay_forecasts(payload, inputs, device)
         matches = {s: math.isclose(actual[s], truth[s], rel_tol=RTOL, abs_tol=ATOL) for s in SCORES}
-        references[name] = {
+        references[label] = {
             "released": truth,
             "measured": actual,
             "matches": matches,
-            "summary_sha256": sha(summaries[name]),
+            "summary_sha256": sha(summaries[label]),
         }
     if (sha(a0), sha(last), sha(joint)) != initial_hashes:
         raise ValueError("archive changed during candidate corroboration")
@@ -261,7 +265,7 @@ def authenticate_candidate(seed: int) -> dict[str, Any]:
         "last_sha256": initial_hashes[1],
         "joint_sha256": manifest[str(joint)],
         "candidate_path": str(a0),
-        "candidate_manifest_listed": False,
+        "candidate_manifest_listed": str(a0) in manifest,
         "archive_audit_sha256": sha(audit_path),
         "archive_audit_commit": audit["commit"],
         "config_sha256": sha(d / "config.json"),
@@ -272,7 +276,11 @@ def authenticate_candidate(seed: int) -> dict[str, Any]:
         "frozen_encoder_tensors": counts,
         "normalized_stage_config": asdict(cfg),
         "streams": rng,
-        "historical_a0_train_score": score,
+        **(
+            {"historical_a0_train_score": score}
+            if index is None
+            else {"candidate_index": index, "historical_train_score": score}
+        ),
         "first_window": references,
         "rtol": RTOL,
         "atol": ATOL,
@@ -280,21 +288,23 @@ def authenticate_candidate(seed: int) -> dict[str, Any]:
     }
 
 
-def _candidate_worker(rev: str, seed: int, record: Path) -> None:
+def _candidate_worker(rev: str, seed: int, record: Path, index: int | None = None) -> None:
     """Release the candidate-audit CUDA context before the native training subprocesses start."""
     _head(rev)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    result = authenticate_candidate(seed) | {"commit": rev}
+    result = authenticate_candidate(seed, index) | {"commit": rev}
     _head(rev)
     write_json(record, result)
 
 
-def _candidate_receipt(rev: str, seed: int, record: Path) -> dict[str, Any]:
+def _candidate_receipt(
+    rev: str, seed: int, record: Path, index: int | None = None
+) -> dict[str, Any]:
     if not record.exists():
         _idle_gpu()
         proc = multiprocessing.get_context("spawn").Process(
-            target=_candidate_worker, args=(rev, seed, record)
+            target=_candidate_worker, args=(rev, seed, record, index)
         )
         proc.start()
         proc.join()
@@ -302,24 +312,27 @@ def _candidate_receipt(rev: str, seed: int, record: Path) -> dict[str, Any]:
             raise RuntimeError(f"candidate identity worker failed with exit code {proc.exitcode}")
     result = read(record)
     base = ROOT / f"seed{seed}"
+    name = f"a{index if index is not None else 0}"
+    candidate_dir = base / "acquire" / name
     sources = {
-        "final_sha256": base / "acquire/a0/final.pt",
-        "last_sha256": base / "acquire/a0/last.pt",
+        "final_sha256": candidate_dir / "final.pt",
+        "last_sha256": candidate_dir / "last.pt",
         "joint_sha256": base / "joint/final.pt",
-        "config_sha256": base / "acquire/a0/config.json",
+        "config_sha256": candidate_dir / "config.json",
         "selection_sha256": base / "selection.json",
-        "history_sha256": base / "acquire/a0/history.jsonl",
+        "history_sha256": candidate_dir / "history.jsonl",
         "archive_audit_sha256": OUTPUT / f"vision-head-audit-s{seed}/metrics.json",
         "manifest_sha256": DATA / "manifest.json",
     }
     if (
         result["commit"] != rev
         or result["seed"] != seed
+        or (index is not None and result.get("candidate_index") != index)
         or any(result[k] != sha(path) for k, path in sources.items())
     ):
         raise ValueError("candidate receipt or archived source changed")
-    for name, directory in (("joint", base / "joint"), ("a0", base / "acquire/a0")):
-        if result["first_window"][name]["summary_sha256"] != sha(directory / "final.json"):
+    for label, directory in (("joint", base / "joint"), (name, candidate_dir)):
+        if result["first_window"][label]["summary_sha256"] != sha(directory / "final.json"):
             raise ValueError("archived evaluation summary changed")
     return result
 

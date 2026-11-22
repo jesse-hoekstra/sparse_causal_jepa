@@ -92,3 +92,102 @@ def test_both_native_feature_readouts(tmp_path: Path) -> None:
             assert not torch.equal(before.parameters, after.parameters)
     finally:
         torch.set_num_threads(old)
+
+
+def test_long_rgb_episodes_score_native_first_window_after_readout(tmp_path: Path) -> None:
+    """Corroborate both physical splits and the released checkpoint evaluator after each refit."""
+    from diagnostics.vision_dimer import evaluate, train
+
+    from .consensus_queries import sources
+    from .linear_consensus import rgb_eval
+
+    old_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        cpu = torch.device("cpu")
+        cfg = data.DataConfig(
+            train_groups=8,
+            calibration_groups=12,
+            validation_groups=8,
+            test_groups=2,
+            episode_frames=30,
+        )
+        directory = tmp_path / "frames"
+        data.prepare(directory, cfg)
+        inputs = {
+            s: data.RenderedInputs(directory, s, cpu)
+            for s in ("train", "calibration", "validation")
+        }
+        model = build_model(0, phase="full", context=cfg.context, code_dim=4).eval()
+        layer = cast(
+            nn.Linear, cast(nn.Sequential, model.parameter_encoder.get_submodule("head"))[-1]
+        )
+        fits, _ = fit_readout(rgb_features(model, inputs["train"]), layer)
+        physical = {s: data.load_labels(directory, s) for s in ("calibration", "validation")}
+        for labels in physical.values():
+            assert labels["states"].shape[2] == cfg.episode_frames
+        assert cfg.frames < cfg.episode_frames
+        original_codes = None
+        for mode in ("own", "sibling"):
+            with torch.no_grad():
+                weight, bias = fits[mode]
+                layer.weight.copy_(weight)
+                layer.bias.copy_(bias)
+                metrics, samples = rgb_eval(model, inputs, data_dir=directory)
+            expected_labels = {
+                s: {"theta": z["theta"], "states": z["states"][:, :, : cfg.frames]}
+                for s, z in physical.items()
+            }
+            for split in ("calibration", "validation"):
+                assert (
+                    samples[split]["states"].shape[:3] == expected_labels[split]["states"].shape[:3]
+                )
+                original = evaluate.evaluate(
+                    model,
+                    samples["calibration"],
+                    expected_labels["calibration"],
+                    samples[split],
+                    expected_labels[split],
+                )
+                row = metrics[split]
+                assert row["mse"] == original["prediction_mse"]
+                assert row["nmse"] == original["nmse"]
+                assert row["mcc"] == original["mcc"]
+                assert row["r2"] == original["parameter_r2_min"]
+                assert row["shd"] == sum(
+                    original[k + "_shd"] for k in ("state", "action", "parameter")
+                )
+                assert row["spearman_assignment"] == original["spearman_assignment"]
+            if mode == "own":
+                original_codes = samples["validation"]["codes"]
+            else:
+                assert original_codes is not None
+                assert not torch.equal(original_codes, samples["validation"]["codes"])
+            source = tmp_path / f"{mode}.pt"
+            torch.save(
+                {
+                    "meta": {
+                        "seed": 0,
+                        "context": cfg.context,
+                        "code_dim": 4,
+                        "shape": list(cfg.renderer.shape),
+                        "stage": "full",
+                    },
+                    "config": {"stage": "full"},
+                    "model": model.state_dict(),
+                },
+                source,
+            )
+            released = train.evaluate_checkpoint(
+                source, directory, tmp_path / f"{mode}.json", device="cpu"
+            )
+            assert metrics["calibration"]["mse"] == released["calibration_prediction_mse"]
+            assert metrics["validation"]["mse"] == released["prediction_mse"]
+            assert metrics["validation"]["mcc"] == released["mcc"]
+            assert metrics["validation"]["r2"] == released["parameter_r2_min"]
+        queries = sources(
+            "linear-consensus-vision-window", tmp_path, {"checkpoint_sha256": "digest"}
+        )
+        assert queries == {"sibling": ("full", tmp_path / "final.pt", "digest")}
+    finally:
+        torch.set_num_threads(old_threads)

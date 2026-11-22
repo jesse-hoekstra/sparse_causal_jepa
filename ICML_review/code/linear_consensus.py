@@ -25,6 +25,7 @@ from scjepa.experiments.storage import file_lock, write_json
 from scjepa.models.model import SCJEPA
 from scjepa.training.loop import TrainingObjective
 
+from . import stable_readout
 from .changed_queries import require
 from .single_acquisition import COMPARISON, _head, _idle_gpu  # pyright: ignore[reportPrivateUsage]
 from .single_acquisition import DATA as SYN_DATA
@@ -62,6 +63,26 @@ licenses the remaining four seeds for that dataset. A failed scientific check cl
 branch; no tuning. No test scoring. A successful fit is a post-training loss on a single-episode
 encoder and does not establish pointwise invariance, identifiability or the need for restarts.
 """
+
+
+STABLE_PROTOCOL = """Hypothesis: frozen single-episode features include a more reproducible
+predictive chart than the final readout. Change only the last affine layer. Choose its
+TRAIN subspace by minimizing within-system code variance under unit total covariance, then
+fit an affine map from TRAIN system means in that subspace to the original teacher means.
+This objective explicitly protects rank during selection. Its within-system guarantee is
+in sample and relative to a linear feature class. Fail the pilot if the boundary is
+unresolved or alignment cannot retain all output directions. Use an exact copy of the
+original last-layer coefficients as the paired control. Frozen trunk, state encoders, graph
+gates, group membership, single-episode deployment and original upstream budget are shared.
+Do one label-free feature pass and FP64 solve, with no SGD or added scalar penalty weight.
+On each CAL and VAL cohort require 10% lower worst generalized within fraction, rank retained,
+minimum between variance in original units at least 0.80, raw MSE within 10% of the original
+control. The paired VAL 95% interval for the worst change must be entirely below zero.
+Require VAL MCC loss at most 0.01, no extra aligned graph errors and minimum parameter R2
+at least the larger of native minus 0.02 and the relevant floor (0.80 synthetic, 0.95 RGB).
+Report the actual native tolerance separately. No physical labels are used to fit the map.
+Advance a passing seed-zero fit separately within each benchmark. A failure retains its
+receipt and any existing endpoint for independent validation queries; no test is scored."""
 
 
 def eigh(matrix: Tensor) -> tuple[Tensor, Tensor]:
@@ -227,11 +248,15 @@ def rgb_features(model: SCJEPA, inputs: data.RenderedInputs) -> Tensor:
 
 
 def rgb_eval(
-    model: SCJEPA, sets: dict[str, data.RenderedInputs]
+    model: SCJEPA, sets: dict[str, data.RenderedInputs], *, data_dir: Path = DATA
 ) -> tuple[dict[str, Any], dict[str, dict[str, Tensor]]]:
     """Score fixed CAL/VAL first windows using the released estimators."""
     samples = {s: evaluate.collect(model, train.rendered_batches(sets[s])) for s in SPLITS}
-    labels = {s: data.load_labels(DATA, s) for s in SPLITS}
+    labels: dict[str, dict[str, Tensor]] = {}
+    for split in SPLITS:
+        raw = data.load_labels(data_dir, split)
+        # Mirror the released evaluator: rendered_batches selects start zero in every episode.
+        labels[split] = {"states": raw["states"][:, :, : sets[split].frames], "theta": raw["theta"]}
     metrics: dict[str, Any] = {}
     for s in SPLITS:
         r = evaluate.evaluate(
@@ -257,26 +282,42 @@ def endpoint(dataset: str, seed: int) -> Path:
 
 
 @torch.no_grad()
-def run(commit: str, dataset: str, seed: int) -> None:
+def run(commit: str, dataset: str, seed: int, *, stable: bool = False) -> None:
     """Fit, evaluate and archive one frozen-feature readout comparison."""
-    out = OUTPUT / f"linear-consensus-{dataset}-s{seed}"
+    if dataset not in {"synthetic", "vision", "vision-window"}:
+        raise ValueError("unknown linear consensus benchmark")
+    selector = "vision-window" if dataset in {"vision", "vision-window"} else dataset
+    invoker = dataset
+    dataset = "vision" if selector == "vision-window" else "synthetic"
+    method = f"stable-readout-{dataset}" if stable else f"linear-consensus-{selector}"
+    out = OUTPUT / f"{method}-s{seed}"
     _head(commit)
     path = endpoint(dataset, seed)
     expected = checkpoint_hashes()[str(path)]
     identity = DATA / "manifest.json" if dataset == "vision" else SYN_DATA / "completion.json"
     source_id = sha(identity)
     cmd = shlex.join(
-        [PYTHON, "-m", "ICML_review.code.linear_consensus", commit, dataset, str(seed)]
+        [PYTHON, "-m", "ICML_review.code.linear_consensus", commit, invoker, str(seed)]
+        + (["--stable"] if stable else [])
     )
     note = (
-        f"# Single-episode linear consensus, {dataset} seed {seed}\n\n{PROTOCOL}\n\n"
+        f"# {method}, seed {seed}\n\n{STABLE_PROTOCOL if stable else PROTOCOL}\n\n"
         f"Git {commit}\nData {identity} SHA-256 {source_id}\nReported {path} SHA-256 {expected}\n"
         f"\n    PYTHONPATH=$PWD:$PWD/src {cmd}\n"
     )
+    if dataset == "vision" and not stable:
+        # Both equivalent CLI spellings resolve to one revision-bound result.
+        prefix = f"PYTHONPATH=$PWD:$PWD/src {PYTHON} -m ICML_review.code.linear_consensus {commit}"
+        note = note.split("    PYTHONPATH=", maxsplit=1)[0] + (
+            "Evaluate the physical state labels from the same first window as the RGB inputs, "
+            "as in the release evaluator. The earlier run remains in its original directory. "
+            "Equivalent commands follow.\n\n"
+            f"    {prefix} vision-window {seed}\n    {prefix} vision {seed}\n"
+        )
     with file_lock(out / ".lock"):
         declared(out / "NOTE.md", note)
         if seed:
-            pilot = read(OUTPUT / f"linear-consensus-{dataset}-s0/metrics.json")
+            pilot = read(OUTPUT / f"{method}-s0/metrics.json")
             require(pilot["passed"] and pilot["commit"] == commit, "Pilot did not qualify")
         subprocess.run(
             ["sha256sum", "-c", "--quiet", MANIFEST.name], cwd=MANIFEST.parent, check=True
@@ -287,7 +328,10 @@ def run(commit: str, dataset: str, seed: int) -> None:
             require(
                 r["commit"] == commit
                 and r["note_sha256"] == sha(out / "NOTE.md")
-                and sha(out / "final.pt") == r["checkpoint_sha256"],
+                and (
+                    (r.get("reason") == "unresolved_training_chart" and not r["passed"])
+                    or sha(out / "final.pt") == r["checkpoint_sha256"]
+                ),
                 "Stored run changed",
             )
             return
@@ -333,7 +377,29 @@ def run(commit: str, dataset: str, seed: int) -> None:
             nn.Linear, cast(nn.Sequential, model.parameter_encoder.get_submodule("head"))[-1]
         )
         original_readout = (layer.weight.detach().cpu().clone(), layer.bias.detach().cpu().clone())
-        fits, training = fit_readout(feats, layer)
+        try:
+            fits, training = (stable_readout.fit_readout if stable else fit_readout)(feats, layer)
+        except stable_readout.StableReadoutError as failure:
+            _head(commit)
+            write_json(
+                out / "metrics.json",
+                {
+                    "commit": commit,
+                    "method": method,
+                    "dataset": dataset,
+                    "seed": seed,
+                    "command": cmd,
+                    "source": str(path),
+                    "source_sha256": expected,
+                    "data_identity": source_id,
+                    "note_sha256": sha(out / "NOTE.md"),
+                    "passed": False,
+                    "reason": "unresolved_training_chart",
+                    "fit": {"reason": failure.reason, "diagnostics": failure.diagnostics},
+                    "checks": {"training_subspace": False},
+                },
+            )
+            return
         del feats
         elapsed = time.monotonic() - start
         checks: dict[str, bool] = {}
@@ -412,6 +478,7 @@ def run(commit: str, dataset: str, seed: int) -> None:
                 "commit": commit,
                 "seed": seed,
                 "dataset": dataset,
+                "method": method,
                 "note_sha256": sha(out / "NOTE.md"),
                 "source": str(path),
                 "source_sha256": expected,
@@ -436,10 +503,13 @@ def main() -> None:
     """Run the seed-zero pilot or a qualified replication on the server."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("commit")
-    parser.add_argument("dataset", choices=("synthetic", "vision"))
+    parser.add_argument("dataset", choices=("synthetic", "vision", "vision-window"))
     parser.add_argument("seed", type=int, choices=range(5))
+    parser.add_argument(
+        "--stable", action="store_true", help="fit a minimum within-variance subspace"
+    )
     args = parser.parse_args()
-    run(args.commit, args.dataset, args.seed)
+    run(args.commit, args.dataset, args.seed, stable=args.stable)
 
 
 if __name__ == "__main__":

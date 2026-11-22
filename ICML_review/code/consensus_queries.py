@@ -23,7 +23,14 @@ from .vision_acquisition import (
     sha,
 )
 
-METHODS = ("linear-consensus-vision", "rgb-predictive", "vision-invariant")
+METHODS = (
+    "linear-consensus-vision",
+    "linear-consensus-vision-window",
+    "stable-readout-vision",
+    "rgb-predictive",
+    "rgb-four",
+    "vision-invariant",
+)
 PROTOCOL = """Hypothesis: a changed encoder can improve forecast or consistency while
 degrading the named physical intervention. Within each reported seed and sparse condition,
 replace only the evaluated endpoint. Refit the declared scalar and joint affine physical
@@ -40,12 +47,18 @@ A trial ending before the sparse endpoint yields no downstream estimate."""
 def sources(method: str, root: Path, record: dict[str, Any]) -> dict[str, tuple[str, Path, str]]:
     """Bind every actually produced terminal checkpoint to its training receipt."""
     hashes = record.get("checkpoint_sha256")
-    if method == "linear-consensus-vision":
+    if method == "stable-readout-vision" and hashes:
+        return {"stable": ("full", root / "final.pt", str(hashes))}
+    if method in {"linear-consensus-vision", "linear-consensus-vision-window"}:
         return {"sibling": ("full", root / "final.pt", str(hashes))}
     if method == "vision-invariant" and hashes and "other" in hashes:
         return {
             a: ("full", root / a / "final.pt", hashes[m])
             for a, m in (("own", "same"), ("sibling", "other"))
+        }
+    if method == "rgb-four" and record["terminal_paths"] and hashes:
+        return {
+            a: (a, Path(path), hashes[f"500k/{a}"]) for a, path in record["terminal_paths"].items()
         }
     if method == "rgb-predictive" and hashes and "validation" in record:
         return {
