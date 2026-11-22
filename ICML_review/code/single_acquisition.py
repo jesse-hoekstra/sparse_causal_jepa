@@ -5,6 +5,8 @@ import math
 import os
 import shlex
 import subprocess
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,16 @@ GATE = (
     "Passing seed zero licenses all remaining seeds. Failure keeps the cheaper protocol "
     "unestablished. A five-seed result reports every outcome."
 )
+
+
+@dataclass(frozen=True)
+class AcquisitionRoute:
+    """Declare an alternative acquisition before reusing the original post-admission stages."""
+
+    name: str
+    module: str
+    declaration: Callable[[int], str]
+    prepare: Callable[[Path, int, str, str, str], dict[str, Any]]
 
 
 def _head(expected: str) -> None:
@@ -78,13 +90,22 @@ def _note(commit: str, data_id: str, command: list[str], first_admitted: bool = 
 
 
 def _stage(
-    directory: Path, args: list[str], commit: str, data_id: str, first_admitted: bool = False
+    directory: Path,
+    args: list[str],
+    commit: str,
+    data_id: str,
+    first_admitted: bool = False,
+    declaration: str | None = None,
 ) -> None:
     _head(commit)
     directory.mkdir(parents=True, exist_ok=True)
     results = directory / "results"
     args = [PYTHON, "-m", *args]
-    note = _note(commit, data_id, args, first_admitted)
+    note = (
+        declaration + f"\n\n    PYTHONPATH=$PWD:$PWD/src {shlex.join(args)}\n"
+        if declaration is not None
+        else _note(commit, data_id, args, first_admitted)
+    )
     path = directory / "NOTE.md"
     if path.exists() and path.read_text() != note:
         raise RuntimeError(f"Different declared command in {directory}")
@@ -308,10 +329,21 @@ def _carry_forward(
     )
 
 
-def run(commit: str, seed: int, phase: str, *, first_admitted: bool = False) -> None:
+def run(
+    commit: str,
+    seed: int,
+    phase: str,
+    *,
+    first_admitted: bool = False,
+    route: AcquisitionRoute | None = None,
+) -> None:
     """Run a CPU assessment or a GPU phase at fixed HEAD, with separate output locks."""
     _head(commit)
     policy = "single-admitted" if first_admitted else "single-acquisition"
+    if route is not None:
+        if first_admitted:
+            raise ValueError("choose one acquisition route")
+        policy = route.name
     root = PRIVATE / f"{policy}-s{seed}"
     pilot = PRIVATE / f"{policy}-s0/metrics.json"
     if seed:
@@ -327,10 +359,20 @@ def run(commit: str, seed: int, phase: str, *, first_admitted: bool = False) -> 
     receipt = root / "admission.json"
     root.mkdir(parents=True, exist_ok=True)
     with file_lock(root / f".{phase}.lock"):
-        args = [PYTHON, "-m", "ICML_review.code.single_acquisition", commit, str(seed), phase]
+        module = route.module if route else "ICML_review.code.single_acquisition"
+        args = [PYTHON, "-m", module, commit, str(seed), phase]
         if first_admitted:
             args.append("--first-admitted")
-        stage_note = _note(commit, data_id, args, first_admitted)
+        declaration = (
+            None
+            if route is None
+            else (route.declaration(seed) + f"\n\nGit commit: {commit}\nData identity: {data_id}\n")
+        )
+        stage_note = (
+            _note(commit, data_id, args, first_admitted)
+            if declaration is None
+            else declaration + f"\n    PYTHONPATH=$PWD:$PWD/src {shlex.join(args)}\n"
+        )
         if phase == "prepare":
             note = root / "NOTE.md"
             if note.exists() and note.read_text() != stage_note:
@@ -341,7 +383,14 @@ def run(commit: str, seed: int, phase: str, *, first_admitted: bool = False) -> 
                 cwd="outputs",
                 check=True,
             )
-            write_json(receipt, _admission(seed, commit, data_id, first_admitted))
+            record = (
+                _admission(seed, commit, data_id, first_admitted)
+                if route is None
+                else route.prepare(root, seed, commit, data_id, stage_note)
+            )
+            if receipt.exists() and read_json(receipt) != record:
+                raise RuntimeError("acquisition admission changed")
+            write_json(receipt, record)
         admission = read_json(receipt)
         if admission["commit"] != commit or admission["data_identity"] != data_id:
             raise RuntimeError("Acquisition admission belongs to a different run")
@@ -352,6 +401,26 @@ def run(commit: str, seed: int, phase: str, *, first_admitted: bool = False) -> 
                 "passed": False,
                 "reason": "train_admission",
             }
+            if route is not None:
+                failure.update(
+                    policy=policy,
+                    data_identity=data_id,
+                    attempted=1,
+                    checkpoint_sha256={"acquisition": admission["checkpoint_sha256"]},
+                    acquisition_receipt_sha256=sha(receipt),
+                )
+                write_json(
+                    root / "prepare.json",
+                    {
+                        "ready": False,
+                        "seed": seed,
+                        "commit": commit,
+                        "admission_sha256": sha(receipt),
+                        "acquisition_sha256": admission["checkpoint_sha256"],
+                    },
+                )
+                failure["prepare_sha256"] = sha(root / "prepare.json")
+                failure["cold_control"] = admission["cold_control"]
             if first_admitted:
                 failure.update(
                     data_identity=data_id,
@@ -363,7 +432,11 @@ def run(commit: str, seed: int, phase: str, *, first_admitted: bool = False) -> 
             write_json(root / "metrics.json", failure)
             return
         index = int(admission["selected_index"]) if first_admitted else 0
-        acquisition = PARENT / f"acquisition-{index}-s{seed}/results"
+        acquisition = (
+            PARENT / f"acquisition-{index}-s{seed}/results"
+            if route is None
+            else root / "acquisition/results"
+        )
         if first_admitted and _reuse_planned(root, seed, index, phase, commit):
             if phase == "prepare":
                 _carry_forward(
@@ -411,6 +484,7 @@ def run(commit: str, seed: int, phase: str, *, first_admitted: bool = False) -> 
                 commit,
                 data_id,
                 first_admitted,
+                declaration,
             )
             _stage(
                 adapt,
@@ -434,8 +508,31 @@ def run(commit: str, seed: int, phase: str, *, first_admitted: bool = False) -> 
                 commit,
                 data_id,
                 first_admitted,
+                declaration,
             )
+            if route is not None:
+                _head(commit)
+                write_json(
+                    root / "prepare.json",
+                    {
+                        "ready": True,
+                        "seed": seed,
+                        "commit": commit,
+                        "admission_sha256": sha(receipt),
+                        "acquisition_sha256": admission["checkpoint_sha256"],
+                        "project_sha256": sha(project / "results/last.pt"),
+                        "adapt_sha256": sha(adapt / "results/last.pt"),
+                    },
+                )
         elif phase in ("full", "baseline"):
+            if route is not None:
+                prepared = read_json(root / "prepare.json")
+                if (
+                    prepared["commit"] != commit
+                    or prepared["admission_sha256"] != sha(receipt)
+                    or prepared["adapt_sha256"] != sha(adapt / "results/last.pt")
+                ):
+                    raise RuntimeError("warm acquisition preparation changed")
             first, final = root / f"{phase}-300k", root / f"{phase}-350k"
             _stage(
                 first,
@@ -458,6 +555,7 @@ def run(commit: str, seed: int, phase: str, *, first_admitted: bool = False) -> 
                 commit,
                 data_id,
                 first_admitted,
+                declaration,
             )
             _stage(
                 final,
@@ -479,6 +577,7 @@ def run(commit: str, seed: int, phase: str, *, first_admitted: bool = False) -> 
                 commit,
                 data_id,
                 first_admitted,
+                declaration,
             )
         else:
             from diagnostics.masked_mlp_oracle.paper_analysis import load_run
@@ -491,9 +590,20 @@ def run(commit: str, seed: int, phase: str, *, first_admitted: bool = False) -> 
             measured = {a: load_run(root / f"{a}-350k/results", a, seed).metrics for a in reference}
             checks = decision(measured, reference)
             hashes = {s: sha(root / s / "results/last.pt") for s in STAGES}
+            if route is not None:
+                hashes["acquisition"] = admission["checkpoint_sha256"]
             write_json(
                 root / "metrics.json",
                 {
+                    **(
+                        {
+                            "policy": policy,
+                            "prepare_sha256": sha(root / "prepare.json"),
+                            "cold_control": admission["cold_control"],
+                        }
+                        if route
+                        else {}
+                    ),
                     "commit": commit,
                     "seed": seed,
                     "data_identity": data_id,

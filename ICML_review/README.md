@@ -134,3 +134,25 @@ After the matched intervention queries have closed, compare the frozen models' r
 ```bash
 bash ICML_review/code/forecast_diagnostics.sh "$revision" system-effects "$query_worker"
 ```
+
+## Single-episode consistency and acquisition initialization
+
+From the server checkout, set `revision=$(git rev-parse HEAD)` and `export PYTHONPATH=$PWD:$PWD/src`. Verify the reported manifest from `outputs/` before use. The following commands start a pilot for each intervention. Their notes specify the comparisons and all promotion criteria. Each benchmark advances independently.
+
+```bash
+.venv/bin/python -m ICML_review.code.restart_diagnosis "$revision"
+.venv/bin/python -m ICML_review.code.linear_consensus "$revision" synthetic 0
+.venv/bin/python -m ICML_review.code.linear_consensus "$revision" vision 0
+.venv/bin/python -m ICML_review.code.synthetic_consensus "$revision" 0 same
+.venv/bin/python -m ICML_review.code.synthetic_consensus "$revision" 0 other
+.venv/bin/python -m ICML_review.code.synthetic_consensus "$revision" 0 assess
+.venv/bin/python -m ICML_review.code.vision_invariant "$revision" 0 prepare
+.venv/bin/python -m ICML_review.code.rgb_predictive "$revision" 0 prepare
+.venv/bin/python -m ICML_review.code.synthetic_warm "$revision" 0 prepare
+```
+
+For the RGB teacher continuation, follow preparation with `own` and `sibling` on separate idle GPUs, then `assess`. For either acquisition alternative, continue each admitted preparation with `full` and `baseline`, then `assess`. The synthetic warm acquisition reuses the joint head. The RGB procedure keeps the first acquired head and changes its compression. The affine fits change a single episode encoder readout. The longer continuations compare two frozen-teacher targets with a matched encoder-gradient cap.
+
+Run `.venv/bin/python -m ICML_review.code.consensus_queries "$revision" METHOD SEED` for the validation intervention comparisons. The accepted methods are `linear-consensus-vision`, `vision-invariant` and `rgb-predictive`. The controls require the original chart and kicks validation receipts for the seed.
+
+To schedule all eligible stages across a shared server checkout, launch `.venv/bin/python -m ICML_review.code.consensus_queue "$revision"` in a detached session on each available worker. The queue checks process occupancy before each stage, locks one stage per device and matches stochastic teacher continuations to the original GPU family. A pilot's terminal receipt controls expansion through seed four. Worker logs, starts, exits and return codes live in `outputs/consensus-queue/` within the review folder. Scientific checkpoints and receipts live in the method-specific seed folders. The synthetic archive audit is a separate CPU-only invocation.

@@ -6,8 +6,8 @@ import math
 import multiprocessing
 import shlex
 import subprocess
-from collections.abc import Mapping
-from dataclasses import asdict
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -419,14 +419,28 @@ def _base(rev: str, seed: int, trigger: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def run_phase(rev: str, seed: int, phase: str) -> None:
+@dataclass(frozen=True)
+class OneHeadTrial:
+    """Configure a one-head trial using the archived admission and sparse gates."""
+
+    folder: str = "vision-one-head"
+    module: str = MODULE
+    protocol: str = PROTOCOL
+    trigger: Callable[[Path], dict[str, Any]] = scientific_trigger
+    project_command: tuple[str, ...] | None = None
+
+
+ORIGINAL_TRIAL = OneHeadTrial()
+
+
+def run_phase(rev: str, seed: int, phase: str, *, trial: OneHeadTrial = ORIGINAL_TRIAL) -> None:
     """Execute one independently lockable phase against the predeclared original comparator."""
     _head(rev)
-    out = OUTPUT / f"vision-one-head-s{seed}"
+    out = OUTPUT / f"{trial.folder}-s{seed}"
     base = ROOT / f"seed{seed}"
-    trigger = scientific_trigger(OUTPUT)
+    trigger = trial.trigger(OUTPUT)
     if seed:
-        pilot = read(OUTPUT / "vision-one-head-s0/metrics.json")
+        pilot = read(OUTPUT / f"{trial.folder}-s0/metrics.json")
         if (
             pilot["commit"] != rev
             or pilot["seed"] != 0
@@ -436,7 +450,7 @@ def run_phase(rev: str, seed: int, phase: str) -> None:
         ):
             raise ValueError("expansion requires the same-revision complete passing pilot")
     commands = [
-        "PYTHONPATH=$PWD:$PWD/src " + shlex.join([PYTHON, "-m", MODULE, rev, str(seed), p])
+        "PYTHONPATH=$PWD:$PWD/src " + shlex.join([PYTHON, "-m", trial.module, rev, str(seed), p])
         for p in PHASES
     ]
     manifest = read(DATA / "manifest.json")
@@ -444,7 +458,7 @@ def run_phase(rev: str, seed: int, phase: str) -> None:
         s: manifest["splits"][s]["sha256"] for s in ("train", "calibration", "validation")
     }
     note = (
-        f"# One fixed acquisition, vision seed {seed}\n\n{PROTOCOL}\n\nCommit: {rev}\n"
+        f"# One fixed acquisition, vision seed {seed}\n\n{trial.protocol}\n\nCommit: {rev}\n"
         f"Data manifest SHA-256: {sha(DATA / 'manifest.json')}\n"
         f"Used split SHA-256: {json.dumps(split_hashes, sort_keys=True)}\n"
         f"Data: {DATA}. Fixed candidate: {base / 'acquire/a0/final.pt'}.\n\n    "
@@ -456,7 +470,11 @@ def run_phase(rev: str, seed: int, phase: str) -> None:
         declared(root_note, note)
     elif root_note.read_text() != note:
         raise ValueError("scientific declaration differs")
-    group = f"icml-review-one-head-s{seed}"
+    group = (
+        f"icml-review-one-head-s{seed}"
+        if trial.folder == "vision-one-head"
+        else f"icml-review-{trial.folder}-s{seed}"
+    )
     final = out / "metrics.json"
     subprocess.run(
         ["sha256sum", "-c", "--quiet", "reported-checkpoints.sha256"], cwd="outputs", check=True
@@ -499,6 +517,7 @@ def run_phase(rev: str, seed: int, phase: str) -> None:
                 base=base,
                 data_dir=DATA,
                 group=group,
+                project_command=trial.project_command,
             )
             result["checkpoint_sha256"].update(hashes)
             root.update(result)

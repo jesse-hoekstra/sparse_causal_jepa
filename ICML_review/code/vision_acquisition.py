@@ -281,6 +281,7 @@ def project_adapt(
     base: Path,
     data_dir: Path,
     group: str,
+    project_command: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Apply the reported projection and frozen adaptation to a specific overcomplete source."""
     projected, adapted = out / "projected", out / "adapt"
@@ -289,8 +290,7 @@ def project_adapt(
         rev,
         projected,
         [
-            *TRAIN,
-            "project",
+            *(project_command if project_command is not None else (*TRAIN, "project")),
             "--source",
             str(source.parent),
             "--data-dir",
