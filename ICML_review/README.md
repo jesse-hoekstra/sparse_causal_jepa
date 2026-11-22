@@ -159,7 +159,7 @@ To schedule all eligible stages across a shared server checkout, launch `.venv/b
 
 ## Post-training readout and finite-support controls
 
-The corrected RGB readout scores state labels over the first input window. Use `linear_consensus "$revision" vision-window 0` with the module prefix above. The independent stable-subspace comparison takes `linear_consensus "$revision" synthetic 0 --stable` or `linear_consensus "$revision" vision-window 0 --stable`. It selects a minimum within-system variance subspace of the *final* TRAIN features at fixed total covariance, then fits the observed system means back to the deployed chart. A missing spectral gap or insufficient rank closes the fit. In all three cases the trained predictor receives one episode at deployment.
+The corrected RGB readout scores state labels over the first input window. Use `linear_consensus "$revision" vision-window 0` with the module prefix above. The independent stable-subspace comparison takes `linear_consensus "$revision" synthetic 0 --stable` or `linear_consensus "$revision" vision 0 --stable`. It selects a minimum within-system variance subspace of the *final* TRAIN features at fixed total covariance, then fits the observed system means back to the deployed chart. A missing spectral gap or insufficient rank closes the fit. In all three cases the trained predictor receives one episode at deployment.
 
 The two-support estimator uses the original endpoint and the least-squares mean of two sibling codes at inference. Run `.venv/bin/python -m ICML_review.code.support_pair "$revision" synthetic 0` or replace `synthetic` with `vision`. It measures stability across disjoint support pairs and forecasts for independent recipients. The separate RGB physical intervention audit is `.venv/bin/python -m ICML_review.code.support_queries "$revision" 0`.
 
@@ -168,3 +168,24 @@ On a pinned idle GPU, `bash ICML_review/code/readout_queue.sh "$revision" METHOD
 The bounded RGB acquisition comparison takes the first four archived candidate seeds and applies the original training-only selector. Run `.venv/bin/python -m ICML_review.code.rgb_four "$revision" 0 prepare`, followed by `full`, `baseline` and `assess` when preparation calls for new sparse endpoints. Previously completed, identical stages retain their authenticated outcomes. Use the `rgb-four` selector for the matching `consensus_queries` evaluation. The `--four` option to `consensus_queue` schedules this campaign in its own queue. A gateway can run `bash ICML_review/code/four_after_readouts.sh "$revision" WORKER ...` to launch eligible workers after the frozen-readout studies exit.
 
 For unattended execution of both follow-ups on the same pinned checkout, run `bash ICML_review/code/readout_launch.sh "$revision" WORKER ...` in a detached gateway session. It checks the release manifest, distributes the readout studies to free devices and waits for their exit receipts before starting the four-head comparison.
+
+
+## Combining a shorter acquisition with the sibling-episode loss
+
+The interaction study requires terminal decisions for all five original seeds of each constituent. Run the CPU cohort audit from the pinned checkout. Use `synthetic` for warm acquisition with the frozen sibling teacher, and `vision` for the bounded RGB acquisition with the same teacher rule. Each cohort declaration specifies its required recovery and application checks.
+
+```bash
+bash ICML_review/code/combined_run.sh "$revision" synthetic 0 cohort
+bash ICML_review/code/combined_run.sh "$revision" vision 0 cohort
+```
+
+For an eligible cohort, run seed zero on an idle worker of the original continuation's GPU model. Use the same command with seeds one through four after a passing combined pilot. The combined run charges the native acquisition and reuses its full and baseline controls. For a changed RGB winner it trains against that seed's own frozen teacher. The seed receipt records any inherited trajectory and the paired validation intervention errors. The launcher records its command and checkout in `ICML_review/outputs/combined-queue/`.
+
+```bash
+bash ICML_review/code/combined_run.sh "$revision" synthetic 0 run
+bash ICML_review/code/combined_run.sh "$revision" vision 0 run
+```
+
+To schedule each qualified seed on its matched device, start `bash ICML_review/code/combined_launch.sh "$revision" DATASET WORKER ...` in a detached gateway session after the constituent campaigns close. Receipt-only and exactly inherited routes use CPU. The launcher schedules the four replicates after the seed-zero verdict.
+
+The bounded synthetic fallback compares existing warm and first-cold trajectories. It tries cold only when warm fails the original TRAIN admission cutoff and charges both attempts. Run `bash ICML_review/code/warm_fallback_queue.sh "$revision"` on server CPU after all warm and cold decisions are available. The per-seed route is written before reading held-out endpoint scores.
