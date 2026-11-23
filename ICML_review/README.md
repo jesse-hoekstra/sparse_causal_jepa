@@ -189,3 +189,7 @@ bash ICML_review/code/combined_run.sh "$revision" vision 0 run
 To schedule each qualified seed on its matched device, start `bash ICML_review/code/combined_launch.sh "$revision" DATASET WORKER ...` in a detached gateway session after the constituent campaigns close. Receipt-only and exactly inherited routes use CPU. The launcher schedules the four replicates after the seed-zero verdict.
 
 The bounded synthetic fallback compares existing warm and first-cold trajectories. It tries cold only when warm fails the original TRAIN admission cutoff and charges both attempts. Run `bash ICML_review/code/warm_fallback_queue.sh "$revision"` on server CPU after all warm and cold decisions are available. The per-seed route is written before reading held-out endpoint scores.
+
+### Checking the native RGB continuation
+
+Run `PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.vision_native_control "$revision"` on the idle worker and physical GPU recorded for the native four-acquisition seed-three full arm. The diagnostic requires both archived control attempts. It compares their saved random-generator states and optimizer step counters, then calls the original RGB training CLI in two fresh processes. Each resumes the same 300k checkpoint for one logging interval. The first repetition checks the archived training record. The second checks repeatability between fresh processes. Declarations, exact commands and field comparisons are written under `ICML_review/outputs/vision-native-control-s3/`.
