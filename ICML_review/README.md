@@ -228,3 +228,18 @@ server CPU. The comparison uses common held-out systems and requires both endpoi
 PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_comparison "$revision" synthetic
 PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_comparison "$revision" rgb
 ```
+
+For a synthetic joint-start interruption during adaptation, the breakdown diagnostic compares
+the saved first adaptation minibatch against the original first-head projection. Its CPU mode
+examines every sibling donor offset, physical retention, code rank and forecast error.
+The optional original-device replay restores the in-memory model, AdamW and random streams
+and stops at the first failed clip or the first unlogged interval. Use the diagnostic
+checkout and the earlier training checkout as separate arguments. Run the indicated
+declaration before each mode and verify the release checkpoint manifest before reading inputs.
+
+```bash
+PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_breakdown "$revision" "$training_revision" --declare
+PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_breakdown "$revision" "$training_revision"
+PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_breakdown "$revision" "$training_revision" --gpu --declare
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_breakdown "$revision" "$training_revision" --gpu
+```
