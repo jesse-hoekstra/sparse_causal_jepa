@@ -243,3 +243,13 @@ PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_breakdown "
 PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_breakdown "$revision" "$training_revision" --gpu --declare
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_breakdown "$revision" "$training_revision" --gpu
 ```
+
+To inspect the original RGB projection on the fixed candidate from both schedules, run the
+following diagnostic after the training checkout is idle. It captures the TRAIN code
+covariances and the native projected inverse on the recorded worker. The archived calibration
+and validation evaluations supply the physical recovery and forecast measurements.
+
+```bash
+PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_rgb_projection "$revision" "$training_revision" --declare
+CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_rgb_projection "$revision" "$training_revision"
+```
