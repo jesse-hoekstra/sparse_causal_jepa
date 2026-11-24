@@ -193,3 +193,38 @@ The bounded synthetic fallback compares existing warm and first-cold trajectorie
 ### Checking the native RGB continuation
 
 Run `PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.vision_native_control "$revision"` on the idle worker and physical GPU recorded for the native four-acquisition seed-three full arm. The diagnostic requires both archived control attempts. It compares their saved random-generator states and optimizer step counters, then calls the original RGB training CLI in two fresh processes. Each resumes the same 300k checkpoint for one logging interval. The first repetition checks the archived training record. The second checks repeatability between fresh processes. Declarations, exact commands and field comparisons are written under `ICML_review/outputs/vision-native-control-s3/`.
+
+## Fixed first acquisition and timing of sibling guidance
+
+The four-arm stress test uses the historical first cold acquisition on synthetic seed four and
+RGB seed three. It compares the first joint update with the first sparse update as the onset
+of sibling guidance. Both arms freeze their own adapted teacher at the start of sparse training.
+The entire-training arm uses detached sibling codes from the current TRAIN minibatch before
+adaptation finishes. The frozen teacher uses all TRAIN groups. Both variants deploy a single
+episode. The existing first-cold synthetic endpoint supplies a matched untreated control.
+
+Run the declaration once for all four arms in the pinned server checkout. Then start one
+dispatcher per arm in a detached gateway session. Pass eligible worker names from the
+same GPU family for the two schedules within a dataset.
+
+```bash
+revision=$(git rev-parse HEAD)
+PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_declaration "$revision"
+bash ICML_review/code/timing_dispatch.sh "$revision" synthetic entire "$worker"
+bash ICML_review/code/timing_dispatch.sh "$revision" synthetic sparse "$worker"
+bash ICML_review/code/timing_dispatch.sh "$revision" rgb entire "$rgb_worker"
+bash ICML_review/code/timing_dispatch.sh "$revision" rgb sparse "$rgb_worker"
+```
+
+The four output folders are `outputs/timing-{synthetic,rgb}-{entire,sparse}-s{seed}/` under
+the review folder. Each contains a prospective declaration, training receipts, stage identities
+and held-out evaluation. Each dispatcher waits for a free GPU and keeps the prescribed
+initialization. The experiment uses calibration and validation for the endpoint comparison.
+
+After the two terminal receipts for a dataset are available, run its paired comparison on
+server CPU. The comparison uses common held-out systems and requires both endpoint digests.
+
+```bash
+PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_comparison "$revision" synthetic
+PYTHONPATH=$PWD:$PWD/src .venv/bin/python -m ICML_review.code.timing_comparison "$revision" rgb
+```
